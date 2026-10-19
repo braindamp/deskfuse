@@ -34,7 +34,7 @@ internal static class Program
           trusted-phones --forget-phone ID   revoke a phone and its approvals
           --new-pairing      rotate the host public key (all phones must re-enroll)
           --single-session   exit after one phone session
-          --enable-phone-mic --phone-mic-output-id ID --phone-mic-device-id DEVICE_ID
+          --experimental-mic-cable --phone-mic-output-id ID --phone-mic-device-id DEVICE_ID
                              DEV BRIDGE: opt in to route authorized Android microphone
                              into explicitly selected Windows render endpoint ID.
                              Select a virtual cable's corresponding RECORDING device
@@ -161,7 +161,7 @@ internal static class Program
         // A Windows render-endpoint ID is not a DeskFuse PnP mic identity.
         var microphoneOutputId = Opt(args, "--phone-mic-output-id");
         var microphoneDeviceId = Opt(args, "--phone-mic-device-id");
-        var allowMicrophone = args.Contains("--enable-phone-mic") &&
+        var allowMicrophone = args.Contains("--experimental-mic-cable") &&
             !string.IsNullOrWhiteSpace(microphoneOutputId) &&
             !string.IsNullOrWhiteSpace(microphoneDeviceId);
         var options = new HostOptions
