@@ -111,7 +111,10 @@ public static class ServerMessages
     {
         var array = new JsonArray();
         foreach (var window in windows)
-            array.Add(new JsonObject { ["id"] = window.Id, ["title"] = window.Title, ["appLabel"] = window.AppLabel });
+            array.Add(new JsonObject {
+                ["id"] = window.Id, ["title"] = window.Title, ["appLabel"] = window.AppLabel,
+                ["sessionStable"] = window.SessionStable,
+            });
         return new JsonObject { ["type"] = "window_list", ["windows"] = array };
     }
     public static JsonObject FileList(FileListing listing)
