@@ -137,4 +137,17 @@ This interface deliberately distinguishes *source identity* from *capture backen
 - Don't equate UI fidelity with a `GetDpiForWindow` return value alone. Validate actual captured/decoded pixels.
 - Don't treat this strategy note as an instruction to merge experimental work into `main` or to change the already assigned WGC POC.
 
-**Status at writing:** This document records product direction and verifiable API candidates. No browser OSR prototype, source selection policy or spatial-desk product has yet been demonstrated on the DeskFuse test PC.
+
+## 9. Additional product-design research: native touch, gamepads and privileged sessions
+
+**Scope note:** These are future DeskFuse product ideas requested after the WGC POC was delegated. They are **not an expansion of the GPU/WGC agent's assignment** and are not evidence that the related capabilities work.
+
+**1:1 phone input.** Use a focused `WindowSource` and explicit input ownership to transform phone coordinates (accounting for desk zoom/pan, window origin, cropping, monitor layout and user DPI) into **real Windows virtual-screen coordinates**. Investigate native PT_TOUCH/PT_PEN using Microsoft's [`CreateSyntheticPointerDevice` / `InjectSyntheticPointerInput`](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-injectsyntheticpointerinput); its `ptPixelLocation` uses virtual-screen pixel positions and supports touch contact arrays. Maintain normal mouse, keyboard, IME, wheel and shortcuts as independent options. Do not seize the physical user's pointer or assume `ClipCursor` is a safe default.
+
+**Games.** Optional gamepad synthesis may help game streaming; historical ViGEm/ViGEmBus is a possible compatibility reference but [upstream is archived/retired](https://docs.nefarius.at/projects/ViGEm/End-of-Life/). Explore maintained alternatives and driver signing, permission, anti-cheat and lifecycle risks before any production decision. No unsolicited driver installation.
+
+**Service / secure-desktop investigation.** Sunshine/Apollo-like use cases motivate a small privileged broker/service for supported machine-scoped actions, but **a SYSTEM service in Session 0 cannot simply capture/control the user's UAC secure desktop, lock screen or Ctrl+Alt+Del**. Microsoft [discourages interactive services](https://learn.microsoft.com/en-us/windows/desktop/services/interactive-services) and recommends user-session processes for UI work; Windows' [`SendSAS`](https://learn.microsoft.com/en-us/windows/win32/api/sas/nf-sas-sendsas) has additional configuration and authorization constraints. Research separately for each protected state and distinguish *observability* from *control*. Proposed split: authenticated, least-privilege **interactive per-user capture/input agent** plus a **minimal privileged broker** for specific authorized functionality. Do not run the media/network stack as SYSTEM by default or promise bypasses of UAC, Winlogon, protected desktops or credentials.
+
+**Success criteria for future design research:** platform permissions, exact support matrix, security threat model, signed/installable components, consent and revocation, per-user-session boundaries, touch/gamepad injection fidelity and physical-monitor isolation. This is not part of the completed return-handshake campaign.
+
+**Status as of 20 October 2026:** The previous v0.3 return-handshake test campaign is concluded per the owner; exact 1440×3120/336-DPI Approach A remains open. A separate agent owns the GPU/WGC POC. This document records product direction and verifiable API candidates. No browser OSR prototype, source selection policy or spatial-desk product has yet been demonstrated on the DeskFuse test PC.
