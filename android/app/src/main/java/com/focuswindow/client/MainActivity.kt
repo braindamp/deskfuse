@@ -45,6 +45,7 @@ import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 import com.focuswindow.client.input.InputMapper
+import com.focuswindow.client.media.PcAudioOutput
 import com.focuswindow.client.profile.PhoneProfile
 import com.focuswindow.client.profile.ProfileProvider
 import com.focuswindow.client.protocol.InputEvent
@@ -145,6 +146,7 @@ class MainActivity : ComponentActivity() {
             keepScreenOn = true
         }
         controller.attachSurface(surfaceView)
+        controller.attachPcAudioOutput(PcAudioOutput(applicationContext))
         input = InputMapper(surfaceView)
         surfaceView.onCommittedText = { controller.sendInput(InputEvent.Text(it)) }
         surfaceView.onDeleteBackward = { sendSyntheticKey(KeyEvent.KEYCODE_DEL) }
@@ -165,6 +167,7 @@ class MainActivity : ComponentActivity() {
         setContent {
             val state by controller.state.collectAsState()
             val advisories by controller.advisories.collectAsState()
+            val pcAudioStatus by controller.pcAudioStatus.collectAsState()
             var modifierMask by remember { mutableIntStateOf(Modifiers.NONE) }
             var diagnostics by remember { mutableStateOf(false) }
             var showWindows by remember { mutableStateOf(false) }
@@ -381,6 +384,8 @@ class MainActivity : ComponentActivity() {
                     onShowKeyboard = { showPhoneKeyboard() },
                     onSelectWindow = { controller.requestWindows(); showWindows = true; appDialogVisible = true },
                     onSendFile = { controller.browsePc(); showPcFiles = true; appDialogVisible = true },
+                    pcAudioStatus = pcAudioStatus,
+                    onTogglePcAudio = { controller.togglePcAudio() },
                     onAdvisoryAction = { },
                 )
             }
