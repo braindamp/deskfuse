@@ -22,6 +22,7 @@ import com.focuswindow.client.protocol.RemoteFileEntry
 import com.focuswindow.client.render.PhoneSurfaceView
 import com.focuswindow.client.transport.LanTransport
 import com.focuswindow.client.transport.PairingPayload
+import com.focuswindow.client.transport.PairingRepository
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -46,6 +47,7 @@ import kotlin.math.min
 class SessionController(
     private val scope: CoroutineScope,
     private val clientVersion: String,
+    private val audioPreferences: PairingRepository? = null,
 ) {
 
     private val _state = MutableStateFlow<SessionState>(SessionState.Idle)
@@ -75,6 +77,8 @@ class SessionController(
     private val _bridgeState = MutableStateFlow<ServerMessage.BridgeState?>(null)
     val bridgeState: StateFlow<ServerMessage.BridgeState?> = _bridgeState.asStateFlow()
     private var pcAudioRequested = false
+    private var pcAudioDesired = false
+    private var pcAudioFailedOnConnection = false
     private var hostPcAudioAvailable = false
     private var pcAudioOutput: PcAudioOutput? = null
     private val transport = LanTransport(scope)
@@ -103,22 +107,38 @@ class SessionController(
         pcAudioOutput = output
     }
 
+    /** Last user-selected PC playback route, scoped to this paired Windows host.
+     *  This mirrors PC output to Android; it is NOT a selectable Windows speaker.
+     */
     fun togglePcAudio() {
         if (_state.value !is SessionState.Streaming) return
         if (!hostPcAudioAvailable) {
             _pcAudioStatus.value = "Unavailable"
             return
         }
-        if (pcAudioRequested) {
-            pcAudioRequested = false
-            pcAudioOutput?.stop()
-            _pcAudioStatus.value = "Off"
-            scope.launch { transport.send(ClientMessage.Audio("stop_pc")) }
+        val enabled = !pcAudioDesired
+        pcAudioDesired = enabled
+        payload?.let { audioPreferences?.setAudioWanted(it, "pc_sound", enabled) }
+        if (!enabled) {
+            val wasRequested = pcAudioRequested
+            stopPcAudioLocal()
+            if (wasRequested) scope.launch { transport.send(ClientMessage.Audio("stop_pc")) }
         } else {
-            pcAudioRequested = true
-            _pcAudioStatus.value = "Starting"
-            scope.launch { transport.send(ClientMessage.Audio("start_pc")) }
+            // An explicit user tap can retry after a previous audio error.
+            pcAudioFailedOnConnection = false
+            requestPreferredPcAudio()
         }
+    }
+
+    /** Called only after streaming is ready, not on unapproved Hello.
+     *  A transport reconnection resets pcAudioRequested, but not the saved preference.
+     */
+    private fun requestPreferredPcAudio() {
+        if (!pcAudioDesired || !hostPcAudioAvailable || pcAudioRequested ||
+            pcAudioFailedOnConnection || _state.value !is SessionState.Streaming) return
+        pcAudioRequested = true
+        _pcAudioStatus.value = "Starting"
+        scope.launch { transport.send(ClientMessage.Audio("start_pc")) }
     }
 
     private fun stopPcAudioLocal() {
@@ -144,8 +164,10 @@ class SessionController(
 
     fun start(payload: PairingPayload, profile: PhoneProfile) {
         hostPcAudioAvailable = false
+        pcAudioFailedOnConnection = false
         _bridgeState.value = null
         stopPcAudioLocal()
+        pcAudioDesired = audioPreferences?.audioWanted(payload, "pc_sound") ?: false
         this.payload = payload
         this.profile = profile
         attempt = 0
@@ -212,6 +234,8 @@ class SessionController(
                 }
 
                 is LanTransport.TransportEvent.Failed -> {
+                    hostPcAudioAvailable = false
+                    pcAudioFailedOnConnection = false
                     stopPcAudioLocal()
                     uploadJob?.cancel()
                     abortDownload("Connection lost; incomplete download discarded")
@@ -224,6 +248,8 @@ class SessionController(
                 }
 
                 is LanTransport.TransportEvent.Closed -> {
+                    hostPcAudioAvailable = false
+                    pcAudioFailedOnConnection = false
                     stopPcAudioLocal()
                     uploadJob?.cancel()
                     abortDownload("Connection closed; incomplete download discarded")
@@ -239,7 +265,9 @@ class SessionController(
             when (msg) {
                 is ServerMessage.Hello -> {
                     hostPcAudioAvailable = msg.pcAudioAvailable
+                    pcAudioFailedOnConnection = false
                     _pcAudioStatus.value = if (msg.pcAudioAvailable) "Off" else "Unavailable"
+                    requestPreferredPcAudio()
                 }
 
                 is ServerMessage.Stage -> {
@@ -301,8 +329,13 @@ class SessionController(
                                 transport.send(ClientMessage.Audio("stop_pc"))
                             }
                         }
-                        "stopped" -> stopPcAudioLocal()
+                        "stopped" -> {
+                            // A late stop acknowledgement must not override a new
+                            // start request after a quick off/on action.
+                            if (!pcAudioDesired) stopPcAudioLocal()
+                        }
                         "error" -> {
+                            pcAudioFailedOnConnection = true
                             stopPcAudioLocal()
                             _pcAudioStatus.value = "Unavailable"
                         }
@@ -421,6 +454,7 @@ class SessionController(
             invariantClean = drift == null,
             invariantDrift = emptyList(),
         )
+        requestPreferredPcAudio()
     }
 
     private fun scheduleReconnect(reason: String) {
