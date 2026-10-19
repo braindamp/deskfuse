@@ -266,7 +266,7 @@ internal static class DprChallengeLab
                         window.MeasuredRulerHeightPx is >= 345 and <= 355;
                     var observed350 = window.Awareness == "PerMonitorV2" &&
                         window.WindowDpi >= 336 && ruler350 &&
-                        density.MonitorDpiX >= 336;
+                        row.MonitorDpiX >= 336;
                     row.WriteVerdict = wroteScale
                         ? !row.WriteApiResult.Contains("win32-return=0", StringComparison.Ordinal)
                             ? "REJECTED"
