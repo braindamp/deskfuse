@@ -191,6 +191,10 @@ public sealed class FakeDisplayBackend : IDisplayBackend
     public bool? ProbeRulerOk = true;
     public bool ProbeAvailable = true;
     public bool ProbeClientFullSize = true;
+    public int? ProbeViewportWindowDpi;
+    public bool ProbeViewportAvailable = true;
+    public int ViewportProbeCalls;
+
     public readonly List<MonitorRequest> Created = new();
     private MonitorRequest? _lastRequest;
     /// <summary>Thread-safe view of the newest monitor request (the test publisher reads it while the session runs).</summary>
@@ -239,6 +243,20 @@ public sealed class FakeDisplayBackend : IDisplayBackend
             ProbeClientFullSize ? _bounds : new RectI(0, 0, _bounds.Width, _bounds.Height - 38), 100,
             drawRuler ? expected : null, drawRuler ? expected : null, rulerOk,
             rulerOk == false ? "ruler did not match" : drawRuler ? "ruler matched" : "ruler not requested"));
+    }
+    public Task<WindowDensityReport?> ProbeViewportAsync(
+        MonitorInfo monitor, RectI viewport, bool drawRuler, CancellationToken ct)
+    {
+        ViewportProbeCalls++;
+        if (!ProbeViewportAvailable) return Task.FromResult<WindowDensityReport?>(null);
+        var actualDpi = ProbeViewportWindowDpi ?? _dpi;
+        var expected = (int)Math.Round(100 * actualDpi / 96.0);
+        return Task.FromResult<WindowDensityReport?>(new WindowDensityReport(
+            actualDpi, ProbeAwareness, viewport,
+            ProbeClientFullSize ? new RectI(0, 0, viewport.Width, viewport.Height)
+                : new RectI(0, 0, viewport.Width, viewport.Height - 1),
+            100, drawRuler ? expected : null, drawRuler ? expected : null,
+            drawRuler ? ProbeRulerOk : null, "fake pixel-exact cropped viewport"));
     }
     public Task RemoveMonitorAsync(CancellationToken ct)
     {
