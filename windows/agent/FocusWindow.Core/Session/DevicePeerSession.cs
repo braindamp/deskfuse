@@ -37,7 +37,10 @@ internal sealed class DevicePeerSession(
                 "Unsupported accessory capability requested.", fatal: true));
             return;
         }
-        conn.SendControl(ServerMessages.Hello(options.HostVersion, options.HostName, options.Channel));
+        conn.SendControl(ServerMessages.Hello(options.HostVersion, options.HostName, options.Channel,
+            phoneMicrophoneBridgeAvailable: options.AllowPhoneMicrophone &&
+                services.CreatePhoneMicrophoneSink is not null &&
+                requested.Contains(DeviceCapabilities.Microphone)));
         // Approval remains OS-user-scoped, in addition to per-phone encrypted
         // credentials validated by HostListener. This role cannot grant itself
         // filesystem, input, desktop, monitor or Windows capture permissions.
@@ -64,7 +67,10 @@ internal sealed class DevicePeerSession(
 
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(
             shutdown, lease.Cancellation);
-        var control = ReadControlsAsync(conn, linked.Token);
+        using var mic = new PhoneMicrophoneRoute(
+            conn, options, services, lease.Peer.DeviceId, log);
+        var microphonePump = mic.PumpAsync(linked.Token);
+        var control = ReadControlsAsync(conn, mic, requested, linked.Token);
         try
         {
             await Task.WhenAny(control, conn.Completion).ConfigureAwait(false);
@@ -73,17 +79,24 @@ internal sealed class DevicePeerSession(
         {
             linked.Cancel();
             await conn.DisposeAsync().ConfigureAwait(false);
-            try { await control.ConfigureAwait(false); }
+            try { await Task.WhenAll(control, microphonePump).ConfigureAwait(false); }
             catch (OperationCanceledException) when (linked.IsCancellationRequested) { }
             log.Info("Accessory peer detached: " + lease.Peer.DeviceId);
         }
     }
 
-    private static async Task ReadControlsAsync(PhoneConnection conn, CancellationToken ct)
+    private static async Task ReadControlsAsync(PhoneConnection conn,
+        PhoneMicrophoneRoute microphone, IReadOnlyList<string> requested, CancellationToken ct)
     {
         await foreach (var msg in conn.Messages.ReadAllAsync(ct).ConfigureAwait(false))
         {
             if (msg is ClientBye) return;
+            if (msg is ClientMicrophone mic &&
+                requested.Contains(DeviceCapabilities.Microphone))
+            {
+                microphone.Handle(mic);
+                continue;
+            }
             // An accessory peer MUST NOT dispatch input/file/window/monitor
             // actions through PhoneSession. Hardware commands will require
             // separate capability checks when real endpoints are introduced.
