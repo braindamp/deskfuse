@@ -59,6 +59,21 @@ public sealed class DprChallengeTheoryTests
         Assert.Equal(225, DprChallengeTheory.PredictedMaximumForLogicalDesktop(1440, 3120));
     }
 
+    // Exact two-axis boundaries proposed by Arena.ai and refined to the
+    // adjacent even-pixel modes. To be validated against Windows -3 readback.
+    [Theory]
+    [InlineData(2100, 2800, 350)] // 600x800 DIPs at 350%
+    [InlineData(2100, 2798, 300)] // long edge <800 DIPs at 350%
+    [InlineData(1200, 1600, 200)] // 600x800 DIPs at 200%
+    [InlineData(1200, 1598, 175)] // long edge <800 DIPs at 200%
+    [InlineData(1198, 1600, 175)] // short edge <600 DIPs at 200%
+    public void Both_logical_axes_constrain_the_model(
+        int width, int height, int predictedMax)
+    {
+        Assert.Equal(predictedMax,
+            DprChallengeTheory.PredictedMaximumForLogicalDesktop(width, height));
+    }
+
     [Theory]
     [InlineData(200, 350, 4)]
     [InlineData(100, 350, 8)]
