@@ -142,6 +142,15 @@ class DensityContractTest {
         assertTrue(flagship().validate().isEmpty())
     }
 
+    @Test
+    fun `DPR must be a measured finite Android value and cannot default silently`() {
+        assertTrue(flagship().validate().isEmpty())
+        assertTrue(flagship().copy(dpr = Float.NaN).validate().isNotEmpty())
+        assertTrue(flagship().copy(dpr = Float.POSITIVE_INFINITY).validate().isNotEmpty())
+        assertTrue(flagship().copy(dpr = 0f).validate().isNotEmpty())
+        assertTrue(flagship().copy(dpr = 5.5f).validate().isNotEmpty())
+    }
+
     private fun record(dpi: Int, native: Boolean) = TargetRecord(
         version = 1,
         occupant = TargetRecord.Occupant.CLONE,
