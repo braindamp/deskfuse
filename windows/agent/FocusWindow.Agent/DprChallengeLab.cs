@@ -36,6 +36,7 @@ internal static class DprChallengeLab
         public int Predicted600Max { get; init; }
         public int? RecommendedPercent { get; set; }
         public int? InitialPercent { get; set; }
+        public int? PostWritePercent { get; set; }
         public int? ReportedMaximumPercent { get; set; }
         public int? MonitorDpiX { get; set; }
         public int? WindowDpi { get; set; }
@@ -111,6 +112,10 @@ internal static class DprChallengeLab
         var run = args.Contains("--run");
         var try350 = args.Contains("--try-350");
         var beyondCap = args.Contains("--try-above-cap");
+        var settleMs = int.TryParse(Option(args, "--settle-ms"), NumberStyles.None,
+            CultureInfo.InvariantCulture, out var requestedSettle) ? requestedSettle : 1500;
+        if (settleMs < 500 || settleMs > 30000)
+            throw new ArgumentException("--settle-ms must be 500–30000.");
         if (beyondCap && (!try350 || !args.Contains("--i-accept-unsupported-scale-risk")))
             throw new ArgumentException(
                 "--try-above-cap requires --try-350 and --i-accept-unsupported-scale-risk.");
@@ -127,6 +132,7 @@ internal static class DprChallengeLab
                 $"{DprChallengeTheory.PredictedMaximum(m.Width, m.Height, 640)}%, " +
                 $"600-DIP hypothesis max {DprChallengeTheory.PredictedMaximum(m.Width, m.Height, 600)}%");
         Console.WriteLine("  Requested target: genuine 336 DPI; 350 physical pixels for a 100-DIP square.");
+        Console.WriteLine($"  Post-write wait: {settleMs} ms (change with --settle-ms 10000).");
         Console.WriteLine("  Independent PMv2 witness: tools/df-density-readonly.cpp, run while a mode is attached.");
         Console.WriteLine("  A full 1440x3120 GPU/NVENC crop is NOT implemented by this lab.");
         if (!run)
@@ -227,7 +233,7 @@ internal static class DprChallengeLab
                         var result = backend.TrySetChallengeScale(monitor, TargetScale,
                             allowBeyondMaximum: row.WriteAttempt == "ABOVE_REPORTED_CAP_UNDOCUMENTED");
                         row.WriteApiResult = result.Detail;
-                        await Task.Delay(1500, heartbeatStop.Token).ConfigureAwait(false);
+                        await Task.Delay(settleMs, heartbeatStop.Token).ConfigureAwait(false);
                     }
                     else
                     {
@@ -235,15 +241,22 @@ internal static class DprChallengeLab
                             (try350 ? "NOT_ALLOWED_BY_CAP" : "READ_ONLY");
                     }
 
+                    var postSetCaps = backend.ReadScaleCaps(monitor);
+                    row.PostWritePercent = postSetCaps?.CurrentPercent;
+                    Console.WriteLine($"  -3 readback after settle: " +
+                        (postSetCaps is null ? "UNAVAILABLE" :
+                            $"recommended={postSetCaps.RecommendedPercent}% current={postSetCaps.CurrentPercent}% max={postSetCaps.MaxPercent}%"));
                     WindowDensityReport? window = null;
                     for (var witness = 1; witness <= 3; witness++)
                     {
                         var currentDensity = backend.ReadDensity(monitor);
+                        var witnessCaps = backend.ReadScaleCaps(monitor);
                         row.MonitorDpiX = currentDensity.MonitorDpiX;
                         window = await backend.ProbeWindowAsync(monitor, true,
                             heartbeatStop.Token).ConfigureAwait(false);
                         if (window is null) throw new IOException("PMv2 ruler window unavailable");
-                        var note = $"witness {witness}: monitor={currentDensity.MonitorDpiX} DPI, " +
+                        var note = $"witness {witness}: -3-current={witnessCaps?.CurrentPercent.ToString() ?? "UNAVAILABLE"}%, " +
+                            $"monitor={currentDensity.MonitorDpiX} DPI, " +
                             $"window={window.WindowDpi} DPI, awareness={window.Awareness}, " +
                             $"bounds={window.Window}, client={window.Client}, " +
                             $"ruler={window.MeasuredRulerWidthPx}x{window.MeasuredRulerHeightPx}, " +
@@ -291,8 +304,9 @@ internal static class DprChallengeLab
                             : "NOT_VERIFIED_OR_NOT_350";
                     }
                     CheckPhysical(guard, before, row, "measurement");
-                    Console.WriteLine($"  -3 recommended/current/max: " +
-                        $"{row.RecommendedPercent}/{originalCaps.CurrentPercent}/{row.ReportedMaximumPercent}%");
+                    Console.WriteLine($"  -3 initial recommended/current/max: " +
+                        $"{row.RecommendedPercent}/{originalCaps.CurrentPercent}/{row.ReportedMaximumPercent}%; " +
+                        $"post-set current={row.PostWritePercent?.ToString() ?? "UNAVAILABLE"}%");
                     Console.WriteLine($"  independent observations: monitor={row.MonitorDpiX} DPI; " +
                         $"PMv2={row.WindowDpi} DPI; ruler={row.RulerWidthPx}x{row.RulerHeightPx}px");
                     Console.WriteLine($"  -4: {row.WriteApiResult}; verdict={row.WriteVerdict}");
@@ -372,13 +386,13 @@ internal static class DprChallengeLab
                 new JsonSerializerOptions { WriteIndented = true }), CancellationToken.None)
                 .ConfigureAwait(false);
             var csv = new StringBuilder();
-            csv.AppendLine("mode,diag_mm,predicted_640_max,predicted_600_max,recommended,initial,max,monitor_dpi,window_dpi,ruler_w,ruler_h,write_verdict,crop_verdict,restored,physical_unchanged,monitor_removed,error");
+            csv.AppendLine("mode,diag_mm,predicted_640_max,predicted_600_max,recommended,initial,post_set,max,monitor_dpi,window_dpi,ruler_w,ruler_h,write_verdict,crop_verdict,restored,physical_unchanged,monitor_removed,error");
             foreach (var o in observations)
             {
                 string Escape(object? v) => "\"" + Convert.ToString(v, CultureInfo.InvariantCulture)?.Replace("\"", "\"\"") + "\"";
                 csv.AppendLine(string.Join(",", new object?[] { o.Mode, o.EdidDiagonalMm,
                     o.Predicted640Max, o.Predicted600Max, o.RecommendedPercent, o.InitialPercent,
-                    o.ReportedMaximumPercent, o.MonitorDpiX, o.WindowDpi, o.RulerWidthPx,
+                    o.PostWritePercent, o.ReportedMaximumPercent, o.MonitorDpiX, o.WindowDpi, o.RulerWidthPx,
                     o.RulerHeightPx, o.WriteVerdict, o.CropVerdict, o.RestoreResult,
                     o.PhysicalDisplaysUnchanged, o.DriverMonitorRemoved, o.Error }.Select(Escape)));
             }
