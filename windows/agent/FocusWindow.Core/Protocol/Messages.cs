@@ -23,7 +23,7 @@ public static class Wire
 }
 /// <summary>Client -> host messages (ClientMessage in Protocol.kt).</summary>
 public abstract record ClientMessage;
-public sealed record ClientHello(int ProtocolVersion, string ClientVersion, PhoneProfile Profile) : ClientMessage;
+public sealed record ClientHello(int ProtocolVersion, string ClientVersion, PhoneProfile Profile, string Role = "display") : ClientMessage;
 public sealed record ClientProfile(PhoneProfile Profile) : ClientMessage;
 public sealed record ClientDensity(string Preset) : ClientMessage;           // logical | native | one_to_one
 public sealed record ClientRefresh(int Hz) : ClientMessage;
@@ -69,7 +69,8 @@ public static class ClientMessageParser
                 "hello" => new ClientHello(
                     root["protocolVersion"]?.GetValue<int>() ?? 0,
                     root["clientVersion"]?.GetValue<string>() ?? "?",
-                    PhoneProfile.Parse(root["profile"]!.AsObject())),
+                    PhoneProfile.Parse(root["profile"]!.AsObject()),
+                    root["role"]?.GetValue<string>() ?? "display"),
                 "profile" => new ClientProfile(PhoneProfile.Parse(root["profile"]!.AsObject())),
                 "density" => new ClientDensity(root["preset"]!.GetValue<string>()),
                 "refresh" => new ClientRefresh(root["hz"]!.GetValue<int>()),
