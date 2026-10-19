@@ -18,6 +18,7 @@ public sealed record HostOptions
     // --auto-approve must never imply full filesystem access.
     public bool AllowFullUserFiles { get; init; } = true;
     public bool SingleSession { get; init; }
+    public bool CameraFreePairing { get; init; }
 }
 /// <summary>Decides whether a phone that just authenticated may use this PC (default: ask the user).</summary>
 public interface IApprovalPolicy
@@ -50,4 +51,5 @@ public sealed record HostServices(
     IPairingStore PairingStore,
     Action<NegotiationOutcome>? OnNegotiated = null,
     IClipboardBridge? Clipboard = null,
-    IWindowWorkflow? Windows = null);
+    IWindowWorkflow? Windows = null,
+    IDeviceCredentialStore? DeviceCredentials = null);
