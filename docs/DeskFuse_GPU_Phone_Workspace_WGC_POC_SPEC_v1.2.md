@@ -189,7 +189,7 @@ From a normal PowerShell terminal on the Windows test PC:
 ```powershell
 cd D:\Coding\DeskFuse\dpr-lab
 
-git fetch origin main diagnostics/dpi-propagation-20261019
+git fetch origin main diagnostics/dpi-propagation-20261019 docs/window-first-architecture-20261019
 
 git worktree list
 git status --short
@@ -199,6 +199,14 @@ git worktree add -b poc/gpu-phone-workspace-wgc ..\dpr-gpu-wgc origin/main
 cd ..\dpr-gpu-wgc
 
 git rev-parse HEAD  # record this precise base commit in evidence / README
+
+# Import only the two handoff documents from the docs branch; do not merge branches.
+git restore --source=origin/docs/window-first-architecture-20261019 -- `
+    docs/DeskFuse_GPU_Phone_Workspace_WGC_POC_SPEC_v1.2.md `
+    docs/WINDOW_FIRST_WORKSPACE_AND_RENDERING_PIPELINES.md
+
+# Both documentation files are now local uncommitted additions in THIS worktree.
+git status --short
 ```
 
 If `poc/gpu-phone-workspace-wgc` already exists, **do not overwrite** it; use another branch name and record why. Check `git status --short` for the new worktree before editing.
