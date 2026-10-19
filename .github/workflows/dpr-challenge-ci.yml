@@ -13,6 +13,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: dpr-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   windows:
     name: Windows host compile and driver-free DPI tests
