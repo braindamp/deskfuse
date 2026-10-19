@@ -34,7 +34,7 @@ Status: delivery checklist, 20 October 2026. Distinguish implemented building bl
 
 ## Near-term implementation sequence
 
-**A.** Deliver PC -> phone audio on a separate branch (independent of virtual-monitor POC). Use system-output loopback explicitly, not an unverified per-app feed. Default OFF.
+**A.** Deliver PC -> phone audio on a separate branch (independent of virtual-monitor POC). Use system-output loopback explicitly, not an unverified per-app feed. Default OFF on the phone AND host. The host operator must opt in with `--enable-pc-audio`; the phone must request playback. PCM16 stereo, 48kHz LAN transport is an initial implementation, not a measured A/V sync or performance claim. Older hosts advertise no audio capability.
 
 **B.** Implement phone mic capture + network path after establishing actual Windows virtual capture endpoint strategy. The network path alone is not a functional virtual microphone.
 
