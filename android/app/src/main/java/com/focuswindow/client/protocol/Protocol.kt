@@ -185,7 +185,10 @@ sealed interface ServerMessage {
 data class RemoteFileEntry(val path: String, val name: String, val directory: Boolean, val size: Long = 0)
 
 @Serializable
-data class WindowEntry(val id: String, val title: String, val appLabel: String)
+data class WindowEntry(
+    val id: String, val title: String, val appLabel: String,
+    val sessionStable: Boolean = false,
+)
 
 /** Client → host. The phone is the display authority. */
 @Serializable
