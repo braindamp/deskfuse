@@ -31,7 +31,7 @@ public sealed class SecureChannel : IDisposable
 {
     // Envelope: 8-byte monotonic record counter + 16-byte AES-GCM tag.
     public const int RecordOverheadBytes = 8 + 16;
-    private sealed record KeySet(byte[] SendKey, byte[] RecvKey, string Code);
+    private sealed record KeySet(byte[] SendKey, byte[] RecvKey, string Code, string? DeviceId = null);
     private readonly List<KeySet> _candidates;
     private KeySet? _locked;
     private long _sendCounter;
@@ -40,24 +40,45 @@ public sealed class SecureChannel : IDisposable
     private SecureChannel(List<KeySet> candidates) => _candidates = candidates;
     /// <summary>The 6-digit short authentication string the user compares on both screens.</summary>
     public string VerificationCode => (_locked ?? _candidates[0]).Code;
+    /// <summary>Only populated after a valid first AES-GCM packet unlocks this credential.</summary>
+    public string? CredentialDeviceId => _locked?.DeviceId;
     public static async Task<SecureChannel> AcceptAsync(
         Stream stream,
         ECDiffieHellman hostKeyPair,
         byte[] pairingSecret,
         CancellationToken ct)
     {
+        return await AcceptAnyAsync(stream, hostKeyPair,
+            new[] { new DeviceCredential(string.Empty, pairingSecret) }, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Authenticate a phone against per-device secrets, without exposing those secrets during
+    /// discovery or enrollment. Only the candidate authenticating the first GCM packet wins.
+    /// </summary>
+    public static async Task<SecureChannel> AcceptAnyAsync(
+        Stream stream, ECDiffieHellman hostKeyPair,
+        IReadOnlyList<DeviceCredential> credentials, CancellationToken ct)
+    {
+        if (credentials.Count == 0) throw new CryptographicException("No enrolled phones");
+        if (credentials.Count > 128) throw new CryptographicException("Too many pairing candidates");
         var clientKeyBytes = await ReadLengthPrefixedAsync(stream, 4096, ct).ConfigureAwait(false);
         using var peer = ECDiffieHellman.Create();
         peer.ImportSubjectPublicKeyInfo(clientKeyBytes, out _);
         var ourPublic = hostKeyPair.ExportSubjectPublicKeyInfo();
         await WriteLengthPrefixedAsync(stream, ourPublic, ct).ConfigureAwait(false);
         var shared = hostKeyPair.DeriveRawSecretAgreement(peer.PublicKey);
-        var candidates = new List<KeySet> { Derive(shared, pairingSecret) };
+        var candidates = new List<KeySet>();
         var trimmed = TrimLeadingZeros(shared);
-        if (trimmed.Length != shared.Length)
+        foreach (var credential in credentials)
         {
-            candidates.Add(Derive(trimmed, pairingSecret));
+            if (credential.Secret.Length != 32) continue;
+            var deviceId = credential.DeviceId.Length == 0 ? null : credential.DeviceId;
+            candidates.Add(Derive(shared, credential.Secret, deviceId));
+            if (trimmed.Length != shared.Length)
+                candidates.Add(Derive(trimmed, credential.Secret, deviceId));
         }
+        if (candidates.Count == 0) throw new CryptographicException("No valid enrolled credentials");
         CryptographicOperations.ZeroMemory(shared);
         return new SecureChannel(candidates);
     }
@@ -86,7 +107,7 @@ public sealed class SecureChannel : IDisposable
         CryptographicOperations.ZeroMemory(shared);
         return new SecureChannel(new List<KeySet> { mirrored });
     }
-    private static KeySet Derive(ReadOnlySpan<byte> shared, byte[] pairingSecret)
+    private static KeySet Derive(ReadOnlySpan<byte> shared, byte[] pairingSecret, string? deviceId = null)
     {
         static byte[] Info(string s) => System.Text.Encoding.UTF8.GetBytes(s);
         var prk = HKDF.Extract(HashAlgorithmName.SHA256, shared.ToArray(), pairingSecret);
@@ -94,7 +115,7 @@ public sealed class SecureChannel : IDisposable
         var s2c = HKDF.Expand(HashAlgorithmName.SHA256, prk, 32, Info("focuswindow:s2c:v3"));
         var confirm = HKDF.Expand(HashAlgorithmName.SHA256, prk, 4, Info("focuswindow:confirm:v3"));
         var value = BinaryPrimitives.ReadInt32BigEndian(confirm) & 0x7FFFFFFF;
-        return new KeySet(SendKey: s2c, RecvKey: c2s, Code: (value % 1_000_000).ToString("D6"));
+        return new KeySet(SendKey: s2c, RecvKey: c2s, Code: (value % 1_000_000).ToString("D6"), DeviceId: deviceId);
     }
     private static byte[] TrimLeadingZeros(byte[] value)
     {
