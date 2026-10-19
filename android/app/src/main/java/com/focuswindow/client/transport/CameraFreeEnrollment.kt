@@ -89,8 +89,8 @@ object CameraFreeEnrollment {
             withContext(Dispatchers.Main) { onCode(code) }
             try {
                 val decision = read(input)
-                check(decision.getString("status") == "approved") {
-                    "The PC did not approve this phone"
+                if (decision.optString("status") != "approved") {
+                    throw EnrollmentDeniedException()
                 }
                 val nonce = Base64.decode(decision.getString("nonce"), Base64.DEFAULT)
                 val sealed = Base64.decode(decision.getString("ciphertext"), Base64.DEFAULT)

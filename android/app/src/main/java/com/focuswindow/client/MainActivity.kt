@@ -42,6 +42,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 import com.focuswindow.client.input.InputMapper
 import com.focuswindow.client.profile.PhoneProfile
@@ -56,6 +57,7 @@ import com.focuswindow.client.transport.PairingRepository
 import com.focuswindow.client.transport.CameraFreeDiscovery
 import com.focuswindow.client.transport.CameraFreeEnrollment
 import com.focuswindow.client.transport.DiscoveredPc
+import com.focuswindow.client.transport.EnrollmentMessages
 import com.focuswindow.client.ui.SessionChrome
 import com.focuswindow.client.ui.StateScreen
 
@@ -640,8 +642,10 @@ class MainActivity : ComponentActivity() {
                 pairings.remember(pairing)
                 pcPickerVisible = false
                 controller.start(pairing, p)
+            } catch (ex: CancellationException) {
+                throw ex
             } catch (ex: Exception) {
-                pcPairingError = "Could not pair: ${ex.message ?: "check Windows and retry"}"
+                pcPairingError = EnrollmentMessages.describeFailure(ex)
             } finally {
                 pcPairingBusy = false
                 pcPairingCode = null
