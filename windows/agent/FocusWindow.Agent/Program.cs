@@ -33,6 +33,8 @@ internal static class Program
           trusted-phones --forget-phone ID   revoke a phone and its approvals
           --new-pairing      rotate the host public key (all phones must re-enroll)
           --single-session   exit after one phone session
+          --enable-pc-audio  allow approved phones to request mixed PC playback sound
+                             (OFF by default; may include audio from other PC apps)
           --ruler-probe      verify rendered density with a pixel ruler at the start of every session
           --adaptive-dpi     EXPERIMENTAL: calibrate a larger virtual desktop per phone DPR,
                              verify 1:1 crop, and stream only phone-sized pixels
@@ -140,6 +142,7 @@ internal static class Program
             AllowFullUserFiles = !args.Contains("--auto-approve"),
             CameraFreePairing = !args.Contains("--legacy-qr"),
             AdaptiveDpiViewport = args.Contains("--adaptive-dpi"),
+            AllowPcAudio = args.Contains("--enable-pc-audio"),
         };
         log.Info($"Focus Window host agent {Version}");
         var guards = new List<PhysicalDisplayGuard>();
