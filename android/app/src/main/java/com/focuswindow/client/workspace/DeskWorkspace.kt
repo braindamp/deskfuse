@@ -3,11 +3,14 @@ package com.focuswindow.client.workspace
 import java.util.UUID
 
 /** Metadata from an authenticated Windows window-list response. Never persisted. */
-data class DeskWindow(val handle: String, val title: String, val appLabel: String)
+data class DeskWindow(
+    val handle: String, val title: String, val appLabel: String,
+    val sessionStable: Boolean = false,
+)
 
 data class DeskTopic(val id: String, val name: String)
 
-/** The logical card ID is private to this live session; [handle] is not a durable identity. */
+/** [handle] is an authenticated wire focus token (opaque ID on current hosts, HWND on older hosts). */
 data class DeskCard(
     val sourceId: String,
     val handle: String,
@@ -23,11 +26,10 @@ data class DeskSnapshot(val topics: List<DeskTopic>, val cards: List<DeskCard>)
 /**
  * Local-only desk state over the existing v3 window-list/focus commands.
  *
- * This is intentionally NOT a capture service. HWNDs are short-lived focus tokens.
- * They are never used as a stable identity, persisted, or passed into a rendering API.
- * Replacement windows receive new sourceIds even if Windows recycles an HWND.
- * Topic/card arrangements survive list refreshes in the same live connection only.
- * Future host source identities will allow durable persistence and reconnection.
+ * Not a capture service. On updated hosts the wire ID is a session-scoped opaque
+ * source token. Older hosts send ephemeral HWNDs: title/app changes replace the
+ * local identity rather than trusting a recycled handle. Never persist wire IDs
+ * or window titles. Topics and card positions survive catalog refreshes only.
  */
 class DeskWorkspace(private val newId: () -> String = { UUID.randomUUID().toString() }) {
     companion object {
@@ -50,12 +52,14 @@ class DeskWorkspace(private val newId: () -> String = { UUID.randomUUID().toStri
             if (entry.handle.isBlank() || entry.title.isBlank() || entry.appLabel.isBlank() ||
                 next.containsKey(entry.handle)) return@forEach
             val old = cards[entry.handle]
-            if (old != null && old.title == entry.title && old.appLabel == entry.appLabel) {
-                next[entry.handle] = old
+            if (old != null && (entry.sessionStable ||
+                    (old.title == entry.title && old.appLabel == entry.appLabel))) {
+                next[entry.handle] = old.copy(title = entry.title, appLabel = entry.appLabel)
             } else {
                 val position = next.size
                 next[entry.handle] = DeskCard(
-                    sourceId = newId(), handle = entry.handle, title = entry.title,
+                    sourceId = if (entry.sessionStable) "host:" + entry.handle else newId(),
+                    handle = entry.handle, title = entry.title,
                     appLabel = entry.appLabel, topicId = INBOX,
                     x = 20f + (position % 2) * 174f,
                     y = 26f + (position / 2) * 154f,
