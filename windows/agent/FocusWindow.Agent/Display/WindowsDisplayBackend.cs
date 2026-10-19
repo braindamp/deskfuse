@@ -127,6 +127,48 @@ internal sealed class WindowsDisplayBackend : IDisplayBackend
         _target is null
             ? new ScaleSetResult(false, "no phone monitor")
             : DisplayConfigApi.SetScale(_target, percent);
+    /// <summary>
+    /// Challenge-only companion to the production scale setter. The lab gate
+    /// checks the active target identity, owner opt-in and restoration obligations.
+    /// </summary>
+    internal ScaleSetResult TrySetChallengeScale(MonitorInfo monitor, int percent,
+        bool allowBeyondMaximum)
+    {
+        if (_target is null || !string.Equals(_target.GdiName, monitor.GdiName,
+                StringComparison.OrdinalIgnoreCase))
+            return new ScaleSetResult(false, "REJECTED_PRECHECK: no identified virtual monitor");
+        return DisplayConfigApi.TrySetScaleForChallenge(_target, percent, allowBeyondMaximum);
+    }
+
+    /// <summary>
+    /// FA+BB POC: render a PMv2 window inside the phone-sized viewport on a
+    /// LARGER virtual display, read the complete driver BGRA surface, and crop
+    /// its top-left 1440x3120 pixels exactly (CPU lab copy, NO interpolation).
+    /// A full-frame ruler test alone would not prove a phone-visible crop.
+    /// This does NOT implement a production GPU/NVENC crop.
+    /// </summary>
+    internal async Task<WindowDensityReport?> ProbeCropViewportAsync(MonitorInfo monitor,
+        int viewportWidth, int viewportHeight, CancellationToken ct)
+    {
+        if (_surface is null || viewportWidth <= 0 || viewportHeight <= 0 ||
+            viewportWidth > monitor.Bounds.Width || viewportHeight > monitor.Bounds.Height)
+            return null;
+        using var frames = _surface.CreateFrameSource();
+        var fullBuffer = Array.Empty<byte>();
+        (byte[] Bgra, int Width, int Height)? Capture()
+        {
+            if (!frames.TryRead(400, ref fullBuffer, out var info)) return null;
+            if (info.Width != monitor.Bounds.Width || info.Height != monitor.Bounds.Height)
+                return null;
+            var visiblePixels = DprChallengeTheory.CopyViewportBgra(fullBuffer.AsSpan(),
+                info.Width, info.Height, new RectI(0, 0, viewportWidth, viewportHeight));
+            return (visiblePixels, viewportWidth, viewportHeight);
+        }
+        var topLeft = new RectI(monitor.Bounds.X, monitor.Bounds.Y,
+            viewportWidth, viewportHeight);
+        return await ProbeWindow.RunAsync(topLeft, true, Capture).ConfigureAwait(false);
+    }
+
     public async Task<WindowDensityReport?> ProbeWindowAsync(MonitorInfo monitor, bool drawRuler, CancellationToken ct)
     {
         if (_surface is null) return null;
