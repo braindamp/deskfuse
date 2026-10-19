@@ -22,6 +22,7 @@ internal static class Program
           FocusWindow.Agent dpi-challenge         FA/BB DPI lab: PLAN ONLY unless explicitly armed
           FocusWindow.Agent driver-status         talk to the display driver and print its state
           FocusWindow.Agent display-paths         read current Windows CCD display names (NO driver installation)
+          FocusWindow.Agent audio-devices          list Windows audio endpoints (READ ONLY)
           FocusWindow.Agent hold-gate-self-test    test release-file gate (NO driver installation)
           FocusWindow.Agent --version
         Host options:
@@ -84,6 +85,7 @@ internal static class Program
                 "driver-status" => DriverStatus(),
                 "display-paths" => PrintDisplayPaths(),
                 "trusted-phones" => TrustedPhones(args),
+                "audio-devices" => ListAudioDevices(),
                 "hold-gate-self-test" => await HoldGateSelfTestAsync(),
                 _ => Fail($"Unknown command '{command}'.\n\n{Usage}"),
             };
@@ -99,6 +101,27 @@ internal static class Program
             return 1;
         }
     }
+    /// <summary>Read-only audio endpoint discovery for explicit cable routing.
+    /// Does not change Windows default inputs/outputs or device state.
+    /// </summary>
+    private static int ListAudioDevices()
+    {
+        using var enumerator = new NAudio.CoreAudioApi.MMDeviceEnumerator();
+        using var devices = enumerator.EnumerateAudioEndPoints(
+            NAudio.CoreAudioApi.DataFlow.All, NAudio.CoreAudioApi.DeviceState.All);
+        foreach (var item in devices)
+        {
+            using (item)
+            {
+                Console.WriteLine($"{item.DataFlow} / {item.State}: {item.FriendlyName}");
+                Console.WriteLine($"  id: {item.ID}");
+            }
+        }
+        Console.WriteLine("For the development mic bridge use a virtual cable's RENDER endpoint ID.");
+        Console.WriteLine("Select its corresponding CAPTURE endpoint in Windows applications.");
+        return 0;
+    }
+
     private static int Fail(string message)
     {
         Console.Error.WriteLine(message);
