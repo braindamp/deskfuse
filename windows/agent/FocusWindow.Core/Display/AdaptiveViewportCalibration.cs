@@ -277,7 +277,16 @@ public sealed class AdaptiveViewportCalibration
                 if (!succeeded && attemptedScale)
                 {
                     var restore = _backend.TrySetScale(monitor, beforeScale);
-                    var after = _backend.ReadScaleCaps(monitor);
+                    ScaleCaps? after = null;
+                    if (restore.Ok)
+                    {
+                        for (var retry = 0; retry < 12; retry++)
+                        {
+                            after = _backend.ReadScaleCaps(monitor);
+                            if (after?.CurrentPercent == beforeScale) break;
+                            await Task.Delay(150, CancellationToken.None).ConfigureAwait(false);
+                        }
+                    }
                     if (!restore.Ok || after?.CurrentPercent != beforeScale)
                         throw new DisplayException("scale-restore",
                             $"Could not verify original virtual-display scale {beforeScale}% " +
