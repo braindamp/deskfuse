@@ -58,6 +58,33 @@ public sealed class AdaptiveViewportTests
     }
 
     [Fact]
+    public async Task Landscape_phone_calibrates_height_from_its_DPR_not_a_fixed_2100_width()
+    {
+        var landscape = TestProfiles.Flagship() with
+        {
+            DeviceId = "landscape-phone-test",
+            PhysicalW = 3120,
+            PhysicalH = 1440,
+            Orientation = "LANDSCAPE"
+        };
+        await using var backend = new FakeDisplayBackend(3200, 1750)
+        {
+            RecommendedPercent = 100,
+            MaxPercentFor = (_, h) => h >= 1680 ? 350 : 225
+        };
+        var result = await NewCalibration(backend).TryRunAsync(
+            landscape, null, CancellationToken.None);
+        Assert.NotNull(result);
+        Assert.True(result!.Native);
+        Assert.Equal(PlanKind.VerifiedViewport, result.Plan.Kind);
+        Assert.Equal(3120, result.Monitor.Bounds.Width);
+        Assert.Equal(1680, result.Monitor.Bounds.Height); // exact height cutoff
+        Assert.Equal(3120, result.Plan.PixelW); // 1:1 landscape phone viewport
+        Assert.Equal(1440, result.Plan.PixelH);
+        Assert.Contains(backend.Created, r => r.Height == 1678);
+    }
+
+    [Fact]
     public async Task Verified_cutoff_is_reused_on_reconnect_but_remeasured()
     {
         var phone = TestProfiles.Flagship() with
