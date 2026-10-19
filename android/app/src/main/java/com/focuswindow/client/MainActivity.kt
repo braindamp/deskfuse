@@ -44,6 +44,7 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import com.focuswindow.client.input.InputMapper
 import com.focuswindow.client.profile.PhoneProfile
@@ -163,6 +164,15 @@ class MainActivity : ComponentActivity() {
                     .setPrimaryClip(ClipData.newPlainText("DeskFuse PC", text))
             }
         }
+        lifecycleScope.launch {
+            controller.windowFocusEvents.collect { activated ->
+                if (!activated) Toast.makeText(
+                    this@MainActivity,
+                    "Windows could not focus that application. Reopen Desk and refresh.",
+                    Toast.LENGTH_SHORT,
+                ).show()
+            }
+        }
 
         handleExternalShare(intent)
 
@@ -187,6 +197,14 @@ class MainActivity : ComponentActivity() {
                     appDialogVisible = false
                 }
                 deskSnapshot = desk.snapshot()
+            }
+            // Inventory refresh runs only while the user is viewing the desk.
+            // Closed windows disappear, and no hidden background polling is done.
+            LaunchedEffect(showWindows, state is SessionState.Streaming) {
+                while (showWindows && state is SessionState.Streaming) {
+                    delay(2_000)
+                    controller.requestWindows()
+                }
             }
 
             Box(Modifier.fillMaxSize()) {
