@@ -73,8 +73,6 @@ public sealed class AdaptiveViewportCalibration
             !CanUseBacking(phone.PhysicalW, phone.PhysicalH, phone.PhysicalW, phone.PhysicalH))
             return null;
 
-        var (mmW, mmH) = PhysicalSize.FromDiagonal(phone.DiagonalMm,
-            phone.PhysicalW, phone.PhysicalH);
         var refresh = Math.Min(phone.MaxRefreshHz, 120);
         var serial = PhysicalSize.StableSerial(phone.DeviceId);
         MonitorInfo? lastMonitor = null;
@@ -88,6 +86,8 @@ public sealed class AdaptiveViewportCalibration
                 return null;
             if (lastWidth == width && lastCaps is not null) return lastCaps;
             progress?.Invoke("Calibrating display density", $"Testing {width} px width at {percent}%");
+            var (mmW, mmH) = PhysicalSize.FromDiagonal(phone.DiagonalMm,
+                width, phone.PhysicalH);
             lastMonitor = await _backend.CreateMonitorAsync(
                 new MonitorRequest(width, phone.PhysicalH, refresh, mmW, mmH,
                     serial, percent.Value), ct).ConfigureAwait(false);
