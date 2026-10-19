@@ -138,8 +138,12 @@ internal sealed class PhoneSession
     }
     private async Task<NegotiationOutcome> NegotiatePhoneDisplayAsync(PhoneProfile phone, CancellationToken ct)
     {
-        void Progress(string stage, string detail) =>
-            _conn.SendControl(ServerMessages.Stage(stage, detail));
+        void Progress(string stage, string detail)
+        {
+            // Repeated resolution-search updates are diagnostics, not useful phone UI.
+            if (stage == "Calibrating display density") _log.Info(detail);
+            else _conn.SendControl(ServerMessages.Stage(stage, detail));
+        }
 
         // During calibration there is no HousekeepingAsync yet. Keep the
         // existing FocusIdd ten-second dead-agent removal timer fed while
@@ -162,7 +166,7 @@ internal sealed class PhoneSession
             if (_o.AdaptiveDpiViewport)
             {
                 var calibrated = await new AdaptiveViewportCalibration(
-                    _backend, _guard, _before, _log)
+                    _backend, _guard, _before, _log) { RememberVerifiedWidth = true }
                     .TryRunAsync(phone, Progress, ct).ConfigureAwait(false);
                 if (calibrated is not null) return calibrated;
                 _log.Warn("Exact-DPR adaptive viewport not verified; reverting to honest normal density probe.");
