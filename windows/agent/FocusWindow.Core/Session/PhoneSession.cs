@@ -191,9 +191,10 @@ internal sealed class PhoneSession
 
     private void RestoreAdaptiveScale()
     {
-        var original = _outcome?.RestoreScalePercent;
-        if (original is null || _backend is null) return;
-        var monitor = _outcome.Monitor;
+        var outcome = _outcome;
+        var original = outcome?.RestoreScalePercent;
+        if (outcome is null || original is null || _backend is null) return;
+        var monitor = outcome.Monitor;
         var result = _backend.TrySetScale(monitor, original.Value);
         var readback = _backend.ReadScaleCaps(monitor);
         if (!result.Ok || readback?.CurrentPercent != original.Value)
