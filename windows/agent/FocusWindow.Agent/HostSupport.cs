@@ -98,9 +98,16 @@ internal sealed class ConsoleApproval : IApprovalPolicy, IEnrollmentApprovalPoli
     public async Task<bool> ApproveNewPairingAsync(string deviceId, string deviceLabel,
         string verificationCode, CancellationToken ct)
     {
-        if (!Environment.UserInteractive) return false;
-        var granted = await ShowEnrollmentWindowAsync(deviceLabel, verificationCode, ct)
+        if (!Environment.UserInteractive)
+        {
+            _log.Warn("Enrollment refused: the agent has no interactive desktop for owner approval.");
+            return false;
+        }
+        var decision = await ShowEnrollmentWindowAsync(deviceLabel, verificationCode, ct)
             .ConfigureAwait(false);
+        if (decision == EnrollmentDecision.TimedOut)
+            _log.Warn($"Enrollment approval timed out after 60 s; denied '{SafeLabel(deviceLabel)}'.");
+        var granted = decision == EnrollmentDecision.Allowed;
         if (granted)
         {
             var approved = Load(_path);
@@ -113,14 +120,20 @@ internal sealed class ConsoleApproval : IApprovalPolicy, IEnrollmentApprovalPoli
         return granted;
     }
 
-    private static async Task<bool> ShowEnrollmentWindowAsync(
+    private enum EnrollmentDecision { Denied, Allowed, TimedOut, Cancelled }
+
+    private static string SafeLabel(string value) =>
+        new string(value.Where(c => !char.IsControl(c)).Take(80).ToArray());
+
+    private static async Task<EnrollmentDecision> ShowEnrollmentWindowAsync(
         string deviceLabel, string code, CancellationToken ct)
     {
-        var result = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var result = new TaskCompletionSource<EnrollmentDecision>(TaskCreationOptions.RunContinuationsAsynchronously);
         var thread = new Thread(() =>
         {
             try
             {
+                var decision = EnrollmentDecision.Denied;
                 using var window = new Form
                 {
                     Text = "DeskFuse — Allow this phone?",
@@ -130,7 +143,7 @@ internal sealed class ConsoleApproval : IApprovalPolicy, IEnrollmentApprovalPoli
                     MaximizeBox = false, MinimizeBox = false,
                     ShowInTaskbar = true, TopMost = true
                 };
-                var safeLabel = new string(deviceLabel.Where(c => !char.IsControl(c)).Take(80).ToArray());
+                var safeLabel = SafeLabel(deviceLabel);
                 var message = new Label
                 {
                     Text = $"Allow {safeLabel} to control this PC?\n\n" +
@@ -161,7 +174,13 @@ internal sealed class ConsoleApproval : IApprovalPolicy, IEnrollmentApprovalPoli
                 window.AcceptButton = allow;
                 window.CancelButton = deny;
                 using var timeout = new System.Windows.Forms.Timer { Interval = 60_000 };
-                timeout.Tick += (_, _) => { timeout.Stop(); window.DialogResult = DialogResult.Cancel; window.Close(); };
+                timeout.Tick += (_, _) =>
+                {
+                    timeout.Stop();
+                    decision = EnrollmentDecision.TimedOut;
+                    window.DialogResult = DialogResult.Cancel;
+                    window.Close();
+                };
                 window.Shown += (_, _) =>
                 {
                     // A host launched with a hidden/minimized startup window also
@@ -174,10 +193,14 @@ internal sealed class ConsoleApproval : IApprovalPolicy, IEnrollmentApprovalPoli
                 };
                 using var cancellation = ct.Register(() =>
                 {
+                    decision = EnrollmentDecision.Cancelled;
                     try { if (window.IsHandleCreated && !window.IsDisposed)
                         window.BeginInvoke(new Action(() => window.Close())); } catch (InvalidOperationException) { }
                 });
-                result.TrySetResult(window.ShowDialog() == DialogResult.OK && !ct.IsCancellationRequested);
+                var shown = window.ShowDialog();
+                result.TrySetResult(ct.IsCancellationRequested ? EnrollmentDecision.Cancelled
+                    : shown == DialogResult.OK ? EnrollmentDecision.Allowed
+                    : decision);
             }
             catch (Exception ex) { result.TrySetException(ex); }
         });
@@ -193,16 +216,16 @@ internal sealed class ConsoleApproval : IApprovalPolicy, IEnrollmentApprovalPoli
         var fullFiles = Load(_fullFilesPath);
         if (!_autoApprove && approved.Contains(deviceId) && fullFiles.Contains(deviceId))
         {
-            _log.Info($"'{deviceLabel}' has previously approved full-user file scope; connecting");
+            _log.Info($"'{SafeLabel(deviceLabel)}' has previously approved full-user file scope; connecting");
             return true;
         }
         if (_autoApprove)
         {
-            _log.Warn($"--auto-approve: letting '{deviceLabel}' in WITHOUT asking. Anyone holding the QR can use this PC.");
+            _log.Warn($"--auto-approve: letting '{SafeLabel(deviceLabel)}' in WITHOUT asking. Anyone holding the QR can use this PC.");
             return true;
         }
         Console.WriteLine();
-        Console.WriteLine($"  A phone wants to use this PC:  {deviceLabel}");
+        Console.WriteLine($"  A phone wants to use this PC:  {SafeLabel(deviceLabel)}");
         Console.WriteLine($"  Confirm this code matches the phone's screen:   {verificationCode}");
         Console.WriteLine("  This grants DESKTOP CONTROL and FULL FILE ACCESS as your signed-in Windows user.");
         Console.WriteLine("  The paired phone can read, upload and download accessible files and shares.");
