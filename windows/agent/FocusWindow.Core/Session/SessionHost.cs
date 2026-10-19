@@ -62,6 +62,7 @@ public sealed class SessionHost : IDisposable
     {
         if (_listener is null || _offer is null || _mediaPeers is null)
             throw new InvalidOperationException("call StartAsync first");
+        var peers = _mediaPeers;
         // Display session is exclusive to the monitor. Camera/mic/speaker peers
         // can connect in parallel; these sessions never instantiate PhoneSession.
         Task? displayTask = null;
@@ -105,7 +106,7 @@ public sealed class SessionHost : IDisposable
                     {
                         try
                         {
-                            await new DevicePeerSession(_options, _services, _mediaPeers, _log)
+                            await new DevicePeerSession(_options, _services, peers, _log)
                                 .RunAsync(connection, hello, ct).ConfigureAwait(false);
                         }
                         catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
