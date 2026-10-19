@@ -35,9 +35,9 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
-      - uses: android-actions/setup-android@v3
       - name: Install Android SDK 35
-        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+        run: |
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
       - name: Android build and unit tests
         working-directory: android
         run: bash ./gradlew :app:testDebugUnitTest :app:assembleDebug --no-daemon --stacktrace
