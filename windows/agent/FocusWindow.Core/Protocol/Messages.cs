@@ -23,7 +23,8 @@ public static class Wire
 }
 /// <summary>Client -> host messages (ClientMessage in Protocol.kt).</summary>
 public abstract record ClientMessage;
-public sealed record ClientHello(int ProtocolVersion, string ClientVersion, PhoneProfile Profile, string Role = "display") : ClientMessage;
+public sealed record ClientHello(int ProtocolVersion, string ClientVersion, PhoneProfile Profile,
+    string Role = "display", IReadOnlyList<string>? Capabilities = null) : ClientMessage;
 public sealed record ClientProfile(PhoneProfile Profile) : ClientMessage;
 public sealed record ClientDensity(string Preset) : ClientMessage;           // logical | native | one_to_one
 public sealed record ClientRefresh(int Hz) : ClientMessage;
@@ -69,13 +70,15 @@ public static class ClientMessageParser
                 "hello" => new ClientHello(
                     root["protocolVersion"]?.GetValue<int>() ?? 0,
                     root["clientVersion"]?.GetValue<string>() ?? "?",
-                    PhoneProfile.Parse(root["profile"]!.AsObject())),
+                    PhoneProfile.Parse(root["profile"]!.AsObject()), "display",
+                    ParseCapabilities(root)),
                 // A distinct first-message type ensures pre-bridge hosts reject
                 // accessory sessions instead of creating a virtual display.
                 "bridge_hello" => new ClientHello(
                     root["protocolVersion"]?.GetValue<int>() ?? 0,
                     root["clientVersion"]?.GetValue<string>() ?? "?",
-                    PhoneProfile.Parse(root["profile"]!.AsObject()), "media"),
+                    PhoneProfile.Parse(root["profile"]!.AsObject()), "accessory",
+                    ParseCapabilities(root)),
                 "profile" => new ClientProfile(PhoneProfile.Parse(root["profile"]!.AsObject())),
                 "density" => new ClientDensity(root["preset"]!.GetValue<string>()),
                 "refresh" => new ClientRefresh(root["hz"]!.GetValue<int>()),
@@ -102,6 +105,17 @@ public static class ClientMessageParser
             throw new FormatException($"malformed '{type}' message: {ex.Message}", ex);
         }
     }
+
+    // An old bridge_hello without capabilities remains valid but requests no
+    // actual hardware role. The client cannot grant itself a Windows endpoint.
+    private static IReadOnlyList<string> ParseCapabilities(JsonObject root)
+    {
+        if (root["capabilities"] is null) return Array.Empty<string>();
+        if (root["capabilities"] is not JsonArray array || array.Count > 12)
+            throw new FormatException("invalid device capability list");
+        return array.Select(value => value?.GetValue<string>()
+            ?? throw new FormatException("missing device capability")).ToArray();
+    }
 }
 /// <summary>Host -> client message builders (ServerMessage in Protocol.kt).</summary>
 public static class ServerMessages
@@ -126,6 +140,20 @@ public static class ServerMessages
             array.Add(new JsonObject { ["id"] = window.Id, ["title"] = window.Title, ["appLabel"] = window.AppLabel });
         return new JsonObject { ["type"] = "window_list", ["windows"] = array };
     }
+    // Status is about a peer connection, not proof of OS camera/mic availability.
+    public static JsonObject BridgeState(IReadOnlyList<string> requested, IReadOnlyList<string> active)
+    {
+        var wants = new JsonArray();
+        foreach (var capability in requested) wants.Add(capability);
+        var live = new JsonArray();
+        foreach (var capability in active) live.Add(capability);
+        return new JsonObject {
+            ["type"] = "bridge_state",
+            ["requestedCapabilities"] = wants,
+            ["activeCapabilities"] = live,
+        };
+    }
+
     public static JsonObject AudioState(string state, int streamId, int sampleRate = 0, int channels = 0,
         string? detail = null) => new()
     {
