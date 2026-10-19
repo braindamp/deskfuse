@@ -67,7 +67,8 @@ public sealed class SecureChannel : IDisposable
         peer.ImportSubjectPublicKeyInfo(clientKeyBytes, out _);
         var ourPublic = hostKeyPair.ExportSubjectPublicKeyInfo();
         await WriteLengthPrefixedAsync(stream, ourPublic, ct).ConfigureAwait(false);
-        var shared = hostKeyPair.DeriveRawSecretAgreement(peer.PublicKey);
+        byte[] shared;
+        lock (hostKeyPair) shared = hostKeyPair.DeriveRawSecretAgreement(peer.PublicKey);
         var candidates = new List<KeySet>();
         var trimmed = TrimLeadingZeros(shared);
         foreach (var credential in credentials)
