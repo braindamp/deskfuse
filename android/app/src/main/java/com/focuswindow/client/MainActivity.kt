@@ -15,6 +15,7 @@ import android.view.MotionEvent
 import android.view.WindowManager
 import android.view.inputmethod.InputMethodManager
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.layout.Box
@@ -205,6 +206,19 @@ class MainActivity : ComponentActivity() {
                     delay(2_000)
                     controller.requestWindows()
                 }
+            }
+            // Window-first by default; the legacy full-desktop stream remains
+            // available by deliberately choosing Desktop from the desk.
+            LaunchedEffect(state is SessionState.Streaming) {
+                if (state is SessionState.Streaming) {
+                    showWindows = true
+                    appDialogVisible = true
+                    controller.requestWindows()
+                }
+            }
+            BackHandler(enabled = showWindows) {
+                showWindows = false
+                appDialogVisible = false
             }
 
             Box(Modifier.fillMaxSize()) {
