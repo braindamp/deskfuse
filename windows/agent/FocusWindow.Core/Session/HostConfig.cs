@@ -39,7 +39,9 @@ public interface IClipboardBridge
     Task<string?> ReadTextAsync(CancellationToken ct);
     Task WriteTextAsync(string text, CancellationToken ct);
 }
-public sealed record WindowItem(string Id, string Title, string AppLabel);
+// InstanceKey is host-internal, never serialized. It distinguishes the lifetime of
+// a HWND from its name and from HWND reuse across different process lifetimes.
+public sealed record WindowItem(string Id, string Title, string AppLabel, string? InstanceKey = null);
 /// <summary>Explicit window picker: list and focus only; never move/resize physical PC windows.</summary>
 public interface IWindowWorkflow
 {
