@@ -55,21 +55,43 @@ $stderr = Join-Path $OutDirectory "runner-$stamp.stderr.txt"
 Write-Host "Agent: $AgentExe"
 Write-Host "Arguments: $line"
 Write-Host "Evidence: $OutDirectory"
-$child = Start-Process -FilePath $AgentExe -ArgumentList $line -PassThru -NoNewWindow `
-    -RedirectStandardOutput $stdout -RedirectStandardError $stderr
-if (-not $child.WaitForExit($TimeoutSeconds * 1000)) {
-    try { $child.Kill() } catch { }
-    Write-Warning "Hard timeout. Process killed. FocusIdd's existing heartbeat watchdog should remove its virtual monitor after approximately 10 seconds."
-    Write-Warning 'Check your physical displays and driver-status before any further test.'
-    throw "DPR challenge exceeded $TimeoutSeconds seconds. Inspect $stdout / $stderr."
+# Use System.Diagnostics.Process directly: Start-Process -PassThru can leave
+# ExitCode null on Windows PowerShell 5.1 even after WaitForExit() succeeds.
+# Read both streams asynchronously so output cannot deadlock a long sweep.
+$startInfo = New-Object System.Diagnostics.ProcessStartInfo
+$startInfo.FileName = $AgentExe
+$startInfo.Arguments = $line
+$startInfo.WorkingDirectory = (Get-Location).Path
+$startInfo.UseShellExecute = $false
+$startInfo.CreateNoWindow = $true
+$startInfo.RedirectStandardOutput = $true
+$startInfo.RedirectStandardError = $true
+$startInfo.StandardOutputEncoding = New-Object System.Text.UTF8Encoding($false)
+$startInfo.StandardErrorEncoding = New-Object System.Text.UTF8Encoding($false)
+$child = New-Object System.Diagnostics.Process
+$child.StartInfo = $startInfo
+try {
+    if (-not $child.Start()) { throw 'Could not start the DeskFuse challenge agent.' }
+    $outputTask = $child.StandardOutput.ReadToEndAsync()
+    $errorTask = $child.StandardError.ReadToEndAsync()
+    $completed = $child.WaitForExit($TimeoutSeconds * 1000)
+    if (-not $completed) {
+        try { $child.Kill() } catch { }
+        Write-Warning "Hard timeout. Process killed. FocusIdd's watchdog should remove its virtual monitor after approximately 10 seconds."
+        Write-Warning 'Check physical displays and driver-status before any further test.'
+        throw "DPR challenge exceeded $TimeoutSeconds seconds. Confirm virtual monitor removal."
+    }
+    # The process has exited; unlike Start-Process -PassThru, ExitCode is reliable.
+    $code = [int]$child.ExitCode
+    $outputText = $outputTask.GetAwaiter().GetResult()
+    $errorText = $errorTask.GetAwaiter().GetResult()
+    [System.IO.File]::WriteAllText($stdout, $outputText, (New-Object System.Text.UTF8Encoding($false)))
+    [System.IO.File]::WriteAllText($stderr, $errorText, (New-Object System.Text.UTF8Encoding($false)))
+    if ($outputText) { Write-Host $outputText }
+    if ($errorText) { Write-Warning "Stderr log: $stderr"; Write-Host $errorText }
+    if ($code -ne 0) {
+        throw "Challenge returned exit code $code. Check evidence and confirm virtual monitor removed."
+    }
+    Write-Host 'Challenge ended successfully. The measurements may still show DPI below target.' -ForegroundColor Green
 }
-$child.Refresh()
-Get-Content -LiteralPath $stdout
-if ((Test-Path $stderr) -and ((Get-Item $stderr).Length -gt 0)) {
-    Write-Warning "Stderr log: $stderr"
-    Get-Content -LiteralPath $stderr
-}
-if ($child.ExitCode -ne 0) {
-    throw "Challenge returned $($child.ExitCode). Check evidence and confirm virtual monitor removed."
-}
-Write-Host 'Challenge ended. Review CSV/JSON readbacks; green CI alone is NOT a hardware success.' -ForegroundColor Green
+finally { $child.Dispose() }
