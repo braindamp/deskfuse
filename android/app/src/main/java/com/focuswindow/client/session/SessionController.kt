@@ -140,6 +140,14 @@ class SessionController(
     /** Only called by Activity after runtime Android permission is granted. */
     fun togglePhoneMicrophone() {
         if (_state.value !is SessionState.Streaming) return
+        // Even if the Windows endpoint has since vanished, users can revoke
+        // their remembered on-state without waiting for that endpoint to return.
+        if (!hostMicAvailable && phoneMicDesired) {
+            phoneMicDesired = false
+            payload?.let { audioPreferences?.setAudioWanted(it, "phone_mic", false) }
+            stopPhoneMicrophoneLocal()
+            return
+        }
         if (!hostMicAvailable) {
             _phoneMicStatus.value = "Unavailable"
             return
