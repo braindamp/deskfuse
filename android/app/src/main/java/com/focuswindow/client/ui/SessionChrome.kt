@@ -326,7 +326,7 @@ private fun ModifierBar(
         ModKey("Send clip → PC", false) { onSendClipboard() }
         ModKey("PC clip → phone", false) { onReceiveClipboard() }
         ModKey("Keyboard", false) { onShowKeyboard() }
-        ModKey("Apps", false) { onSelectWindow() }
+        ModKey("Desk", false) { onSelectWindow() }
         ModKey("PC files", false) { onSendFile() }
     }
     Row(
