@@ -35,7 +35,9 @@ public sealed class PhoneConnection : IAsyncDisposable
 
     public static bool CanSendAccessUnit(int byteCount) =>
         byteCount > 0 && byteCount <= MaxVideoAccessUnitBytes;
-    private sealed record Outbound(byte Kind, byte[]? Plain, bool IsFrame, bool ReleasesSlot = false);
+    // Audio chunks are independent PCM; dropping stale chunks is safe and helps latency.
+    private sealed record Outbound(byte Kind, byte[]? Plain, bool IsFrame,
+        bool ReleasesSlot = false, bool IsAudio = false);
     private readonly TcpClient _tcp;
     private readonly Stream _stream;
     private readonly SecureChannel _chan;
@@ -51,6 +53,9 @@ public sealed class PhoneConnection : IAsyncDisposable
     private Task? _reader;
     private Task? _writer;
     private int _frameBacklog;
+    private int _audioBacklog;
+    private const int MaxAudioBacklog = 8;
+    private const int MaxAudioPayload = 3840;
     private long _pingSentTimestamp;
     private double _rttMs = -1;
     private long _framesSent;
@@ -134,6 +139,25 @@ public sealed class PhoneConnection : IAsyncDisposable
         Interlocked.Decrement(ref _frameBacklog);
         return false;
     }
+    /// <summary>
+    /// Queue at most eight audio chunks so a stalled video/file connection cannot
+    /// accumulate seconds of speech. The first 4 plaintext bytes are the stream ID.
+    /// Sealing happens in the same ordered writer as video/control.
+    /// </summary>
+    public bool TrySendAudio(ReadOnlySpan<byte> pcm16le, int streamId)
+    {
+        if (pcm16le.Length is < 4 or > MaxAudioPayload || (pcm16le.Length & 3) != 0 ||
+            Volatile.Read(ref _audioBacklog) >= MaxAudioBacklog)
+            return false;
+        var plain = new byte[4 + pcm16le.Length];
+        BinaryPrimitives.WriteInt32BigEndian(plain.AsSpan(0, 4), streamId);
+        pcm16le.CopyTo(plain.AsSpan(4));
+        Interlocked.Increment(ref _audioBacklog);
+        if (_outgoing.Writer.TryWrite(new Outbound(Wire.KindAudio, plain, false, IsAudio: true)))
+            return true;
+        Interlocked.Decrement(ref _audioBacklog);
+        return false;
+    }
     private async Task<byte[]> ReadSealedControlAsync(CancellationToken ct)
     {
         var lenBuf = new byte[4];
@@ -209,6 +233,7 @@ public sealed class PhoneConnection : IAsyncDisposable
                 {
                     // Seal HERE, in dequeue order, so counter order == wire order.
                     var sealedBytes = _chan.Seal(o.Plain!);
+                    if (o.IsAudio) Interlocked.Decrement(ref _audioBacklog);
                     if (o.IsFrame)
                     {
                         Interlocked.Decrement(ref _frameBacklog);
