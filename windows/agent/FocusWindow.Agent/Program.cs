@@ -19,6 +19,7 @@ internal static class Program
         Focus Window host agent
           FocusWindow.Agent                       run the host (pair a phone, stream the phone display)
           FocusWindow.Agent density-probe         CREATE the phone monitor, then MEASURE what Windows really did
+          FocusWindow.Agent dpi-challenge         FA/BB DPI lab: PLAN ONLY unless explicitly armed
           FocusWindow.Agent driver-status         talk to the display driver and print its state
           FocusWindow.Agent display-paths         read current Windows CCD display names (NO driver installation)
           FocusWindow.Agent hold-gate-self-test    test release-file gate (NO driver installation)
@@ -41,6 +42,12 @@ internal static class Program
           --out DIR          where to write density-evidence-*.md/.json (default: current directory)
           --hold-until-flag PATH   safety-runner only: keep the 1440x3120 monitor attached until OK releases it
           --experimental-scale-write    UNSUPPORTED Windows DPI API; explicit opt-in on a test PC only
+        dpi-challenge options (NO driver install/uninstall, NO physical-monitor SET):
+          --modes 1440x3120,1600x3120,1920x3120,2100x3120,2240x3120,2240x3360
+          --diag-mm N --out DIR
+          --run --i-accept-virtual-display-test       explicitly create temporary virtual modes
+          --try-350                                    attempt undocumented -4 only if legal
+          --try-above-cap --i-accept-unsupported-scale-risk   also attempt 350% beyond cap at 1440x3120
         """;
     private static async Task<int> Main(string[] args)
     {
@@ -58,11 +65,12 @@ internal static class Program
         try
         {
             var command = args.Length > 0 && !args[0].StartsWith("--") ? args[0] : "run";
-            if (command is "run" or "density-probe") RequirePerMonitorV2();
+            if (command is "run" or "density-probe" or "dpi-challenge") RequirePerMonitorV2();
             return command switch
             {
                 "run" => await RunHostAsync(args, shutdown.Token),
                 "density-probe" => await DensityProbeAsync(args, shutdown.Token),
+                "dpi-challenge" => await DprChallengeLab.RunAsync(args, shutdown.Token),
                 "driver-status" => DriverStatus(),
                 "display-paths" => PrintDisplayPaths(),
                 "trusted-phones" => TrustedPhones(args),
