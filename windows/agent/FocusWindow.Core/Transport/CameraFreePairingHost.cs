@@ -47,7 +47,10 @@ public sealed class CameraFreePairingHost : IDisposable
     private readonly TcpListener _tcp;
     private readonly UdpClient _udp;
     private readonly CancellationTokenSource _stop = new();
-    private readonly SemaphoreSlim _pending = new(3, 3);
+    // Do not stack multiple approval dialogs or let unauthenticated LAN peers flood the desktop.
+    private readonly SemaphoreSlim _pending = new(1, 1);
+    private readonly Dictionary<IPAddress, DateTime> _lastAttempt = new();
+    private readonly object _attemptGate = new();
     private readonly Task _discoveryTask;
     private readonly Task _enrollmentTask;
     private readonly string _hostName;
@@ -113,6 +116,26 @@ public sealed class CameraFreePairingHost : IDisposable
                 TcpClient client;
                 try { client = await _tcp.AcceptTcpClientAsync(token).ConfigureAwait(false); }
                 catch { _pending.Release(); throw; }
+                var remoteAddress = ((IPEndPoint?)client.Client.RemoteEndPoint)?.Address;
+                var permitted = remoteAddress is not null;
+                if (remoteAddress is not null)
+                {
+                    lock (_attemptGate)
+                    {
+                        // One enrollment attempt per source each 15 seconds.
+                        if (_lastAttempt.TryGetValue(remoteAddress, out var last) &&
+                            DateTime.UtcNow - last < TimeSpan.FromSeconds(15))
+                            permitted = false;
+                        if (permitted) _lastAttempt[remoteAddress] = DateTime.UtcNow;
+                        if (_lastAttempt.Count > 512) _lastAttempt.Clear();
+                    }
+                }
+                if (!permitted)
+                {
+                    client.Dispose();
+                    _pending.Release();
+                    continue;
+                }
                 // The approval dialog is deliberately not on the listener thread.
                 _ = Task.Run(async () =>
                 {
@@ -159,7 +182,8 @@ public sealed class CameraFreePairingHost : IDisposable
         });
         await WriteAsync(stream, response, ct).ConfigureAwait(false);
 
-        var shared = _offer.KeyPair.DeriveRawSecretAgreement(peer.PublicKey);
+        byte[] shared;
+        lock (_offer.KeyPair) shared = _offer.KeyPair.DeriveRawSecretAgreement(peer.PublicKey);
         var transcript = EnrollmentCrypto.Transcript(clientNonce, serverNonce, clientPub, hostPublic);
         var (code, key) = EnrollmentCrypto.Derive(shared, transcript);
         CryptographicOperations.ZeroMemory(shared);
@@ -223,7 +247,7 @@ public sealed class CameraFreePairingHost : IDisposable
         _tcp.Stop();
         _udp.Dispose();
         _stop.Dispose();
-        _pending.Dispose();
+        // Outstanding enrollment tasks release their slots after shutdown.
     }
 }
 
