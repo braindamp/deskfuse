@@ -3,6 +3,7 @@ package com.focuswindow.client.session
 import android.view.Surface
 import android.util.Base64
 import java.io.InputStream
+import java.io.IOException
 import java.io.OutputStream
 import java.security.MessageDigest
 import java.util.UUID
@@ -11,6 +12,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
 import com.focuswindow.client.media.VideoDecoder
 import com.focuswindow.client.media.PcAudioOutput
+import com.focuswindow.client.media.PhoneMicrophoneCapture
 import com.focuswindow.client.profile.PhoneProfile
 import com.focuswindow.client.protocol.ClientMessage
 import com.focuswindow.client.protocol.DensityPreset
@@ -82,6 +84,19 @@ class SessionController(
     private var pcAudioFailedOnConnection = false
     private var hostPcAudioAvailable = false
     private var pcAudioOutput: PcAudioOutput? = null
+
+    // Independent Android -> Windows input track. A saved user preference is
+    // never a grant to bypass Android mic permission or host endpoint approval.
+    private val _phoneMicStatus = MutableStateFlow("Off")
+    val phoneMicStatus: StateFlow<String> = _phoneMicStatus.asStateFlow()
+    private var phoneMicCapture: PhoneMicrophoneCapture? = null
+    private var phoneMicDesired = false
+    private var hostMicAvailable = false
+    private var phoneMicForeground = false
+    private var phoneMicRequested = false
+    private var phoneMicFailed = false
+    private var phoneMicStreamId = 0
+    private var phoneMicJob: Job? = null
     private val transport = LanTransport(scope)
     private lateinit var decoder: VideoDecoder
 
@@ -106,6 +121,121 @@ class SessionController(
 
     fun attachPcAudioOutput(output: PcAudioOutput) {
         pcAudioOutput = output
+    }
+
+    fun attachPhoneMicrophone(capture: PhoneMicrophoneCapture) {
+        phoneMicCapture = capture
+    }
+
+    /** Foreground-only permission boundary; no implicit background recording. */
+    fun setPhoneMicrophoneForeground(foreground: Boolean) {
+        phoneMicForeground = foreground
+        if (!foreground) {
+            val wasRequested = phoneMicRequested
+            stopPhoneMicrophoneLocal()
+            if (wasRequested) scope.launch { transport.send(ClientMessage.Microphone("stop")) }
+        } else requestPreferredPhoneMicrophone()
+    }
+
+    /** Only called by Activity after runtime Android permission is granted. */
+    fun togglePhoneMicrophone() {
+        if (_state.value !is SessionState.Streaming) return
+        if (!hostMicAvailable) {
+            _phoneMicStatus.value = "Unavailable"
+            return
+        }
+        if (!phoneMicDesired && phoneMicCapture?.permitted() != true) {
+            _phoneMicStatus.value = "Permission needed"
+            return
+        }
+        phoneMicDesired = !phoneMicDesired
+        payload?.let { audioPreferences?.setAudioWanted(it, "phone_mic", phoneMicDesired) }
+        if (!phoneMicDesired) {
+            val wasRequested = phoneMicRequested
+            stopPhoneMicrophoneLocal()
+            if (wasRequested) scope.launch { transport.send(ClientMessage.Microphone("stop")) }
+        } else {
+            phoneMicFailed = false
+            requestPreferredPhoneMicrophone()
+        }
+    }
+
+    private fun requestPreferredPhoneMicrophone() {
+        if (!phoneMicDesired || !phoneMicForeground || !hostMicAvailable ||
+            phoneMicRequested || phoneMicFailed || _state.value !is SessionState.Streaming) return
+        if (phoneMicCapture?.permitted() != true) {
+            _phoneMicStatus.value = "Permission needed"
+            return
+        }
+        phoneMicRequested = true
+        _phoneMicStatus.value = "Starting"
+        scope.launch { transport.send(ClientMessage.Microphone("start")) }
+    }
+
+    private fun stopPhoneMicrophoneLocal() {
+        phoneMicRequested = false
+        phoneMicStreamId = 0
+        phoneMicCapture?.stop()
+        phoneMicJob?.cancel()
+        phoneMicJob = null
+        _phoneMicStatus.value = "Off"
+    }
+
+    private fun onMicrophoneState(msg: ServerMessage.MicrophoneState) {
+        when (msg.state) {
+            "started" -> {
+                if (!phoneMicRequested || !phoneMicDesired || !phoneMicForeground ||
+                    phoneMicCapture?.permitted() != true ||
+                    msg.streamId <= 0 || msg.sampleRate != 16000 ||
+                    msg.channels != 1 || msg.format != "pcm_s16le") {
+                    stopPhoneMicrophoneLocal()
+                    scope.launch { transport.send(ClientMessage.Microphone("stop")) }
+                    return
+                }
+                phoneMicStreamId = msg.streamId
+                val capture = phoneMicCapture ?: return
+                _phoneMicStatus.value = "On"
+                phoneMicJob?.cancel()
+                phoneMicJob = scope.launch {
+                    try {
+                        capture.capture { pcm ->
+                            if (phoneMicStreamId != msg.streamId ||
+                                !transport.sendPhoneMicrophone(msg.streamId, pcm)) {
+                                throw IOException("Phone microphone transport ended")
+                            }
+                        }
+                        if (phoneMicStreamId == msg.streamId) {
+                            phoneMicFailed = true
+                            stopPhoneMicrophoneLocal()
+                            _phoneMicStatus.value = "Unavailable"
+                            transport.send(ClientMessage.Microphone("stop"))
+                        }
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (ex: Exception) {
+                        if (phoneMicStreamId == msg.streamId) {
+                            phoneMicFailed = true
+                            stopPhoneMicrophoneLocal()
+                            _phoneMicStatus.value = "Unavailable"
+                            transport.send(ClientMessage.Microphone("stop"))
+                        }
+                    }
+                }
+            }
+            "stopped" -> {
+                if (!phoneMicDesired) stopPhoneMicrophoneLocal()
+                else if (msg.streamId > 0 && phoneMicStreamId == msg.streamId) {
+                    phoneMicFailed = true
+                    stopPhoneMicrophoneLocal()
+                    _phoneMicStatus.value = "Unavailable"
+                }
+            }
+            "unavailable", "error" -> {
+                phoneMicFailed = true
+                stopPhoneMicrophoneLocal()
+                _phoneMicStatus.value = "Unavailable"
+            }
+        }
     }
 
     /** Last user-selected PC playback route, scoped to this paired Windows host.
@@ -170,6 +300,10 @@ class SessionController(
         _bridgeState.value = null
         stopPcAudioLocal()
         pcAudioDesired = audioPreferences?.audioWanted(payload, "pc_sound") ?: false
+        hostMicAvailable = false
+        phoneMicFailed = false
+        stopPhoneMicrophoneLocal()
+        phoneMicDesired = audioPreferences?.audioWanted(payload, "phone_mic") ?: false
         this.payload = payload
         this.profile = profile
         attempt = 0
@@ -236,6 +370,9 @@ class SessionController(
                 }
 
                 is LanTransport.TransportEvent.Failed -> {
+                    hostMicAvailable = false
+                    phoneMicFailed = false
+                    stopPhoneMicrophoneLocal()
                     hostPcAudioAvailable = false
                     pcAudioFailedOnConnection = false
                     stopPcAudioLocal()
@@ -250,6 +387,9 @@ class SessionController(
                 }
 
                 is LanTransport.TransportEvent.Closed -> {
+                    hostMicAvailable = false
+                    phoneMicFailed = false
+                    stopPhoneMicrophoneLocal()
                     hostPcAudioAvailable = false
                     pcAudioFailedOnConnection = false
                     stopPcAudioLocal()
@@ -267,10 +407,16 @@ class SessionController(
             when (msg) {
                 is ServerMessage.Hello -> {
                     hostPcAudioAvailable = msg.pcAudioAvailable
+                    hostMicAvailable = msg.phoneMicrophoneBridgeAvailable
+                    phoneMicFailed = false
+                    if (!hostMicAvailable) _phoneMicStatus.value = "Unavailable"
                     pcAudioFailedOnConnection = false
                     _pcAudioStatus.value = if (msg.pcAudioAvailable) "Off" else "Unavailable"
                     requestPreferredPcAudio()
+                    requestPreferredPhoneMicrophone()
                 }
+
+                is ServerMessage.MicrophoneState -> onMicrophoneState(msg)
 
                 is ServerMessage.Stage -> {
                     if (msg.stage == "file" || msg.stage == "files") _fileStatus.emit(msg.detail)
@@ -473,6 +619,7 @@ class SessionController(
             invariantDrift = emptyList(),
         )
         requestPreferredPcAudio()
+        requestPreferredPhoneMicrophone()
     }
 
     private fun scheduleReconnect(reason: String) {
@@ -663,6 +810,8 @@ class SessionController(
     }
 
     fun stop(reason: String = "user ended the session") {
+        stopPhoneMicrophoneLocal()
+        hostMicAvailable = false
         _bridgeState.value = null
         stopPcAudioLocal()
         pendingClipboardRead = false
