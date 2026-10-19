@@ -175,6 +175,19 @@ int MaxUnderFloor(UINT32 w, UINT32 h, int minWidth, int minHeight) {
     return best;
 }
 
+// Empirical 800x600 effective-desktop ceiling model, independent of orientation.
+// It predicts Settings' maximum; it does NOT claim an undocumented DPI SET will render.
+int MaxUnderEffectiveDesktop(UINT32 w, UINT32 h) {
+    const UINT32 shortSide = std::min(w, h);
+    const UINT32 longSide = std::max(w, h);
+    int best = 0;
+    for (const int step : kScales) {
+        if (100ULL * shortSide >= 600ULL * step &&
+            100ULL * longSide >= 800ULL * step) best = step;
+    }
+    return best;
+}
+
 Record ReadOne(const DISPLAYCONFIG_PATH_INFO& path,
                const std::vector<DISPLAYCONFIG_MODE_INFO>& modes) {
     Record r{};
@@ -277,6 +290,8 @@ void PrintOne(const Record& r) {
                << L"]\n";
     if (!r.sourceModeValid) return;
     std::wcout << std::fixed << std::setprecision(1);
+    std::wcout << L"Empirical short-side >=600, long-side >=800 DIP model predicts max: "
+               << MaxUnderEffectiveDesktop(r.width, r.height) << L"%\n";
     std::wcout << L"H1 (640x480 DIP floor) predicts max: "
                << MaxUnderFloor(r.width, r.height, 640, 480) << L"%\n";
     std::wcout << L"Alternative (800x600 DIP floor) predicts max: "
