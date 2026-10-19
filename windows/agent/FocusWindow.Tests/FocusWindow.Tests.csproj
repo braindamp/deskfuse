@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Version>0.3.0</Version>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\FocusWindow.Core\FocusWindow.Core.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- The independent phone-side client (follows SecureChannel.kt/LanTransport.kt, not our C#). -->
+    <Content Include="..\tests\interop\phone-client.mjs" Link="interop\phone-client.mjs" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\..\tests\protocol3\protocol-v3-vectors.properties" Link="protocol-v3-vectors.properties" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

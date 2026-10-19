@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Mirrors the tokens used in SessionChrome.kt / StateScreens.kt. -->
+    <color name="canvas">#FF070808</color>
+    <color name="panel">#FF0A0D0B</color>
+    <color name="ink">#FFF2F2EC</color>
+    <color name="muted">#FFA9ACA4</color>
+    <color name="dim">#FF878D84</color>
+    <color name="lime">#FFD6FB6D</color>
+    <color name="amber">#FFF2C56F</color>
+    <color name="coral">#FFFF9484</color>
+    <color name="sky">#FFA3C8FF</color>
+</resources>

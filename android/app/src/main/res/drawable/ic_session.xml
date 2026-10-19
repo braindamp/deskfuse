@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Notification icon for an active session (SessionService).
+  A monitor with a phone-shaped target inside it: the whole product in 24dp.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24"
+    android:tint="#FFFFFFFF">
+
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M3,4h11v2H5v8h4v2H3V4z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M12,9h8a1,1 0 0 1 1,1v9a1,1 0 0 1 -1,1h-8a1,1 0 0 1 -1,-1v-9a1,1 0 0 1 1,-1zM13,11v7h6v-7h-6z" />
+</vector>

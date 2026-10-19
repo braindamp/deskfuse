@@ -1,0 +1,43 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    Windows-only glue around FocusWindow.Core: driver IOCTLs, display-config queries, DPI read-back,
+    the probe window, SendInput, DPAPI pairing storage, and the CLI.
+    Build on Windows:  dotnet publish -c Release -r win-x64 (self-contained).
+    Compile check on a non-Windows box (cannot run the result): dotnet build, with EnableWindowsTargeting set to true.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <AssemblyName>FocusWindow.Agent</AssemblyName>
+    <RootNamespace>FocusWindow.Agent</RootNamespace>
+    <Version>0.3.0</Version>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <!--
+      WFAC010 wants DPI awareness set from a project property instead of the manifest. The manifest is
+      deliberate: it takes effect before Main runs, and every density read-back in this agent is
+      meaningless in a DPI-virtualised process. Program.RequirePerMonitorV2() verifies it at runtime.
+    -->
+    <NoWarn>$(NoWarn);WFAC010</NoWarn>
+    <!-- Publish as a normal self-contained app directory. The former single-file
+         bundle required writable %TEMP%\.net extraction just to launch, which
+         failed on the test machine. Keep dependencies beside the EXE. -->
+    <PublishSingleFile>false</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>false</IncludeNativeLibrariesForSelfExtract>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="QRCoder" Version="1.6.0" />
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="8.0.0" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\FocusWindow.Core\FocusWindow.Core.csproj" />
+  </ItemGroup>
+</Project>

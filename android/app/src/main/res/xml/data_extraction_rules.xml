@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  FR-TRUST-01 — pairing material never leaves the device.
+
+  Cloud backup and device-to-device transfer are both disabled for the
+  encrypted pairing store. A host key copied onto another phone would be a
+  silent extension of trust that the user never granted, so we require a fresh
+  QR scan on every new device.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="sharedpref" path="focuswindow.pairing.enc.xml" />
+        <exclude domain="sharedpref" path="focuswindow.pairing.xml" />
+        <exclude domain="sharedpref" path="focuswindow.profile.xml" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="sharedpref" path="focuswindow.pairing.enc.xml" />
+        <exclude domain="sharedpref" path="focuswindow.pairing.xml" />
+        <exclude domain="sharedpref" path="focuswindow.profile.xml" />
+    </device-transfer>
+</data-extraction-rules>

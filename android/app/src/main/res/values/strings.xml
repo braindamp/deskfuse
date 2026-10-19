@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Focus Window</string>
+
+    <!-- FR-TRUST-06 — the posture statement is a product surface, so it lives
+         in the app as well as on the store listing. These strings are asserted
+         by the store-copy review checklist. -->
+    <string name="posture_summary">No account. No session limits. No ADB, no root, no accessibility service. End-to-end encrypted, LAN by default.</string>
+    <string name="posture_lan">This connection is direct to your PC on your own network. Nothing passes through our servers.</string>
+    <string name="posture_relay">This connection uses a relay because the PC is not on this network. Traffic stays end-to-end encrypted.</string>
+
+    <!-- FR-OPS-03 — named states. Kept here so support can quote them verbatim. -->
+    <string name="state_idle">Not connected</string>
+    <string name="state_pairing">Scan the pairing code</string>
+    <string name="state_verifying">Confirm the code on your PC</string>
+    <string name="state_preparing">Preparing the display target</string>
+    <string name="state_stale">Paused — the host stopped sending frames</string>
+    <string name="state_reconnecting">Reconnecting to the same document</string>
+
+    <!-- FR-DPI-04 / FR-DPI-12 — the two sentences that keep the promise honest. -->
+    <string name="advisory_not_native">The host could not match this screen\'s density. You are seeing a scaled image, not a native render.</string>
+    <string name="advisory_small_tokens">The render is native, but this app\'s own interface is small. Raise the app\'s zoom on the PC for comfort.</string>
+
+    <string name="action_scan">Scan pairing code</string>
+    <string name="action_retry">Try again</string>
+    <string name="action_end">End session</string>
+</resources>

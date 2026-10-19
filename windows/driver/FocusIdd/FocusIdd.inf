@@ -1,0 +1,83 @@
+;
+; FocusIdd.inf - session-scoped indirect display driver for Focus Window.
+;
+; Root-enumerated UMDF 2 indirect display adapter for Windows 10 19045.
+; Windows 10 needs AddService=WUDFRd: WUDFRD.inf exists only on Windows 11+.
+;
+
+[Version]
+PnpLockDown=1
+Signature="$Windows NT$"
+ClassGUID = {4D36E968-E325-11CE-BFC1-08002BE10318}
+Class = Display
+ClassVer = 2.0
+Provider=%ManufacturerName%
+CatalogFile=FocusIdd.cat
+DriverVer=01/01/2025,1.0.0.0
+
+[Manufacturer]
+%ManufacturerName%=Standard,NT$ARCH$.10.0...19045
+
+[Standard.NT$ARCH$.10.0...19045]
+%DeviceName%=FocusIdd_Install, Root\FocusIdd
+
+[SourceDisksFiles]
+FocusIdd.dll=1
+
+[SourceDisksNames]
+1 = %DiskName%
+
+; =================== UMDF Device ==================================
+
+[FocusIdd_Install.NT]
+CopyFiles=UMDriverCopy
+
+[FocusIdd_Install.NT.hw]
+AddReg = FocusIdd_HardwareDeviceSettings
+
+[FocusIdd_HardwareDeviceSettings]
+HKR,, "UpperFilters",  %REG_MULTI_SZ%, "IndirectKmd"
+HKR, "WUDF", "DeviceGroupId", %REG_SZ%, "FocusIddDriverGroup"
+; Explicit per-device access. The normal user cannot issue display-control IOCTLs.
+; BA = Administrators, SY = SYSTEM, UD = User-Mode Driver Framework hosts.
+; This avoids relying on the Display class default security for our custom interface.
+HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;UD)"
+
+[FocusIdd_Install.NT.Services]
+; WUDFRd is the function driver (associated service) for this UMDF device.
+; 0x000001fa preserves pre-existing system service configuration.
+AddService=WUDFRd,0x000001fa,WUDFRD_ServiceInstall
+
+[WUDFRD_ServiceInstall]
+DisplayName = %WudfRdDisplayName%
+ServiceType = 1
+StartType = 3
+ErrorControl = 1
+ServiceBinary = %12%\WUDFRd.sys
+
+[FocusIdd_Install.NT.Wdf]
+UmdfService=FocusIdd,FocusIdd_ServiceInstall
+UmdfServiceOrder=FocusIdd
+UmdfKernelModeClientPolicy = AllowKernelModeClients
+
+[FocusIdd_ServiceInstall]
+UmdfLibraryVersion=$UMDFVERSION$
+ServiceBinary=%12%\UMDF\FocusIdd.dll
+UmdfExtensions = IddCx0102
+
+[DestinationDirs]
+UMDriverCopy=12,UMDF ; copy to drivers\umdf
+
+[UMDriverCopy]
+FocusIdd.dll
+
+; =================== Generic ==================================
+
+[Strings]
+ManufacturerName="Focus Window"
+DiskName = "FocusIdd Installation Disk"
+DeviceName="Focus Window Virtual Display"
+WudfRdDisplayName="Windows Driver Foundation - User-mode Driver Framework Reflector"
+
+REG_MULTI_SZ  = 0x00010000
+REG_SZ        = 0x00000000

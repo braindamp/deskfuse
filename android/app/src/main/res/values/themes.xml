@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:tools="http://schemas.android.com/tools">
+
+    <!--
+      A deliberately dark, chrome-free theme.
+
+      The remote surface is the content; anything the OS draws around it is
+      wasted glass. We go edge-to-edge with transparent system bars and let
+      SessionChrome own the overlay, so a 1:1 stream really does fill the
+      panel (FR-DPI-06, FR-MOB-04).
+    -->
+    <style name="Theme.FocusWindow" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowBackground">@color/canvas</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:enforceNavigationBarContrast" tools:targetApi="29">false</item>
+        <item name="android:enforceStatusBarContrast" tools:targetApi="29">false</item>
+
+        <!-- Let the surface extend into the cutout; insets are handled as part
+             of the profile rather than by cropping the content. -->
+        <item name="android:windowLayoutInDisplayCutoutMode" tools:targetApi="28">shortEdges</item>
+    </style>
+</resources>

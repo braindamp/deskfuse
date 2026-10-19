@@ -1,0 +1,103 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  FR-TRUST-04 / NFR-SEC-01 — the dependency surface IS the product claim.
+
+  Deliberately ABSENT from this manifest, and audited in release CI:
+    * android.permission.BIND_ACCESSIBILITY_SERVICE  (no accessibility abuse)
+    * any <service android:name=".*AccessibilityService">
+    * WRITE_SECURE_SETTINGS / ADB-adjacent permissions
+    * READ_PHONE_STATE, GET_ACCOUNTS, or any identity permission
+    * QUERY_ALL_PACKAGES
+
+  Android 17 / Advanced Protection Mode removes AccessibilityService from apps
+  that are not accessibility tools, and adbd restrictions are under discussion.
+  Every incumbent in this category depends on one or the other. We depend on
+  neither, which is both a policy posture and a durability decision.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- LAN transport only. No relay in the default path (FR-TRUST-03). -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+
+    <!-- QR pairing only. Never recorded, never uploaded (FR-TRUST-02). -->
+    <uses-permission android:name="android.permission.CAMERA" />
+
+    <!-- FR-REF-03 — keep the screen alive for the length of a session. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- Foreground service so a session survives the app going background. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <uses-feature android:name="android.hardware.camera.any" android:required="false" />
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+
+    <application
+        android:name=".FocusWindowApp"
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:icon="@drawable/ic_launcher_fw"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.FocusWindow"
+        android:enableOnBackInvokedCallback="true"
+        tools:targetApi="34">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:screenOrientation="fullSensor"
+            android:resizeableActivity="true"
+            android:supportsPictureInPicture="false"
+            android:theme="@style/Theme.FocusWindow"
+            android:windowSoftInputMode="adjustResize"
+            android:hardwareAccelerated="true"
+            android:preferMinimalPostProcessing="true"
+            tools:targetApi="31"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|density|keyboard|keyboardHidden|navigation|uiMode|fontScale">
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!-- Supported cross-app entry: Share a document/photo into DeskFuse.
+                 Source app grants temporary content-URI read permission; the transfer
+                 remains explicit and authenticated, never a silent background upload. -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+
+            <!-- FR-TRUST-02 — deep link form of the pairing payload. -->
+            <intent-filter android:autoVerify="false">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="focuswindow" android:host="pair" />
+            </intent-filter>
+        </activity>
+
+        <!--
+          FR-REF-05 — the session survives the phone sleeping or switching
+          networks, and reattaches to the SAME document. A data-sync foreground
+          service is the honest classification: we are holding a live stream,
+          not playing media.
+        -->
+        <service
+            android:name=".session.SessionService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <!-- No ADB, no root, no accessibility service. Asserted by CI. -->
+        <meta-data android:name="com.focuswindow.posture.accessibility" android:value="none" />
+        <meta-data android:name="com.focuswindow.posture.adb" android:value="none" />
+        <meta-data android:name="com.focuswindow.posture.account" android:value="none" />
+    </application>
+</manifest>
