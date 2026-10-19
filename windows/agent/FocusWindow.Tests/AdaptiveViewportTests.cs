@@ -58,6 +58,47 @@ public sealed class AdaptiveViewportTests
     }
 
     [Fact]
+    public async Task Verified_cutoff_is_reused_on_reconnect_but_remeasured()
+    {
+        var phone = TestProfiles.Flagship() with
+        {
+            DeviceId = "verified-cache-reconnect-test"
+        };
+        await using var first = new FakeDisplayBackend(2700, 3120)
+        {
+            RecommendedPercent = 100,
+            MaxPercentFor = (width, _) => width >= 2098 ? 350 : 225
+        };
+        var firstResult = await new AdaptiveViewportCalibration(
+            first, new StaticGuard(), new StaticGuard().Snapshot(), new ListLog())
+        {
+            RememberVerifiedWidth = true,
+            InitialSettlingMs = 0,
+            RetrySettlingMs = 0
+        }.TryRunAsync(phone, null, CancellationToken.None);
+        Assert.NotNull(firstResult);
+        Assert.Equal(2098, firstResult!.Monitor.Bounds.Width);
+        Assert.True(first.Created.Count > 4);
+
+        await using var second = new FakeDisplayBackend(2700, 3120)
+        {
+            RecommendedPercent = 100,
+            MaxPercentFor = (width, _) => width >= 2098 ? 350 : 225
+        };
+        var secondResult = await new AdaptiveViewportCalibration(
+            second, new StaticGuard(), new StaticGuard().Snapshot(), new ListLog())
+        {
+            RememberVerifiedWidth = true,
+            InitialSettlingMs = 0,
+            RetrySettlingMs = 0
+        }.TryRunAsync(phone, null, CancellationToken.None);
+        Assert.NotNull(secondResult);
+        Assert.Single(second.Created);
+        Assert.Equal(2098, second.Created[0].Width);
+        Assert.True(second.ViewportProbeCalls > 0); // cache never bypasses proof
+    }
+
+    [Fact]
     public async Task A_336_dpi_monitor_with_96_dpi_PMv2_is_not_accepted()
     {
         await using var backend = new FakeDisplayBackend(2700, 3120)
