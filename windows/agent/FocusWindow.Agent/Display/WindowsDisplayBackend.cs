@@ -141,33 +141,40 @@ internal sealed class WindowsDisplayBackend : IDisplayBackend
     }
 
     /// <summary>
-    /// FA+BB POC: render a PMv2 window inside the phone-sized viewport on a
-    /// LARGER virtual display, read the complete driver BGRA surface, and crop
-    /// its top-left 1440x3120 pixels exactly (CPU lab copy, NO interpolation).
-    /// A full-frame ruler test alone would not prove a phone-visible crop.
-    /// This does NOT implement a production GPU/NVENC crop.
+    /// Capture an EXACT viewport from a real driver frame and measure its
+    /// PMv2 ruler. No scaling and no output-frame resizing are allowed.
+    /// Currently copies pixels on CPU (before ffmpeg), not zero-copy GPU.
     /// </summary>
-    internal async Task<WindowDensityReport?> ProbeCropViewportAsync(MonitorInfo monitor,
-        int viewportWidth, int viewportHeight, CancellationToken ct)
+    public async Task<WindowDensityReport?> ProbeViewportAsync(MonitorInfo monitor,
+        RectI viewport, bool drawRuler, CancellationToken ct)
     {
-        if (_surface is null || viewportWidth <= 0 || viewportHeight <= 0 ||
-            viewportWidth > monitor.Bounds.Width || viewportHeight > monitor.Bounds.Height)
+        if (_surface is null || viewport.Width <= 0 || viewport.Height <= 0 ||
+            viewport.X < monitor.Bounds.X || viewport.Y < monitor.Bounds.Y ||
+            viewport.Right > monitor.Bounds.Right ||
+            viewport.Bottom > monitor.Bounds.Bottom)
             return null;
+        ct.ThrowIfCancellationRequested();
         using var frames = _surface.CreateFrameSource();
-        var fullBuffer = Array.Empty<byte>();
+        var buffer = Array.Empty<byte>();
+        var relative = new RectI(viewport.X - monitor.Bounds.X,
+            viewport.Y - monitor.Bounds.Y, viewport.Width, viewport.Height);
         (byte[] Bgra, int Width, int Height)? Capture()
         {
-            if (!frames.TryRead(400, ref fullBuffer, out var info)) return null;
+            if (!frames.TryRead(400, ref buffer, out var info)) return null;
             if (info.Width != monitor.Bounds.Width || info.Height != monitor.Bounds.Height)
                 return null;
-            var visiblePixels = DprChallengeTheory.CopyViewportBgra(fullBuffer.AsSpan(),
-                info.Width, info.Height, new RectI(0, 0, viewportWidth, viewportHeight));
-            return (visiblePixels, viewportWidth, viewportHeight);
+            var pixels = DprChallengeTheory.CopyViewportBgra(
+                buffer.AsSpan(), info.Width, info.Height, relative);
+            return (pixels, viewport.Width, viewport.Height);
         }
-        var topLeft = new RectI(monitor.Bounds.X, monitor.Bounds.Y,
-            viewportWidth, viewportHeight);
-        return await ProbeWindow.RunAsync(topLeft, true, Capture).ConfigureAwait(false);
+        return await ProbeWindow.RunAsync(viewport, drawRuler, Capture).ConfigureAwait(false);
     }
+
+    // Backward-compatible entry used by the hardware diagnostic.
+    internal Task<WindowDensityReport?> ProbeCropViewportAsync(MonitorInfo monitor,
+        int viewportWidth, int viewportHeight, CancellationToken ct) =>
+        ProbeViewportAsync(monitor, new RectI(monitor.Bounds.X, monitor.Bounds.Y,
+            viewportWidth, viewportHeight), true, ct);
 
     public async Task<WindowDensityReport?> ProbeWindowAsync(MonitorInfo monitor, bool drawRuler, CancellationToken ct)
     {
