@@ -114,12 +114,6 @@ public static class ServerMessages
             array.Add(new JsonObject { ["id"] = window.Id, ["title"] = window.Title, ["appLabel"] = window.AppLabel });
         return new JsonObject { ["type"] = "window_list", ["windows"] = array };
     }
-    public static JsonObject WindowFocusResult(string sourceId, bool activated) => new()
-    {
-        ["type"] = "window_focus",
-        ["id"] = sourceId,
-        ["activated"] = activated,
-    };
     public static JsonObject FileList(FileListing listing)
     {
         var entries = new JsonArray();
