@@ -27,6 +27,11 @@ namespace FocusWindow.Core.Transport;
 /// </summary>
 public sealed class PhoneConnection : IAsyncDisposable
 {
+    public sealed record PhoneMicrophonePacket(int StreamId, byte[] Pcm16Mono);
+    private readonly Channel<PhoneMicrophonePacket> _phoneMicrophone =
+        Channel.CreateBounded<PhoneMicrophonePacket>(new BoundedChannelOptions(8) {
+            SingleReader = true, SingleWriter = true, FullMode = BoundedChannelFullMode.DropOldest
+        });
     public const int MaxFrameBacklog = 4;
     // Wire.MaxFrameBytes limits the SEALED packet body, not the Annex-B access unit.
     // The 20-byte video header and 24-byte AES-GCM record envelope also count.
@@ -70,6 +75,7 @@ public sealed class PhoneConnection : IAsyncDisposable
     }
     public string VerificationCode => _chan.VerificationCode;
     public ChannelReader<ClientMessage> Messages => _incoming.Reader;
+    public ChannelReader<PhoneMicrophonePacket> MicrophonePackets => _phoneMicrophone.Reader;
     public Task Completion => _completion.Task;
     public int FrameBacklog => Volatile.Read(ref _frameBacklog);
     /// <summary>Last measured ping round trip, or null before the first pong.</summary>
@@ -169,6 +175,19 @@ public sealed class PhoneConnection : IAsyncDisposable
         await _stream.ReadExactlyAsync(sealedBytes, ct).ConfigureAwait(false);
         return _chan.Open(sealedBytes);
     }
+    private async Task<byte[]> ReadSealedMicrophoneAsync(CancellationToken ct)
+    {
+        var lengthBytes = new byte[4];
+        await _stream.ReadExactlyAsync(lengthBytes, ct).ConfigureAwait(false);
+        var size = BinaryPrimitives.ReadInt32BigEndian(lengthBytes);
+        if (size < SecureChannel.RecordOverheadBytes + 6 ||
+            size > SecureChannel.RecordOverheadBytes + 644)
+            throw new InvalidDataException("microphone packet exceeds PCM wire budget");
+        var packet = new byte[size];
+        await _stream.ReadExactlyAsync(packet, ct).ConfigureAwait(false);
+        return packet;
+    }
+
     private async Task ReadLoopAsync(CancellationToken ct)
     {
         var kind = new byte[1];
@@ -194,6 +213,23 @@ public sealed class PhoneConnection : IAsyncDisposable
                         }
                         break;
                     }
+                    case Wire.KindPhoneMic:
+                    {
+                        // Strictly bounded 16 kHz mono PCM16, <=20 ms samples.
+                        // Audio is still encrypted/authenticated by SecureChannel.
+                        // Any unconsumed packets are dropped rather than building
+                        // stale audio or backpressuring control/video.
+                        var sealedBytes = await ReadSealedMicrophoneAsync(ct).ConfigureAwait(false);
+                        var plain = _chan.Open(sealedBytes);
+                        if (plain.Length < 6 || plain.Length > 644 ||
+                            (plain.Length & 1) != 0)
+                            throw new InvalidDataException("invalid microphone PCM length");
+                        var streamId = BinaryPrimitives.ReadInt32BigEndian(plain.AsSpan(0, 4));
+                        if (streamId <= 0) throw new InvalidDataException("invalid microphone stream ID");
+                        _phoneMicrophone.Writer.TryWrite(new PhoneMicrophonePacket(
+                            streamId, plain.AsSpan(4).ToArray()));
+                        break;
+                    }
                     case Wire.KindPong:
                     {
                         var sent = Interlocked.Read(ref _pingSentTimestamp);
@@ -214,6 +250,7 @@ public sealed class PhoneConnection : IAsyncDisposable
         finally
         {
             _incoming.Writer.TryComplete();
+            _phoneMicrophone.Writer.TryComplete();
             Finish();
         }
     }
