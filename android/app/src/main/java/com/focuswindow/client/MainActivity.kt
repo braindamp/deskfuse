@@ -97,19 +97,6 @@ class MainActivity : ComponentActivity() {
     private var pcPairingError by mutableStateOf<String?>(null)
     private var manualPc by mutableStateOf("")
 
-    /**
-     * Registered during creation, as AndroidX requires. The scanner returns a
-     * raw payload; parsing and validation happen in [handlePairingUri].
-     */
-    private val scanLauncher = registerForActivityResult(ScannerActivity.Contract()) { result ->
-        val payload = result.payload
-        if (payload != null) {
-            handlePairingUri(payload)
-        } else {
-            controller.stop(result.error ?: "Scan cancelled.")
-        }
-    }
-
     private val savePcFile = registerForActivityResult(ActivityResultContracts.CreateDocument(
         "application/octet-stream")) { uri ->
         val remote = pendingRemoteFile
