@@ -139,7 +139,11 @@ class MainActivity : ComponentActivity() {
 
         profiles = ProfileProvider(applicationContext)
         pairings = PairingRepository(applicationContext)
-        controller = SessionController(lifecycleScope, clientVersion = BuildConfig.VERSION_NAME)
+        controller = SessionController(
+            lifecycleScope,
+            clientVersion = BuildConfig.VERSION_NAME,
+            audioPreferences = pairings,
+        )
 
         surfaceView = PhoneSurfaceView(this).apply {
             // The decoder writes here directly; see NFR-PIX-01.
