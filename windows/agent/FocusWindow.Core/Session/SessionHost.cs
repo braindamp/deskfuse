@@ -4,8 +4,9 @@ using FocusWindow.Core.Media;
 using FocusWindow.Core.Transport;
 namespace FocusWindow.Core.Session;
 /// <summary>
-/// One virtual-display owner at a time, while media-only authenticated phones
-/// can connect simultaneously without creating or changing any monitor.
+/// Concurrent authenticated accessory and display sessions. Backend admission
+/// currently protects the single-monitor FocusIdd runtime, but the protocol and
+/// peer model do not impose a one-device or one-display product limit.
 ///
 /// The pairing is deliberately LONG-LIVED: the phone stores the host key + salt so it can
 /// reattach after sleep or a Wi-Fi handover without a new scan (FR-REF-05). Authorisation
@@ -20,7 +21,7 @@ public sealed class SessionHost : IDisposable
     private HostListener? _listener;
     private PairingOffer? _offer;
     private CameraFreePairingHost? _cameraFree;
-    private DevicePeerRegistry? _mediaPeers;
+    private DevicePeerRegistry? _devicePeers;
     private string _encoderName = "pending native-resolution qualification";
     public SessionHost(HostOptions options, HostServices services, ILog log)
     {
@@ -47,7 +48,7 @@ public sealed class SessionHost : IDisposable
         // DevicePeerRegistry provides *logical* identities only, not PnP devices.
         var scope = Convert.ToHexString(SHA256.HashData(
             offer.KeyPair.ExportSubjectPublicKeyInfo()));
-        _mediaPeers = new DevicePeerRegistry(scope);
+        _devicePeers = new DevicePeerRegistry(scope);
         if (_options.CameraFreePairing)
         {
             if (_services.DeviceCredentials is null)
@@ -60,13 +61,16 @@ public sealed class SessionHost : IDisposable
     }
     public async Task RunSessionsAsync(CancellationToken ct)
     {
-        if (_listener is null || _offer is null || _mediaPeers is null)
+        if (_listener is null || _offer is null || _devicePeers is null)
             throw new InvalidOperationException("call StartAsync first");
-        var peers = _mediaPeers;
-        // Display session is exclusive to the monitor. Camera/mic/speaker peers
-        // can connect in parallel; these sessions never instantiate PhoneSession.
-        Task? displayTask = null;
-        var mediaTasks = new List<Task>();
+        var peers = _devicePeers;
+        // Every display request receives an independent lease; only the current
+        // host-global FocusIdd backend requires exclusive admission. This can
+        // expand after the independent GPU/virtual-monitor POC has a per-display
+        // resource interface, without changing how a device declares its roles.
+        var displayAdmission = _services.DisplayAdmission ?? new ExclusiveVirtualDisplayAdmission();
+        var displayTasks = new List<Task>();
+        var accessoryTasks = new List<Task>();
         try
         {
             while (!ct.IsCancellationRequested)
@@ -83,9 +87,9 @@ public sealed class SessionHost : IDisposable
                     break;
                 }
 
-                if (accepted.hello.Role == "media")
+                if (accepted.hello.Role is "media" or "accessory")
                 {
-                    // Media-only identities MUST be backed by per-device
+                    // Accessory identities MUST be backed by per-device
                     // credentials. Legacy QR credentials don't bind DeviceId.
                     if (!_options.CameraFreePairing || _services.DeviceCredentials is null ||
                         _options.SingleSession)
@@ -93,16 +97,16 @@ public sealed class SessionHost : IDisposable
                         await accepted.connection.DisposeAsync().ConfigureAwait(false);
                         continue;
                     }
-                    mediaTasks.RemoveAll(task => task.IsCompleted);
-                    if (mediaTasks.Count >= 8)
+                    accessoryTasks.RemoveAll(task => task.IsCompleted);
+                    if (accessoryTasks.Count >= 8)
                     {
                         await accepted.connection.DisposeAsync().ConfigureAwait(false);
-                        _log.Warn("media-only connection capacity reached");
+                        _log.Warn("accessory connection capacity reached");
                         continue;
                     }
                     var connection = accepted.connection;
                     var hello = accepted.hello;
-                    mediaTasks.Add(Task.Run(async () =>
+                    accessoryTasks.Add(Task.Run(async () =>
                     {
                         try
                         {
@@ -125,31 +129,38 @@ public sealed class SessionHost : IDisposable
                     continue;
                 }
 
-                if (displayTask is { IsCompleted: false })
+                displayTasks.RemoveAll(task => task.IsCompleted);
+                // Resource admission is a backend safety contract, not a user
+                // or device role limit. It prevents current FocusIdd sessions
+                // from racing over global display creation/removal.
+                var displayLease = displayAdmission.TryAcquire(accepted.hello.Profile.DeviceId);
+                if (displayLease is null)
                 {
-                    // A second display must not reinitialize the physical
-                    // display guard or remove the first phone's virtual monitor.
-                    _log.Warn("display is occupied by another authenticated phone");
+                    _log.Warn("virtual display backend is currently occupied");
                     await accepted.connection.DisposeAsync().ConfigureAwait(false);
                     continue;
                 }
 
                 var displayConnection = accepted.connection;
                 var displayHello = accepted.hello;
-                displayTask = Task.Run(async () =>
+                var displayTask = Task.Run(async () =>
                 {
-                    try
+                    using (displayLease)
                     {
-                        await new PhoneSession(_options, _services, _encoderName, _log)
-                            .RunAsync(displayConnection, displayHello, ct).ConfigureAwait(false);
-                    }
-                    catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
-                    catch (Exception ex)
-                    {
-                        _log.Error("display session failed: " + ex);
-                        await displayConnection.DisposeAsync().ConfigureAwait(false);
+                        try
+                        {
+                            await new PhoneSession(_options, _services, _encoderName, _log)
+                                .RunAsync(displayConnection, displayHello, ct).ConfigureAwait(false);
+                        }
+                        catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
+                        catch (Exception ex)
+                        {
+                            _log.Error("display session failed: " + ex);
+                            await displayConnection.DisposeAsync().ConfigureAwait(false);
+                        }
                     }
                 });
+                displayTasks.Add(displayTask);
                 if (_options.SingleSession)
                 {
                     await displayTask.ConfigureAwait(false);
@@ -159,11 +170,10 @@ public sealed class SessionHost : IDisposable
         }
         finally
         {
-            // Cancelled host shutdown closes media and display independently.
-            // No media-only task ever invokes FocusIdd removal/scale restore.
-            var tasks = mediaTasks.ToList();
-            if (displayTask is not null) tasks.Add(displayTask);
-            if (tasks.Count != 0) await Task.WhenAll(tasks).ConfigureAwait(false);
+            // Host shutdown joins accessory and display workers independently.
+            // Only a display worker may own and remove its virtual display.
+            var tasks = accessoryTasks.Concat(displayTasks).ToArray();
+            if (tasks.Length != 0) await Task.WhenAll(tasks).ConfigureAwait(false);
         }
     }
     public async Task RunAsync(CancellationToken ct)
