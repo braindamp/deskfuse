@@ -31,6 +31,8 @@ internal sealed class PhoneSession
     private PhoneProfile _profile = null!;
     private InputGeometry _geometry = null!;
     private IVideoEncoder? _encoder;
+    private IHostAudioCapture? _pcAudio;
+    private int _pcAudioStreamId;
     private FileUploadReceiver? _uploads;
     private CancellationTokenSource? _downloadStop;
     private Task? _downloadTask;
@@ -470,6 +472,9 @@ internal sealed class PhoneSession
                 case ClientWindows windows:
                     HandleWindows(windows);
                     break;
+                case ClientAudio audio:
+                    HandlePcAudio(audio.Action);
+                    break;
                 case ClientFiles files:
                     HandleFiles(files, ct);
                     break;
@@ -600,6 +605,48 @@ internal sealed class PhoneSession
         }
     }
 
+    private void HandlePcAudio(string action)
+    {
+        if (action == "stop_pc")
+        {
+            StopPcAudio();
+            _conn.SendControl(ServerMessages.AudioState("stopped", _pcAudioStreamId));
+            return;
+        }
+        if (action != "start_pc" || _s.CreateAudioCapture is null)
+        {
+            _conn.SendControl(ServerMessages.AudioState("error", _pcAudioStreamId,
+                detail: "Windows playback capture unavailable."));
+            return;
+        }
+        StopPcAudio();
+        try
+        {
+            var capture = _s.CreateAudioCapture();
+            _pcAudio = capture;
+            var streamId = ++_pcAudioStreamId;
+            _conn.SendControl(ServerMessages.AudioState("started", streamId,
+                capture.SampleRate, capture.Channels));
+            capture.Start(samples => _conn.TrySendAudio(samples.Span, streamId));
+        }
+        catch (Exception ex)
+        {
+            _log.Warn("PC audio capture unavailable: " + ex.GetType().Name);
+            StopPcAudio();
+            _conn.SendControl(ServerMessages.AudioState("error", _pcAudioStreamId,
+                detail: "Could not capture the selected Windows playback endpoint."));
+        }
+    }
+
+    private void StopPcAudio()
+    {
+        var capture = _pcAudio;
+        _pcAudio = null;
+        if (capture is null) return;
+        try { capture.Dispose(); }
+        catch (Exception ex) { _log.Warn("stopping PC audio: " + ex.GetType().Name); }
+    }
+
     private void HandleWindows(ClientWindows request)
     {
         if (_s.Windows is null) return;
@@ -709,6 +756,7 @@ internal sealed class PhoneSession
         _conn.SendControl(ServerMessages.Stage(stage, detail, remediation, fatal: true));
     private async Task TeardownAsync()
     {
+        StopPcAudio();
         _downloadStop?.Cancel();
         if (_downloadTask is not null)
         {
