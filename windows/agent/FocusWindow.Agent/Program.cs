@@ -28,8 +28,8 @@ internal static class Program
           --ffmpeg PATH      (default: ffmpeg.exe next to the agent, else PATH)
           --auto-approve     legacy QR test-mode only; does NOT bypass first-time LAN enrollment
           --legacy-qr       explicitly enable historical QR pairing instead of phone discovery
-          --trusted-phones   list enrolled device IDs (for review and revocation)
-          --forget-phone ID revoke one phone credential and its saved approvals
+          trusted-phones    list enrolled device IDs (for review and revocation)
+          trusted-phones --forget-phone ID   revoke a phone and its approvals
           --new-pairing      rotate the host public key (all phones must re-enroll)
           --single-session   exit after one phone session
           --ruler-probe      verify rendered density with a pixel ruler at the start of every session
@@ -170,7 +170,9 @@ internal static class Program
         if (!string.IsNullOrEmpty(forget))
         {
             store.Revoke(forget);
-            Console.WriteLine("Phone credential revoked. Existing sessions remain active until disconnected.");
+            using var log = new ConsoleLog(null);
+            new ConsoleApproval(false, log).ForgetDevice(forget);
+            Console.WriteLine("Phone authorization revoked. Existing sessions remain active until disconnected.");
             return 0;
         }
         foreach (var item in store.All())
