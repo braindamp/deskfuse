@@ -10,6 +10,7 @@ param(
     [switch]$Run,
     [switch]$Try350,
     [switch]$TryAboveCap,
+    [ValidateRange(500,30000)][int]$SettleMs = 1500,
     [ValidateRange(30,600)][int]$TimeoutSeconds = 300
 )
 $ErrorActionPreference = 'Stop'
@@ -45,7 +46,7 @@ if ($Run) {
     }
 }
 $line = 'dpi-challenge --modes "' + $Modes + '" --diag-mm ' + $DiagonalMm +
-    ' --out "' + $OutDirectory + '"'
+    ' --out "' + $OutDirectory + '" --settle-ms ' + $SettleMs
 if ($Run) { $line += ' --run --i-accept-virtual-display-test' }
 if ($Try350) { $line += ' --try-350' }
 if ($TryAboveCap) { $line += ' --try-above-cap --i-accept-unsupported-scale-risk' }
