@@ -66,8 +66,8 @@ $startInfo.UseShellExecute = $false
 $startInfo.CreateNoWindow = $true
 $startInfo.RedirectStandardOutput = $true
 $startInfo.RedirectStandardError = $true
-$startInfo.StandardOutputEncoding = New-Object System.Text.UTF8Encoding($false)
-$startInfo.StandardErrorEncoding = New-Object System.Text.UTF8Encoding($false)
+$startInfo.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$startInfo.StandardErrorEncoding = [System.Text.UTF8Encoding]::new($false)
 $child = New-Object System.Diagnostics.Process
 $child.StartInfo = $startInfo
 try {
@@ -85,8 +85,8 @@ try {
     $code = [int]$child.ExitCode
     $outputText = $outputTask.GetAwaiter().GetResult()
     $errorText = $errorTask.GetAwaiter().GetResult()
-    [System.IO.File]::WriteAllText($stdout, $outputText, (New-Object System.Text.UTF8Encoding($false)))
-    [System.IO.File]::WriteAllText($stderr, $errorText, (New-Object System.Text.UTF8Encoding($false)))
+    [System.IO.File]::WriteAllText($stdout, $outputText, ([System.Text.UTF8Encoding]::new($false)))
+    [System.IO.File]::WriteAllText($stderr, $errorText, ([System.Text.UTF8Encoding]::new($false)))
     if ($outputText) { Write-Host $outputText }
     if ($errorText) { Write-Warning "Stderr log: $stderr"; Write-Host $errorText }
     if ($code -ne 0) {
