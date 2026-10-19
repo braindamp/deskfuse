@@ -31,6 +31,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.ui.unit.dp
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -60,6 +61,9 @@ import com.focuswindow.client.transport.DiscoveredPc
 import com.focuswindow.client.transport.EnrollmentMessages
 import com.focuswindow.client.ui.SessionChrome
 import com.focuswindow.client.ui.StateScreen
+import com.focuswindow.client.workspace.DeskWorkspace
+import com.focuswindow.client.workspace.DeskWindow
+import com.focuswindow.client.workspace.WorkspaceDesk
 
 /**
  * The single activity.
@@ -168,10 +172,22 @@ class MainActivity : ComponentActivity() {
             var modifierMask by remember { mutableIntStateOf(Modifiers.NONE) }
             var diagnostics by remember { mutableStateOf(false) }
             var showWindows by remember { mutableStateOf(false) }
+            val desk = remember { DeskWorkspace() }
+            var deskSnapshot by remember { mutableStateOf(desk.snapshot()) }
             var showPcFiles by remember { mutableStateOf(false) }
             var typedPcPath by remember { mutableStateOf("") }
             val windows by controller.windows.collectAsState()
             val pcFiles by controller.files.collectAsState()
+            LaunchedEffect(windows, state is SessionState.Streaming) {
+                if (state is SessionState.Streaming) {
+                    desk.sync(windows.map { DeskWindow(it.id, it.title, it.appLabel) })
+                } else {
+                    desk.clearWindows()
+                    showWindows = false
+                    appDialogVisible = false
+                }
+                deskSnapshot = desk.snapshot()
+            }
 
             Box(Modifier.fillMaxSize()) {
                 // The remote surface sits underneath everything.
@@ -279,31 +295,6 @@ class MainActivity : ComponentActivity() {
                     )
                 }
 
-                if (showWindows) {
-                    AlertDialog(
-                        onDismissRequest = { showWindows = false; appDialogVisible = false },
-                        title = { Text("Windows applications") },
-                        text = {
-                            androidx.compose.foundation.lazy.LazyColumn {
-                                items(windows.size) { i ->
-                                    val win = windows[i]
-                                    Text(
-                                        "${win.appLabel} · ${win.title}",
-                                        modifier = Modifier.clickable {
-                                            controller.activateWindow(win.id)
-                                            showWindows = false
-                                            appDialogVisible = false
-                                        }.padding(9.dp),
-                                    )
-                                }
-                            }
-                        },
-                        confirmButton = {
-                            TextButton(onClick = { showWindows = false; appDialogVisible = false }) { Text("Close") }
-                        },
-                    )
-                }
-
                 if (showPcFiles) {
                     AlertDialog(
                         onDismissRequest = { showPcFiles = false; appDialogVisible = false },
@@ -383,6 +374,30 @@ class MainActivity : ComponentActivity() {
                     onSendFile = { controller.browsePc(); showPcFiles = true; appDialogVisible = true },
                     onAdvisoryAction = { },
                 )
+                if (showWindows && state is SessionState.Streaming) {
+                    WorkspaceDesk(
+                        snapshot = deskSnapshot,
+                        onRefresh = { controller.requestWindows() },
+                        onClose = { showWindows = false; appDialogVisible = false },
+                        onFocus = { sourceId ->
+                            desk.focusHandle(sourceId)?.let(controller::activateWindow)
+                            showWindows = false
+                            appDialogVisible = false
+                        },
+                        onMove = { sourceId, dx, dy ->
+                            if (desk.move(sourceId, dx, dy)) deskSnapshot = desk.snapshot()
+                        },
+                        onMoveToTopic = { sourceId, topicId ->
+                            if (desk.moveToTopic(sourceId, topicId)) deskSnapshot = desk.snapshot()
+                        },
+                        onAddTopic = { name ->
+                            desk.addTopic(name).also { if (it) deskSnapshot = desk.snapshot() }
+                        },
+                        onRemoveTopic = { id ->
+                            if (desk.removeTopic(id)) deskSnapshot = desk.snapshot()
+                        },
+                    )
+                }
             }
         }
 
