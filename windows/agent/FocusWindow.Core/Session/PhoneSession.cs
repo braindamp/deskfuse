@@ -396,6 +396,10 @@ internal sealed class PhoneSession
     }
     private async Task RenegotiateAsync(PhoneProfile next, CancellationToken ct)
     {
+        var invalidProfile = next.Validate();
+        if (invalidProfile.Length != 0)
+            throw new DisplayException("profile",
+                "Phone sent an invalid updated display profile: " + invalidProfile);
         await _gate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
@@ -650,6 +654,7 @@ internal sealed class PhoneSession
         }
     }
     private bool GeometryChanged(PhoneProfile next) =>
+        !float.IsFinite(next.Dpr) ||
         next.PhysicalW != _profile.PhysicalW ||
         next.PhysicalH != _profile.PhysicalH ||
         Math.Abs(next.Dpr - _profile.Dpr) > 0.001f ||
