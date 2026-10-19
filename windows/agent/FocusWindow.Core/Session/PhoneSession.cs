@@ -45,6 +45,9 @@ internal sealed class PhoneSession
     private readonly long _ptsOrigin = Stopwatch.GetTimestamp();
     private long _lastPtsUs;
     private byte[] _frameBuf = Array.Empty<byte>();
+    // A wider backing monitor is NEVER encoded at backing resolution:
+    // the phone gets only its exact native-pixel top-left viewport.
+    private byte[] _visibleFrameBuf = Array.Empty<byte>();
     private int _frameBytes;
     public PhoneSession(HostOptions o, HostServices s, string encoderName, ILog log)
     {
@@ -118,11 +121,10 @@ internal sealed class PhoneSession
     private async Task StreamAsync(CancellationToken ct)
     {
         _conn.SendControl(ServerMessages.Stage("Preparing the display", "Creating the phone-shaped monitor."));
-        _outcome = await _negotiator.RunAsync(_profile,
-            (stage, detail) => _conn.SendControl(ServerMessages.Stage(stage, detail)), ct).ConfigureAwait(false);
+        _outcome = await NegotiatePhoneDisplayAsync(_profile, ct).ConfigureAwait(false);
         _s.OnNegotiated?.Invoke(_outcome);
         using var frames = _backend.OpenFrameSource();
-        _geometry = new InputGeometry(_outcome.Monitor.Bounds, _outcome.Plan.PixelW, _outcome.Plan.PixelH);
+        _geometry = ViewportInputGeometry(_outcome);
         _version = 1;
         await SelectNativeEncoderAsync(ct).ConfigureAwait(false);
         _encoder = StartEncoder(_version);
@@ -134,6 +136,48 @@ internal sealed class PhoneSession
             transportCompletion: _conn.Completion,
             shutdown: ct).ConfigureAwait(false);
     }
+    private async Task<NegotiationOutcome> NegotiatePhoneDisplayAsync(PhoneProfile phone, CancellationToken ct)
+    {
+        void Progress(string stage, string detail) =>
+            _conn.SendControl(ServerMessages.Stage(stage, detail));
+        if (_o.AdaptiveDpiViewport)
+        {
+            var calibrated = await new AdaptiveViewportCalibration(
+                _backend, _guard, _before, _log)
+                .TryRunAsync(phone, Progress, ct).ConfigureAwait(false);
+            if (calibrated is not null) return calibrated;
+            _log.Warn("Exact-DPR adaptive viewport not verified; reverting to honest normal density probe.");
+        }
+        return await _negotiator.RunAsync(phone, Progress, ct).ConfigureAwait(false);
+    }
+
+    private static InputGeometry ViewportInputGeometry(NegotiationOutcome outcome)
+    {
+        var bounds = outcome.Monitor.Bounds;
+        var width = outcome.Plan.PixelW;
+        var height = outcome.Plan.PixelH;
+        // Input coordinates and the streamed pixels share the SAME origin
+        // and 1:1 size. Never stretch touch across the hidden backing region.
+        var viewport = outcome.Plan.Kind == PlanKind.VerifiedViewport
+            ? new RectI(bounds.X, bounds.Y, width, height)
+            : bounds;
+        return new InputGeometry(viewport, width, height);
+    }
+
+    private async Task RestoreAdaptiveScaleAsync()
+    {
+        var original = _outcome?.RestoreScalePercent;
+        if (original is null || _backend is null) return;
+        var monitor = _outcome.Monitor;
+        var result = _backend.TrySetScale(monitor, original.Value);
+        var readback = _backend.ReadScaleCaps(monitor);
+        if (!result.Ok || readback?.CurrentPercent != original.Value)
+            throw new DisplayException("scale-restore",
+                $"Original virtual-display scale {original}% not restored: {result.Detail}; " +
+                $"readback={readback?.CurrentPercent.ToString() ?? "unavailable"}");
+        _log.Info($"Adaptive virtual-display scale restored to {original}%");
+    }
+
     private async Task SelectNativeEncoderAsync(CancellationToken ct)
     {
         var plan = _outcome.Plan;
@@ -207,18 +251,29 @@ internal sealed class PhoneSession
             if (frames.TryRead(wait, ref _frameBuf, out var info))
             {
                 var plan = _outcome.Plan;
-                if (info.Width != plan.PixelW || info.Height != plan.PixelH)
+                var backing = _outcome.Monitor.Bounds;
+                if (info.Width != backing.Width || info.Height != backing.Height)
                 {
                     // Right after a mode change a stale frame of the old size can still arrive.
                     // A persistent mismatch is real: the driver is not delivering the target.
                     if (++mismatches > 60)
                         throw new DisplayException("mode",
-                            $"The display driver delivers {info.Width}x{info.Height} but the phone target is {plan.PixelW}x{plan.PixelH}.",
+                            $"The display driver delivers {info.Width}x{info.Height} but the backing monitor is {backing.Width}x{backing.Height}.",
                             "Windows picked a different mode for the phone monitor. Check Display settings, then reconnect.");
                     continue;
                 }
                 mismatches = 0;
                 _frameBytes = info.Width * info.Height * 4;
+                if (plan.Kind == PlanKind.VerifiedViewport)
+                {
+                    var visibleBytes = checked(plan.PixelW * plan.PixelH * 4);
+                    if (_visibleFrameBuf.Length != visibleBytes)
+                        _visibleFrameBuf = new byte[visibleBytes];
+                    DprChallengeTheory.CopyViewportBgra(
+                        _frameBuf.AsSpan(0, _frameBytes), info.Width, info.Height,
+                        new RectI(0, 0, plan.PixelW, plan.PixelH),
+                        _visibleFrameBuf);
+                }
                 Interlocked.Increment(ref _framesSeen);
                 dirty = true;
             }
@@ -249,7 +304,12 @@ internal sealed class PhoneSession
             write.CancelAfter(TimeSpan.FromSeconds(5)); // a wedged ffmpeg must not wedge the session
             try
             {
-                await _encoder.WriteFrameAsync(_frameBuf.AsMemory(0, _frameBytes), write.Token).ConfigureAwait(false);
+                await _encoder.WriteFrameAsync(
+                    _outcome.Plan.Kind == PlanKind.VerifiedViewport
+                        ? _visibleFrameBuf.AsMemory(0, checked(_outcome.Plan.PixelW *
+                            _outcome.Plan.PixelH * 4))
+                        : _frameBuf.AsMemory(0, _frameBytes),
+                    write.Token).ConfigureAwait(false);
             }
             catch (Exception ex) when (ex is EncoderUnavailableException ||
                                        (ex is OperationCanceledException && !ct.IsCancellationRequested))
@@ -285,7 +345,13 @@ internal sealed class PhoneSession
             _resync = true; // output of the new process is accepted from its first keyframe on
             _encoder = StartEncoder(Interlocked.Read(ref _version));
             if (_frameBytes > 0)
-                await _encoder.WriteFrameAsync(_frameBuf.AsMemory(0, _frameBytes), ct).ConfigureAwait(false);
+            {
+                var view = _outcome.Plan.Kind == PlanKind.VerifiedViewport
+                    ? _visibleFrameBuf.AsMemory(0, checked(_outcome.Plan.PixelW *
+                        _outcome.Plan.PixelH * 4))
+                    : _frameBuf.AsMemory(0, _frameBytes);
+                await _encoder.WriteFrameAsync(view, ct).ConfigureAwait(false);
+            }
         }
         finally
         {
@@ -302,10 +368,10 @@ internal sealed class PhoneSession
             var old = _encoder;
             _encoder = null;
             if (old is not null) await old.DisposeAsync().ConfigureAwait(false);
-            _outcome = await _negotiator.RunAsync(next,
-                (stage, detail) => _conn.SendControl(ServerMessages.Stage(stage, detail)), ct).ConfigureAwait(false);
+            await RestoreAdaptiveScaleAsync().ConfigureAwait(false);
+            _outcome = await NegotiatePhoneDisplayAsync(next, ct).ConfigureAwait(false);
             _s.OnNegotiated?.Invoke(_outcome);
-            _geometry = new InputGeometry(_outcome.Monitor.Bounds, _outcome.Plan.PixelW, _outcome.Plan.PixelH);
+            _geometry = ViewportInputGeometry(_outcome);
             _frameBytes = 0; // the old frame is the wrong size now
             var version = Interlocked.Increment(ref _version);
             _resync = true;
@@ -615,6 +681,8 @@ internal sealed class PhoneSession
         }
         if (_backend is not null)
         {
+            try { await RestoreAdaptiveScaleAsync().ConfigureAwait(false); }
+            catch (Exception ex) { _log.Warn("restoring the virtual monitor's original scale: " + ex.Message); }
             try { await _backend.RemoveMonitorAsync(CancellationToken.None).ConfigureAwait(false); }
             catch (Exception ex) { _log.Warn("removing the phone monitor: " + ex.Message); }
             try { await _backend.DisposeAsync().ConfigureAwait(false); } catch { /* best effort */ }
