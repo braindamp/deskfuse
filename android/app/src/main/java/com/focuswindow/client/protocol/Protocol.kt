@@ -173,6 +173,12 @@ sealed interface ServerMessage {
     @Serializable @SerialName("window_list")
     data class WindowList(val windows: List<WindowEntry>) : ServerMessage
 
+    @Serializable @SerialName("bridge_state")
+    data class BridgeState(
+        val requestedCapabilities: List<String> = emptyList(),
+        val activeCapabilities: List<String> = emptyList(),
+    ) : ServerMessage
+
     @Serializable @SerialName("audio_state")
     data class AudioState(
         val state: String, val streamId: Int,
@@ -203,6 +209,7 @@ sealed interface ClientMessage {
         val protocolVersion: Int = PROTOCOL_VERSION,
         val clientVersion: String,
         val profile: PhoneProfile,
+        val capabilities: List<String> = emptyList(),
     ) : ClientMessage
 
     // Never send a role flag in ordinary "hello": pre-bridge Windows hosts
@@ -213,6 +220,7 @@ sealed interface ClientMessage {
         val protocolVersion: Int = PROTOCOL_VERSION,
         val clientVersion: String,
         val profile: PhoneProfile,
+        val capabilities: List<String> = emptyList(),
     ) : ClientMessage
 
     /** FR-DPI-09 — rotation/fold/font-scale re-derive the TARGET, nothing else. */
