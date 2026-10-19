@@ -158,6 +158,7 @@ internal static class Program
             DeviceCredentials: new DpapiDeviceCredentialStore(),
             Clipboard: new WindowsClipboardBridge(),
             Windows: new WindowsWindowWorkflow(),
+            CreateAudioCapture: () => new WindowsLoopbackAudioCapture(),
             OnNegotiated: outcome =>
             {
                 var path = Path.Combine(AppData.Directory, "last-session-evidence.md");
