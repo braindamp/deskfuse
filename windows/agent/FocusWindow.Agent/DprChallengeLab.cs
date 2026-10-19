@@ -303,7 +303,7 @@ internal static class DprChallengeLab
                                 check?.CurrentPercent == originalCaps.CurrentPercent
                                 ? "RESTORED_AND_READ_BACK"
                                 : "RESTORE_FAILED_OR_UNVERIFIED: " + restored.Detail +
-                                  $"; readback={check?.CurrentPercent?.ToString() ?? "missing"}";
+                                  $"; readback={(check is null ? "missing" : check.CurrentPercent.ToString(CultureInfo.InvariantCulture))}";
                             if (row.RestoreResult != "RESTORED_AND_READ_BACK")
                                 failure ??= $"{mode}: original virtual monitor scale not restored";
                         }
