@@ -37,7 +37,14 @@ jobs:
           $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
           if (-not $vs) { throw 'MSVC C++ build tools missing from Windows CI runner' }
           $vcvars = Join-Path $vs 'VC\\Auxiliary\\Build\\vcvars64.bat'
-          cmd.exe /d /c "`"$vcvars`" >nul && cl /nologo /W4 /WX /EHsc /std:c++17 /DUNICODE /D_UNICODE tools\\df-density-readonly.cpp user32.lib shcore.lib /Fe:tools\\df-density-readonly.exe"
+          $script = Join-Path $env:RUNNER_TEMP 'build-native-ruler.cmd'
+          @(
+            '@echo off'
+            "call `"$vcvars`""
+            'if errorlevel 1 exit /b 1'
+            'cl /nologo /W4 /WX /EHsc /std:c++17 /DUNICODE /D_UNICODE tools\\df-density-readonly.cpp user32.lib shcore.lib /Fe:tools\\df-density-readonly.exe'
+          ) | Set-Content -LiteralPath $script -Encoding Ascii
+          & cmd.exe /d /c $script
           if ($LASTEXITCODE -ne 0) { throw 'Native ruler compile failed' }
       - name: Run unit and simulated tests (no display changes)
         run: dotnet test windows/agent/FocusWindow.Tests/FocusWindow.Tests.csproj -c Release --verbosity minimal
