@@ -3,7 +3,7 @@
 **Document ID:** DF-ARCH-WINDOW-FIRST-001  
 **Status:** Product direction and research backlog; **not** a validated implementation or a change in Approach A acceptance  
 **Date:** 2026-10-19  
-**Related POC:** `DF-GPU-WGC-POC-001` v1.1+ (standalone WGC/GPU window-capture experiment)  
+**Related POC:** [`DF-GPU-WGC-POC-001` v1.2](./DeskFuse_GPU_Phone_Workspace_WGC_POC_SPEC_v1.2.md) (standalone WGC/GPU window-capture experiment)  
 **Repository:** https://github.com/braindamp/deskfuse
 
 ## 1. Product intent (from the DeskFuse design conversation)
