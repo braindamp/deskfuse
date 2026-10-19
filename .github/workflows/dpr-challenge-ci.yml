@@ -1,0 +1,28 @@
+name: DPR challenge software checks
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/dpr-challenge-ci.yml'
+      - 'windows/agent/**'
+      - 'tools/dpr-challenge*.ps1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Windows host compile and driver-free DPI tests
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Compile host (never install FocusIdd)
+        run: dotnet build windows/agent/FocusWindow.Agent/FocusWindow.Agent.csproj -c Release -p:Platform=x64 -warnaserror
+      - name: Run unit and simulated tests (no display changes)
+        run: dotnet test windows/agent/FocusWindow.Tests/FocusWindow.Tests.csproj -c Release --verbosity minimal
