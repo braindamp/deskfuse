@@ -613,13 +613,14 @@ internal sealed class PhoneSession
             _conn.SendControl(ServerMessages.AudioState("stopped", _pcAudioStreamId));
             return;
         }
-        if (action != "start_pc" || _s.CreateAudioCapture is null)
+        if (action != "start_pc" || !_o.AllowPcAudio || _s.CreateAudioCapture is null)
         {
             _conn.SendControl(ServerMessages.AudioState("error", _pcAudioStreamId,
                 detail: "Windows playback capture unavailable."));
             return;
         }
         StopPcAudio();
+        _log.Info("Approved phone requested mixed PC playback audio (host opted in).");
         try
         {
             var capture = _s.CreateAudioCapture();
