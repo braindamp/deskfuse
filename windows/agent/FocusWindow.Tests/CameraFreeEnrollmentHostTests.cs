@@ -230,6 +230,51 @@ public sealed class CameraFreeEnrollmentHostTests
     }
 
     [Fact]
+    public async Task Denied_re_enrollment_leaves_an_existing_credential_untouched()
+    {
+        var existing = new DeviceCredential("phone-test-0005",
+            RandomNumberGenerator.GetBytes(32));
+        var store = new MemoryDeviceCredentialStore();
+        store.Save(existing);
+        var approval = new ScriptedApproval(allow: false);
+        var (host, offer) = StartHost(approval, store);
+        using var offerScope = offer;
+        using var hostScope = host;
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+
+        using var session = await EnrollAsync(host.EnrollmentPort, "phone-test-0005",
+            "Spoofed label", cts.Token);
+        var decision = await ReadDecisionAsync(session, cts.Token);
+        Assert.Equal("denied", decision.GetProperty("status").GetString());
+
+        var stored = Assert.Single(store.All());
+        Assert.Equal(existing.DeviceId, stored.DeviceId);
+        Assert.Equal(existing.Secret, stored.Secret);
+    }
+
+    [Fact]
+    public async Task Malformed_request_never_asks_the_owner_or_touches_the_store()
+    {
+        var approval = new ScriptedApproval(allow: true);
+        var store = new MemoryDeviceCredentialStore();
+        var (host, offer) = StartHost(approval, store);
+        using var offerScope = offer;
+        using var hostScope = host;
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+
+        using var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, host.EnrollmentPort, cts.Token);
+        var stream = client.GetStream();
+        await WriteFramedAsync(stream,
+            JsonSerializer.SerializeToUtf8Bytes(new { v = 2 }), cts.Token);
+        await Assert.ThrowsAnyAsync<IOException>(async () =>
+            await ReadFramedAsync(stream, cts.Token));
+
+        Assert.Null(approval.Code);
+        Assert.Empty(store.All());
+    }
+
+    [Fact]
     public async Task Second_attempt_from_the_same_address_is_dropped_by_the_rate_limit()
     {
         var approval = new ScriptedApproval(allow: false);
