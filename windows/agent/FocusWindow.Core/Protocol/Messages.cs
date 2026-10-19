@@ -12,6 +12,8 @@ public static class Wire
     public const byte KindFrame = 2;
     public const byte KindPing = 3;
     public const byte KindPong = 4;
+    // Host -> phone PCM blocks, only after explicit opt-in from compatible client.
+    public const byte KindAudio = 5;
     public const int MaxControlBytes = 1 << 20;
     public const int MaxFrameBytes = 1 << 24;
     public const int FrameMagic = 0x4657; // 'F' 'W'
@@ -38,6 +40,7 @@ public sealed record ClientFile(string Action, string Id, string? Name = null, l
 public sealed record ClientFiles(string Action, string? Path = null, string? Id = null, int Offset = 0) : ClientMessage;
 public sealed record ClientKeyframeRequest : ClientMessage;
 public sealed record ClientWindows(string Action, string? Id) : ClientMessage;
+public sealed record ClientAudio(string Action) : ClientMessage;
 public sealed record ClientBye(string Reason) : ClientMessage;
 public sealed record ClientUnknown(string Type) : ClientMessage;
 public static class ClientMessageParser
@@ -75,6 +78,7 @@ public static class ClientMessageParser
                 "clipboard" => new ClientClipboard(root["mime"]?.GetValue<string>() ?? "", root["text"]?.GetValue<string>()),
                 "keyframe" => new ClientKeyframeRequest(),
                 "windows" => new ClientWindows(root["action"]?.GetValue<string>() ?? "", root["id"]?.GetValue<string>()),
+                "audio" => new ClientAudio(root["action"]?.GetValue<string>() ?? ""),
                 "files" => new ClientFiles(root["action"]?.GetValue<string>() ?? "",
                     root["path"]?.GetValue<string>(), root["id"]?.GetValue<string>(),
                     root["offset"]?.GetValue<int>() ?? 0),
@@ -114,6 +118,17 @@ public static class ServerMessages
             array.Add(new JsonObject { ["id"] = window.Id, ["title"] = window.Title, ["appLabel"] = window.AppLabel });
         return new JsonObject { ["type"] = "window_list", ["windows"] = array };
     }
+    public static JsonObject AudioState(string state, int streamId, int sampleRate = 0, int channels = 0,
+        string? detail = null) => new()
+    {
+        ["type"] = "audio_state",
+        ["state"] = state,
+        ["streamId"] = streamId,
+        ["sampleRate"] = sampleRate,
+        ["channels"] = channels,
+        ["format"] = "pcm_s16le",
+        ["detail"] = detail,
+    };
     public static JsonObject FileList(FileListing listing)
     {
         var entries = new JsonArray();
