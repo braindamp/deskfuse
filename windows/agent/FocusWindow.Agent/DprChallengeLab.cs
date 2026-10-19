@@ -245,6 +245,7 @@ internal static class DprChallengeLab
                         if (window is null) throw new IOException("PMv2 ruler window unavailable");
                         var note = $"witness {witness}: monitor={currentDensity.MonitorDpiX} DPI, " +
                             $"window={window.WindowDpi} DPI, awareness={window.Awareness}, " +
+                            $"bounds={window.Window}, client={window.Client}, " +
                             $"ruler={window.MeasuredRulerWidthPx}x{window.MeasuredRulerHeightPx}, " +
                             $"ruler-ok={window.RulerOk}";
                         row.DpiProbeAttempts.Add(note);
