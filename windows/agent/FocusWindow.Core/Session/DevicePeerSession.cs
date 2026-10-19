@@ -40,6 +40,7 @@ internal sealed class DevicePeerSession(
         conn.SendControl(ServerMessages.Hello(options.HostVersion, options.HostName, options.Channel,
             phoneMicrophoneBridgeAvailable: options.AllowPhoneMicrophone &&
                 services.CreatePhoneMicrophoneSink is not null &&
+                services.CanUsePhoneMicrophone?.Invoke(hello.Profile.DeviceId) == true &&
                 requested.Contains(DeviceCapabilities.Microphone)));
         // Approval remains OS-user-scoped, in addition to per-phone encrypted
         // credentials validated by HostListener. This role cannot grant itself
