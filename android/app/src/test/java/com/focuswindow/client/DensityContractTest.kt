@@ -125,12 +125,14 @@ class DensityContractTest {
         )
     }
 
-    /** FR-TGT-01 — a non-native tier must never be labelled as native. */
+    /** FR-TGT-01 — a non-native tier must never be labelled as DPI-verified. */
     @Test
     fun `tier label never claims native for a window capture`() {
         val windowTier = record(dpi = 96, native = false)
             .copy(occupant = TargetRecord.Occupant.WINDOW)
-        assertTrue(windowTier.tierLabel().contains("not native"))
+        val label = windowTier.tierLabel()
+        assertTrue(label.contains("unverified"))
+        assertFalse(label.contains("DPI verified"))
     }
 
     @Test

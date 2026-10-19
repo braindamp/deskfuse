@@ -53,11 +53,17 @@ public static class EncoderArgs
                 sb.Append($"-crf 20 -maxrate {k}k -bufsize {Math.Max(250, k / 2)}k ");
                 break;
             case "h264_nvenc":
-                sb.Append("-c:v h264_nvenc -preset p1 -tune ll -rc vbr -cq 21 -bf 0 -g 120 -forced-idr 1 ");
+                // -delay 0 is REQUIRED, not cosmetic: the nvenc wrapper defaults to
+                // AVCodecContext.delay = INT_MAX, so without it the encoder buffers the
+                // newest frames and a desktop that goes quiet strands the last picture
+                // in ffmpeg. Verified against ffmpeg 9 with a real NVENC session.
+                sb.Append("-c:v h264_nvenc -preset p1 -tune ll -rc vbr -cq 21 -bf 0 -g 120 -forced-idr 1 -delay 0 ");
                 sb.Append($"-b:v {k}k -maxrate {k}k -bufsize {Math.Max(250, k / 2)}k ");
                 break;
             case "h264_qsv":
-                sb.Append("-c:v h264_qsv -preset veryfast -look_ahead 0 -bf 0 -g 120 ");
+                // -async_depth 1 keeps only one frame in the QSV pipeline for the same
+                // reason: the tail frame of a static desktop must not sit in the driver.
+                sb.Append("-c:v h264_qsv -preset veryfast -look_ahead 0 -async_depth 1 -bf 0 -g 120 ");
                 sb.Append($"-b:v {k}k -maxrate {k}k ");
                 break;
             case "h264_amf":
@@ -231,10 +237,15 @@ public static class EncoderPicker
     }
 
     /// <summary>Legacy startup probe for tool tests; the session always uses PickForTargetAsync.</summary>
-    public static async Task<string> PickAsync(string ffmpegPath, CodecPreference pref, ILog log, CancellationToken ct)
+    public static async Task<string> PickAsync(
+        string ffmpegPath,
+        CodecPreference pref,
+        ILog log,
+        CancellationToken ct,
+        IReadOnlyList<string>? candidates = null)
     {
         var small = new EncoderSettings(320, 240, 30, 2000, ffmpegPath, "libx264");
-        foreach (var name in Candidates)
+        foreach (var name in candidates ?? Candidates)
         {
             if (await TryEncoderAsync(small with { EncoderName = name }, log, ct).ConfigureAwait(false))
             {
@@ -277,7 +288,7 @@ public static class EncoderPicker
             log.Info($"probe {settings.EncoderName}: timed out at {settings.Width}x{settings.Height}");
             return false;
         }
-        catch (Exception ex) when (ex is EncoderUnavailableException or IOException or InvalidOperationException or OverflowException)
+        catch (Exception ex) when (ex is EncoderUnavailableException or IOException or InvalidOperationException or ArgumentException or OverflowException)
         {
             log.Info($"probe {settings.EncoderName}: {ex.Message}");
             return false;

@@ -28,6 +28,21 @@ public sealed class FactIfNodeAttribute : FactAttribute
         if (ToolLocator.Node is null) Skip = "node is not on PATH";
     }
 }
+/// <summary>
+/// The 10-minute soak is deliberately excluded from the normal suite and the
+/// acceptance matrix; it runs only when an operator asks for it. Skips (never
+/// silently passes) when the tools or FOCUS_SOAK_MINUTES are absent.
+/// </summary>
+public sealed class FactIfSoakAttribute : FactAttribute
+{
+    public FactIfSoakAttribute()
+    {
+        if (ToolLocator.Ffmpeg is null) Skip = "FOCUS_FFMPEG is not set";
+        else if (ToolLocator.Node is null) Skip = "node is not on PATH";
+        else if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("FOCUS_SOAK_MINUTES")))
+            Skip = "FOCUS_SOAK_MINUTES is not set; the soak is excluded from the normal suite";
+    }
+}
 public static class ToolLocator
 {
     public static string? Ffmpeg => Existing(Environment.GetEnvironmentVariable("FOCUS_FFMPEG"));

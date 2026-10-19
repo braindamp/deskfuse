@@ -1,0 +1,19 @@
+# build outputs
+bin/
+obj/
+build/
+.gradle/
+.kotlin/
+TestResults/
+x64/
+
+# delivery/evidence artifacts (kept out of the code repo)
+evidence/
+*.zip
+*SHA256SUMS*.txt
+PROTECTED_FILE_AUDIT.txt
+
+# misc
+.vs/
+*.user
+*.log

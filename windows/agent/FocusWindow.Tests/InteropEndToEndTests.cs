@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.Text.Json.Nodes;
 using FocusWindow.Core.Display;
 using FocusWindow.Core.Protocol;
@@ -79,7 +80,7 @@ public class InteropEndToEndTests
             Cts.Dispose();
         }
     }
-    private async Task<Rig> StartRig(Action<FakeDisplayBackend>? configure = null, bool approve = true, bool ruler = true, bool singleSession = true)
+    private async Task<Rig> StartRig(Action<FakeDisplayBackend>? configure = null, bool approve = true, bool ruler = true, bool singleSession = true, TimeSpan? rigLifetime = null)
     {
         var backend = new FakeDisplayBackend(maxW: 3200, maxH: 3200);
         configure?.Invoke(backend);
@@ -94,20 +95,18 @@ public class InteropEndToEndTests
         };
         var services = new HostServices(() => backend, () => input, () => guard, approval, new MemoryPairingStore());
         var host = new SessionHost(options, services, log);
-        var cts = new CancellationTokenSource(TimeSpan.FromMinutes(3));
+        var cts = new CancellationTokenSource(rigLifetime ?? TimeSpan.FromMinutes(3));
         var offer = await host.StartAsync(cts.Token);
         var sessions = Task.Run(() => host.RunSessionsAsync(cts.Token));
         return new Rig(backend, input, guard, approval, log, host, offer, sessions, cts);
     }
-    private static (int W, int H, int Index) _unused;
     /// <summary>Publishes moving frames at the size of whatever monitor the host last created, then one FINAL frame, then goes idle.</summary>
-    private static Task<(int W, int H, int Index)> Publish(FakeDisplayBackend be, TimeSpan runFor, int intervalMs, CancellationToken ct) =>
+    private static Task<(int W, int H, int Index, int Count, DateTimeOffset FinalAt)> Publish(FakeDisplayBackend be, TimeSpan runFor, int intervalMs, CancellationToken ct) =>
         Task.Run(async () =>
         {
             var artists = new Dictionary<(int, int), FrameArtist>();
             var end = DateTime.UtcNow + runFor;
             var i = 0;
-            (int W, int H, int Index) last = (0, 0, 0);
             while (DateTime.UtcNow < end && !ct.IsCancellationRequested)
             {
                 var req = be.LastRequest;
@@ -115,19 +114,22 @@ public class InteropEndToEndTests
                 if (!artists.TryGetValue((req.Width, req.Height), out var artist))
                     artists[(req.Width, req.Height)] = artist = new FrameArtist(req.Width, req.Height);
                 be.Surface.Publish(artist.Render(i), req.Width, req.Height);
-                last = (req.Width, req.Height, i);
                 i++;
                 await Task.Delay(intervalMs, ct);
             }
             // The FINAL frame: after this the desktop is idle (no more frames are published).
+            // On cancellation (a failed soak) skip it: the surface may be about to be freed.
             var finalReq = be.LastRequest!;
             var finalIndex = i + 1000;
-            if (!artists.TryGetValue((finalReq.Width, finalReq.Height), out var finalArtist))
-                artists[(finalReq.Width, finalReq.Height)] = finalArtist = new FrameArtist(finalReq.Width, finalReq.Height);
-            be.Surface.Publish(finalArtist.Render(finalIndex), finalReq.Width, finalReq.Height);
-            return (finalReq.Width, finalReq.Height, finalIndex);
+            if (!ct.IsCancellationRequested)
+            {
+                if (!artists.TryGetValue((finalReq.Width, finalReq.Height), out var finalArtist))
+                    artists[(finalReq.Width, finalReq.Height)] = finalArtist = new FrameArtist(finalReq.Width, finalReq.Height);
+                be.Surface.Publish(finalArtist.Render(finalIndex), finalReq.Width, finalReq.Height);
+            }
+            return (finalReq.Width, finalReq.Height, finalIndex, i + 1, DateTimeOffset.UtcNow);
         }, ct);
-    private async Task<(JsonObject Report, string OutDir, string ConsoleOut)> RunPhone(Rig rig, string extraArgs, string? outName = null)
+    private async Task<(JsonObject Report, string OutDir, string ConsoleOut)> RunPhone(Rig rig, string extraArgs, string? outName = null, TimeSpan? timeout = null)
     {
         var node = ToolLocator.Node!;
         var script = Path.Combine(AppContext.BaseDirectory, "interop", "phone-client.mjs");
@@ -135,7 +137,7 @@ public class InteropEndToEndTests
         Directory.CreateDirectory(outDir);
         var (code, output) = await ToolLocator.RunAsync(node,
             $"\"{script}\" --host 127.0.0.1 --port {rig.Host.Port} --out \"{outDir}\" {extraArgs}",
-            TimeSpan.FromMinutes(2),
+            timeout ?? TimeSpan.FromMinutes(2),
             new Dictionary<string, string> { ["FOCUS_URI"] = rig.Offer.Uri });
         _out.WriteLine("node: " + output.Trim());
         Assert.True(code == 0, $"phone client exited {code}: {output}");
@@ -150,8 +152,13 @@ public class InteropEndToEndTests
         using var publishCts = new CancellationTokenSource();
         var publisher = Publish(rig.Backend, TimeSpan.FromSeconds(9), 66, publishCts.Token);
         var (r, dir, _) = await RunPhone(rig,
-            "--frames 24 --keyframe-at 8 --rotate-at 14 --inputs --until-idle-ms 2600");
-        var (finalW, finalH, finalIndex) = await publisher;
+            // The idle window must outlast the publisher's final frame. A shorter
+            // window made the client leave just before the final picture arrived,
+            // so the pixel comparison below was racing the test's own publisher.
+            "--frames 24 --keyframe-at 8 --rotate-at 14 --inputs --until-idle-ms 4000");
+        var (finalW, finalH, finalIndex, _, _) = await publisher;
+        _out.WriteLine($"publisher final frame index {finalIndex}");
+        _out.WriteLine("host log:\n" + string.Join("\n", rig.Log.Lines));
         await rig.Sessions.WaitAsync(TimeSpan.FromSeconds(20));
         // ---- the protocol was spoken correctly, as an independent implementation sees it ----
         _out.WriteLine("violations: " + r["violations"]!.ToJsonString());
@@ -296,7 +303,91 @@ public class InteropEndToEndTests
         Assert.Equal((1440, 3120), (Int(t["widthPx"]), Int(t["heightPx"])));
         Assert.Equal(240, Int(t["dpi"]));                       // 250%: the highest Windows would give
         Assert.Equal((576, 1248), (Int(t["canvasDpW"]), Int(t["canvasDpH"]))); // 1440 px * 96 / 240 DPI = 576 dp, not the phone's 411
-        Assert.Contains("readability floor", (string)t["degradedReason"]!);
+        // PreserveRequestedResolution deliberately keeps the 1:1 monitor and reports
+        // the measured cap instead of silently recreating it at a smaller pixel count.
+        Assert.Contains("250% scaling maximum", (string)t["degradedReason"]!);
+        Assert.Contains("no resolution fallback", (string)t["degradedReason"]!);
         Assert.Empty(r["violations"]!.AsArray());
+    }
+    /// <summary>
+    /// The SESSION_METRICS soak: the production pipeline (real session code, real ffmpeg,
+    /// real TCP, independent Node client) run for FOCUS_SOAK_MINUTES and measured, not
+    /// estimated. Excluded from the normal suite: without FOCUS_SOAK_MINUTES this test
+    /// reports SKIPPED, never PASS. Software-path evidence only (synthetic driver surface,
+    /// same machine, Node client, no Android MediaCodec) - it does not satisfy the E3
+    /// 10-minute hardware gate, which needs the installed FocusIdd driver.
+    /// </summary>
+    [FactIfSoak]
+    public async Task Soak_measures_native_pixels_fps_bytes_and_publish_to_receive_latency()
+    {
+        var minutes = int.Parse(Environment.GetEnvironmentVariable("FOCUS_SOAK_MINUTES")!, CultureInfo.InvariantCulture);
+        await using var rig = await StartRig(rigLifetime: TimeSpan.FromMinutes(minutes + 5));
+        using var publishCts = new CancellationTokenSource();
+        var publisher = Publish(rig.Backend, TimeSpan.FromMinutes(minutes), 33, publishCts.Token);
+        JsonObject r;
+        try
+        {
+            (r, _, _) = await RunPhone(rig,
+                $"--frames 30 --keyframe-at 50 --inputs --until-idle-ms 5000 --timeout-ms {minutes * 60_000 + 120_000}",
+                "soak",
+                TimeSpan.FromMinutes(minutes + 3));
+        }
+        catch
+        {
+            // If the phone client fails, the publisher is still writing into the native
+            // surface. Stop it and wait for it to leave BEFORE the rig frees the memory:
+            // a live publisher over freed memory is an AccessViolation, not a test failure.
+            publishCts.Cancel();
+            try { await publisher; } catch (OperationCanceledException) { }
+            throw;
+        }
+        var (w, h, _, publishedCount, finalAt) = await publisher;
+        await rig.Sessions.WaitAsync(TimeSpan.FromSeconds(20));
+        var durationMs = Int(r["durationMs"]!);
+        var accepted = Int(r["frames"]!["accepted"]!);
+        var total = Int(r["frames"]!["total"]!);
+        var keyframes = Int(r["frames"]!["keyframes"]!);
+        var bytes = (long)r["frames"]!["bytes"]!;
+        var pings = Int(r["pings"]!);
+        // Same-machine clocks: the Node report carries its own epoch start, so the final
+        // publish->receive figure needs no spawn-skew correction. It measures encode +
+        // authenticated transport + client receive; it is NOT a MediaCodec glass-to-glass
+        // latency and NOT an E3 hardware measurement.
+        var nodeStart = DateTimeOffset.FromUnixTimeMilliseconds((long)r["startedAtEpochMs"]!);
+        var lastFrameArrival = nodeStart.AddMilliseconds(Int(r["lastFrameMs"]!));
+        var latencyMs = (long)(lastFrameArrival - finalAt).TotalMilliseconds;
+        var acceptedFps = accepted * 1000.0 / Math.Max(1, durationMs);
+        _out.WriteLine($"soak: {minutes} min, target {w}x{h} native pixels, encoder {rig.Log.Lines.FirstOrDefault(l => l.Contains("video encoder"))}");
+        _out.WriteLine($"soak: published {publishedCount}, client accepted {accepted} of {total}, keyframes {keyframes}, bytes {bytes}, pings {pings}");
+        _out.WriteLine($"soak: accepted fps {acceptedFps:0.0}, node-measured duration {durationMs} ms, publish->receive (final frame) {latencyMs} ms");
+        var csv = Environment.GetEnvironmentVariable("FOCUS_SOAK_CSV");
+        if (!string.IsNullOrWhiteSpace(csv))
+        {
+            var invariant = CultureInfo.InvariantCulture;
+            var lines = new List<string>
+            {
+                "metric,value,method,environment",
+                $"run_minutes,{minutes},FOCUS_SOAK_MINUTES,synthetic-software-path",
+                $"target_pixels,{w}x{h},negotiated Target widthPx x heightPx,synthetic-software-path",
+                $"published_frames,{publishedCount},publisher frame count,synthetic-software-path",
+                $"client_accepted_frames,{accepted},frame headers accepted by the independent Node client,synthetic-software-path",
+                $"client_total_frames,{total},all frame headers received,synthetic-software-path",
+                $"keyframes,{keyframes},flags bit 1 on accepted frames,synthetic-software-path",
+                $"media_bytes,{bytes},H.264 payload bytes accepted,synthetic-software-path",
+                $"idle_pings,{pings},host ping packets,synthetic-software-path",
+                $"accepted_fps,{acceptedFps.ToString("0.0", invariant)},accepted frames / node-measured duration,synthetic-software-path",
+                $"publish_to_receive_ms_final,{latencyMs},final publish wallclock vs node last-frame arrival (same machine),synthetic-software-path",
+                $"encoder,{rig.Log.Lines.FirstOrDefault(l => l.Contains("video encoder")) ?? "unknown"},host log,synthetic-software-path",
+                $"session_epochs,1,one authenticated session in this run,synthetic-software-path",
+                "hardware_10min_session,NOT_AVAILABLE,FocusIdd driver not installed; see UNRESOLVED_BLOCKERS.md,hardware-focusidd",
+            };
+            await File.AppendAllLinesAsync(csv, lines);
+            _out.WriteLine("soak CSV appended: " + csv);
+        }
+        // Truthful invariants a broken run must fail: frames flowed, the transport stayed
+        // silent-protocol clean, and no protocol violation was observed.
+        Assert.Empty(r["violations"]!.AsArray());
+        Assert.True(accepted > minutes * 100, $"only {accepted} frames were accepted over {minutes} minutes");
+        Assert.True(latencyMs >= 0 && latencyMs < 5000, $"final publish->receive latency was {latencyMs} ms");
     }
 }

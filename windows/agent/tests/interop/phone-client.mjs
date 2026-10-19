@@ -197,6 +197,7 @@ let keyframeRequestedAt = null;
 let rotated = false;
 let inputsDone = false;
 let lastFrameAt = 0;
+let firstFrameAt = 0;
 function streamFor(version) {
   if (!streams.has(version)) streams.set(version, fs.createWriteStream(path.join(outDir, `stream-v${version}.h264`)));
   return streams.get(version);
@@ -214,6 +215,7 @@ function onFrame(plain) {
   const payload = plain.subarray(20, 20 + len);
   report.frames.total++;
   lastFrameAt = Date.now();
+  if (!firstFrameAt) firstFrameAt = lastFrameAt;
   if (!knownVersions.has(version)) violation(`frame of version ${version} arrived before its Target message`);
   if (pts <= lastPts) violation(`pts not strictly increasing: ${pts} after ${lastPts}`);
   lastPts = pts;
@@ -340,6 +342,10 @@ if (wrongSecret) {
   await sleep(300);
 }
 report.durationMs = Date.now() - startedAt;
+// Same-machine timing aids (the tests measure publish->receive latency against these).
+report.startedAtEpochMs = startedAt;
+report.firstFrameMs = firstFrameAt ? firstFrameAt - startedAt : null;
+report.lastFrameMs = lastFrameAt ? lastFrameAt - startedAt : null;
 done = true;
 clearTimeout(watchdog);
 sock.end();

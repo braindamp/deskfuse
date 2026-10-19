@@ -29,17 +29,19 @@ public sealed class SessionHost : IDisposable
     public int Port => _listener?.Port ?? 0;
     public string EncoderName => _encoderName;
     /// <summary>Binds the port, picks a working encoder, and builds the QR offer.</summary>
-    public async Task<PairingOffer> StartAsync(CancellationToken ct)
+    public Task<PairingOffer> StartAsync(CancellationToken ct)
     {
+        ct.ThrowIfCancellationRequested();
         // The phone's native dimensions are unknown here. Selecting a GPU based
         // on a tiny startup probe can produce a black screen at 1440x3120.
         // PhoneSession qualifies NVENC/QSV/AMF/software after density negotiation.
         _listener = new HostListener(IPAddress.Parse(_options.Bind), _options.Port, _log);
         var state = Pairing.LoadOrCreate(_services.PairingStore, _options.NewPairing);
         var address = Pairing.PickLanAddress() ?? "127.0.0.1";
-        _offer = Pairing.BuildOffer(state, address, _listener.Port, _options.HostName);
+        var offer = Pairing.BuildOffer(state, address, _listener.Port, _options.HostName);
+        _offer = offer;
         _log.Info($"listening on {_options.Bind}:{_listener.Port}; pairing address {address}");
-        return _offer;
+        return Task.FromResult(offer);
     }
     public async Task RunSessionsAsync(CancellationToken ct)
     {

@@ -9,7 +9,6 @@ import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContract
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.CameraSelector
-import androidx.camera.core.ExperimentalGetImage
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
@@ -80,7 +79,6 @@ class ScannerActivity : ComponentActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
-    @OptIn(ExperimentalGetImage::class)
     private fun analyse(proxy: ImageProxy, scanner: BarcodeScanner) {
         val media = proxy.image
         if (media == null || handled.get()) {

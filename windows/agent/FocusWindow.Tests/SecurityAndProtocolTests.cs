@@ -133,7 +133,7 @@ public class SecureChannelTests
         await clientStream.ReadExactlyAsync(hostSpki);
         using var host = await hostTask;
         var trimmed = raw!.SkipWhile(b => b == 0).ToArray();
-        Assert.True(trimmed.Length < raw.Length);
+        Assert.True(trimmed.Length < raw!.Length);
         var prk = HKDF.Extract(HashAlgorithmName.SHA256, trimmed, secret);
         var c2s = HKDF.Expand(HashAlgorithmName.SHA256, prk, 32, Encoding.UTF8.GetBytes("focuswindow:c2s:v3"));
         var s2c = HKDF.Expand(HashAlgorithmName.SHA256, prk, 32, Encoding.UTF8.GetBytes("focuswindow:s2c:v3"));

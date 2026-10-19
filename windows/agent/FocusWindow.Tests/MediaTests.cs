@@ -28,9 +28,16 @@ public class EncoderArgsTests
     [Fact]
     public void Each_hardware_encoder_has_its_own_rate_control_and_unknown_ones_are_refused()
     {
-        Assert.Contains("h264_nvenc", EncoderArgs.Build(S("h264_nvenc")));
-        Assert.Contains("-forced-idr 1", EncoderArgs.Build(S("h264_nvenc")));
-        Assert.Contains("h264_qsv", EncoderArgs.Build(S("h264_qsv")));
+        var nvenc = EncoderArgs.Build(S("h264_nvenc"));
+        Assert.Contains("h264_nvenc", nvenc);
+        Assert.Contains("-forced-idr 1", nvenc);
+        // Without -delay 0 the nvenc wrapper buffers frames (default INT_MAX): the last
+        // picture of a quiet desktop would never reach the phone. Verified with real ffmpeg.
+        Assert.Contains("-delay 0", nvenc);
+        var qsv = EncoderArgs.Build(S("h264_qsv"));
+        Assert.Contains("h264_qsv", qsv);
+        // Same class of bug for the QSV pipeline: only one in-flight frame may exist.
+        Assert.Contains("-async_depth 1", qsv);
         Assert.Contains("h264_amf", EncoderArgs.Build(S("h264_amf")));
         Assert.Throws<ArgumentException>(() => EncoderArgs.Build(S("libx265")));
     }
@@ -254,13 +261,18 @@ public class FfmpegEncoderTests
         Assert.True(DensityMeasure.EvaluateRuler(box, 100, 336).Ok);
     }
     [FactIfFfmpeg]
-    public async Task The_picker_falls_through_unavailable_hardware_encoders_to_libx264()
+    public async Task The_picker_falls_through_unavailable_encoders_to_libx264()
     {
         var log = new ListLog();
-        var picked = await EncoderPicker.PickAsync(ToolLocator.Ffmpeg!, CodecPreference.Auto, log, CancellationToken.None);
+        // Deterministic fallback test: the first candidate is not an ffmpeg encoder
+        // on any machine. (Testing with the real candidate list made the result
+        // depend on whether this PC happened to expose NVENC/QSV/AMF.)
+        var picked = await EncoderPicker.PickAsync(
+            ToolLocator.Ffmpeg!, CodecPreference.Auto, log, CancellationToken.None,
+            new[] { "h264_not_available_on_this_build", "libx264" });
         _out.WriteLine(string.Join("\n", log.Lines));
-        Assert.Equal("libx264", picked);   // this box has no NVENC/QSV/AMF in its ffmpeg
-        Assert.Contains(log.Lines, l => l.Contains("h264_nvenc") && l.Contains("not usable"));
+        Assert.Equal("libx264", picked);
+        Assert.Contains(log.Lines, l => l.Contains("h264_not_available_on_this_build") && l.Contains("not usable"));
     }
     [FactIfFfmpeg]
     public async Task A_wrong_frame_size_is_refused_before_it_can_corrupt_the_stream()
