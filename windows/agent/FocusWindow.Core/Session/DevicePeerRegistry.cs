@@ -4,14 +4,15 @@ using System.Text;
 namespace FocusWindow.Core.Session;
 
 /// <summary>
-/// Identity and session ownership for authenticated media-only Android peers.
+/// Identity and session ownership for authenticated accessory-capability peers.
 /// This is NOT a Windows PnP device provider; a later signed endpoint service
 /// will consume these lifetimes to publish real camera/audio device interfaces.
 /// </summary>
 public sealed class DevicePeerRegistry
 {
     public sealed record Endpoints(string Camera, string Microphone, string Speakers);
-    public sealed record ConnectedPeer(string DeviceId, string Label, Endpoints Endpoints);
+    public sealed record ConnectedPeer(string DeviceId, string Label, Endpoints Endpoints,
+        IReadOnlyList<string> RequestedCapabilities);
     private sealed record Online(Guid Lease, ConnectedPeer Peer, CancellationTokenSource Stop);
     private readonly Dictionary<string, Online> _online = new(StringComparer.Ordinal);
     private readonly object _gate = new();
@@ -38,9 +39,11 @@ public sealed class DevicePeerRegistry
         return new Endpoints(Key("camera"), Key("microphone"), Key("speakers"));
     }
 
-    public PeerLease Attach(string deviceId, string label, CancellationToken shutdown)
+    public PeerLease Attach(string deviceId, string label, CancellationToken shutdown,
+        IEnumerable<string>? requestedCapabilities = null)
     {
-        var peer = new ConnectedPeer(deviceId, label, Identities(deviceId));
+        var requested = DeviceCapabilities.Validate(requestedCapabilities, accessoryOnly: true);
+        var peer = new ConnectedPeer(deviceId, label, Identities(deviceId), requested);
         var token = CancellationTokenSource.CreateLinkedTokenSource(shutdown);
         var lease = Guid.NewGuid();
         Online? prior;
