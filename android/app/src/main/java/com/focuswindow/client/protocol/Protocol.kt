@@ -172,10 +172,6 @@ sealed interface ServerMessage {
     @Serializable @SerialName("window_list")
     data class WindowList(val windows: List<WindowEntry>) : ServerMessage
 
-    // The host's source catalog confirms or denies explicit user focus attempts.
-    @Serializable @SerialName("window_focus")
-    data class WindowFocus(val id: String, val activated: Boolean) : ServerMessage
-
     @Serializable @SerialName("clipboard")
     data class Clipboard(val mime: String, val text: String? = null, val base64: String? = null) :
         ServerMessage
