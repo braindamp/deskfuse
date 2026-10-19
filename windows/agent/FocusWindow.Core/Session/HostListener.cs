@@ -29,6 +29,13 @@ public sealed class HostListener : IDisposable
     public async Task<(PhoneConnection Connection, ClientHello Hello)> AcceptAuthenticatedAsync(
         PairingOffer offer, CancellationToken ct)
     {
+        return await AcceptAuthenticatedAsync(offer, null, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>When credentials are supplied, QR possession alone never grants a session.</summary>
+    public async Task<(PhoneConnection Connection, ClientHello Hello)> AcceptAuthenticatedAsync(
+        PairingOffer offer, IDeviceCredentialStore? credentials, CancellationToken ct)
+    {
         while (true)
         {
             ct.ThrowIfCancellationRequested();
@@ -48,8 +55,9 @@ public sealed class HostListener : IDisposable
                 var stream = client.GetStream();
                 using var budget = CancellationTokenSource.CreateLinkedTokenSource(ct);
                 budget.CancelAfter(HandshakeTimeout);
-                var channel = await SecureChannel
-                    .AcceptAsync(stream, offer.KeyPair, offer.Secret, budget.Token).ConfigureAwait(false);
+                var channel = credentials is null
+                    ? await SecureChannel.AcceptAsync(stream, offer.KeyPair, offer.Secret, budget.Token).ConfigureAwait(false)
+                    : await SecureChannel.AcceptAnyAsync(stream, offer.KeyPair, credentials.All(), budget.Token).ConfigureAwait(false);
                 var connection = new PhoneConnection(client, stream, channel, _log);
                 ClientMessage first;
                 try
@@ -65,6 +73,13 @@ public sealed class HostListener : IDisposable
                 {
                     await connection.DisposeAsync().ConfigureAwait(false);
                     _log.Warn($"{remote}: first message was not a hello; dropped");
+                    continue;
+                }
+                if (credentials is not null &&
+                    !string.Equals(channel.CredentialDeviceId, hello.Profile.DeviceId, StringComparison.Ordinal))
+                {
+                    await connection.DisposeAsync().ConfigureAwait(false);
+                    _log.Warn($"{remote}: encrypted credential does not match phone identity; dropped");
                     continue;
                 }
                 _log.Info($"{remote}: authenticated ({hello.Profile.DeviceLabel}, client {hello.ClientVersion})");
