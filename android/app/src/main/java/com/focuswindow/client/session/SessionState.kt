@@ -22,9 +22,9 @@ sealed interface SessionState {
         override val stageLabel = "Not connected"
     }
 
-    /** FR-TRUST-02 — scanning a pairing QR. */
+    /** FR-TRUST-02 - waiting for the Windows owner to approve this phone. */
     data object AwaitingPairing : SessionState {
-        override val stageLabel = "Scan the pairing code"
+        override val stageLabel = "Waiting for the PC"
     }
 
     data class Connecting(val host: String, val port: Int) : SessionState {

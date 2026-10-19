@@ -11,7 +11,7 @@
 
     <!-- FR-OPS-03 — named states. Kept here so support can quote them verbatim. -->
     <string name="state_idle">Not connected</string>
-    <string name="state_pairing">Scan the pairing code</string>
+    <string name="state_pairing">Waiting for the PC</string>
     <string name="state_verifying">Confirm the code on your PC</string>
     <string name="state_preparing">Preparing the display target</string>
     <string name="state_stale">Paused — the host stopped sending frames</string>
@@ -21,7 +21,6 @@
     <string name="advisory_not_native">The host could not match this screen\'s density. You are seeing a scaled image, not a native render.</string>
     <string name="advisory_small_tokens">The render is native, but this app\'s own interface is small. Raise the app\'s zoom on the PC for comfort.</string>
 
-    <string name="action_scan">Scan pairing code</string>
     <string name="action_retry">Try again</string>
     <string name="action_end">End session</string>
 </resources>

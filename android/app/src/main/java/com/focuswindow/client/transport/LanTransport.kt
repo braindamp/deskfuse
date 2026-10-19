@@ -265,13 +265,13 @@ class LanTransport(
         is java.net.UnknownHostException -> TransportEvent.Failed(
             stage = "resolve",
             detail = "Cannot resolve ${payload.host}.",
-            remediation = "Re-scan the pairing QR; the host's address may have changed.",
+            remediation = "Choose the PC again; its network address may have changed.",
         )
 
         is IllegalArgumentException -> TransportEvent.Failed(
             stage = "verify",
             detail = t.message ?: "The host failed verification.",
-            remediation = "Generate a fresh pairing code on the PC and scan it again.",
+            remediation = "Pair this phone with the PC again.",
         )
 
         else -> TransportEvent.Failed(
