@@ -28,6 +28,22 @@ internal class SecureRecordWriter(
         output.flush()
     }
 
+    /** A short encrypted mono PCM block after the host authorizes mic capture.
+     *  Shares the same lock/counter as all other client-to-host records.
+     */
+    @Synchronized
+    fun microphone(streamId: Int, pcm16le: ByteArray) {
+        require(streamId > 0 && pcm16le.size in 2..640 && pcm16le.size % 2 == 0)
+        val plain = ByteArray(4 + pcm16le.size)
+        java.nio.ByteBuffer.wrap(plain).order(java.nio.ByteOrder.BIG_ENDIAN)
+            .putInt(streamId).put(pcm16le)
+        val sealed = channel.seal(plain)
+        output.writeByte(KIND_PHONE_MIC)
+        output.writeInt(sealed.size)
+        output.write(sealed)
+        output.flush()
+    }
+
     @Synchronized
     fun pong() {
         output.writeByte(KIND_PONG)
@@ -37,6 +53,7 @@ internal class SecureRecordWriter(
     private companion object {
         const val KIND_CONTROL = 1
         const val KIND_PONG = 4
+        const val KIND_PHONE_MIC = 6
         const val MAX_CONTROL_BYTES = 1 shl 20
     }
 }
