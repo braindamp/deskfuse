@@ -47,16 +47,26 @@ bool TestWindow::Create(const TestWindowOptions& options, std::wstring& error)
     background_ = CreateSolidBrush(RGB(255, 0, 255));
     green_ = CreateSolidBrush(RGB(0, 255, 0));
     white_ = CreateSolidBrush(RGB(255, 255, 255));
+    bool colorBrushesOk = true;
+    for (int i = 0; i < kColorProbeCount; ++i)
+    {
+        colorBrushes_[i] = CreateSolidBrush(
+            RGB(kColorProbes[i].r, kColorProbes[i].g, kColorProbes[i].b));
+        if (!colorBrushes_[i]) colorBrushesOk = false;
+    }
     CreateChecker();
-    if (!background_ || !green_ || !white_ || !checkerBitmap_ || !checkerDc_)
+    if (!background_ || !green_ || !white_ || !colorBrushesOk || !checkerBitmap_ || !checkerDc_)
     {
         error = L"Could not create the GDI test pattern resources.";
         DestroyGdi();
         return false;
     }
 
+    dotX_ = 100;
+    dotY_ = options.height - 80;
+
     hwnd_ = CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+        0,
         kClassName,
         L"DeskFuse GPU POC 1440x3120",
         WS_POPUP | WS_VISIBLE,
@@ -71,7 +81,7 @@ bool TestWindow::Create(const TestWindowOptions& options, std::wstring& error)
 
     // WS_POPUP has no nonclient area; force the exact physical rectangle once
     // more after creation so DPI suggested rectangles cannot change it.
-    SetWindowPos(hwnd_, HWND_TOPMOST, options.x, options.y, options.width, options.height,
+    SetWindowPos(hwnd_, HWND_TOP, options.x, options.y, options.width, options.height,
         SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED);
     ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
     UpdateWindow(hwnd_);
@@ -79,8 +89,6 @@ bool TestWindow::Create(const TestWindowOptions& options, std::wstring& error)
     GetWindowRect(hwnd_, &windowRect_);
     GetClientRect(hwnd_, &clientRect_);
     dpi_ = GetDpiForWindow(hwnd_);
-    dotY_ = clientRect_.bottom - 80;
-    dotX_ = 100;
 
     if (windowRect_.right - windowRect_.left != options.width ||
         windowRect_.bottom - windowRect_.top != options.height)
@@ -137,6 +145,10 @@ void TestWindow::DestroyGdi()
     if (background_) { DeleteObject(background_); background_ = nullptr; }
     if (green_) { DeleteObject(green_); green_ = nullptr; }
     if (white_) { DeleteObject(white_); white_ = nullptr; }
+    for (auto& brush : colorBrushes_)
+    {
+        if (brush) { DeleteObject(brush); brush = nullptr; }
+    }
 }
 
 void TestWindow::CreateChecker()
@@ -181,6 +193,13 @@ void TestWindow::Paint(HWND hwnd)
 
     RECT line{kLineX, kLineY, kLineX + 1, kLineY + kLineHeight};
     FillRect(dc, &line, white_);
+
+    for (int i = 0; i < kColorProbeCount; ++i)
+    {
+        RECT probe{kColorProbeX + i * kColorProbeSize, kColorProbeY,
+            kColorProbeX + (i + 1) * kColorProbeSize, kColorProbeY + kColorProbeSize};
+        FillRect(dc, &probe, colorBrushes_[i]);
+    }
 
     RECT dot{dotX_, dotY_, dotX_ + kDotSize, dotY_ + kDotSize};
     if (dot.left >= 0 && dot.top >= 0 && dot.right <= client.right && dot.bottom <= client.bottom)
@@ -249,7 +268,7 @@ LRESULT TestWindow::Handle(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam
         dpiChanged_ = dpi_ != expectedDpi_;
         // Keep the exact physical rectangle instead of accepting the suggested
         // DPI rectangle. The capture source must remain 1440x3120.
-        SetWindowPos(hwnd, HWND_TOPMOST, targetX_, targetY_, targetWidth_, targetHeight_,
+        SetWindowPos(hwnd, HWND_TOP, targetX_, targetY_, targetWidth_, targetHeight_,
             SWP_NOACTIVATE | SWP_NOZORDER);
         GetWindowRect(hwnd, &windowRect_);
         GetClientRect(hwnd, &clientRect_);

@@ -59,6 +59,7 @@ private:
     NV_ENC_CONFIG encodeConfig_{};
     uint32_t maxApiVersion_ = 0;
     uint64_t framesEncoded_ = 0;
+    uint64_t framesSubmitted_ = 0;
     uint64_t bytesWritten_ = 0;
     uint32_t frameIndex_ = 0;
     std::wstring lastError_;

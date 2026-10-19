@@ -10,7 +10,7 @@
 #include <windows.graphics.directx.direct3d11.interop.h>
 
 #include <algorithm>
-#include <thread>
+#include <iostream>
 
 using namespace winrt::Windows::Graphics::Capture;
 using namespace winrt::Windows::Graphics::DirectX;
@@ -65,11 +65,6 @@ bool WgcCapture::CreateResources(std::wstring& error)
     desc.CPUAccessFlags = 0;
     desc.MiscFlags = 0;
 
-    D3D11_QUERY_DESC disjointDesc{};
-    disjointDesc.Query = D3D11_QUERY_TIMESTAMP_DISJOINT;
-    D3D11_QUERY_DESC timestampDesc{};
-    timestampDesc.Query = D3D11_QUERY_TIMESTAMP;
-
     for (auto& slot : slots_)
     {
         HRESULT hr = device_->CreateTexture2D(&desc, nullptr, slot.texture.GetAddressOf());
@@ -79,30 +74,13 @@ bool WgcCapture::CreateResources(std::wstring& error)
                 Widen(FormatHresult(hr));
             return false;
         }
-        hr = device_->CreateQuery(&disjointDesc, slot.disjoint.GetAddressOf());
-        if (FAILED(hr))
-        {
-            error = L"CreateQuery(disjoint) failed: " + Widen(FormatHresult(hr));
-            return false;
-        }
-        hr = device_->CreateQuery(&timestampDesc, slot.timestampStart.GetAddressOf());
-        if (FAILED(hr))
-        {
-            error = L"CreateQuery(timestamp start) failed: " + Widen(FormatHresult(hr));
-            return false;
-        }
-        hr = device_->CreateQuery(&timestampDesc, slot.timestampEnd.GetAddressOf());
-        if (FAILED(hr))
-        {
-            error = L"CreateQuery(timestamp end) failed: " + Widen(FormatHresult(hr));
-            return false;
-        }
     }
     return true;
 }
 
 bool WgcCapture::Start(HWND hwnd, std::wstring& error)
 {
+    std::wstring stage = L"CreateForWindow";
     try
     {
         if (started_)
@@ -118,9 +96,21 @@ bool WgcCapture::Start(HWND hwnd, std::wstring& error)
 
         auto factory = winrt::get_activation_factory<GraphicsCaptureItem>();
         auto interop = factory.as<IGraphicsCaptureItemInterop>();
-        winrt::check_hresult(interop->CreateForWindow(
-            hwnd, winrt::guid_of<GraphicsCaptureItem>(), winrt::put_abi(item_)));
+        // A just-created window can race DWM registration and return E_INVALIDARG.
+        // WS_EX_TOOLWINDOW / taskbar-hidden windows are also rejected on Win10, so
+        // the test window deliberately uses a plain top-level style.
+        HRESULT createHr = E_FAIL;
+        for (int attempt = 0; attempt < 15; ++attempt)
+        {
+            createHr = interop->CreateForWindow(
+                hwnd, winrt::guid_of<GraphicsCaptureItem>(), winrt::put_abi(item_));
+            if (SUCCEEDED(createHr)) break;
+            if (createHr != E_INVALIDARG) break;
+            Sleep(100);
+        }
+        winrt::check_hresult(createHr);
 
+        stage = L"item.Size";
         const auto itemSize = item_.Size();
         if (itemSize.Width != width_ || itemSize.Height != height_)
         {
@@ -130,33 +120,42 @@ bool WgcCapture::Start(HWND hwnd, std::wstring& error)
             return false;
         }
 
+        stage = L"CreateDirect3D11DeviceFromDXGIDevice";
         ComPtr<IDXGIDevice> dxgiDevice;
         winrt::check_hresult(device_->QueryInterface(IID_PPV_ARGS(dxgiDevice.GetAddressOf())));
         winrt::com_ptr<IInspectable> inspectable;
         winrt::check_hresult(CreateDirect3D11DeviceFromDXGIDevice(dxgiDevice.Get(), inspectable.put()));
         graphicsDevice_ = inspectable.as<IDirect3DDevice>();
 
+        stage = L"CreateFreeThreaded " + std::to_wstring(itemSize.Width) + L"x" +
+            std::to_wstring(itemSize.Height);
         pool_ = Direct3D11CaptureFramePool::CreateFreeThreaded(
             graphicsDevice_, DirectXPixelFormat::B8G8R8A8UIntNormalized, 3, itemSize);
+        stage = L"CreateCaptureSession";
         session_ = pool_.CreateCaptureSession(item_);
+        stage = L"IsCursorCaptureEnabled";
         try { session_.IsCursorCaptureEnabled(false); } catch (...) {}
+        stage = L"IsBorderRequired";
         try { session_.IsBorderRequired(false); } catch (...) {}
 
+        stage = L"FrameArrived";
         frameArrivedToken_ = pool_.FrameArrived([this](auto&&, auto&&) { OnFrameArrived(); });
+        stage = L"ItemClosed";
         itemClosedToken_ = item_.Closed([this](auto&&, auto&&) { OnClosed(L"capture item closed"); });
 
+        stage = L"StartCapture";
         session_.StartCapture();
         started_ = true;
         return true;
     }
     catch (const winrt::hresult_error& ex)
     {
-        error = L"WGC start failed: " + HresultText(ex);
+        error = L"WGC start failed at " + stage + L": " + HresultText(ex);
         return false;
     }
     catch (const std::exception& ex)
     {
-        error = L"WGC start failed: " + Widen(ex.what());
+        error = L"WGC start failed at " + stage + L": " + Widen(ex.what());
         return false;
     }
 }
@@ -194,12 +193,28 @@ void WgcCapture::Stop()
     for (int i = 0; i < 300 && callbacks_.load() > 0; ++i)
         Sleep(10);
 
+    std::deque<CapturedFrame> pending;
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        pending.swap(queue_);
+        closed_ = true;
+    }
+    for (auto& frame : pending)
+    {
+        if (frame.slot >= 0 && frame.slot < static_cast<int>(slots_.size()))
+            slots_[static_cast<size_t>(frame.slot)].state = SlotState::Free;
+        if (frame.frame)
+        {
+            try { frame.frame.Close(); } catch (...) {}
+            frame.frame = nullptr;
+        }
+    }
+
     session_ = nullptr;
     pool_ = nullptr;
     item_ = nullptr;
     graphicsDevice_ = nullptr;
     started_ = false;
-    closed_ = true;
     frameReady_.notify_all();
 }
 
@@ -235,11 +250,60 @@ void WgcCapture::OnFrameArrived()
             return;
         }
 
-        auto surface = frame.Surface();
+        // Never do GPU work or wait on a D3D query from the WGC callback. The
+        // frame pool owns this thread; blocking it can stall the capture
+        // producer and deadlock the copy. Keep the frame alive and materialize
+        // it on the caller's thread.
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        if (closed_) return;
+        if (queue_.size() >= slots_.size())
+        {
+            ++droppedNoSlot_;
+            return;
+        }
+
+        CapturedFrame captured{};
+        captured.width = static_cast<uint32_t>(content.Width);
+        captured.height = static_cast<uint32_t>(content.Height);
+        captured.qpcArrival = QpcNow();
+        captured.systemRelativeTime = frame.SystemRelativeTime().count();
+        captured.frame = frame;
+        queue_.push_back(std::move(captured));
+        ++arrived_;
+        frameReady_.notify_one();
+    }
+    catch (...)
+    {
+        ++copyErrors_;
+        // A WinRT exception must never escape the event handler.
+    }
+}
+
+bool WgcCapture::MaterializeFrame(CapturedFrame& frame, std::wstring& error)
+{
+    if (!frame.frame)
+    {
+        error = L"The queued WGC frame is empty.";
+        return false;
+    }
+
+    auto closeFrame = [&] {
+        if (frame.frame)
+        {
+            try { frame.frame.Close(); } catch (...) {}
+            frame.frame = nullptr;
+        }
+    };
+
+    try
+    {
+        auto surface = frame.frame.Surface();
         if (!surface)
         {
             ++copyErrors_;
-            return;
+            closeFrame();
+            error = L"The WGC frame has no surface.";
+            return false;
         }
         auto access = surface.as<::Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
         winrt::com_ptr<ID3D11Texture2D> source;
@@ -247,7 +311,9 @@ void WgcCapture::OnFrameArrived()
         if (!source)
         {
             ++copyErrors_;
-            return;
+            closeFrame();
+            error = L"The WGC surface is not an ID3D11Texture2D.";
+            return false;
         }
 
         D3D11_TEXTURE2D_DESC sourceDesc{};
@@ -255,7 +321,33 @@ void WgcCapture::OnFrameArrived()
         if (sourceDesc.Format != format_)
         {
             ++unsupportedFormat_;
-            return;
+            closeFrame();
+            error = L"The WGC frame format is " + std::to_wstring(static_cast<unsigned>(sourceDesc.Format)) +
+                L", expected " + std::to_wstring(static_cast<unsigned>(format_)) + L".";
+            return false;
+        }
+
+        ComPtr<ID3D11Device> sourceDevice;
+        source->GetDevice(&sourceDevice);
+        if (sourceDevice.Get() != device_)
+        {
+            std::wcout << L"POC-WGC source texture is on a different D3D11 device; source=" <<
+                sourceDevice.Get() << L" ours=" << device_ << L"\n" << std::flush;
+            ++copyErrors_;
+            closeFrame();
+            error = L"WGC frame texture belongs to a different D3D11 device.";
+            return false;
+        }
+        static std::atomic<int> sourceLogs{ 0 };
+        if (sourceLogs.fetch_add(1) < 1)
+        {
+            std::wcout << L"POC-WGC source desc " << sourceDesc.Width << L"x" << sourceDesc.Height <<
+                L" fmt=" << static_cast<unsigned>(sourceDesc.Format) <<
+                L" mips=" << sourceDesc.MipLevels << L" array=" << sourceDesc.ArraySize <<
+                L" samples=" << sourceDesc.SampleDesc.Count <<
+                L" usage=" << static_cast<unsigned>(sourceDesc.Usage) <<
+                L" bind=0x" << std::hex << sourceDesc.BindFlags << std::dec <<
+                L" misc=0x" << std::hex << sourceDesc.MiscFlags << std::dec << L"\n" << std::flush;
         }
 
         int slotIndex = -1;
@@ -270,85 +362,70 @@ void WgcCapture::OnFrameArrived()
                     break;
                 }
             }
-            if (slotIndex < 0)
-            {
-                ++droppedNoSlot_;
-                return;
-            }
+        }
+        if (slotIndex < 0)
+        {
+            ++droppedNoSlot_;
+            closeFrame();
+            error = L"No free capture slot for the WGC frame.";
+            return false;
         }
 
-        const int64_t arrival = QpcNow();
-        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint{};
-        UINT64 timestampStart = 0;
-        UINT64 timestampEnd = 0;
-        HRESULT queryResult = S_OK;
         {
             std::lock_guard<std::mutex> copyLock(copyMutex_);
             auto& slot = slots_[static_cast<size_t>(slotIndex)];
-            context_->Begin(slot.disjoint.Get());
-            context_->End(slot.timestampStart.Get());
             context_->CopyResource(slot.texture.Get(), source.get());
-            context_->End(slot.timestampEnd.Get());
-            context_->End(slot.disjoint.Get());
             context_->Flush();
-
-            // Resolve the GPU timestamps before reusing the query. This is a
-            // copy+sync boundary only for the diagnostic; the NVENC map would
-            // otherwise synchronize the same texture. No CPU pixels are read.
-            for (int spin = 0; spin < 100000; ++spin)
-            {
-                queryResult = context_->GetData(slot.disjoint.Get(), &disjoint, sizeof(disjoint), 0);
-                if (queryResult != S_FALSE) break;
-                std::this_thread::yield();
-            }
-            if (queryResult == S_OK)
-            {
-                context_->GetData(slot.timestampStart.Get(), &timestampStart, sizeof(timestampStart), 0);
-                context_->GetData(slot.timestampEnd.Get(), &timestampEnd, sizeof(timestampEnd), 0);
-            }
         }
 
-        const int64_t copyDone = QpcNow();
-        double gpuCopyMs = -1.0;
-        if (queryResult == S_OK && !disjoint.Disjoint && disjoint.Frequency != 0)
-            gpuCopyMs = static_cast<double>(timestampEnd - timestampStart) * 1000.0 /
-                static_cast<double>(disjoint.Frequency);
-
+        frame.slot = slotIndex;
+        frame.format = sourceDesc.Format;
+        frame.qpcCopyDone = QpcNow();
+        frame.gpuCopyMs = -1.0;
+        frame.gpuDisjoint = false;
         {
             std::lock_guard<std::mutex> lock(stateMutex_);
-            auto& slot = slots_[static_cast<size_t>(slotIndex)];
-            slot.state = SlotState::Queued;
-            CapturedFrame captured{};
-            captured.slot = slotIndex;
-            captured.width = static_cast<uint32_t>(content.Width);
-            captured.height = static_cast<uint32_t>(content.Height);
-            captured.format = sourceDesc.Format;
-            captured.qpcArrival = arrival;
-            captured.qpcCopyDone = copyDone;
-            captured.systemRelativeTime = frame.SystemRelativeTime().count();
-            captured.gpuCopyMs = gpuCopyMs;
-            captured.gpuDisjoint = disjoint.Disjoint != 0;
-            queue_.push_back(captured);
-            ++arrived_;
-            frameReady_.notify_one();
+            slots_[static_cast<size_t>(slotIndex)].state = SlotState::Queued;
         }
+        closeFrame();
+        return true;
     }
-    catch (...)
+    catch (const winrt::hresult_error& ex)
     {
         ++copyErrors_;
-        // A WinRT exception must never escape the event handler.
+        error = L"WGC frame materialization failed: " + HresultText(ex);
+        closeFrame();
+        return false;
+    }
+    catch (const std::exception& ex)
+    {
+        ++copyErrors_;
+        error = L"WGC frame materialization failed: " + Widen(ex.what());
+        closeFrame();
+        return false;
     }
 }
 
 bool WgcCapture::WaitFrame(CapturedFrame& frame, int timeoutMs)
 {
-    std::unique_lock<std::mutex> lock(stateMutex_);
-    if (!frameReady_.wait_for(lock, std::chrono::milliseconds(timeoutMs),
-            [this] { return !queue_.empty() || closed_; }))
+    CapturedFrame pending;
+    {
+        std::unique_lock<std::mutex> lock(stateMutex_);
+        if (!frameReady_.wait_for(lock, std::chrono::milliseconds(timeoutMs),
+                [this] { return !queue_.empty() || closed_; }))
+            return false;
+        if (queue_.empty()) return false;
+        pending = std::move(queue_.front());
+        queue_.pop_front();
+    }
+
+    std::wstring materializeError;
+    if (!MaterializeFrame(pending, materializeError))
+    {
+        SetError(materializeError);
         return false;
-    if (queue_.empty()) return false;
-    frame = queue_.front();
-    queue_.pop_front();
+    }
+    frame = std::move(pending);
     return true;
 }
 
@@ -358,6 +435,10 @@ void WgcCapture::ReleaseFrame(const CapturedFrame& frame)
         std::lock_guard<std::mutex> lock(stateMutex_);
         if (frame.slot >= 0 && frame.slot < static_cast<int>(slots_.size()))
             slots_[static_cast<size_t>(frame.slot)].state = SlotState::Free;
+    }
+    if (frame.frame)
+    {
+        try { frame.frame.Close(); } catch (...) {}
     }
     frameReady_.notify_all();
 }
@@ -402,12 +483,15 @@ bool WgcCapture::Readback(int slot, std::vector<uint8_t>& bgra, int& width, int&
     {
         std::lock_guard<std::mutex> copyLock(copyMutex_);
         context_->CopyResource(staging_.Get(), slots_[static_cast<size_t>(slot)].texture.Get());
-        context_->Flush();
+        // Map on the caller thread blocks until the copy completes. This is the
+        // one-off ruler path only; the steady path never maps a texture.
         D3D11_MAPPED_SUBRESOURCE mapped{};
         const HRESULT hr = context_->Map(staging_.Get(), 0, D3D11_MAP_READ, 0, &mapped);
         if (FAILED(hr))
         {
-            error = L"Map(staging) failed: " + Widen(FormatHresult(hr));
+            const HRESULT removed = device_->GetDeviceRemovedReason();
+            error = L"Map(staging) failed: " + Widen(FormatHresult(hr)) +
+                L"; device removed reason=" + Widen(FormatHresult(removed));
             return false;
         }
         width = width_;

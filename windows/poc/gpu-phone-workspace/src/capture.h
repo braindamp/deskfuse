@@ -24,6 +24,7 @@ struct CapturedFrame
     int64_t systemRelativeTime = 0;
     double gpuCopyMs = -1.0;
     bool gpuDisjoint = false;
+    winrt::Windows::Graphics::Capture::Direct3D11CaptureFrame frame{ nullptr };
 };
 
 /// Windows.Graphics.Capture of one HWND into persistent D3D11 BGRA textures.
@@ -63,14 +64,12 @@ private:
     struct Slot
     {
         ComPtr<ID3D11Texture2D> texture;
-        ComPtr<ID3D11Query> disjoint;
-        ComPtr<ID3D11Query> timestampStart;
-        ComPtr<ID3D11Query> timestampEnd;
         SlotState state = SlotState::Free;
     };
 
     void OnFrameArrived();
     void OnClosed(const wchar_t* why);
+    bool MaterializeFrame(CapturedFrame& frame, std::wstring& error);
     bool EnsureStaging(std::wstring& error);
     void SetError(const std::wstring& error);
 

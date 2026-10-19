@@ -7,6 +7,7 @@ using System.Security.Principal;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.Json.Serialization.Metadata;
 using FocusWindow.Core;
 using FocusWindow.Core.Display;
 using FocusWindow.Core.Protocol;
@@ -698,8 +699,16 @@ internal static class PocMonitorHost
     private static string KvEscape(string value) =>
         value.Replace("\r", " ").Replace("\n", " ").Replace("\t", " ").Trim();
 
+    // The POC runs under the agent's published reflection settings. Be explicit so JSON
+    // serialization does not depend on JsonSerializer.IsReflectionEnabledByDefault.
+    private static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        WriteIndented = true,
+        TypeInfoResolver = new DefaultJsonTypeInfoResolver(),
+    };
+
     private static void WriteJson(string path, JsonNode node) =>
-        WriteAtomic(path, node.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+        WriteAtomic(path, node.ToJsonString(JsonOptions));
 
     private static void WriteAtomic(string path, string text)
     {
@@ -738,7 +747,7 @@ internal static class PocMonitorHost
             try
             {
                 return File.Exists(path)
-                    ? JsonSerializer.Deserialize<ClientProfile>(File.ReadAllText(path))
+                    ? JsonSerializer.Deserialize<ClientProfile>(File.ReadAllText(path), JsonOptions)
                     : null;
             }
             catch (Exception ex)
@@ -750,7 +759,7 @@ internal static class PocMonitorHost
         public static void Save(string path, ClientProfile profile)
         {
             var tmp = path + ".tmp-" + Guid.NewGuid().ToString("N");
-            File.WriteAllText(tmp, JsonSerializer.Serialize(profile, new JsonSerializerOptions { WriteIndented = true }),
+            File.WriteAllText(tmp, JsonSerializer.Serialize(profile, JsonOptions),
                 new UTF8Encoding(false));
             File.Move(tmp, path, overwrite: true);
         }

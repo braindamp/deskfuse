@@ -65,7 +65,10 @@ struct RulerResult
     int checkerMismatches = 0;
     int checkerSamples = 0;
     int lineWhitePixels = 0;
+    int colorProbeMismatches = 0;
+    int colorProbeSamples = 0;
     bool backgroundOk = false;
+    uint8_t corners[4][4]{};
     std::string detail;
 };
 
@@ -108,7 +111,7 @@ void Print(const std::wstring& text)
 
 void PrintLine(const std::wstring& text)
 {
-    std::cout << Utf8(text) << "\n";
+    std::cout << Utf8(text) << "\n" << std::flush;
 }
 
 std::wstring WinRtErrorText(const winrt::hresult_error& error)
@@ -248,33 +251,27 @@ RulerResult AnalyzeRuler(const std::vector<uint8_t>& bgra, int width, int height
             static_cast<size_t>(x)) * 4;
     };
 
-    int minX = width;
-    int minY = height;
-    int maxX = -1;
-    int maxY = -1;
-    for (int y = 0; y < height; ++y)
+    int minX = kRulerOriginX;
+    int minY = kRulerOriginY;
+    int maxX = kRulerOriginX + kRulerPx - 1;
+    int maxY = kRulerOriginY + kRulerPx - 1;
+    for (int y = kRulerOriginY; y < kRulerOriginY + kRulerPx; ++y)
     {
-        for (int x = 0; x < width; ++x)
+        for (int x = kRulerOriginX; x < kRulerOriginX + kRulerPx; ++x)
         {
             const uint8_t* p = pixel(x, y);
-            // BGRA; the exact GDI green is (0, 255, 0).
+            // BGRA; the exact GDI green is (0, 255, 0). Scan only the ruler
+            // rectangle so the green color probe cannot inflate this count.
             if (p[1] >= 245 && p[0] <= 10 && p[2] <= 10)
             {
                 ++result.greenPixels;
-                minX = std::min(minX, x);
-                minY = std::min(minY, y);
-                maxX = std::max(maxX, x);
-                maxY = std::max(maxY, y);
             }
         }
     }
-    if (maxX >= 0)
-    {
-        result.greenLeft = minX;
-        result.greenTop = minY;
-        result.greenRight = maxX;
-        result.greenBottom = maxY;
-    }
+    result.greenLeft = minX;
+    result.greenTop = minY;
+    result.greenRight = maxX;
+    result.greenBottom = maxY;
 
     for (int y = 0; y < kCheckerSize; ++y)
     {
@@ -292,6 +289,26 @@ RulerResult AnalyzeRuler(const std::vector<uint8_t>& bgra, int width, int height
         }
     }
 
+    for (int i = 0; i < kColorProbeCount; ++i)
+    {
+        const RgbProbe& expected = kColorProbes[i];
+        for (int y = 0; y < kColorProbeSize; ++y)
+        {
+            for (int x = 0; x < kColorProbeSize; ++x)
+            {
+                const uint8_t* p = pixel(kColorProbeX + i * kColorProbeSize + x,
+                    kColorProbeY + y);
+                ++result.colorProbeSamples;
+                if (std::abs(static_cast<int>(p[0]) - expected.b) > 2 ||
+                    std::abs(static_cast<int>(p[1]) - expected.g) > 2 ||
+                    std::abs(static_cast<int>(p[2]) - expected.r) > 2)
+                {
+                    ++result.colorProbeMismatches;
+                }
+            }
+        }
+    }
+
     for (int y = kLineY; y < kLineY + kLineHeight; ++y)
     {
         const uint8_t* p = pixel(kLineX, y);
@@ -305,6 +322,8 @@ RulerResult AnalyzeRuler(const std::vector<uint8_t>& bgra, int width, int height
         pixel(margin, height - margin - 1),
         pixel(width - margin - 1, height - margin - 1),
     };
+    for (int i = 0; i < 4; ++i)
+        std::copy(corners[i], corners[i] + 4, result.corners[i]);
     result.backgroundOk = std::all_of(std::begin(corners), std::end(corners), [](const uint8_t* p) {
         return p[0] >= 240 && p[2] >= 240 && p[1] <= 16; // magenta
     });
@@ -315,7 +334,7 @@ RulerResult AnalyzeRuler(const std::vector<uint8_t>& bgra, int width, int height
         result.greenRight == kRulerOriginX + kRulerPx - 1 &&
         result.greenBottom == kRulerOriginY + kRulerPx - 1;
     result.pass = greenExact && result.checkerMismatches <= 64 && result.lineWhitePixels == kLineHeight &&
-        result.backgroundOk;
+        result.colorProbeMismatches == 0 && result.backgroundOk;
 
     std::ostringstream detail;
     detail << "greenPixels=" << result.greenPixels << " expected=" << expectedGreen
@@ -323,7 +342,9 @@ RulerResult AnalyzeRuler(const std::vector<uint8_t>& bgra, int width, int height
            << result.greenRight << "," << result.greenBottom
            << " checkerMismatches=" << result.checkerMismatches << "/" << result.checkerSamples
            << " lineWhite=" << result.lineWhitePixels << "/" << kLineHeight
-           << " background=" << (result.backgroundOk ? "magenta" : "unexpected");
+           << " colorProbeMismatches=" << result.colorProbeMismatches << "/" << result.colorProbeSamples
+           << " background=" << (result.backgroundOk ? "magenta" : "unexpected")
+           << " corners=" << HexBytes(reinterpret_cast<const uint8_t*>(result.corners), sizeof(result.corners));
     result.detail = detail.str();
     return result;
 }
@@ -507,6 +528,7 @@ void Usage()
         "\n"
         "  DeskFuse.GpuWorkspacePoc --plan\n"
         "  DeskFuse.GpuWorkspacePoc --run --monitor-kv PATH --out DIR [options]\n"
+        "  DeskFuse.GpuWorkspacePoc --encoder-selftest --out DIR\n"
         "\n"
         "Options for --run:\n"
         "  --duration-sec N       capture/encode duration, default 20\n"
@@ -540,6 +562,7 @@ bool ParseArgs(int argc, wchar_t** argv, Options& options, std::wstring& error)
         else if (arg == L"--run") options.run = true;
         else if (arg == L"--static") options.animate = false;
         else if (arg == L"--save-full-reference") options.saveFullReference = true;
+        else if (arg == L"--encoder-selftest") options.encoderSelfTest = true;
         else if (arg == L"--help" || arg == L"-h") options.help = true;
         else if (arg == L"--monitor-kv")
         {
@@ -592,9 +615,14 @@ bool ParseArgs(int argc, wchar_t** argv, Options& options, std::wstring& error)
     }
 
     if (options.help) return true;
+    if (options.encoderSelfTest)
+    {
+        if (options.outDir.empty()) error = L"--encoder-selftest requires --out DIR.";
+        return error.empty();
+    }
     if (!options.plan && !options.run)
     {
-        error = L"Specify --plan or --run.";
+        error = L"Specify --plan, --run, or --encoder-selftest.";
         return false;
     }
     if (options.run)
@@ -657,6 +685,208 @@ int PrintPlan()
     }
     std::cout << "expected=1440x3120@60 dpi=336 ruler=350x350\n";
     return 0;
+}
+
+int RunEncoderSelfTest(const Options& options)
+{
+    std::error_code directoryError;
+    std::filesystem::create_directories(std::filesystem::path(options.outDir), directoryError);
+    if (directoryError)
+    {
+        std::cerr << "Could not create the self-test directory: " << Utf8(options.outDir) << "\n";
+        return 10;
+    }
+
+    Json result;
+    result["schema"] = "deskfuse.gpu-poc.encoder-selftest.v1";
+    result["notAcceptanceEvidence"] = true;
+    result["purpose"] = "D3D11 texture -> NVENC H.264 interop diagnostic; no WGC or monitor";
+    result["startedUtc"] = IsoNowUtc();
+    result["sdkVersion"] = POC_SDK_VERSION;
+    result["osVersion"] = OsVersionString();
+    result["elevated"] = IsElevated();
+
+    auto finish = [&](const std::string& overall, int code, const std::wstring& detail) -> int {
+        result["overall"] = overall;
+        result["finishedUtc"] = IsoNowUtc();
+        if (!detail.empty())
+            result["failure"] = Json{ {"code", overall}, {"detail", Utf8(detail)} };
+        std::wstring writeError;
+        if (!WriteTextFile(Join(options.outDir, L"encoder-selftest.json"), DumpJson(result), writeError))
+            std::cerr << "Could not write the self-test result: " << Utf8(writeError) << "\n";
+        PrintLine(L"POC-ENC-SELFTEST " + Widen(overall));
+        return code;
+    };
+
+    const int width = kWindowWidth;
+    const int height = kWindowHeight;
+    D3D_FEATURE_LEVEL featureLevel = D3D_FEATURE_LEVEL_11_0;
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11DeviceContext> context;
+    auto createDevice = [&](const D3D_FEATURE_LEVEL* levels, UINT count) -> HRESULT {
+        device.Reset();
+        context.Reset();
+        return D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels, count, D3D11_SDK_VERSION,
+            device.GetAddressOf(), &featureLevel, context.GetAddressOf());
+    };
+    const D3D_FEATURE_LEVEL levels11[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
+    HRESULT hr = createDevice(levels11, 2);
+    if (FAILED(hr))
+    {
+        const D3D_FEATURE_LEVEL levels10[] = { D3D_FEATURE_LEVEL_11_0 };
+        hr = createDevice(levels10, 1);
+    }
+    if (FAILED(hr))
+        return finish("SELF_TEST_D3D11_DEVICE_FAILED", 10, L"D3D11CreateDevice failed: " + Widen(FormatHresult(hr)));
+    PrintLine(L"POC-ENC-SELFTEST device=" + Widen(FeatureLevelName(featureLevel)));
+
+    ComPtr<IDXGIDevice> dxgiDevice;
+    ComPtr<IDXGIAdapter> adapter;
+    DXGI_ADAPTER_DESC adapterDesc{};
+    if (SUCCEEDED(device.As(&dxgiDevice)) && SUCCEEDED(dxgiDevice->GetAdapter(adapter.GetAddressOf())))
+        adapter->GetDesc(&adapterDesc);
+    result["gpu"] = Json{
+        {"description", Utf8(std::wstring(adapterDesc.Description))},
+        {"vendorId", adapterDesc.VendorId},
+        {"deviceId", adapterDesc.DeviceId},
+        {"featureLevel", FeatureLevelName(featureLevel)},
+    };
+
+    std::vector<uint8_t> pixels(static_cast<size_t>(width) * static_cast<size_t>(height) * 4);
+    for (int y = 0; y < height; ++y)
+    {
+        for (int x = 0; x < width; ++x)
+        {
+            uint8_t* p = pixels.data() + (static_cast<size_t>(y) * width + x) * 4;
+            p[0] = static_cast<uint8_t>((x * 255) / (width - 1));
+            p[1] = static_cast<uint8_t>((y * 255) / (height - 1));
+            p[2] = ((x / 64 + y / 64) & 1) ? 255 : 0;
+            p[3] = 255;
+        }
+    }
+
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = static_cast<UINT>(width);
+    desc.Height = static_cast<UINT>(height);
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    D3D11_SUBRESOURCE_DATA initial{};
+    initial.pSysMem = pixels.data();
+    initial.SysMemPitch = static_cast<UINT>(width) * 4;
+    ComPtr<ID3D11Texture2D> texture0;
+    ComPtr<ID3D11Texture2D> texture1;
+    hr = device->CreateTexture2D(&desc, &initial, texture0.GetAddressOf());
+    if (SUCCEEDED(hr))
+        hr = device->CreateTexture2D(&desc, &initial, texture1.GetAddressOf());
+    if (FAILED(hr))
+        return finish("SELF_TEST_TEXTURE_FAILED", 10, L"CreateTexture2D failed: " + Widen(FormatHresult(hr)));
+
+    std::vector<ID3D11Texture2D*> slots{ texture0.Get(), texture1.Get() };
+    EncoderConfig encoderConfig{};
+    encoderConfig.width = width;
+    encoderConfig.height = height;
+    encoderConfig.fps = 60;
+    encoderConfig.bitrate = 20000000;
+    encoderConfig.outputPath = Join(options.outDir, L"encoder-selftest.h264");
+
+    NvEncoder encoder;
+    std::wstring error;
+    const bool initialized = encoder.Initialize(device.Get(), slots.data(),
+        static_cast<int>(slots.size()), encoderConfig, error);
+    result["encoder"] = Json{
+        {"backend", "NVENC"},
+        {"codec", "H.264"},
+        {"preset", Utf8(encoder.Preset())},
+        {"initialized", initialized},
+        {"maxApiVersion", encoder.MaxApiVersion()},
+        {"output", Utf8(encoderConfig.outputPath)},
+        {"error", Utf8(error)},
+    };
+    if (!initialized)
+    {
+        PrintLine(L"POC-ENC-SELFTEST init blocked: " + error);
+        encoder.Shutdown();
+        return finish("ENCODER_BLOCKED", 20, error);
+    }
+    PrintLine(L"POC-ENC-SELFTEST initialized maxApi=" + std::to_wstring(encoder.MaxApiVersion()));
+
+    std::vector<double> submitTimes;
+    std::vector<double> lockTimes;
+    std::vector<double> totalTimes;
+    int failures = 0;
+    std::wstring firstError;
+    for (int i = 0; i < 60; ++i)
+    {
+        uint32_t bytes = 0;
+        double submitMs = 0;
+        double lockMs = 0;
+        const int64_t start = QpcNow();
+        if (!encoder.Encode(i % 2, static_cast<uint64_t>(i) * 166667u, static_cast<uint32_t>(i),
+            bytes, submitMs, lockMs, error))
+        {
+            ++failures;
+            if (firstError.empty()) firstError = error;
+            break;
+        }
+        submitTimes.push_back(submitMs);
+        lockTimes.push_back(lockMs);
+        totalTimes.push_back(QpcDeltaMs(start, QpcNow()));
+        if ((i + 1) % 10 == 0)
+            PrintLine(L"POC-ENC-SELFTEST encoded=" + std::to_wstring(encoder.FramesEncoded()) +
+                L" framesSubmitted=" + std::to_wstring(i + 1));
+    }
+
+    PrintLine(L"POC-ENC-SELFTEST submit loop done");
+    std::wstring flushError;
+    const bool flushed = encoder.Flush(flushError);
+    PrintLine(L"POC-ENC-SELFTEST flush=" + std::to_wstring(flushed ? 1 : 0) + L" error=" + flushError);
+    if (!flushed && failures == 0)
+    {
+        ++failures;
+        firstError = flushError;
+    }
+    const uint64_t framesEncoded = encoder.FramesEncoded();
+    const uint64_t bytesWritten = encoder.BytesWritten();
+    PrintLine(L"POC-ENC-SELFTEST before shutdown encoded=" + std::to_wstring(framesEncoded) +
+        L" bytes=" + std::to_wstring(bytesWritten));
+    encoder.Shutdown();
+    PrintLine(L"POC-ENC-SELFTEST shutdown done");
+
+    const BitstreamCheck bitstream = InspectBitstream(encoderConfig.outputPath);
+    const bool pass = failures == 0 && framesEncoded >= 60 && bitstream.exists &&
+        bitstream.annexB && bitstream.sps && bitstream.pps && bitstream.idr;
+    result["frames"] = Json{
+        {"submitted", 60},
+        {"encoded", framesEncoded},
+        {"bytesWritten", bytesWritten},
+    };
+    result["bitstream"] = Json{
+        {"path", Utf8(encoderConfig.outputPath)},
+        {"exists", bitstream.exists},
+        {"size", bitstream.size},
+        {"annexB", bitstream.annexB},
+        {"sps", bitstream.sps},
+        {"pps", bitstream.pps},
+        {"idr", bitstream.idr},
+        {"firstBytesHex", bitstream.firstBytes},
+    };
+    result["latency"] = Json{
+        {"submitToEncodeReturn", PercentileJson(ComputePercentiles(submitTimes))},
+        {"bitstreamLock", PercentileJson(ComputePercentiles(lockTimes))},
+        {"textureToBitstream", PercentileJson(ComputePercentiles(totalTimes))},
+    };
+    result["flushed"] = flushed;
+    if (failures > 0) result["error"] = Utf8(firstError);
+
+    if (!pass)
+        return finish("SELF_TEST_NVENC_H264_INCOMPLETE", 20,
+            firstError.empty() ? L"Not all 60 frames produced a valid H.264 Annex B bitstream." : firstError);
+    return finish("SELF_TEST_NVENC_H264_PASS", 0, L"");
 }
 
 int Run(const Options& options)
@@ -927,6 +1157,7 @@ int Run(const Options& options)
         window.Destroy();
         return Fail(result, options.outDir, "WGC_START_FAILED", error, 13);
     }
+    PrintLine(L"POC-WGC reference started");
 
     std::vector<uint8_t> referencePixels;
     int referenceWidth = 0;
@@ -935,6 +1166,8 @@ int Run(const Options& options)
     RulerResult ruler;
     bool referencePass = false;
     const int64_t referenceStart = QpcNow();
+    int64_t lastReferenceLog = referenceStart;
+    int referenceAttempts = 0;
     while (QpcDeltaMs(referenceStart, QpcNow()) < 10000.0)
     {
         window.PumpMessages();
@@ -942,11 +1175,18 @@ int Run(const Options& options)
         if (!referenceCapture.WaitFrame(frame, 50))
         {
             if (!referenceCapture.Error().empty()) break;
+            if (QpcDeltaMs(lastReferenceLog, QpcNow()) >= 1000.0)
+            {
+                lastReferenceLog = QpcNow();
+                PrintLine(L"POC-WGC reference waiting arrived=" +
+                    std::to_wstring(referenceCapture.Arrived()) + L" error=" + referenceCapture.Error());
+            }
             continue;
         }
         ++referenceFrames;
         if (!referenceCapture.Readback(frame.slot, referencePixels, referenceWidth, referenceHeight, error))
         {
+            PrintLine(L"POC-WGC reference readback failed: " + error);
             referenceCapture.ReleaseFrame(frame);
             break;
         }
@@ -957,10 +1197,16 @@ int Run(const Options& options)
             referencePass = true;
             break;
         }
+        if (++referenceAttempts >= 5)
+            break;
     }
     const uint64_t referenceArrived = referenceCapture.Arrived();
     const uint64_t referenceWrongSize = referenceCapture.WrongSize();
+    PrintLine(L"POC-WGC reference loop done frames=" + std::to_wstring(referenceFrames) +
+        L" arrived=" + std::to_wstring(referenceArrived) + L" pass=" +
+        std::to_wstring(referencePass ? 1 : 0));
     referenceCapture.Stop();
+    PrintLine(L"POC-WGC reference stopped");
 
     std::wstring referenceBmp = Join(options.outDir,
         referencePass ? L"gpu-poc-reference.bmp" : L"gpu-poc-reference-failed.bmp");
@@ -980,6 +1226,14 @@ int Run(const Options& options)
             referenceWidth, referenceHeight, 0, 0, referenceWidth, referenceHeight, bmpError))
             PrintLine(L"POC-WARN: " + bmpError);
     }
+    if (!referencePass && !referencePixels.empty())
+    {
+        // A tiny corner crop is enough to identify an unexpected occluder or
+        // color conversion without writing an 18 MB failure bitmap.
+        std::wstring bmpError;
+        WriteBgraBmp(Join(options.outDir, L"gpu-poc-reference-corner.bmp"), referencePixels,
+            referenceWidth, referenceHeight, 0, 0, 240, 240, bmpError);
+    }
 
     result["reference"] = Json{
         {"purpose", "one-off CPU readback for physical-pixel ruler verification"},
@@ -997,7 +1251,16 @@ int Run(const Options& options)
         {"checkerSamples", ruler.checkerSamples},
         {"lineWhitePixels", ruler.lineWhitePixels},
         {"lineExpectedPixels", kLineHeight},
+        {"colorProbeMismatches", ruler.colorProbeMismatches},
+        {"colorProbeSamples", ruler.colorProbeSamples},
+        {"colorProbes", Json::array({
+            "red", "green", "blue", "cyan", "magenta", "yellow", "white", "black"})},
         {"backgroundMagenta", ruler.backgroundOk},
+        {"backgroundCornersBgra", Json::array({
+            HexBytes(ruler.corners[0], 4),
+            HexBytes(ruler.corners[1], 4),
+            HexBytes(ruler.corners[2], 4),
+            HexBytes(ruler.corners[3], 4)})},
         {"pass", referencePass},
         {"detail", ruler.detail},
         {"bmp", Utf8(referenceBmp)},
@@ -1062,6 +1325,12 @@ int Run(const Options& options)
             {"height", kWindowHeight},
             {"fps", options.fps},
             {"bitrate", options.bitrate},
+            {"inputFormat", "ARGB"},
+            {"outputRange", "full"},
+            {"colorPrimaries", "BT.709"},
+            {"transferCharacteristics", "BT.709"},
+            {"matrixCoefficients", "BT.709"},
+            {"chromaFormat", "4:2:0"},
             {"output", Utf8(encoderConfig.outputPath)},
             {"error", Utf8(encoderError)},
             {"verdict", encoderReady ? "INITIALIZED" : "ENCODER_BLOCKED"},
@@ -1081,9 +1350,11 @@ int Run(const Options& options)
         window.Destroy();
         return Fail(result, options.outDir, "WGC_START_FAILED", error, 13);
     }
+    PrintLine(L"POC-WGC steady capture started");
 
     bool gotFirstFrame = false;
     const int64_t warmupStart = QpcNow();
+    int64_t lastWarmupLog = warmupStart;
     while (QpcDeltaMs(warmupStart, QpcNow()) < 3000.0)
     {
         window.PumpMessages();
@@ -1095,6 +1366,12 @@ int Run(const Options& options)
             break;
         }
         if (!capture.Error().empty()) break;
+        if (QpcDeltaMs(lastWarmupLog, QpcNow()) >= 1000.0)
+        {
+            lastWarmupLog = QpcNow();
+            PrintLine(L"POC-WGC steady waiting arrived=" + std::to_wstring(capture.Arrived()) +
+                L" error=" + capture.Error());
+        }
     }
     if (!gotFirstFrame)
     {
@@ -1368,6 +1645,8 @@ int wmain(int argc, wchar_t** argv)
         Usage();
         return 0;
     }
+    if (options.encoderSelfTest)
+        return RunEncoderSelfTest(options);
     if (options.plan)
         return PrintPlan();
     return Run(options);

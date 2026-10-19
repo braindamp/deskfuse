@@ -200,6 +200,17 @@ bool NvEncoder::Initialize(ID3D11Device* device, ID3D11Texture2D* const* slotTex
     encodeConfig_.encodeCodecConfig.h264Config.chromaFormatIDC = 1;
     encodeConfig_.encodeCodecConfig.h264Config.sliceMode = 0;
     encodeConfig_.encodeCodecConfig.h264Config.sliceModeData = 0;
+    auto& vui = encodeConfig_.encodeCodecConfig.h264Config.h264VUIParameters;
+    vui.videoSignalTypePresentFlag = 1;
+    vui.videoFormat = NV_ENC_VUI_VIDEO_FORMAT_COMPONENT;
+    vui.videoFullRangeFlag = 1;
+    vui.colourDescriptionPresentFlag = 1;
+    vui.colourPrimaries = NV_ENC_VUI_COLOR_PRIMARIES_BT709;
+    vui.transferCharacteristics = NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
+    vui.colourMatrix = NV_ENC_VUI_MATRIX_COEFFS_BT709;
+    vui.timingInfoPresentFlag = 1;
+    vui.numUnitInTicks = 1;
+    vui.timeScale = static_cast<uint32_t>(config.fps) * 2;
 
     NV_ENC_INITIALIZE_PARAMS init{};
     init.version = NV_ENC_INITIALIZE_PARAMS_VER;
@@ -330,6 +341,7 @@ bool NvEncoder::Encode(int slot, uint64_t timestamp, uint32_t frameIndex, uint32
         error = L"ENCODER_BLOCKED: " + StatusText(L"NvEncEncodePicture", status);
         return Fail(error);
     }
+    ++framesSubmitted_;
 
     const int64_t lockStart = QpcNow();
     NV_ENC_LOCK_BITSTREAM lock{};
@@ -368,6 +380,16 @@ bool NvEncoder::Flush(std::wstring& error)
 {
     if (!session_ || !functions_) return true;
 
+    // With frameIntervalP=1 and no B-frames, a synchronous encode produces one
+    // bitstream per submitted picture. Sending EOS and then locking again can
+    // block forever once the last picture has already been drained, so only
+    // enter the EOS drain path when frames are actually pending.
+    if (framesEncoded_ >= framesSubmitted_)
+    {
+        file_.flush();
+        return true;
+    }
+
     NV_ENC_PIC_PARAMS picture{};
     picture.version = NV_ENC_PIC_PARAMS_VER;
     picture.inputWidth = static_cast<uint32_t>(width_);
@@ -383,14 +405,24 @@ bool NvEncoder::Flush(std::wstring& error)
         return Fail(error);
     }
 
-    for (int i = 0; i < 600; ++i)
+    int emptyWaits = 0;
+    for (int i = 0; i < 240; ++i)
     {
         NV_ENC_LOCK_BITSTREAM lock{};
         lock.version = NV_ENC_LOCK_BITSTREAM_VER;
         lock.outputBitstream = bitstream_;
-        lock.doNotWait = 0;
+        // A blocking lock after EOS can wait forever once every delayed frame has
+        // been drained. Poll briefly instead, then treat the final NEED_MORE_INPUT
+        // as the normal end of the stream.
+        lock.doNotWait = 1;
         status = functions_->nvEncLockBitstream(session_, &lock);
-        if (status == NV_ENC_ERR_NEED_MORE_INPUT) break;
+        if (status == NV_ENC_ERR_NEED_MORE_INPUT)
+        {
+            if (++emptyWaits >= 50) break;
+            Sleep(5);
+            continue;
+        }
+        emptyWaits = 0;
         if (status != NV_ENC_SUCCESS)
         {
             error = L"ENCODER_BLOCKED: " + StatusText(L"NvEncLockBitstream(flush)", status);
