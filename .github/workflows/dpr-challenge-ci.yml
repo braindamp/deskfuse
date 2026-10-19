@@ -2,12 +2,13 @@ name: DPR challenge software checks
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'diagnostics/dpi-propagation-20261019']
     paths:
       - '.github/workflows/dpr-challenge-ci.yml'
       - 'windows/agent/**'
       - 'android/app/src/main/java/com/focuswindow/client/profile/**'
       - 'tools/run-dpr-challenge.ps1'
+      - 'tools/df-density-readonly.cpp'
   workflow_dispatch:
 
 permissions:
@@ -29,6 +30,15 @@ jobs:
           dotnet-version: '8.0.x'
       - name: Compile host (never install FocusIdd)
         run: dotnet build windows/agent/FocusWindow.Agent/FocusWindow.Agent.csproj -c Release -p:Platform=x64 -warnaserror
+      - name: Compile independent native Win32 DPI ruler (no display changes)
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\\Microsoft Visual Studio\\Installer\\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw 'MSVC C++ build tools missing from Windows CI runner' }
+          $vcvars = Join-Path $vs 'VC\\Auxiliary\\Build\\vcvars64.bat'
+          cmd.exe /d /c "`"$vcvars`" >nul && cl /nologo /W4 /WX /EHsc /std:c++17 /DUNICODE /D_UNICODE tools\\df-density-readonly.cpp user32.lib shcore.lib /Fe:tools\\df-density-readonly.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'Native ruler compile failed' }
       - name: Run unit and simulated tests (no display changes)
         run: dotnet test windows/agent/FocusWindow.Tests/FocusWindow.Tests.csproj -c Release --verbosity minimal
       - name: Windows PowerShell 5.1 wrapper smoke (plan-only; no driver needed)
