@@ -26,6 +26,7 @@
 #include <vector>
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "shcore.lib")
+#pragma comment(lib, "gdi32.lib")
 
 namespace {
 constexpr std::array<int, 12> kScales{{100, 125, 150, 175, 200, 225,
@@ -288,13 +289,98 @@ void PrintOne(const Record& r) {
                << r.width * 100.0 / r.maximum << L"x"
                << r.height * 100.0 / r.maximum << L" DIPs\n";
 }
+// Independent PIXEL witness. The normal no-arguments path above is still read-only.
+// This mode temporarily paints a DPI-sized green ruler on the named monitor;
+// the DeskFuse host measures its exact pixels in FocusIdd's captured BGRA frames.
+// It does not adjust resolution, Windows scaling, driver state, or other monitors.
+constexpr wchar_t kRulerClass[] = L"DeskFuse.Density.NativeRuler";
+LRESULT CALLBACK RulerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_PAINT) {
+        PAINTSTRUCT paint{};
+        HDC dc = BeginPaint(hwnd, &paint);
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        HBRUSH background = CreateSolidBrush(RGB(255, 0, 255));
+        FillRect(dc, &client, background);
+        DeleteObject(background);
+        const UINT dpi = GetDpiForWindow(hwnd);
+        const int side = static_cast<int>(std::lround(100.0 * dpi / 96.0));
+        const int offset = static_cast<int>(std::lround(50.0 * dpi / 96.0));
+        RECT square{offset, offset, offset + side, offset + side};
+        HBRUSH green = CreateSolidBrush(RGB(0, 255, 0));
+        FillRect(dc, &square, green);
+        DeleteObject(green);
+        EndPaint(hwnd, &paint);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+int RunNativeRuler(const std::wstring& gdi, const int holdMs) {
+    FindMonitorCtx query{gdi, nullptr};
+    EnumDisplayMonitors(nullptr, nullptr, FindMonitor,
+                        reinterpret_cast<LPARAM>(&query));
+    if (!query.result) {
+        std::wcerr << L"NATIVE_RULER_MONITOR_NOT_FOUND: " << gdi << L"\n";
+        return 3;
+    }
+    MONITORINFO info{};
+    info.cbSize = sizeof(info);
+    if (!GetMonitorInfoW(query.result, &info)) return 4;
+    WNDCLASSEXW klass{};
+    klass.cbSize = sizeof(klass);
+    klass.hInstance = GetModuleHandleW(nullptr);
+    klass.lpfnWndProc = RulerProc;
+    klass.lpszClassName = kRulerClass;
+    if (!RegisterClassExW(&klass)) return 5;
+    const auto& rect = info.rcMonitor;
+    HWND hwnd = CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+        kRulerClass, L"", WS_POPUP, rect.left, rect.top,
+        rect.right - rect.left, rect.bottom - rect.top,
+        nullptr, nullptr, klass.hInstance, nullptr);
+    if (!hwnd) {
+        std::wcerr << L"NATIVE_RULER_CREATE_FAILED: " << GetLastError() << L"\n";
+        UnregisterClassW(kRulerClass, klass.hInstance);
+        return 6;
+    }
+    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    SetWindowPos(hwnd, HWND_TOPMOST, rect.left, rect.top,
+                 rect.right - rect.left, rect.bottom - rect.top,
+                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    const UINT dpi = GetDpiForWindow(hwnd);
+    const int px = static_cast<int>(std::lround(100.0 * dpi / 96.0));
+    std::wcout << L"NATIVE_RULER gdi=" << gdi << L" dpi=" << dpi
+               << L" drawn-side-px=" << px << L" hold-ms=" << holdMs << L"\n";
+    std::wcout.flush();
+    const ULONGLONG end = GetTickCount64() + static_cast<ULONGLONG>(holdMs);
+    while (GetTickCount64() < end) {
+        MSG msg{};
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        Sleep(15);
+    }
+    DestroyWindow(hwnd);
+    UnregisterClassW(kRulerClass, klass.hInstance);
+    return 0;
+}
 }  // namespace
 
-int wmain() {
+int wmain(int argc, wchar_t** argv) {
     // Affects this diagnostic process ONLY; no system-level or monitor DPI change.
     if (!SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)) {
         std::wcerr << L"WARNING: PMv2 context unavailable (process already configured?); "
                    << L"effective-DPI cross-check may be virtualized.\n";
+    }
+    if (argc > 1 && std::wcscmp(argv[1], L"--ruler-window") == 0) {
+        if (argc != 5 || std::wcscmp(argv[3], L"--hold-ms") != 0) {
+            std::wcerr << L"Usage: df-density-readonly.exe --ruler-window \\\\.\\DISPLAY23 --hold-ms 6000\n";
+            return 2;
+        }
+        wchar_t* end = nullptr;
+        const long hold = std::wcstol(argv[4], &end, 10);
+        if (*end != L'\0' || hold < 1000 || hold > 15000) return 2;
+        return RunNativeRuler(argv[2], static_cast<int>(hold));
     }
     std::wcout << L"DeskFuse READ-ONLY density comparison. No driver installs, display SET, "
                << L"registry writes, or mode changes.\n";
