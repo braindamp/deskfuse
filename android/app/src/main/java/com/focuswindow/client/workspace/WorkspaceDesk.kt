@@ -147,7 +147,7 @@ fun WorkspaceDesk(
                 Text("DESKFUSE / DESK", color = lime, fontWeight = FontWeight.Bold, fontSize = 14.sp)
                 Row {
                     TextButton(onClick = onRefresh) { Text("Refresh") }
-                    TextButton(onClick = onClose) { Text("Close") }
+                    TextButton(onClick = onClose) { Text("Desktop") }
                 }
             }
             Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 8.dp)) {
