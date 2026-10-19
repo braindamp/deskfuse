@@ -117,6 +117,7 @@ internal static class DprChallengeLab
         var run = args.Contains("--run");
         var try350 = args.Contains("--try-350");
         var beyondCap = args.Contains("--try-above-cap");
+        var isolateDiagIdentity = args.Contains("--isolate-diag-identity");
         var nativeWitnessExe = Option(args, "--native-witness");
         if (nativeWitnessExe is not null && !File.Exists(nativeWitnessExe))
             throw new ArgumentException("--native-witness must identify an existing executable.");
@@ -141,6 +142,7 @@ internal static class DprChallengeLab
                 $"600-DIP hypothesis max {DprChallengeTheory.PredictedMaximum(m.Width, m.Height, 600)}%");
         Console.WriteLine("  Requested target: genuine 336 DPI; 350 physical pixels for a 100-DIP square.");
         Console.WriteLine($"  Post-write wait: {settleMs} ms (change with --settle-ms 10000).");
+        if (isolateDiagIdentity) Console.WriteLine("  Virtual display identity includes EDID diagonal (isolated cap experiment).");
         Console.WriteLine("  Independent PMv2 witness: tools/df-density-readonly.cpp, run while a mode is attached.");
         Console.WriteLine("  A full 1440x3120 GPU/NVENC crop is NOT implemented by this lab.");
         if (!run)
@@ -219,7 +221,9 @@ internal static class DprChallengeLab
                 {
                     var (mmW, mmH) = PhysicalSize.FromDiagonal(diag, mode.Width, mode.Height);
                     var request = new MonitorRequest(mode.Width, mode.Height, 60, mmW, mmH,
-                        PhysicalSize.StableSerial("DeskFuse.DprChallenge." + mode), TargetScale);
+                        PhysicalSize.StableSerial("DeskFuse.DprChallenge." + mode +
+                            (isolateDiagIdentity ? ".diag." + diag.ToString(CultureInfo.InvariantCulture) : "")),
+                        TargetScale);
                     monitor = await backend.CreateMonitorAsync(request, heartbeatStop.Token)
                         .ConfigureAwait(false);
                     CheckPhysical(guard, before, row, "arrival");
@@ -413,6 +417,7 @@ internal static class DprChallengeLab
                 InitialPhysicalMonitors = before.Monitors,
                 OptInWrite = try350,
                 OptInAboveCap = beyondCap,
+                IsolateDiagIdentity = isolateDiagIdentity,
                 Failure = failure,
                 Observations = observations
             };
