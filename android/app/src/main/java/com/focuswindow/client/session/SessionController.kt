@@ -199,7 +199,8 @@ class SessionController(
                 phoneMicJob = scope.launch {
                     try {
                         capture.capture { pcm ->
-                            if (phoneMicStreamId != msg.streamId ||
+                            if (!phoneMicForeground || !phoneMicRequested ||
+                                phoneMicStreamId != msg.streamId ||
                                 !transport.sendPhoneMicrophone(msg.streamId, pcm)) {
                                 throw IOException("Phone microphone transport ended")
                             }
@@ -208,7 +209,7 @@ class SessionController(
                             phoneMicFailed = true
                             stopPhoneMicrophoneLocal()
                             _phoneMicStatus.value = "Unavailable"
-                            transport.send(ClientMessage.Microphone("stop"))
+                            scope.launch { transport.send(ClientMessage.Microphone("stop")) }
                         }
                     } catch (cancelled: CancellationException) {
                         throw cancelled
@@ -217,7 +218,7 @@ class SessionController(
                             phoneMicFailed = true
                             stopPhoneMicrophoneLocal()
                             _phoneMicStatus.value = "Unavailable"
-                            transport.send(ClientMessage.Microphone("stop"))
+                            scope.launch { transport.send(ClientMessage.Microphone("stop")) }
                         }
                     }
                 }
