@@ -203,7 +203,16 @@ sealed interface ClientMessage {
         val protocolVersion: Int = PROTOCOL_VERSION,
         val clientVersion: String,
         val profile: PhoneProfile,
-        val role: String = "display",
+    ) : ClientMessage
+
+    // Never send a role flag in ordinary "hello": pre-bridge Windows hosts
+    // would ignore it and start a virtual monitor. Older hosts reject this
+    // distinct first-message type without acquiring the display.
+    @Serializable @SerialName("bridge_hello")
+    data class BridgeHello(
+        val protocolVersion: Int = PROTOCOL_VERSION,
+        val clientVersion: String,
+        val profile: PhoneProfile,
     ) : ClientMessage
 
     /** FR-DPI-09 — rotation/fold/font-scale re-derive the TARGET, nothing else. */
