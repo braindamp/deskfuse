@@ -83,4 +83,5 @@ public sealed record HostServices(
     IDeviceCredentialStore? DeviceCredentials = null,
     Func<IHostAudioCapture>? CreateAudioCapture = null,
     IDisplaySessionAdmission? DisplayAdmission = null,
-    Func<string, IPhoneMicrophoneSink?>? CreatePhoneMicrophoneSink = null);
+    Func<string, IPhoneMicrophoneSink?>? CreatePhoneMicrophoneSink = null,
+    Func<string, bool>? CanUsePhoneMicrophone = null);
