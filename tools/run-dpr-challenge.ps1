@@ -11,11 +11,17 @@ param(
     [switch]$Try350,
     [switch]$TryAboveCap,
     [ValidateRange(500,30000)][int]$SettleMs = 1500,
+    [string]$NativeWitnessExe = '',
     [ValidateRange(30,600)][int]$TimeoutSeconds = 300
 )
 $ErrorActionPreference = 'Stop'
 if (!(Test-Path -LiteralPath $AgentExe -PathType Leaf)) { throw "Agent not found: $AgentExe" }
 $AgentExe = (Resolve-Path -LiteralPath $AgentExe).Path
+if ($NativeWitnessExe) {
+    if (!(Test-Path -LiteralPath $NativeWitnessExe -PathType Leaf)) { throw "Native witness not found: $NativeWitnessExe" }
+    $NativeWitnessExe = (Resolve-Path -LiteralPath $NativeWitnessExe).Path
+    if ($NativeWitnessExe.Contains('"')) { throw 'Native witness path contains an unsupported quote character.' }
+}
 if ($Modes -notmatch '^\d{3,4}x\d{3,4}(,\d{3,4}x\d{3,4}){0,9}$') {
     throw 'Modes must be a comma-separated list of at most 10 WIDTHxHEIGHT entries.'
 }
@@ -48,6 +54,7 @@ if ($Run) {
 $line = 'dpi-challenge --modes "' + $Modes + '" --diag-mm ' + $DiagonalMm +
     ' --out "' + $OutDirectory + '" --settle-ms ' + $SettleMs
 if ($Run) { $line += ' --run --i-accept-virtual-display-test' }
+if ($NativeWitnessExe) { $line += ' --native-witness "' + $NativeWitnessExe + '"' }
 if ($Try350) { $line += ' --try-350' }
 if ($TryAboveCap) { $line += ' --try-above-cap --i-accept-unsupported-scale-risk' }
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
