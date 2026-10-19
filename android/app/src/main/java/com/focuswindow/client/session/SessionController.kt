@@ -201,6 +201,9 @@ class SessionController(
 
                 is ServerMessage.Stage -> {
                     if (msg.stage == "file" || msg.stage == "files") _fileStatus.emit(msg.detail)
+                    if (msg.stage == "window_focus") _windowFocusEvents.emit(msg.detail == "activated")
+                    // Hosts predating session-scoped source IDs send this failure stage.
+                    if (msg.stage == "window") _windowFocusEvents.emit(false)
                     if (msg.fatal) {
                         _state.value = SessionState.Failed(
                             msg.stage, msg.detail, msg.remediation, recoverable = true,
@@ -242,8 +245,6 @@ class SessionController(
                 is ServerMessage.FileData -> receiveFileData(msg)
 
                 is ServerMessage.WindowList -> _windows.value = msg.windows
-
-                is ServerMessage.WindowFocus -> _windowFocusEvents.emit(msg.activated)
 
                 is ServerMessage.Clipboard -> {
                     if (pendingClipboardRead && msg.mime == "text/plain" && msg.text != null &&
