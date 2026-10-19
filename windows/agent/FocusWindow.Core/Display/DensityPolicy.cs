@@ -88,6 +88,9 @@ public enum PlanKind
     /// stay 1:1 at the highest allowed scale, so the layout is WIDER than the phone's.
     /// </summary>
     CappedWiderLayout,
+    /// <summary>A larger backing desktop was measured at exact DPI; the phone sees
+    /// a 1:1 pixel viewport with its native logical and physical dimensions.</summary>
+    VerifiedViewport,
 }
 public sealed record DensityPlan(
     PlanKind Kind,
@@ -103,7 +106,7 @@ public sealed record DensityPlan(
 {
     public int PlannedDpi => WindowsScale.DpiFor(ScalePercent);
     /// <summary>True only if BOTH the pixel mapping and the density are exactly the phone's.</summary>
-    public bool WouldBeNative => Kind == PlanKind.Exact && PixelsOneToOne;
+    public bool WouldBeNative => (Kind == PlanKind.Exact || Kind == PlanKind.VerifiedViewport) && PixelsOneToOne;
 }
 public static class DensityPolicy
 {
