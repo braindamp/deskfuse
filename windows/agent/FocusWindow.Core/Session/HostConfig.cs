@@ -22,6 +22,9 @@ public sealed record HostOptions
     /// <summary>Opt-in per-phone exact-DPR virtual backing display calibration.
     /// Remains experimental until real-device viewport/window UX is qualified.</summary>
     public bool AdaptiveDpiViewport { get; init; }
+    // Separate PC-side authorization: a paired device cannot capture mixed PC
+    // output without an explicit host launch flag. Default deny.
+    public bool AllowPcAudio { get; init; }
 }
 /// <summary>Decides whether a phone that just authenticated may use this PC (default: ask the user).</summary>
 public interface IApprovalPolicy
