@@ -95,6 +95,15 @@ internal static class ProbeWindow
     private static WindowDensityReport RunOnStaThread(
         RectI bounds, bool drawRuler, Func<(byte[] Bgra, int Width, int Height)?> captureNewest)
     {
+        // WinForms can create an independent STA using an inherited awareness
+        // context. Require PMv2 on THAT thread, otherwise 96 DPI means the
+        // window was DPI-unaware, not that Windows clamped the monitor.
+        var previousContext = Native.SetThreadDpiAwarenessContext(Native.CtxPerMonitorV2);
+        if (previousContext == IntPtr.Zero)
+            throw new DisplayException("probe-dpi-context",
+                "Could not establish PerMonitorV2 DPI awareness on the probe STA.");
+        try
+        {
         var target = new Rectangle(bounds.X, bounds.Y, bounds.Width, bounds.Height);
         using var form = new ProbeForm(target, drawRuler);
         form.Show();
@@ -145,5 +154,7 @@ internal static class ProbeWindow
         }
         form.Close();
         return new WindowDensityReport(dpi, awareness, window, client, DensityNegotiator.RulerDips, mw, mh, rulerOk, note);
+        }
+        finally { Native.SetThreadDpiAwarenessContext(previousContext); }
     }
 }
