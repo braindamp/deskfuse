@@ -70,6 +70,10 @@ class SessionController(
     val windows: StateFlow<List<WindowEntry>> = _windows.asStateFlow()
     private val _pcAudioStatus = MutableStateFlow("Off")
     val pcAudioStatus: StateFlow<String> = _pcAudioStatus.asStateFlow()
+    // Features requested by a companion device are distinct from OS-provisioned
+    // endpoints. All activeCapabilities stay empty until real providers exist.
+    private val _bridgeState = MutableStateFlow<ServerMessage.BridgeState?>(null)
+    val bridgeState: StateFlow<ServerMessage.BridgeState?> = _bridgeState.asStateFlow()
     private var pcAudioRequested = false
     private var hostPcAudioAvailable = false
     private var pcAudioOutput: PcAudioOutput? = null
@@ -140,6 +144,7 @@ class SessionController(
 
     fun start(payload: PairingPayload, profile: PhoneProfile) {
         hostPcAudioAvailable = false
+        _bridgeState.value = null
         stopPcAudioLocal()
         this.payload = payload
         this.profile = profile
@@ -280,6 +285,8 @@ class SessionController(
                 is ServerMessage.FileData -> receiveFileData(msg)
 
                 is ServerMessage.WindowList -> _windows.value = msg.windows
+
+                is ServerMessage.BridgeState -> _bridgeState.value = msg
 
                 is ServerMessage.AudioState -> {
                     when (msg.state) {
@@ -604,6 +611,7 @@ class SessionController(
     }
 
     fun stop(reason: String = "user ended the session") {
+        _bridgeState.value = null
         stopPcAudioLocal()
         pendingClipboardRead = false
         uploadJob?.cancel()
