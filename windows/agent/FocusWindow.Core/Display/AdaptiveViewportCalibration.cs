@@ -78,30 +78,41 @@ public sealed class AdaptiveViewportCalibration
 
         var requestedDpi = WindowsScale.DpiFor(percent.Value);
         if (Math.Abs(requestedDpi - phone.ExpectedDpi) > 1) return null;
-        var widthMax = MaxEligibleWidth(phone.PhysicalH);
-        if (widthMax < phone.PhysicalW ||
+        // A portrait phone usually needs extra width; after rotation the
+        // restrictive axis may be height. 600/480 DIPs are search hints only.
+        var expandWidth = phone.Dpr * 600.0 - phone.PhysicalW >=
+                          phone.Dpr * 480.0 - phone.PhysicalH;
+        var phoneExtent = expandWidth ? phone.PhysicalW : phone.PhysicalH;
+        var fixedExtent = expandWidth ? phone.PhysicalH : phone.PhysicalW;
+        var extentMax = MaxEligibleWidth(fixedExtent);
+        if (extentMax < phoneExtent ||
             !CanUseBacking(phone.PhysicalW, phone.PhysicalH, phone.PhysicalW, phone.PhysicalH))
             return null;
 
         var refresh = Math.Min(phone.MaxRefreshHz, 120);
         var serial = PhysicalSize.StableSerial(phone.DeviceId);
         MonitorInfo? lastMonitor = null;
-        int? lastWidth = null;
+        int? lastExtent = null;
         ScaleCaps? lastCaps = null;
 
-        async Task<ScaleCaps?> AtWidth(int width)
+        (int Width, int Height) Backing(int extent) =>
+            expandWidth ? (extent, phone.PhysicalH) : (phone.PhysicalW, extent);
+
+        async Task<ScaleCaps?> AtExtent(int extent)
         {
             ct.ThrowIfCancellationRequested();
-            if (!CanUseBacking(width, phone.PhysicalH, phone.PhysicalW, phone.PhysicalH))
+            var (width, height) = Backing(extent);
+            if (!CanUseBacking(width, height, phone.PhysicalW, phone.PhysicalH))
                 return null;
-            if (lastWidth == width && lastCaps is not null) return lastCaps;
-            progress?.Invoke("Calibrating display density", $"Testing {width} px width at {percent}%");
+            if (lastExtent == extent && lastCaps is not null) return lastCaps;
+            progress?.Invoke("Calibrating display density",
+                $"Testing {width}x{height} px at {percent}%");
             var (mmW, mmH) = PhysicalSize.FromDiagonal(phone.DiagonalMm,
-                width, phone.PhysicalH);
+                width, height);
             lastMonitor = await _backend.CreateMonitorAsync(
-                new MonitorRequest(width, phone.PhysicalH, refresh, mmW, mmH,
+                new MonitorRequest(width, height, refresh, mmW, mmH,
                     serial, percent.Value), ct).ConfigureAwait(false);
-            lastWidth = width;
+            lastExtent = extent;
             lastCaps = _backend.ReadScaleCaps(lastMonitor);
             var safety = _guard.Verify(_before);
             if (!safety.Clean)
@@ -116,44 +127,47 @@ public sealed class AdaptiveViewportCalibration
         var candidate = 0;
         if (RememberVerifiedWidth &&
             VerifiedWidths.TryGetValue(cacheKey, out var remembered) &&
-            CanUseBacking(remembered, phone.PhysicalH, phone.PhysicalW, phone.PhysicalH))
+            CanUseBacking(Backing(remembered).Width, Backing(remembered).Height,
+                phone.PhysicalW, phone.PhysicalH))
         {
             // One monitor instead of ~10 during reconnect. Still reverify
             // DPI, scale cap, ruler and physical displays before streaming.
             candidate = remembered;
-            _log.Info($"adaptive DPI using previously verified {candidate} px width");
+            _log.Info($"adaptive DPI reusing verified {candidate} px " +
+                (expandWidth ? "width" : "height"));
         }
         if (candidate == 0)
         {
             // Windows' reported cap is a cheap eligibility test only.
             // Never infer rendered DPI from the cap (see 2240 observation).
-            var initial = await AtWidth(phone.PhysicalW).ConfigureAwait(false);
+            var initial = await AtExtent(phoneExtent).ConfigureAwait(false);
             if (initial is null) return null;
             if (initial.MaxPercent >= percent.Value)
             {
-                candidate = phone.PhysicalW;
+                candidate = phoneExtent;
             }
             else
             {
                 // 600-DIP is a SEARCH SEED, not a Windows rule.
-                var estimated = Math.Max(phone.PhysicalW + 2,
-                    (int)Math.Ceiling(6.0 * percent.Value / 2.0) * 2);
-                var upper = Math.Min(widthMax, estimated);
-                var upperCaps = await AtWidth(upper).ConfigureAwait(false);
+                var hintDips = expandWidth ? 600.0 : 480.0;
+                var estimated = Math.Max(phoneExtent + 2,
+                    (int)Math.Ceiling(hintDips * percent.Value / 100.0 / 2.0) * 2);
+                var upper = Math.Min(extentMax, estimated);
+                var upperCaps = await AtExtent(upper).ConfigureAwait(false);
                 if (upperCaps is null || upperCaps.MaxPercent < percent.Value)
                 {
-                    upper = widthMax;
-                    upperCaps = await AtWidth(upper).ConfigureAwait(false);
+                    upper = extentMax;
+                    upperCaps = await AtExtent(upper).ConfigureAwait(false);
                 }
                 if (upperCaps is null || upperCaps.MaxPercent < percent.Value)
                     return null;
 
-                var lower = phone.PhysicalW;
+                var lower = phoneExtent;
                 while (upper - lower > 2)
                 {
                     var mid = ((lower + upper) / 4) * 2;
                     if (mid <= lower) mid = lower + 2;
-                    var caps = await AtWidth(mid).ConfigureAwait(false);
+                    var caps = await AtExtent(mid).ConfigureAwait(false);
                     if (caps is { MaxPercent: var max } && max >= percent.Value)
                         upper = mid;
                     else
@@ -170,9 +184,10 @@ public sealed class AdaptiveViewportCalibration
         // subsequent widths are tested before falling back honestly.
         for (var offset = 0; offset <= 6; offset += 2)
         {
-            var width = candidate + offset;
-            if (width > widthMax) break;
-            var caps = await AtWidth(width).ConfigureAwait(false);
+            var extent = candidate + offset;
+            if (extent > extentMax) break;
+            var caps = await AtExtent(extent).ConfigureAwait(false);
+            var (width, height) = Backing(extent);
             if (caps is null || caps.MaxPercent < percent.Value) continue;
             var monitor = lastMonitor!;
             var beforeScale = caps.CurrentPercent;
@@ -184,7 +199,7 @@ public sealed class AdaptiveViewportCalibration
                 {
                     attemptedScale = true;
                     var set = _backend.TrySetScale(monitor, percent.Value);
-                    _log.Info($"adaptive DPI {width} -4: {set.Detail}");
+                    _log.Info($"adaptive DPI {width}x{height} -4: {set.Detail}");
                     if (!set.Ok) continue;
                 }
 
@@ -212,7 +227,7 @@ public sealed class AdaptiveViewportCalibration
                         probe.Client.Width == phone.PhysicalW &&
                         probe.Client.Height == phone.PhysicalH &&
                         ruler;
-                    _log.Info($"adaptive DPI {width} attempt {attempt}: " +
+                    _log.Info($"adaptive DPI {width}x{height} attempt {attempt}: " +
                         $"caps current={actualCaps?.CurrentPercent}, monitor={readback.MonitorDpiX}, " +
                         $"PMv2={probe?.WindowDpi} [{probe?.Awareness}], " +
                         $"ruler={probe?.MeasuredRulerWidthPx}x{probe?.MeasuredRulerHeightPx}, " +
@@ -224,35 +239,37 @@ public sealed class AdaptiveViewportCalibration
                             "Physical monitors changed during DPI proof: " +
                             string.Join("; ", physical.Drift));
                     succeeded = true;
-                    if (RememberVerifiedWidth) VerifiedWidths[cacheKey] = width;
+                    if (RememberVerifiedWidth) VerifiedWidths[cacheKey] = extent;
 
                     var ev = new EvidenceLog();
-                    ev.Pass("adaptive-cutoff", "Minimum even-pixel width with eligible Windows scaling",
-                        $"{width} px candidate at {percent}%", $"{width} px", 
+                    ev.Pass("adaptive-cutoff", "Minimum eligible backing axis extent",
+                        $"{extent} px {(expandWidth ? "width" : "height")} candidate at {percent}%",
+                        $"{extent} px", 
                         "Measured -3 cap boundary; each session rechecks rendered DPI and pixels.");
                     ev.Pass("adaptive-dpi", "True phone density in captured 1:1 viewport",
                         $"{requestedDpi} DPI; {expectedRulerPx}px ruler",
                         $"{probe!.WindowDpi} DPI; {probe.MeasuredRulerWidthPx}x{probe.MeasuredRulerHeightPx}px");
                     ev.Pass("adaptive-viewport", "Native phone frame without resampling",
                         $"{phone.PhysicalW}x{phone.PhysicalH} px",
-                        $"{viewport.Width}x{viewport.Height} px at backing {width}x{phone.PhysicalH}");
-                    var crop = width > phone.PhysicalW;
+                        $"{viewport.Width}x{viewport.Height} px at backing {width}x{height}");
+                    var crop = width > phone.PhysicalW || height > phone.PhysicalH;
                     var plan = new DensityPlan(crop ? PlanKind.VerifiedViewport : PlanKind.Exact,
                         phone.PhysicalW, phone.PhysicalH, percent.Value, percent.Value,
                         true, phone.PhysicalW * 100.0 / percent.Value,
                         phone.PhysicalH * 100.0 / percent.Value,
                         DensityPolicy.TokenDp(percent.Value, phone.Dpr),
-                        crop ? $"Verified high-density {width}x{phone.PhysicalH} backing desktop " +
+                        crop ? $"Verified high-density {width}x{height} backing desktop " +
                                $"with an exact {phone.PhysicalW}x{phone.PhysicalH} phone viewport." : null);
                     progress?.Invoke("Display density verified",
-                        $"{requestedDpi} DPI, {width} px backing, {phone.PhysicalW} px visible");
+                        $"{requestedDpi} DPI, {width}x{height} backing, " +
+                        $"{phone.PhysicalW}x{phone.PhysicalH} visible");
                     return new NegotiationOutcome(monitor, plan, readback, actualCaps,
                         probe, readback.MonitorDpiX, true,
                         beforeScale == percent.Value ? DensityMethod.AlreadyCorrect :
                         DensityMethod.PerMonitorOverride, null, ev,
                         RestoreScalePercent: attemptedScale ? beforeScale : null);
                 }
-                _log.Warn($"adaptive DPI {width}: available according to Windows, " +
+                _log.Warn($"adaptive DPI {width}x{height}: available according to Windows, " +
                     "but real PMv2/ruler test failed; no native claim");
             }
             finally
