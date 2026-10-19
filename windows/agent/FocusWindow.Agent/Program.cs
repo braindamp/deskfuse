@@ -33,7 +33,7 @@ internal static class Program
           trusted-phones --forget-phone ID   revoke a phone and its approvals
           --new-pairing      rotate the host public key (all phones must re-enroll)
           --single-session   exit after one phone session
-          --enable-phone-mic --phone-mic-output-id ID
+          --enable-phone-mic --phone-mic-output-id ID --phone-mic-device-id DEVICE_ID
                              DEV BRIDGE: opt in to route authorized Android microphone
                              into explicitly selected Windows render endpoint ID.
                              Select a virtual cable's corresponding RECORDING device
@@ -137,8 +137,10 @@ internal static class Program
         // The cable adapter is deliberately unavailable without both flags.
         // A Windows render-endpoint ID is not a DeskFuse PnP mic identity.
         var microphoneOutputId = Opt(args, "--phone-mic-output-id");
+        var microphoneDeviceId = Opt(args, "--phone-mic-device-id");
         var allowMicrophone = args.Contains("--enable-phone-mic") &&
-            !string.IsNullOrWhiteSpace(microphoneOutputId);
+            !string.IsNullOrWhiteSpace(microphoneOutputId) &&
+            !string.IsNullOrWhiteSpace(microphoneDeviceId);
         var options = new HostOptions
         {
             Port = Int(args, "--port", 47810),
@@ -178,7 +180,12 @@ internal static class Program
             Windows: new WindowsWindowWorkflow(),
             CreateAudioCapture: () => new WindowsLoopbackAudioCapture(),
             CreatePhoneMicrophoneSink: allowMicrophone
-                ? _ => new WindowsPhoneMicrophoneCableSink(microphoneOutputId!)
+                ? id => string.Equals(id, microphoneDeviceId, StringComparison.Ordinal)
+                    ? new WindowsPhoneMicrophoneCableSink(microphoneOutputId!)
+                    : null
+                : null,
+            CanUsePhoneMicrophone: allowMicrophone
+                ? id => string.Equals(id, microphoneDeviceId, StringComparison.Ordinal)
                 : null,
             OnNegotiated: outcome =>
             {
