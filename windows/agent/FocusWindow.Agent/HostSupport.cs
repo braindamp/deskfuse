@@ -43,7 +43,8 @@ internal sealed class DpapiPairingStore : IPairingStore
         {
             if (!File.Exists(_path)) return null;
             var json = ProtectedData.Unprotect(File.ReadAllBytes(_path), null, DataProtectionScope.CurrentUser);
-            return JsonSerializer.Deserialize<PairingState>(json);
+            try { return JsonSerializer.Deserialize<PairingState>(json); }
+            finally { CryptographicOperations.ZeroMemory(json); }
         }
         catch (Exception ex) when (ex is CryptographicException or JsonException or IOException)
         {
@@ -53,7 +54,20 @@ internal sealed class DpapiPairingStore : IPairingStore
     public void Save(PairingState state)
     {
         var json = JsonSerializer.SerializeToUtf8Bytes(state);
-        File.WriteAllBytes(_path, ProtectedData.Protect(json, null, DataProtectionScope.CurrentUser));
+        try
+        {
+            // Atomic replacement: a crash mid-write must not destroy the identity
+            // every already-paired phone depends on.
+            var sealedBytes = ProtectedData.Protect(json, null, DataProtectionScope.CurrentUser);
+            var temp = _path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            try
+            {
+                File.WriteAllBytes(temp, sealedBytes);
+                File.Move(temp, _path, true);
+            }
+            finally { if (File.Exists(temp)) File.Delete(temp); }
+        }
+        finally { CryptographicOperations.ZeroMemory(json); }
     }
 }
 /// <summary>
