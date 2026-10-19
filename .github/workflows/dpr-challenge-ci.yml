@@ -6,6 +6,7 @@ on:
     paths:
       - '.github/workflows/dpr-challenge-ci.yml'
       - 'windows/agent/**'
+      - 'android/app/src/main/java/com/focuswindow/client/profile/**'
       - 'tools/run-dpr-challenge.ps1'
   workflow_dispatch:
 
@@ -32,3 +33,27 @@ jobs:
           $exe = Resolve-Path '.\windows\agent\FocusWindow.Agent\bin\x64\Release\net8.0-windows\FocusWindow.Agent.exe'
           & powershell.exe -NoProfile -ExecutionPolicy Bypass -File '.\tools\run-dpr-challenge.ps1' -AgentExe $exe.Path
           if ($LASTEXITCODE -ne 0) { throw "PowerShell 5.1 runner returned exit $LASTEXITCODE" }
+
+  android:
+    name: Android DPR profile unit tests and debug APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: android-actions/setup-android@v3
+        continue-on-error: true
+      - name: Install Android SDK
+        run: |
+          SDK_ROOT="/usr/local/lib/android/sdk"
+          MANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -name sdkmanager -print -quit)"
+          test -n "$MANAGER"
+          "$MANAGER" --sdk_root="$SDK_ROOT" "platforms;android-35" "build-tools;35.0.0"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+      - name: Build and test Android without devices
+        working-directory: android
+        run: bash ./gradlew :app:testDebugUnitTest :app:assembleDebug --no-daemon
