@@ -36,7 +36,7 @@ internal sealed class WindowSourceCatalog(IWindowWorkflow workflow)
                 : Convert.ToHexString(RandomNumberGenerator.GetBytes(16));
             var source = new Source(id, key, window);
             next.Add(key, source);
-            publicList.Add(new WindowItem(id, window.Title, window.AppLabel));
+            publicList.Add(new WindowItem(id, window.Title, window.AppLabel, SessionStable: true));
         }
         _byInstance = next;
         _byLogicalId = next.Values.ToDictionary(s => s.LogicalId, StringComparer.Ordinal);
