@@ -41,7 +41,8 @@ public interface IClipboardBridge
 }
 // InstanceKey is host-internal, never serialized. It distinguishes the lifetime of
 // a HWND from its name and from HWND reuse across different process lifetimes.
-public sealed record WindowItem(string Id, string Title, string AppLabel, string? InstanceKey = null);
+public sealed record WindowItem(string Id, string Title, string AppLabel,
+    string? InstanceKey = null, bool SessionStable = false);
 /// <summary>Explicit window picker: list and focus only; never move/resize physical PC windows.</summary>
 public interface IWindowWorkflow
 {
