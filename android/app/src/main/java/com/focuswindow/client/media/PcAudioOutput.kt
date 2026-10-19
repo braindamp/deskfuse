@@ -36,8 +36,10 @@ class PcAudioOutput(context: Context) {
             .setAudioAttributes(attributes)
             .setOnAudioFocusChangeListener { change ->
                 val current = track ?: return@setOnAudioFocusChangeListener
-                if (change == AudioManager.AUDIOFOCUS_GAIN) current.play()
-                else current.pause()
+                runCatching {
+                    if (change == AudioManager.AUDIOFOCUS_GAIN) current.play()
+                    else current.pause()
+                }
             }
             .build()
         if (manager.requestAudioFocus(focusRequest) != AudioManager.AUDIOFOCUS_REQUEST_GRANTED)
@@ -78,9 +80,12 @@ class PcAudioOutput(context: Context) {
         val active = track ?: return
         var written = 0
         while (written < chunk.pcm.size && streamId == chunk.streamId) {
-            val count = active.write(
-                chunk.pcm, written, chunk.pcm.size - written, AudioTrack.WRITE_BLOCKING,
-            )
+            // Android may release/pause the track during an in-flight IO write
+            // (disconnect, Bluetooth changes or audio-focus loss). Never cancel
+            // the enclosing authenticated transport job due to an audio error.
+            val count = runCatching {
+                active.write(chunk.pcm, written, chunk.pcm.size - written, AudioTrack.WRITE_BLOCKING)
+            }.getOrDefault(-1)
             if (count <= 0) break
             written += count
         }
