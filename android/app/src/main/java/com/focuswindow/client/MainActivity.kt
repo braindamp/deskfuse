@@ -409,8 +409,11 @@ class MainActivity : ComponentActivity() {
                     phoneMicStatus = phoneMicStatus,
                     onTogglePhoneMic = {
                         if (phoneMicStatus == "Unavailable") {
-                            Toast.makeText(this, "Windows has no approved phone microphone destination",
-                                Toast.LENGTH_SHORT).show()
+                            controller.togglePhoneMicrophone()
+                            if (controller.phoneMicStatus.value == "Unavailable") {
+                                Toast.makeText(this, "Windows has no approved phone microphone destination",
+                                    Toast.LENGTH_SHORT).show()
+                            }
                         } else if (phoneMicStatus in setOf("On", "Starting") ||
                             ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
                             == PackageManager.PERMISSION_GRANTED) {
