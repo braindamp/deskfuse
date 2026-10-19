@@ -294,7 +294,7 @@ void PrintOne(const Record& r) {
 // the DeskFuse host measures its exact pixels in FocusIdd's captured BGRA frames.
 // It does not adjust resolution, Windows scaling, driver state, or other monitors.
 constexpr wchar_t kRulerClass[] = L"DeskFuse.Density.NativeRuler";
-LRESULT CALLBACK RulerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+LRESULT CALLBACK RulerProc(HWND hwnd, UINT msg, WPARAM, LPARAM) {
     if (msg == WM_PAINT) {
         PAINTSTRUCT paint{};
         HDC dc = BeginPaint(hwnd, &paint);
