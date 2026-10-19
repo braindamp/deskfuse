@@ -51,7 +51,12 @@ public sealed class DevicePeerRegistry
         }
         // A reconnect supersedes an older authenticated socket of the same
         // enrollment. Never allow its eventual teardown to evict the new peer.
-        if (prior is not null) prior.Stop.Cancel();
+        if (prior is not null)
+        {
+            // Prior lease can be disposing concurrently with this Attach.
+            try { prior.Stop.Cancel(); }
+            catch (ObjectDisposedException) { /* old session already finished */ }
+        }
         return new PeerLease(this, deviceId, lease, token, peer);
     }
 
