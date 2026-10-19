@@ -114,7 +114,8 @@ data class PhoneProfile(
 
     fun validate(): List<String> = buildList {
         if (physicalW <= 0 || physicalH <= 0) add("physical size must be positive")
-        if (dpr < 1.0f || dpr > 5.0f) add("implausible dpr: $dpr")
+        if (!dpr.isFinite() || dpr < 1.0f || dpr > 5.0f)
+            add("missing or implausible Android display density: $dpr")
         if (maxRefreshHz < 24) add("implausible refresh: $maxRefreshHz")
         if (diagonalMm !in 60..500) add("implausible diagonal: ${diagonalMm}mm")
         if (safeTop < 0 || safeBottom < 0 || safeLeft < 0 || safeRight < 0) add("negative inset")
