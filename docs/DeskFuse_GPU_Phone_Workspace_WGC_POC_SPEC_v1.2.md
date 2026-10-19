@@ -4,7 +4,8 @@
 **Repository:** https://github.com/braindamp/deskfuse  
 **Proposed isolated branch:** `poc/gpu-phone-workspace-wgc`  
 **Priority:** Research POC alongside **Approach A**; this is **NOT** an Approach A replacement or permission to modify the installed driver.  
-**Related product direction:** [Window-first workspace and adaptive rendering pipelines](https://github.com/braindamp/deskfuse/blob/docs/window-first-architecture-20261019/docs/WINDOW_FIRST_WORKSPACE_AND_RENDERING_PIPELINES.md) (future design; not a POC implementation requirement).
+**Related product direction:** [Window-first workspace and adaptive rendering pipelines](https://github.com/braindamp/deskfuse/blob/docs/window-first-architecture-20261019/docs/WINDOW_FIRST_WORKSPACE_AND_RENDERING_PIPELINES.md) (future design; not a POC implementation requirement).  
+**Hardware POC access clarification (2026-10-20):** [Installed-versus-source FocusIdd ACL and elevation decision](./FOCUSIDD_DEVICE_ACL_POC_AND_PRODUCT_DECISION.md); source DD-001 already accepts ordinary-user access, but the **installed driver may still require elevation**. Do not change the installed driver for this POC.
 
 > **Agent assignment:** Build and measure a Windows 10-compatible proof of concept that displays a **1440×3120-pixel native Per-Monitor-V2 Win32 window** on the already-supported **2100×3120 FocusIdd virtual monitor at 350%/336 DPI**, captures the window **directly to a Direct3D 11 GPU texture** via **Windows.Graphics.Capture (WGC)**, and proves an **exact unresized 1440×3120 capture/encode path**. Additionally, implement/test **stable per-phone virtual-monitor identities and reconnection-time scale verification/reapplication**, so Windows/DeskFuse can retain the correct configuration per client without assuming it is applied. Record real latency, copy, VRAM, and compatibility costs. Do not touch `main`, install or replace FocusIdd, change physical displays, or claim the genuine 1440×3120 monitor problem is solved.
 
@@ -95,6 +96,8 @@ These checks are required for POC completeness and mandatory before any claim of
 - Cursor capture behavior, screen-capture border/permissions, HDR/SDR pixel formats, unsupported/protected content, device loss, encoder GPU mismatch/cross-adapter copies, frame pacing and idle-vs-changing-frame behavior.
 
 **No system-wide `ClipCursor`, global `SPI_SETWORKAREA`, permanent AppBar, user profile DPI registry keys, DLL injection, process hooking, or RDP-session switch in this experiment.** Local/input-mapped clamping can be explored *after* the capture POC, but should not modify existing user/physical desktop state.
+
+**POC device-access gate (2026-10-20):** The test agent found `D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;UD)` on the **installed** FocusIdd device. Unelevated driver-control calls fail with Access Denied. In contrast, **current `main` already includes `(A;;GA;;;IU)`** in `windows/driver/FocusIdd/FocusIdd.inf`, and `design_decisions.md` **DD-001** already accepts non-elevated interactive-user access for the eventual product. These are separate facts: source modification does not affect the installed device. Proceed with **UAC elevation for the guarded hardware test process only**; development/build remain unelevated. Do **not** reinstall the driver, edit INF/ACL or implement a broker in this POC. A broker is future security research, not a change to accepted DD-001. Record `ACCESS_DENIED_EXPECTED_UNELEVATED` and elevated outcome in the evidence. See the linked [device-access decision note](./FOCUSIDD_DEVICE_ACL_POC_AND_PRODUCT_DECISION.md).
 
 ---
 
@@ -203,9 +206,10 @@ git rev-parse HEAD  # record this precise base commit in evidence / README
 # Import only the two handoff documents from the docs branch; do not merge branches.
 git restore --source=origin/docs/window-first-architecture-20261019 -- `
     docs/DeskFuse_GPU_Phone_Workspace_WGC_POC_SPEC_v1.2.md `
-    docs/WINDOW_FIRST_WORKSPACE_AND_RENDERING_PIPELINES.md
+    docs/WINDOW_FIRST_WORKSPACE_AND_RENDERING_PIPELINES.md `
+    docs/FOCUSIDD_DEVICE_ACL_POC_AND_PRODUCT_DECISION.md
 
-# Both documentation files are now local uncommitted additions in THIS worktree.
+# These three documentation files are now local uncommitted additions in THIS worktree.
 git status --short
 ```
 
@@ -226,7 +230,15 @@ Prefer compiling the standalone C++ POC first. Existing host build (source-compa
 dotnet build .\windows\agent\FocusWindow.Agent\FocusWindow.Agent.csproj -c Release -p:Platform=x64
 ```
 
-Initial hardware preflight (only with known-good installed driver and no active phone session):
+Initial hardware preflight (**run the hardware phase in an elevated interactive PowerShell if the installed driver retains its old ACL**; do not elevate the entire IDE/build session). To open one UAC-elevated Windows PowerShell without touching the installed driver:
+
+```powershell
+Start-Process powershell.exe -Verb RunAs
+# In the newly elevated window:
+cd D:\\Coding\\DeskFuse\\dpr-gpu-wgc
+```
+
+Then run the preflight below (only with the known-good installed driver and no active phone session):
 
 ```powershell
 $agent = (Resolve-Path '.\windows\agent\FocusWindow.Agent\bin\x64\Release\net8.0-windows\FocusWindow.Agent.exe').Path
@@ -291,6 +303,7 @@ git push -u origin poc/gpu-phone-workspace-wgc
 Produce **timestamped JSON + CSV + Markdown** under `gpu-phone-workspace-evidence/` (ignored/untracked unless small and intentionally curated). Each run records:
 
 - Git commit SHA, OS build, Windows SDK, monitor topology identity, GPU model/driver, encoder backend, codec/preset/bitrate, 60/120 Hz state, measured window DPI and captured sizes.
+- **Device access:** installed FocusIdd open outcome in unelevated vs elevated process, source-INF IU setting vs actual device ACL, POC process integrity, proof of no driver/INF/security or registry modifications. Keep these separate from WGC encoder/capture failure codes.
 - Client-scoped **stable logical device identifier** (an anonymized test pseudonym in shared logs), deterministic derived virtual-monitor serial, Windows-visible monitor/EDID identity, identity-stability evidence on detach/reattach, and **cross-client isolation** results. Avoid logging device secrets or raw long-term credentials.
 - On every attachment: **desired scaling**, recommended/current/reported-max before write, whether Windows restored it vs. DeskFuse reapplied it, API result, post-settle scale readback, independent HWND DPI, ruler pixel bounds, **time to DPI-ready**, number of attempts, failure/fallback action and whether capture was correctly gated. Include 100%-reset recovery evidence or reason unavailable.
 - WGC compositor `SystemRelativeTime` and local high-resolution QPC; monotonic unit conversions, clock-domain caveats and synchronization uncertainties. Frame arrival vs compositor timestamp; capture→encoder-submit; encoder-submit→bitstream-ready; combined pipeline **p50, p95, p99**; steady-state throughput, dropped/skipped/repeated frames.
@@ -313,6 +326,7 @@ Use explicit codes such as:
 - `APP_POPUPS_NOT_IN_HWND_CAPTURE` / `MINIMIZED_NOT_CAPTURED`
 - `GPU_BENCHMARK_MEASURED` / `GPU_BENCHMARK_INCONCLUSIVE`
 - `PHYSICAL_DISPLAYS_UNCHANGED_AND_FOCUSIDD_REMOVED`
+- `ACCESS_DENIED_EXPECTED_UNELEVATED` / `ELEVATED_HARDWARE_PREFLIGHT_OK`
 - `PER_CLIENT_MONITOR_IDENTITY_STABLE` / `IDENTITY_BLOCKED_<reason>`
 - `CLIENT_SETTINGS_ISOLATED` / `CLIENT_SETTINGS_LEAKED`
 - `WINDOWS_RESTORED_SETTINGS` / `DESKFUSE_REAPPLIED_SETTINGS`
@@ -335,6 +349,7 @@ Deliver:
 4a. Per-client A→A→B→A identity/reconnect results: stable Windows-visible monitor ID, separation of preferred versus effective scale, 100%-initial-state detection/reapply, and native HWND/ruler validation before video readiness. Explain any limits in per-client Windows preference persistence and the compensating DeskFuse logic.
 5. A **GO / CONDITIONAL GO / NO-GO** recommendation explaining whether this path could be a production architecture, and **exactly what it does not solve** (not a native 1440×3120 Windows monitor; no automatic full multiwindow desktop capture).
 6. Proof after all tests: **physical monitors unchanged, FocusIdd `monitor arrived 0`**, no install or registry writes.
+7. Explicit installed-device permission finding and DD-001 reconciliation. If the POC uses an elevated process, state that this was a **temporary known-good-driver testing accommodation**, not the product privilege architecture; link `docs/FOCUSIDD_DEVICE_ACL_POC_AND_PRODUCT_DECISION.md`.
 
 **Do not wait for the DPI lead agent, and do not ask that agent to modify `main` or the driver.** The POC can proceed from the known-good supported 2100×3120/350% measurements without relying on the yet-unverified native ruler additions on the diagnostic branch. If environment/driver ownership conflicts with another active hardware test, stop and coordinate a non-overlapping run; code development can proceed independently.
 
