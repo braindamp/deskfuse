@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using FocusWindow.Core.Protocol;
 
 namespace FocusWindow.Core.Display;
@@ -15,6 +16,12 @@ public sealed class AdaptiveViewportCalibration
     // Matches FocusShared.h (driver protocol unchanged).
     public const int MaxPixels = 8_294_400;
     public const int MaxDimension = 4095;
+    private static readonly ConcurrentDictionary<string, int> VerifiedWidths = new();
+    /// <summary>
+    /// Reuse the last proven width on later reconnects within the host process.
+    /// Cached widths are NEVER trusted without a fresh DPI + pixel ruler proof.
+    /// </summary>
+    public bool RememberVerifiedWidth { get; init; } = false;
     private readonly IDisplayBackend _backend;
     private readonly IPhysicalDisplayGuard _guard;
     private readonly DisplaySnapshot _before;
@@ -104,46 +111,56 @@ public sealed class AdaptiveViewportCalibration
             return lastCaps;
         }
 
-        // Windows' reported cap is used as a cheap *eligibility test* only.
-        // We never infer successful rendering from it (see 2240x3120 observation).
-        var initial = await AtWidth(phone.PhysicalW).ConfigureAwait(false);
-        if (initial is null) return null;
-        int candidate;
-        if (initial.MaxPercent >= percent.Value)
+        var cacheKey = $"{Environment.OSVersion.Version}:{phone.DeviceId}:" +
+            $"{phone.PhysicalW}x{phone.PhysicalH}:{percent}:{phone.DiagonalMm}";
+        var candidate = 0;
+        if (RememberVerifiedWidth &&
+            VerifiedWidths.TryGetValue(cacheKey, out var remembered) &&
+            CanUseBacking(remembered, phone.PhysicalH, phone.PhysicalW, phone.PhysicalH))
         {
-            candidate = phone.PhysicalW;
+            // One monitor instead of ~10 during reconnect. Still reverify
+            // DPI, scale cap, ruler and physical displays before streaming.
+            candidate = remembered;
+            _log.Info($"adaptive DPI using previously verified {candidate} px width");
         }
-        else
+        if (candidate == 0)
         {
-            // The observed 600-DIP width is a useful starting guess, not an
-            // architectural hard-coded cutoff. Fall back to the maximum if it
-            // doesn't work on the actual Windows build/EDID.
-            var estimated = Math.Max(phone.PhysicalW + 2,
-                (int)Math.Ceiling(6.0 * percent.Value / 2.0) * 2);
-            var upper = Math.Min(widthMax, estimated);
-            var upperCaps = await AtWidth(upper).ConfigureAwait(false);
-            if (upperCaps is null || upperCaps.MaxPercent < percent.Value)
+            // Windows' reported cap is a cheap eligibility test only.
+            // Never infer rendered DPI from the cap (see 2240 observation).
+            var initial = await AtWidth(phone.PhysicalW).ConfigureAwait(false);
+            if (initial is null) return null;
+            if (initial.MaxPercent >= percent.Value)
             {
-                upper = widthMax;
-                upperCaps = await AtWidth(upper).ConfigureAwait(false);
+                candidate = phone.PhysicalW;
             }
-            if (upperCaps is null || upperCaps.MaxPercent < percent.Value)
-                return null;
+            else
+            {
+                // 600-DIP is a SEARCH SEED, not a Windows rule.
+                var estimated = Math.Max(phone.PhysicalW + 2,
+                    (int)Math.Ceiling(6.0 * percent.Value / 2.0) * 2);
+                var upper = Math.Min(widthMax, estimated);
+                var upperCaps = await AtWidth(upper).ConfigureAwait(false);
+                if (upperCaps is null || upperCaps.MaxPercent < percent.Value)
+                {
+                    upper = widthMax;
+                    upperCaps = await AtWidth(upper).ConfigureAwait(false);
+                }
+                if (upperCaps is null || upperCaps.MaxPercent < percent.Value)
+                    return null;
 
-            var lower = phone.PhysicalW; // known ineligible
-            // Find the FIRST eligible even pixel width. In addition to the
-            // validated boundary, every production use must pass a pixel probe.
-            while (upper - lower > 2)
-            {
-                var mid = ((lower + upper) / 4) * 2;
-                if (mid <= lower) mid = lower + 2;
-                var caps = await AtWidth(mid).ConfigureAwait(false);
-                if (caps is { MaxPercent: var max } && max >= percent.Value)
-                    upper = mid;
-                else
-                    lower = mid;
+                var lower = phone.PhysicalW;
+                while (upper - lower > 2)
+                {
+                    var mid = ((lower + upper) / 4) * 2;
+                    if (mid <= lower) mid = lower + 2;
+                    var caps = await AtWidth(mid).ConfigureAwait(false);
+                    if (caps is { MaxPercent: var max } && max >= percent.Value)
+                        upper = mid;
+                    else
+                        lower = mid;
+                }
+                candidate = upper;
             }
-            candidate = upper;
         }
 
         // Some Windows 10 transitions return 336 monitor DPI with a 96-DPI
@@ -207,6 +224,7 @@ public sealed class AdaptiveViewportCalibration
                             "Physical monitors changed during DPI proof: " +
                             string.Join("; ", physical.Drift));
                     succeeded = true;
+                    if (RememberVerifiedWidth) VerifiedWidths[cacheKey] = width;
 
                     var ev = new EvidenceLog();
                     ev.Pass("adaptive-cutoff", "Minimum even-pixel width with eligible Windows scaling",
@@ -250,6 +268,7 @@ public sealed class AdaptiveViewportCalibration
                 }
             }
         }
+        if (RememberVerifiedWidth) VerifiedWidths.TryRemove(cacheKey, out _);
         return null;
     }
 }
