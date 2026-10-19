@@ -38,10 +38,12 @@ AddReg = FocusIdd_HardwareDeviceSettings
 [FocusIdd_HardwareDeviceSettings]
 HKR,, "UpperFilters",  %REG_MULTI_SZ%, "IndirectKmd"
 HKR, "WUDF", "DeviceGroupId", %REG_SZ%, "FocusIddDriverGroup"
-; Explicit per-device access. The normal user cannot issue display-control IOCTLs.
-; BA = Administrators, SY = SYSTEM, UD = User-Mode Driver Framework hosts.
-; This avoids relying on the Display class default security for our custom interface.
-HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;UD)"
+; Explicit per-device access. BA = Administrators, SY = SYSTEM, UD = User-Mode Driver
+; Framework hosts. IU = interactive users: the agent must work without elevation
+; (design_decisions.md DD-001, accepted 2026-10-19 -- "who cares about more virtual
+; displays created"). Trade-off accepted: any local user process can open the
+; display-control interface; the on-console phone approval prompt stays the gate.
+HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;UD)(A;;GA;;;IU)"
 
 [FocusIdd_Install.NT.Services]
 ; WUDFRd is the function driver (associated service) for this UMDF device.
