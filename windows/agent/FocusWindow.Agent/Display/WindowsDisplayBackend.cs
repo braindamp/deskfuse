@@ -189,6 +189,31 @@ internal sealed class WindowsDisplayBackend : IDisplayBackend
         }
         return await ProbeWindow.RunAsync(monitor.Bounds, drawRuler, Capture).ConfigureAwait(false);
     }
+    /// <summary>
+    /// Measure a 100-DIP square painted by an independent native Win32 process.
+    /// That process is started by DprChallengeLab while the virtual monitor is
+    /// attached. This observer ONLY reads actual FocusIdd BGRA frames; it never
+    /// creates windows or infers pixel sizes from a DPI API.
+    /// </summary>
+    internal async Task<RectI?> MeasureExternalNativeRulerAsync(MonitorInfo monitor,
+        CancellationToken ct)
+    {
+        if (_surface is null) return null;
+        using var frames = _surface.CreateFrameSource();
+        var buffer = Array.Empty<byte>();
+        for (var attempt = 0; attempt < 18; attempt++)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (frames.TryRead(350, ref buffer, out var info) &&
+                info.Width == monitor.Bounds.Width && info.Height == monitor.Bounds.Height &&
+                DensityMeasure.TryFindColorBox(buffer.AsSpan(), info.Width,
+                    info.Height, 0, 255, 0, 40, out var square, 300))
+                return square;
+            await Task.Delay(100, ct).ConfigureAwait(false);
+        }
+        return null;
+    }
+
     public async Task RemoveMonitorAsync(CancellationToken ct)
     {
         var driver = _driver;
