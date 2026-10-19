@@ -35,9 +35,18 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
+      # The runner no longer puts sdkmanager on PATH; the setup action still
+      # installs cmdline-tools, but its legacy 'tools' package step can fail.
+      - uses: android-actions/setup-android@v3
+        continue-on-error: true
       - name: Install Android SDK 35
         run: |
-          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+          SDK_ROOT="/usr/local/lib/android/sdk"
+          MANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -name sdkmanager -print -quit)"
+          test -n "$MANAGER"
+          "$MANAGER" --sdk_root="$SDK_ROOT" "platforms;android-35" "build-tools;35.0.0"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
       - name: Android build and unit tests
         working-directory: android
         run: bash ./gradlew :app:testDebugUnitTest :app:assembleDebug --no-daemon --stacktrace
