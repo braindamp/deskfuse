@@ -145,6 +145,12 @@ internal sealed class PhoneSession
             else _conn.SendControl(ServerMessages.Stage(stage, detail));
         }
 
+        // Initialize the driver interface on this thread BEFORE starting
+        // the heartbeat task, so two threads never race to open the handle.
+        var initialDriver = _backend.ReadDriverHealth();
+        if (!initialDriver.Reachable)
+            throw new DisplayException("driver",
+                "FocusIdd did not respond before adaptive density calibration.");
         // During calibration there is no HousekeepingAsync yet. Keep the
         // existing FocusIdd ten-second dead-agent removal timer fed while
         // Windows creates/replaces candidate virtual displays.
