@@ -18,3 +18,7 @@ PROTECTED_FILE_AUDIT.txt
 .vs/
 *.user
 *.log
+
+# POC hardware evidence stays local
+gpu-phone-workspace-evidence/
+
