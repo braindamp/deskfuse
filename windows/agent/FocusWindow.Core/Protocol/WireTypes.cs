@@ -35,7 +35,8 @@ public sealed record PhoneProfile(
     public string Validate()
     {
         if (PhysicalW <= 0 || PhysicalH <= 0) return "physical size must be positive";
-        if (Dpr < 1.0f || Dpr > 5.0f) return $"implausible dpr {Dpr}";
+        if (!float.IsFinite(Dpr) || Dpr < 1.0f || Dpr > 5.0f)
+            return $"missing or implausible phone DPR {Dpr}; calibration requires the Android device's measured density";
         if (MaxRefreshHz < 24) return $"implausible refresh {MaxRefreshHz}";
         if (DiagonalMm is < 60 or > 500) return $"implausible diagonal {DiagonalMm} mm";
         return "";
