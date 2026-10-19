@@ -190,7 +190,7 @@ class MainActivity : ComponentActivity() {
             val pcFiles by controller.files.collectAsState()
             LaunchedEffect(windows, state is SessionState.Streaming) {
                 if (state is SessionState.Streaming) {
-                    desk.sync(windows.map { DeskWindow(it.id, it.title, it.appLabel) })
+                    desk.sync(windows.map { DeskWindow(it.id, it.title, it.appLabel, it.sessionStable) })
                 } else {
                     desk.clearWindows()
                     showWindows = false
