@@ -44,7 +44,7 @@ public sealed class CameraFreePairingTests
     [Fact]
     public async Task First_encrypted_packet_selects_the_matching_device_identity()
     {
-        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
         var port = ((IPEndPoint)listener.LocalEndpoint).Port;
         using var tcp = new TcpClient();
@@ -67,5 +67,6 @@ public sealed class CameraFreePairingTests
         var sealedPacket = phone.Seal(Encoding.UTF8.GetBytes("hello"));
         Assert.Equal("hello", Encoding.UTF8.GetString(host.Open(sealedPacket)));
         Assert.Equal("phone-0002", host.CredentialDeviceId);
+        listener.Stop();
     }
 }
