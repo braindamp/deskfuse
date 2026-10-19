@@ -10,6 +10,7 @@ param(
     [switch]$Run,
     [switch]$Try350,
     [switch]$TryAboveCap,
+    [switch]$IsolateDiagIdentity,
     [ValidateRange(500,30000)][int]$SettleMs = 1500,
     [string]$NativeWitnessExe = '',
     [ValidateRange(30,600)][int]$TimeoutSeconds = 300
@@ -53,6 +54,7 @@ $line = 'dpi-challenge --modes "' + $Modes + '" --diag-mm ' + $DiagonalMm +
     ' --out "' + $OutDirectory + '" --settle-ms ' + $SettleMs
 if ($Run) { $line += ' --run --i-accept-virtual-display-test' }
 if ($NativeWitnessExe) { $line += ' --native-witness "' + $NativeWitnessExe + '"' }
+if ($IsolateDiagIdentity) { $line += ' --isolate-diag-identity' }
 if ($Try350) { $line += ' --try-350' }
 if ($TryAboveCap) { $line += ' --try-above-cap --i-accept-unsupported-scale-risk' }
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
