@@ -321,12 +321,18 @@ class SessionController(
                 is ServerMessage.AudioState -> {
                     when (msg.state) {
                         "started" -> {
-                            if (pcAudioRequested && pcAudioOutput?.start(
+                            if (!pcAudioDesired || !pcAudioRequested) {
+                                // User switched Off while host was opening the
+                                // previous request. Reject the late success.
+                                stopPcAudioLocal()
+                                transport.send(ClientMessage.Audio("stop_pc"))
+                            } else if (pcAudioOutput?.start(
                                     msg.streamId, msg.sampleRate, msg.channels, msg.format,
                                 ) == true) {
                                 activePcAudioStreamId = msg.streamId
                                 _pcAudioStatus.value = "On"
                             } else {
+                                pcAudioFailedOnConnection = true
                                 stopPcAudioLocal()
                                 _pcAudioStatus.value = "Unavailable"
                                 transport.send(ClientMessage.Audio("stop_pc"))
