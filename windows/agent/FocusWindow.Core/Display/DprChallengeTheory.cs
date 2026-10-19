@@ -38,29 +38,39 @@ public static class DprChallengeTheory
     }
 
     /// <summary>
-    /// Exact BGRA row copy from a driver frame. This is a TEST-ONLY CPU crop, not a
-    /// production GPU crop or a claim that NVENC has been wired to the viewport.
-    /// Every output pixel equals one source pixel; no interpolation or resizing.
+    /// Exact 1:1 BGRA crop with caller-owned reusable output memory.
+    /// No interpolation, scale filter or stream size change.
+    /// The driver still renders the full virtual surface; copying only the
+    /// phone viewport avoids encoding the hidden pixels.
     /// </summary>
-    public static byte[] CopyViewportBgra(ReadOnlySpan<byte> fullBgra, int sourceWidth,
-        int sourceHeight, RectI viewport)
+    public static void CopyViewportBgra(ReadOnlySpan<byte> fullBgra,
+        int sourceWidth, int sourceHeight, RectI viewport, Span<byte> destination)
     {
         if (sourceWidth <= 0 || sourceHeight <= 0 ||
             viewport.X < 0 || viewport.Y < 0 || viewport.Width <= 0 || viewport.Height <= 0 ||
             (long)viewport.X + viewport.Width > sourceWidth ||
             (long)viewport.Y + viewport.Height > sourceHeight)
-            throw new ArgumentOutOfRangeException(nameof(viewport), "Crop must be within the frame.");
+            throw new ArgumentOutOfRangeException(nameof(viewport),
+                "Viewport must fit inside the backing display.");
         var sourceBytes = checked((long)sourceWidth * sourceHeight * 4);
-        var destinationBytes = checked((long)viewport.Width * viewport.Height * 4);
-        if (fullBgra.Length < sourceBytes || destinationBytes > int.MaxValue)
-            throw new ArgumentException("Invalid BGRA source length or crop dimensions.");
-        var result = new byte[(int)destinationBytes];
+        var targetBytes = checked((long)viewport.Width * viewport.Height * 4);
+        if (fullBgra.Length < sourceBytes || targetBytes > int.MaxValue ||
+            destination.Length < targetBytes)
+            throw new ArgumentException("Insufficient BGRA source/destination length.");
         var rowLength = checked(viewport.Width * 4);
         for (var y = 0; y < viewport.Height; y++)
         {
-            var offset = checked(((viewport.Y + y) * sourceWidth + viewport.X) * 4);
-            fullBgra.Slice(offset, rowLength).CopyTo(result.AsSpan(y * rowLength, rowLength));
+            var inputRow = checked(((viewport.Y + y) * sourceWidth + viewport.X) * 4);
+            fullBgra.Slice(inputRow, rowLength).CopyTo(destination.Slice(y * rowLength, rowLength));
         }
+    }
+
+    /// <summary>Allocation convenience for evidence capture; streaming reuses a buffer.</summary>
+    public static byte[] CopyViewportBgra(ReadOnlySpan<byte> fullBgra, int sourceWidth,
+        int sourceHeight, RectI viewport)
+    {
+        var result = new byte[checked(viewport.Width * viewport.Height * 4)];
+        CopyViewportBgra(fullBgra, sourceWidth, sourceHeight, viewport, result);
         return result;
     }
 }
