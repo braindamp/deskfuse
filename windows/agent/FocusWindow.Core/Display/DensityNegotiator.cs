@@ -28,7 +28,8 @@ public sealed record NegotiationOutcome(
     bool Native,
     DensityMethod Method,
     string? DegradedReason,
-    EvidenceLog Evidence);
+    EvidenceLog Evidence,
+    int? RestoreScalePercent = null);
 /// <summary>
 /// The density ladder (FR-DPI-02..04). Every rung is followed by a READ-BACK; nothing is
 /// assumed to have worked.
