@@ -123,6 +123,7 @@ sealed interface ServerMessage {
         /** FR-OPS-01 — the build the user can pin / roll back to. */
         val channel: String,
         val pcAudioAvailable: Boolean = false,
+        val phoneMicrophoneBridgeAvailable: Boolean = false,
     ) : ServerMessage
 
     @Serializable @SerialName("target")
@@ -172,6 +173,16 @@ sealed interface ServerMessage {
 
     @Serializable @SerialName("window_list")
     data class WindowList(val windows: List<WindowEntry>) : ServerMessage
+
+    @Serializable @SerialName("microphone_state")
+    data class MicrophoneState(
+        val state: String,
+        val streamId: Int = 0,
+        val sampleRate: Int = 16000,
+        val channels: Int = 1,
+        val format: String = "pcm_s16le",
+        val detail: String? = null,
+    ) : ServerMessage
 
     @Serializable @SerialName("bridge_state")
     data class BridgeState(
@@ -255,6 +266,9 @@ sealed interface ClientMessage {
 
     @Serializable @SerialName("audio")
     data class Audio(val action: String) : ClientMessage
+
+    @Serializable @SerialName("microphone")
+    data class Microphone(val action: String) : ClientMessage
 
     /** One explicitly selected Android document, delivered in bounded encrypted chunks. */
     @Serializable @SerialName("files")
