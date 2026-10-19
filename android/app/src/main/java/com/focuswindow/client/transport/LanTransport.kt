@@ -246,6 +246,25 @@ class LanTransport(
         }
     }
 
+    /** Forward only host-authorized microphone stream packets.
+     *  Returns false if the authenticated transport disappeared.
+     */
+    suspend fun sendPhoneMicrophone(streamId: Int, pcm16le: ByteArray): Boolean =
+        withContext(Dispatchers.IO) {
+            val sender = writer ?: return@withContext false
+            if (!running.get()) return@withContext false
+            try {
+                sender.microphone(streamId, pcm16le)
+                true
+            } catch (ex: java.io.IOException) {
+                val lost = running.getAndSet(false)
+                closeQuietly()
+                if (lost) _events.emit(TransportEvent.Closed(
+                    ex.message ?: "microphone send failed", recoverable = true))
+                false
+            }
+        }
+
     suspend fun close(reason: String) {
         if (!running.get()) return
         runCatching { send(ClientMessage.Bye(reason)) }
