@@ -53,6 +53,9 @@ fun StateScreen(
     onScan: () -> Unit,
     onDismiss: () -> Unit,
 ) {
+    // Streaming and recoverable reconnect both retain the live/last-decoded
+    // Android surface. An opaque empty Box would hide the actual video.
+    if (state is SessionState.Streaming || state is SessionState.Reconnecting) return
     Box(
         Modifier
             .fillMaxSize()
