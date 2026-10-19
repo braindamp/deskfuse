@@ -28,6 +28,9 @@ class WireFrame(
     val arrivedAtNanos: Long = System.nanoTime(),
 )
 
+/** Audio PCM payloads are independent and may be dropped to avoid old sound. */
+data class PcmAudioChunk(val streamId: Int, val pcm: ByteArray)
+
 /**
  * FR-TRUST-03 — direct LAN transport is the default and the only path required
  * for the free tier. One TCP connection carries two logical channels:
@@ -58,6 +61,11 @@ class LanTransport(
         onBufferOverflow = BufferOverflow.SUSPEND, // never discard approval/target/control state
     )
     val control: SharedFlow<ServerMessage> = _control.asSharedFlow()
+    private val _audio = MutableSharedFlow<PcmAudioChunk>(
+        extraBufferCapacity = 8,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST,
+    )
+    val audio: SharedFlow<PcmAudioChunk> = _audio.asSharedFlow()
 
     private val _frames = MutableSharedFlow<WireFrame>(
         replay = 0,
@@ -155,6 +163,19 @@ class LanTransport(
                         val sealed = ByteArray(len).also { inStream.readFully(it) }
                         val plain = secure.open(sealed)
                         _frames.emit(parseFrame(plain))
+                    }
+
+                    KIND_AUDIO -> {
+                        val len = inStream.readInt()
+                        require(len in 32..4096) { "audio frame too large: $len" }
+                        val sealed = ByteArray(len).also { inStream.readFully(it) }
+                        val plain = secure.open(sealed)
+                        require(plain.size in 8..3844 && (plain.size - 4) % 4 == 0) {
+                            "invalid PCM packet"
+                        }
+                        val streamId = java.nio.ByteBuffer.wrap(plain, 0, 4)
+                            .order(java.nio.ByteOrder.BIG_ENDIAN).int
+                        _audio.emit(PcmAudioChunk(streamId, plain.copyOfRange(4, plain.size)))
                     }
 
                     KIND_PING -> {
@@ -285,6 +306,7 @@ class LanTransport(
         const val KIND_CONTROL = 1
         const val KIND_FRAME = 2
         const val KIND_PING = 3
+        const val KIND_AUDIO = 5
 
         const val CONNECT_TIMEOUT_MS = 4_000
         const val READ_TIMEOUT_MS = 20_000
