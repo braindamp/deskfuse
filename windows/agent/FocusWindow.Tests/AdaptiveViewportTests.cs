@@ -1,0 +1,142 @@
+using FocusWindow.Core.Display;
+using FocusWindow.Core.Protocol;
+using Xunit;
+
+namespace FocusWindow.Tests;
+
+public sealed class AdaptiveViewportTests
+{
+    private static AdaptiveViewportCalibration NewCalibration(FakeDisplayBackend backend) =>
+        new(backend, new StaticGuard(), new StaticGuard().Snapshot(), new ListLog())
+        {
+            InitialSettlingMs = 0,
+            RetrySettlingMs = 0
+        };
+
+    [Theory]
+    [InlineData(3.5f, 350)]
+    [InlineData(2.0f, 200)]
+    [InlineData(2.25f, 225)]
+    [InlineData(2.5f, 250)]
+    [InlineData(3.0f, 300)]
+    [InlineData(4.0f, 400)]
+    [InlineData(2.625f, null)]
+    [InlineData(3.4f, null)]
+    [InlineData(float.NaN, null)]
+    [InlineData(float.PositiveInfinity, null)]
+    public void Requested_scale_comes_only_from_exact_phone_dpr(float dpr, int? scale)
+    {
+        Assert.Equal(scale, AdaptiveViewportCalibration.ExactWindowsStep(
+            TestProfiles.Flagship(dpr)));
+    }
+
+    [Fact]
+    public async Task Binary_boundary_search_finds_minimum_even_width_not_fixed_2100()
+    {
+        await using var backend = new FakeDisplayBackend(2700, 3120)
+        {
+            RecommendedPercent = 100,
+            CurrentPercent = 100,
+            MaxPercentFor = (w, _) => w >= 2098 ? 350 : 225
+        };
+        var phone = TestProfiles.Flagship();
+        var result = await NewCalibration(backend).TryRunAsync(phone, null,
+            CancellationToken.None);
+
+        Assert.NotNull(result);
+        Assert.Equal(PlanKind.VerifiedViewport, result!.Plan.Kind);
+        Assert.True(result.Native);
+        Assert.Equal(2098, result.Monitor.Bounds.Width); // not 2100 or 2240
+        Assert.Equal(1440, result.Plan.PixelW); // phone-sized encode
+        Assert.Equal(3120, result.Plan.PixelH);
+        Assert.Equal(336, result.EffectiveDpi);
+        Assert.Equal(100, result.RestoreScalePercent);
+        Assert.Equal(411.4, result.Plan.CanvasDpW, 1);
+        Assert.Contains(backend.Created, request => request.Width == 2096);
+        Assert.Contains(backend.Created, request => request.Width == 2098);
+        Assert.DoesNotContain(backend.SetCalls, x => x > 350);
+    }
+
+    [Fact]
+    public async Task A_336_dpi_monitor_with_96_dpi_PMv2_is_not_accepted()
+    {
+        await using var backend = new FakeDisplayBackend(2700, 3120)
+        {
+            RecommendedPercent = 100,
+            CurrentPercent = 100,
+            MaxPercentFor = (w, _) => w >= 2100 ? 350 : 225,
+            ProbeViewportWindowDpi = 96
+        };
+        var result = await NewCalibration(backend).TryRunAsync(
+            TestProfiles.Flagship(), null, CancellationToken.None);
+        Assert.Null(result);
+        Assert.True(backend.ViewportProbeCalls >= 3);
+        Assert.Equal(100, backend.CurrentPercent); // restored after every failed width
+        Assert.Contains(350, backend.SetCalls);
+        Assert.Contains(100, backend.SetCalls);
+    }
+
+    [Fact]
+    public async Task The_ruler_must_be_measured_even_if_dpi_looks_right()
+    {
+        await using var backend = new FakeDisplayBackend(2700, 3120)
+        {
+            RecommendedPercent = 100,
+            MaxPercentFor = (w, _) => w >= 2100 ? 350 : 225,
+            ProbeRulerOk = false
+        };
+        Assert.Null(await NewCalibration(backend).TryRunAsync(
+            TestProfiles.Flagship(), null, CancellationToken.None));
+        Assert.Equal(100, backend.CurrentPercent);
+    }
+
+    [Fact]
+    public async Task If_the_native_monitor_allows_the_dpr_it_needs_no_crop()
+    {
+        await using var backend = new FakeDisplayBackend
+        {
+            RecommendedPercent = 350,
+            CurrentPercent = 350,
+            MaxPercentFor = (_, _) => 350
+        };
+        var result = await NewCalibration(backend).TryRunAsync(
+            TestProfiles.Flagship(), null, CancellationToken.None);
+        Assert.NotNull(result);
+        Assert.Equal(PlanKind.Exact, result!.Plan.Kind);
+        Assert.Equal(1440, result.Monitor.Bounds.Width);
+        Assert.True(result.Native);
+        Assert.Null(result.RestoreScalePercent);
+        Assert.Empty(backend.SetCalls);
+    }
+
+    [Fact]
+    public void Exact_pixel_crop_reuses_output_and_correctly_maps_input()
+    {
+        const int width = 7, height = 3;
+        var input = new byte[width * height * 4];
+        for (int i = 0; i < width * height; i++)
+        {
+            input[i * 4] = (byte)(i + 1);
+            input[i * 4 + 3] = 255;
+        }
+        var output = new byte[4 * 3 * 4];
+        DprChallengeTheory.CopyViewportBgra(input, width, height,
+            new RectI(0, 0, 4, 3), output);
+        Assert.Equal(new byte[] { 1, 2, 3, 4, 8, 9, 10, 11, 15, 16, 17, 18 },
+            Enumerable.Range(0, 12).Select(n => output[n * 4]).ToArray());
+
+        var geometry = new InputGeometry(new RectI(3440, 0, 1440, 3120), 1440, 3120);
+        Assert.Equal((3440, 0), geometry.ToDesktop(0, 0));
+        Assert.Equal((4879, 3119), geometry.ToDesktop(1439, 3119));
+    }
+
+    [Fact]
+    public void Exceeding_shared_frame_budget_fails_without_an_unsafe_mode()
+    {
+        Assert.Equal(2658, AdaptiveViewportCalibration.MaxEligibleWidth(3120));
+        Assert.False(AdaptiveViewportCalibration.CanUseBacking(
+            3000, 3120, 1440, 3120));
+        Assert.True(AdaptiveViewportCalibration.CanUseBacking(
+            2100, 3120, 1440, 3120));
+    }
+}
