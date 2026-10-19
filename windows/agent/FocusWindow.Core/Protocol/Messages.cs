@@ -69,8 +69,13 @@ public static class ClientMessageParser
                 "hello" => new ClientHello(
                     root["protocolVersion"]?.GetValue<int>() ?? 0,
                     root["clientVersion"]?.GetValue<string>() ?? "?",
-                    PhoneProfile.Parse(root["profile"]!.AsObject()),
-                    root["role"]?.GetValue<string>() ?? "display"),
+                    PhoneProfile.Parse(root["profile"]!.AsObject())),
+                // A distinct first-message type ensures pre-bridge hosts reject
+                // accessory sessions instead of creating a virtual display.
+                "bridge_hello" => new ClientHello(
+                    root["protocolVersion"]?.GetValue<int>() ?? 0,
+                    root["clientVersion"]?.GetValue<string>() ?? "?",
+                    PhoneProfile.Parse(root["profile"]!.AsObject()), "media"),
                 "profile" => new ClientProfile(PhoneProfile.Parse(root["profile"]!.AsObject())),
                 "density" => new ClientDensity(root["preset"]!.GetValue<string>()),
                 "refresh" => new ClientRefresh(root["hz"]!.GetValue<int>()),
