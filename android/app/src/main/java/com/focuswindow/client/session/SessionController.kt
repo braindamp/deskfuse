@@ -66,6 +66,8 @@ class SessionController(
     private val downloadBusy = AtomicBoolean(false)
     private val _windows = MutableStateFlow<List<WindowEntry>>(emptyList())
     val windows: StateFlow<List<WindowEntry>> = _windows.asStateFlow()
+    private val _windowFocusEvents = MutableSharedFlow<Boolean>(extraBufferCapacity = 4)
+    val windowFocusEvents = _windowFocusEvents.asSharedFlow()
     private val transport = LanTransport(scope)
     private lateinit var decoder: VideoDecoder
 
@@ -240,6 +242,8 @@ class SessionController(
                 is ServerMessage.FileData -> receiveFileData(msg)
 
                 is ServerMessage.WindowList -> _windows.value = msg.windows
+
+                is ServerMessage.WindowFocus -> _windowFocusEvents.emit(msg.activated)
 
                 is ServerMessage.Clipboard -> {
                     if (pendingClipboardRead && msg.mime == "text/plain" && msg.text != null &&
