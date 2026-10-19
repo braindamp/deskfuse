@@ -33,6 +33,12 @@ internal static class Program
           trusted-phones --forget-phone ID   revoke a phone and its approvals
           --new-pairing      rotate the host public key (all phones must re-enroll)
           --single-session   exit after one phone session
+          --enable-phone-mic --phone-mic-output-id ID
+                             DEV BRIDGE: opt in to route authorized Android microphone
+                             into explicitly selected Windows render endpoint ID.
+                             Select a virtual cable's corresponding RECORDING device
+                             in Windows apps. This does NOT install a DeskFuse mic.
+                             Never select physical speakers for this adapter.
           --enable-pc-audio  allow approved phones to request mixed PC playback sound
                              (OFF by default; may include audio from other PC apps)
           --ruler-probe      verify rendered density with a pixel ruler at the start of every session
@@ -128,6 +134,11 @@ internal static class Program
     {
         using var log = new ConsoleLog(Opt(args, "--log"));
         var bundled = Path.Combine(AppContext.BaseDirectory, "ffmpeg.exe");
+        // The cable adapter is deliberately unavailable without both flags.
+        // A Windows render-endpoint ID is not a DeskFuse PnP mic identity.
+        var microphoneOutputId = Opt(args, "--phone-mic-output-id");
+        var allowMicrophone = args.Contains("--enable-phone-mic") &&
+            !string.IsNullOrWhiteSpace(microphoneOutputId);
         var options = new HostOptions
         {
             Port = Int(args, "--port", 47810),
@@ -143,8 +154,12 @@ internal static class Program
             CameraFreePairing = !args.Contains("--legacy-qr"),
             AdaptiveDpiViewport = args.Contains("--adaptive-dpi"),
             AllowPcAudio = args.Contains("--enable-pc-audio"),
+            AllowPhoneMicrophone = allowMicrophone,
         };
         log.Info($"Focus Window host agent {Version}");
+        if (allowMicrophone)
+            log.Warn("Development microphone bridge ENABLED for one explicitly selected Windows playback endpoint. " +
+                "Use a virtual audio cable only; a physical endpoint would play the phone microphone aloud.");
         var guards = new List<PhysicalDisplayGuard>();
         WindowsDisplayBackend? backend = null;
         var services = new HostServices(
@@ -162,6 +177,9 @@ internal static class Program
             Clipboard: new WindowsClipboardBridge(),
             Windows: new WindowsWindowWorkflow(),
             CreateAudioCapture: () => new WindowsLoopbackAudioCapture(),
+            CreatePhoneMicrophoneSink: allowMicrophone
+                ? _ => new WindowsPhoneMicrophoneCableSink(microphoneOutputId!)
+                : null,
             OnNegotiated: outcome =>
             {
                 var path = Path.Combine(AppData.Directory, "last-session-evidence.md");
