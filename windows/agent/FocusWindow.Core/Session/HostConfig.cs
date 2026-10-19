@@ -40,6 +40,16 @@ public interface IClipboardBridge
     Task WriteTextAsync(string text, CancellationToken ct);
 }
 public sealed record WindowItem(string Id, string Title, string AppLabel);
+/// <summary>
+/// One explicitly requested loopback of the user's default Windows output.
+/// Callbacks are synchronous; the sender must copy the transient audio memory.
+/// </summary>
+public interface IHostAudioCapture : IDisposable
+{
+    int SampleRate { get; }
+    int Channels { get; }
+    void Start(Action<ReadOnlyMemory<byte>> onSamples);
+}
 /// <summary>Explicit window picker: list and focus only; never move/resize physical PC windows.</summary>
 public interface IWindowWorkflow
 {
@@ -55,4 +65,5 @@ public sealed record HostServices(
     Action<NegotiationOutcome>? OnNegotiated = null,
     IClipboardBridge? Clipboard = null,
     IWindowWorkflow? Windows = null,
-    IDeviceCredentialStore? DeviceCredentials = null);
+    IDeviceCredentialStore? DeviceCredentials = null,
+    Func<IHostAudioCapture>? CreateAudioCapture = null);
