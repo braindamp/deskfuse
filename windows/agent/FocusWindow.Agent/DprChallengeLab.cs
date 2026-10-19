@@ -38,6 +38,10 @@ internal static class DprChallengeLab
         public int? InitialPercent { get; set; }
         public int? PostWritePercent { get; set; }
         public string? NativeWitnessOutput { get; set; }
+        public string NativeRulerVerdict { get; set; } = "NOT_RUN";
+        public int? NativeRulerProcessDpi { get; set; }
+        public int? NativeRulerWidthPx { get; set; }
+        public int? NativeRulerHeightPx { get; set; }
         public int? ReportedMaximumPercent { get; set; }
         public int? MonitorDpiX { get; set; }
         public int? WindowDpi { get; set; }
@@ -257,6 +261,23 @@ internal static class DprChallengeLab
                         Console.WriteLine("  === independent native Win32 process witness ===");
                         Console.WriteLine(row.NativeWitnessOutput);
                         Console.WriteLine("  === end independent witness ===");
+                        var nativeRuler = await RunNativeRulerWitnessAsync(nativeWitnessExe,
+                            backend, monitor, heartbeatStop.Token).ConfigureAwait(false);
+                        row.NativeRulerProcessDpi = nativeRuler.Dpi;
+                        row.NativeRulerWidthPx = nativeRuler.Width;
+                        row.NativeRulerHeightPx = nativeRuler.Height;
+                        var nativeRulerMatchesDpi = nativeRuler.Dpi is > 0 &&
+                            nativeRuler.Width is not null && nativeRuler.Height is not null &&
+                            Math.Abs(nativeRuler.Width.Value -
+                                Math.Round(100.0 * nativeRuler.Dpi.Value / 96.0)) <= 2 &&
+                            Math.Abs(nativeRuler.Height.Value -
+                                Math.Round(100.0 * nativeRuler.Dpi.Value / 96.0)) <= 2;
+                        row.NativeRulerVerdict = nativeRulerMatchesDpi
+                            ? nativeRuler.Dpi == 336 ? "336_DPI_NATIVE_PIXEL_VERIFIED"
+                                : $"NATIVE_PIXEL_VERIFIED_BUT_{nativeRuler.Dpi}_DPI"
+                            : "NATIVE_RULER_NOT_VERIFIED";
+                        Console.WriteLine("  native captured ruler: " + nativeRuler.Detail);
+                        Console.WriteLine("  native ruler verdict: " + row.NativeRulerVerdict);
                     }
                     WindowDensityReport? window = null;
                     for (var witness = 1; witness <= 3; witness++)
@@ -290,9 +311,10 @@ internal static class DprChallengeLab
                     var ruler350 = window.RulerOk == true &&
                         window.MeasuredRulerWidthPx is >= 345 and <= 355 &&
                         window.MeasuredRulerHeightPx is >= 345 and <= 355;
-                    var observed350 = window.Awareness == "PerMonitorV2" &&
+                    var observed350 = (window.Awareness == "PerMonitorV2" &&
                         window.WindowDpi >= 336 && ruler350 &&
-                        row.MonitorDpiX >= 336;
+                        row.MonitorDpiX >= 336) ||
+                        row.NativeRulerVerdict == "336_DPI_NATIVE_PIXEL_VERIFIED";
                     row.WriteVerdict = wroteScale
                         ? !row.WriteApiResult.Contains("win32-return=0", StringComparison.Ordinal)
                             ? "REJECTED"
@@ -398,14 +420,16 @@ internal static class DprChallengeLab
                 new JsonSerializerOptions { WriteIndented = true }), CancellationToken.None)
                 .ConfigureAwait(false);
             var csv = new StringBuilder();
-            csv.AppendLine("mode,diag_mm,predicted_640_max,predicted_600_max,recommended,initial,post_set,max,monitor_dpi,window_dpi,ruler_w,ruler_h,write_verdict,crop_verdict,restored,physical_unchanged,monitor_removed,error");
+            csv.AppendLine("mode,diag_mm,predicted_640_max,predicted_600_max,recommended,initial,post_set,max,monitor_dpi,window_dpi,ruler_w,ruler_h,native_process_dpi,native_ruler_w,native_ruler_h,native_ruler_verdict,write_verdict,crop_verdict,restored,physical_unchanged,monitor_removed,error");
             foreach (var o in observations)
             {
                 string Escape(object? v) => "\"" + Convert.ToString(v, CultureInfo.InvariantCulture)?.Replace("\"", "\"\"") + "\"";
                 csv.AppendLine(string.Join(",", new object?[] { o.Mode, o.EdidDiagonalMm,
                     o.Predicted640Max, o.Predicted600Max, o.RecommendedPercent, o.InitialPercent,
                     o.PostWritePercent, o.ReportedMaximumPercent, o.MonitorDpiX, o.WindowDpi, o.RulerWidthPx,
-                    o.RulerHeightPx, o.WriteVerdict, o.CropVerdict, o.RestoreResult,
+                    o.RulerHeightPx, o.NativeRulerProcessDpi, o.NativeRulerWidthPx,
+                    o.NativeRulerHeightPx, o.NativeRulerVerdict, o.WriteVerdict,
+                    o.CropVerdict, o.RestoreResult,
                     o.PhysicalDisplaysUnchanged, o.DriverMonitorRemoved, o.Error }.Select(Escape)));
             }
             await File.WriteAllTextAsync(csvFile, csv.ToString(), CancellationToken.None)
@@ -415,6 +439,65 @@ internal static class DprChallengeLab
                                               : "SWEEP INCOMPLETE/UNSAFE — " + failure);
         }
         return failure is null ? 0 : 2;
+    }
+
+    private static async Task<(string Detail, int? Dpi, int? Width, int? Height)>
+        RunNativeRulerWitnessAsync(string exe, WindowsDisplayBackend backend, MonitorInfo monitor,
+            CancellationToken ct)
+    {
+        using var child = new System.Diagnostics.Process();
+        child.StartInfo = new System.Diagnostics.ProcessStartInfo
+        {
+            FileName = Path.GetFullPath(exe),
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        };
+        child.StartInfo.ArgumentList.Add("--ruler-window");
+        child.StartInfo.ArgumentList.Add(monitor.GdiName);
+        child.StartInfo.ArgumentList.Add("--hold-ms");
+        child.StartInfo.ArgumentList.Add("6000");
+        try
+        {
+            if (!child.Start()) return ("native ruler process could not start", null, null, null);
+            var stdout = child.StandardOutput.ReadToEndAsync();
+            var stderr = child.StandardError.ReadToEndAsync();
+            await Task.Delay(500, ct).ConfigureAwait(false);
+            var box = await backend.MeasureExternalNativeRulerAsync(monitor, ct)
+                .ConfigureAwait(false);
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeout.CancelAfter(TimeSpan.FromSeconds(12));
+            try { await child.WaitForExitAsync(timeout.Token).ConfigureAwait(false); }
+            catch (OperationCanceledException)
+            {
+                if (!child.HasExited) child.Kill(entireProcessTree: true);
+                return ("native ruler process timed out or was cancelled", null, null, null);
+            }
+            var output = await stdout.ConfigureAwait(false);
+            var error = await stderr.ConfigureAwait(false);
+            var parsed = System.Text.RegularExpressions.Regex.Match(output, @"\bdpi=(\d+)\b");
+            int? dpi = parsed.Success &&
+                       int.TryParse(parsed.Groups[1].Value, CultureInfo.InvariantCulture, out var v)
+                ? v : null;
+            if (child.ExitCode != 0) return ($"native exit={child.ExitCode}: {error}", null, null, null);
+            return ($"{output.Trim()} captured=" +
+                (box is null ? "NO_GREEN_RULER_IN_DRIVER_FRAME" :
+                    $"{box.Value.Width}x{box.Value.Height}px in FocusIdd raw BGRA"),
+                dpi, box?.Width, box?.Height);
+        }
+        catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or IOException)
+        {
+            return ("native ruler witness failed: " + ex.Message, null, null, null);
+        }
+        finally
+        {
+            if (child.StartInfo is not null)
+            {
+                try { if (!child.HasExited) child.Kill(entireProcessTree: true); }
+                catch (InvalidOperationException) { }
+            }
+        }
     }
 
     private static async Task<string> RunNativeWitnessAsync(string exe, CancellationToken ct)
