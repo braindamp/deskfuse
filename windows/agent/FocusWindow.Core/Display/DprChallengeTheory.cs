@@ -24,6 +24,35 @@ public static class DprChallengeTheory
     }
 
     /// <summary>
+    /// Empirical Windows DPI-dropdown ceiling hypothesis: the effective desktop
+    /// rectangle must fit an orientation-independent 800x600 DIP minimum.
+    /// This is a MODEL, not an API contract or a promise that a -4 write will render.
+    /// Short side and long side are evaluated independently so square displays
+    /// require 800 DIPs on both axes rather than erroneously accepting 600x600.
+    /// </summary>
+    public static int PredictedMaximumForLogicalDesktop(int width, int height,
+        int minimumShortSideDips = 600, int minimumLongSideDips = 800)
+    {
+        if (width <= 0 || height <= 0 ||
+            minimumShortSideDips <= 0 || minimumLongSideDips <= 0 ||
+            minimumLongSideDips < minimumShortSideDips)
+            throw new ArgumentOutOfRangeException(nameof(width),
+                "Dimensions must be positive; long-side DIP minimum must be >= short-side DIP minimum.");
+        var shortSide = Math.Min(width, height);
+        var longSide = Math.Max(width, height);
+        var maximum = 0;
+        foreach (var percent in WindowsScale.Steps)
+        {
+            // Integer arithmetic avoids floating-point edge ambiguity at exactly
+            // 600 / 800 DIPs, which is what the boundary hardware tests exercise.
+            if (shortSide * 100L >= (long)minimumShortSideDips * percent &&
+                longSide * 100L >= (long)minimumLongSideDips * percent)
+                maximum = percent;
+        }
+        return maximum;
+    }
+
+    /// <summary>
     /// Experimental -4 packet's step offset from the recommended step.
     /// Unlike ScaleCaps.RelativeFor this intentionally does NOT check the reported cap.
     /// Never call an OS setter merely because this calculation succeeded.
