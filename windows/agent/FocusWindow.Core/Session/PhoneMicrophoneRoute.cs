@@ -30,7 +30,8 @@ internal sealed class PhoneMicrophoneRoute(
         }
         if (request.Action != "start" || !options.AllowPhoneMicrophone ||
             !options.CameraFreePairing || services.DeviceCredentials is null ||
-            services.CreatePhoneMicrophoneSink is null)
+            services.CreatePhoneMicrophoneSink is null ||
+            services.CanUsePhoneMicrophone?.Invoke(enrolledDeviceId) != true)
         {
             connection.SendControl(ServerMessages.MicrophoneState("unavailable",
                 detail: "Phone microphone requires an enrolled device and an authorized Windows microphone destination."));
