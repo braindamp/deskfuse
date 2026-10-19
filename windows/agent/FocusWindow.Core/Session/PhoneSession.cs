@@ -140,15 +140,40 @@ internal sealed class PhoneSession
     {
         void Progress(string stage, string detail) =>
             _conn.SendControl(ServerMessages.Stage(stage, detail));
-        if (_o.AdaptiveDpiViewport)
+
+        // During calibration there is no HousekeepingAsync yet. Keep the
+        // existing FocusIdd ten-second dead-agent removal timer fed while
+        // Windows creates/replaces candidate virtual displays.
+        using var pulseStop = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var pulse = Task.Run(async () =>
         {
-            var calibrated = await new AdaptiveViewportCalibration(
-                _backend, _guard, _before, _log)
-                .TryRunAsync(phone, Progress, ct).ConfigureAwait(false);
-            if (calibrated is not null) return calibrated;
-            _log.Warn("Exact-DPR adaptive viewport not verified; reverting to honest normal density probe.");
+            try
+            {
+                while (!pulseStop.IsCancellationRequested)
+                {
+                    _backend.Heartbeat();
+                    await Task.Delay(1000, pulseStop.Token).ConfigureAwait(false);
+                }
+            }
+            catch (OperationCanceledException) when (pulseStop.IsCancellationRequested) { }
+        }, CancellationToken.None);
+        try
+        {
+            if (_o.AdaptiveDpiViewport)
+            {
+                var calibrated = await new AdaptiveViewportCalibration(
+                    _backend, _guard, _before, _log)
+                    .TryRunAsync(phone, Progress, ct).ConfigureAwait(false);
+                if (calibrated is not null) return calibrated;
+                _log.Warn("Exact-DPR adaptive viewport not verified; reverting to honest normal density probe.");
+            }
+            return await _negotiator.RunAsync(phone, Progress, ct).ConfigureAwait(false);
         }
-        return await _negotiator.RunAsync(phone, Progress, ct).ConfigureAwait(false);
+        finally
+        {
+            pulseStop.Cancel();
+            await pulse.ConfigureAwait(false);
+        }
     }
 
     private static InputGeometry ViewportInputGeometry(NegotiationOutcome outcome)
