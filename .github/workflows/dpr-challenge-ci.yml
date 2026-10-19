@@ -6,7 +6,7 @@ on:
     paths:
       - '.github/workflows/dpr-challenge-ci.yml'
       - 'windows/agent/**'
-      - 'tools/dpr-challenge*.ps1'
+      - 'tools/run-dpr-challenge.ps1'
   workflow_dispatch:
 
 permissions:
@@ -26,3 +26,9 @@ jobs:
         run: dotnet build windows/agent/FocusWindow.Agent/FocusWindow.Agent.csproj -c Release -p:Platform=x64 -warnaserror
       - name: Run unit and simulated tests (no display changes)
         run: dotnet test windows/agent/FocusWindow.Tests/FocusWindow.Tests.csproj -c Release --verbosity minimal
+      - name: Windows PowerShell 5.1 wrapper smoke (plan-only; no driver needed)
+        shell: pwsh
+        run: |
+          $exe = Resolve-Path '.\windows\agent\FocusWindow.Agent\bin\x64\Release\net8.0-windows\FocusWindow.Agent.exe'
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File '.\tools\run-dpr-challenge.ps1' -AgentExe $exe.Path
+          if ($LASTEXITCODE -ne 0) { throw "PowerShell 5.1 runner returned exit $LASTEXITCODE" }
