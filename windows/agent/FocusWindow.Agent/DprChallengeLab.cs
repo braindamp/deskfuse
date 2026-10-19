@@ -34,6 +34,7 @@ internal static class DprChallengeLab
         public int EdidDiagonalMm { get; init; }
         public int Predicted640Max { get; init; }
         public int Predicted600Max { get; init; }
+        public int Predicted800x600Max { get; init; }
         public int? RecommendedPercent { get; set; }
         public int? InitialPercent { get; set; }
         public int? PostWritePercent { get; set; }
@@ -134,12 +135,12 @@ internal static class DprChallengeLab
             throw new InvalidOperationException("Hardware lab requires an interactive Windows logon.");
 
         Console.WriteLine("DeskFuse DPR challenge — FA diagnostic + BB oversized viewport");
-        Console.WriteLine("This is a hardware EXPERIMENT, not an assertion of the Windows 640-DIP rule.");
+        Console.WriteLine("This is a hardware EXPERIMENT, not proof of the 800x600 effective-desktop scaling model.");
         Console.WriteLine("Driver install/uninstall, PnP, registry, physical display SET: NEVER performed.");
         foreach (var m in modes)
-            Console.WriteLine($"  {m}: 640-DIP hypothesis max " +
-                $"{DprChallengeTheory.PredictedMaximum(m.Width, m.Height, 640)}%, " +
-                $"600-DIP hypothesis max {DprChallengeTheory.PredictedMaximum(m.Width, m.Height, 600)}%");
+            Console.WriteLine($"  {m}: orientation-independent 800x600-DIP hypothesis max " +
+                $"{DprChallengeTheory.PredictedMaximumForLogicalDesktop(m.Width, m.Height)}% " +
+                "(model only; Windows -3 readback is authoritative for this test)");
         Console.WriteLine("  Requested target: genuine 336 DPI; 350 physical pixels for a 100-DIP square.");
         Console.WriteLine($"  Post-write wait: {settleMs} ms (change with --settle-ms 10000).");
         if (isolateDiagIdentity) Console.WriteLine("  Virtual display identity includes EDID diagonal (isolated cap experiment).");
@@ -210,7 +211,8 @@ internal static class DprChallengeLab
                     Mode = mode.ToString(),
                     EdidDiagonalMm = diag,
                     Predicted640Max = DprChallengeTheory.PredictedMaximum(mode.Width, mode.Height, 640),
-                    Predicted600Max = DprChallengeTheory.PredictedMaximum(mode.Width, mode.Height, 600)
+                    Predicted600Max = DprChallengeTheory.PredictedMaximum(mode.Width, mode.Height, 600),
+                    Predicted800x600Max = DprChallengeTheory.PredictedMaximumForLogicalDesktop(mode.Width, mode.Height)
                 };
                 observations.Add(row);
                 MonitorInfo? monitor = null;
@@ -425,12 +427,13 @@ internal static class DprChallengeLab
                 new JsonSerializerOptions { WriteIndented = true }), CancellationToken.None)
                 .ConfigureAwait(false);
             var csv = new StringBuilder();
-            csv.AppendLine("mode,diag_mm,predicted_640_max,predicted_600_max,recommended,initial,post_set,max,monitor_dpi,window_dpi,ruler_w,ruler_h,native_process_dpi,native_ruler_w,native_ruler_h,native_ruler_verdict,write_verdict,crop_verdict,restored,physical_unchanged,monitor_removed,error");
+            csv.AppendLine("mode,diag_mm,predicted_640_max,predicted_600_max,predicted_800x600_max,recommended,initial,post_set,max,monitor_dpi,window_dpi,ruler_w,ruler_h,native_process_dpi,native_ruler_w,native_ruler_h,native_ruler_verdict,write_verdict,crop_verdict,restored,physical_unchanged,monitor_removed,error");
             foreach (var o in observations)
             {
                 string Escape(object? v) => "\"" + Convert.ToString(v, CultureInfo.InvariantCulture)?.Replace("\"", "\"\"") + "\"";
                 csv.AppendLine(string.Join(",", new object?[] { o.Mode, o.EdidDiagonalMm,
-                    o.Predicted640Max, o.Predicted600Max, o.RecommendedPercent, o.InitialPercent,
+                    o.Predicted640Max, o.Predicted600Max, o.Predicted800x600Max,
+                    o.RecommendedPercent, o.InitialPercent,
                     o.PostWritePercent, o.ReportedMaximumPercent, o.MonitorDpiX, o.WindowDpi, o.RulerWidthPx,
                     o.RulerHeightPx, o.NativeRulerProcessDpi, o.NativeRulerWidthPx,
                     o.NativeRulerHeightPx, o.NativeRulerVerdict, o.WriteVerdict,
