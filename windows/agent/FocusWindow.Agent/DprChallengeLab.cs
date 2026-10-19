@@ -42,6 +42,7 @@ internal static class DprChallengeLab
         public string? WindowAwareness { get; set; }
         public int? RulerWidthPx { get; set; }
         public int? RulerHeightPx { get; set; }
+        public List<string> DpiProbeAttempts { get; init; } = new();
         public bool? RulerMatchesReadback { get; set; }
         public string WriteAttempt { get; set; } = "NOT_REQUESTED";
         public string WriteApiResult { get; set; } = "NOT_REQUESTED";
@@ -234,12 +235,27 @@ internal static class DprChallengeLab
                             (try350 ? "NOT_ALLOWED_BY_CAP" : "READ_ONLY");
                     }
 
-                    var density = backend.ReadDensity(monitor);
-                    row.MonitorDpiX = density.MonitorDpiX;
-                    var window = await backend.ProbeWindowAsync(monitor, true,
-                        heartbeatStop.Token).ConfigureAwait(false);
-                    if (window is null) throw new IOException("PMv2 ruler window unavailable");
-                    row.WindowDpi = window.WindowDpi;
+                    WindowDensityReport? window = null;
+                    for (var witness = 1; witness <= 3; witness++)
+                    {
+                        var currentDensity = backend.ReadDensity(monitor);
+                        row.MonitorDpiX = currentDensity.MonitorDpiX;
+                        window = await backend.ProbeWindowAsync(monitor, true,
+                            heartbeatStop.Token).ConfigureAwait(false);
+                        if (window is null) throw new IOException("PMv2 ruler window unavailable");
+                        var note = $"witness {witness}: monitor={currentDensity.MonitorDpiX} DPI, " +
+                            $"window={window.WindowDpi} DPI, awareness={window.Awareness}, " +
+                            $"ruler={window.MeasuredRulerWidthPx}x{window.MeasuredRulerHeightPx}, " +
+                            $"ruler-ok={window.RulerOk}";
+                        row.DpiProbeAttempts.Add(note);
+                        Console.WriteLine($"  {note}");
+                        if (window.Awareness == "PerMonitorV2" &&
+                            currentDensity.MonitorDpiX == window.WindowDpi &&
+                            window.RulerOk == true)
+                            break;
+                        if (witness < 3) await Task.Delay(900, heartbeatStop.Token);
+                    }
+                    row.WindowDpi = window!.WindowDpi;
                     row.WindowAwareness = window.Awareness;
                     row.RulerWidthPx = window.MeasuredRulerWidthPx;
                     row.RulerHeightPx = window.MeasuredRulerHeightPx;
@@ -254,7 +270,7 @@ internal static class DprChallengeLab
                     row.WriteVerdict = wroteScale
                         ? !row.WriteApiResult.Contains("win32-return=0", StringComparison.Ordinal)
                             ? "REJECTED"
-                            : observed350 ? "APPLIED_AND_PIXEL_VERIFIED" : "ACCEPTED_BUT_CLAMPED_OR_IGNORED"
+                            : observed350 ? "APPLIED_AND_PIXEL_VERIFIED" : "ACCEPTED_BUT_WINDOW_RENDERING_UNVERIFIED"
                         : observed350 ? "ALREADY_AT_350_VERIFIED" : "NOT_APPLIED";
 
                     // BB's actual viewport proof: an independent 1440x3120 borderless
