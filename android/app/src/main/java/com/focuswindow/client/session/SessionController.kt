@@ -77,6 +77,7 @@ class SessionController(
     private val _bridgeState = MutableStateFlow<ServerMessage.BridgeState?>(null)
     val bridgeState: StateFlow<ServerMessage.BridgeState?> = _bridgeState.asStateFlow()
     private var pcAudioRequested = false
+    private var activePcAudioStreamId = -1
     private var pcAudioDesired = false
     private var pcAudioFailedOnConnection = false
     private var hostPcAudioAvailable = false
@@ -143,6 +144,7 @@ class SessionController(
 
     private fun stopPcAudioLocal() {
         pcAudioRequested = false
+        activePcAudioStreamId = -1
         pcAudioOutput?.stop()
         _pcAudioStatus.value = "Off"
     }
@@ -322,6 +324,7 @@ class SessionController(
                             if (pcAudioRequested && pcAudioOutput?.start(
                                     msg.streamId, msg.sampleRate, msg.channels, msg.format,
                                 ) == true) {
+                                activePcAudioStreamId = msg.streamId
                                 _pcAudioStatus.value = "On"
                             } else {
                                 stopPcAudioLocal()
@@ -330,9 +333,18 @@ class SessionController(
                             }
                         }
                         "stopped" -> {
-                            // A late stop acknowledgement must not override a new
-                            // start request after a quick off/on action.
-                            if (!pcAudioDesired) stopPcAudioLocal()
+                            // A late stop acknowledgement must not override a
+                            // newer stream after a rapid off/on toggle.
+                            if (!pcAudioDesired) {
+                                stopPcAudioLocal()
+                            } else if (msg.streamId == activePcAudioStreamId) {
+                                // Host unexpectedly stopped the active stream.
+                                // Retain user preference, but avoid a tight retry
+                                // loop on an unavailable output endpoint.
+                                pcAudioFailedOnConnection = true
+                                stopPcAudioLocal()
+                                _pcAudioStatus.value = "Unavailable"
+                            }
                         }
                         "error" -> {
                             pcAudioFailedOnConnection = true
