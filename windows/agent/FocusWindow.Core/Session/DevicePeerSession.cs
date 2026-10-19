@@ -4,8 +4,9 @@ using FocusWindow.Core.Transport;
 namespace FocusWindow.Core.Session;
 
 /// <summary>
-/// Authorized peer without a virtual monitor. Allows a phone to provide its own
-/// media endpoints while a different tablet owns the display. No camera/audio
+/// Authorized accessory peer without a virtual monitor. In the future the
+/// same device may contribute camera, microphone, speakers, touchpad, keyboard
+/// or sensors concurrently while another device owns a display. No camera/audio
 /// endpoints are claimed present until a real Windows provider is installed.
 /// </summary>
 internal sealed class DevicePeerSession(
@@ -25,6 +26,17 @@ internal sealed class DevicePeerSession(
             return;
         }
 
+        IReadOnlyList<string> requested;
+        try
+        {
+            requested = DeviceCapabilities.Validate(hello.Capabilities, accessoryOnly: true);
+        }
+        catch (ArgumentException)
+        {
+            conn.SendControl(ServerMessages.Stage("device_bridge",
+                "Unsupported accessory capability requested.", fatal: true));
+            return;
+        }
         conn.SendControl(ServerMessages.Hello(options.HostVersion, options.HostName, options.Channel));
         // Approval remains OS-user-scoped, in addition to per-phone encrypted
         // credentials validated by HostListener. This role cannot grant itself
@@ -34,17 +46,21 @@ internal sealed class DevicePeerSession(
             conn.VerificationCode, shutdown).ConfigureAwait(false);
         if (!approved)
         {
-            conn.SendControl(ServerMessages.Stage("approval", "Media-only device connection declined.",
+            conn.SendControl(ServerMessages.Stage("approval", "Accessory connection declined.",
                 fatal: true));
             return;
         }
 
         using var lease = peers.Attach(
-            hello.Profile.DeviceId, hello.Profile.DeviceLabel, shutdown);
-        log.Info("Authenticated media-only peer joined: " + lease.Peer.DeviceId);
+            hello.Profile.DeviceId, hello.Profile.DeviceLabel, shutdown, requested);
+        log.Info("Authenticated accessory peer joined: " + lease.Peer.DeviceId);
+        // Distinguish a requested function from an actual, provisioned Windows
+        // endpoint. No accessory provider has been installed in this build.
+        conn.SendControl(ServerMessages.BridgeState(
+            lease.Peer.RequestedCapabilities, DeviceCapabilities.ActiveForAccessory));
         conn.SendControl(ServerMessages.Stage("device_bridge",
-            "Media-only connection ready; phone camera/microphone and speakers are not yet " +
-            "available as Windows devices in this build."));
+            "Accessory connection established. Requested features are not yet " +
+            "active Windows devices or remote input controls in this build."));
 
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(
             shutdown, lease.Cancellation);
@@ -59,7 +75,7 @@ internal sealed class DevicePeerSession(
             await conn.DisposeAsync().ConfigureAwait(false);
             try { await control.ConfigureAwait(false); }
             catch (OperationCanceledException) when (linked.IsCancellationRequested) { }
-            log.Info("Media-only peer detached: " + lease.Peer.DeviceId);
+            log.Info("Accessory peer detached: " + lease.Peer.DeviceId);
         }
     }
 
@@ -68,8 +84,8 @@ internal sealed class DevicePeerSession(
         await foreach (var msg in conn.Messages.ReadAllAsync(ct).ConfigureAwait(false))
         {
             if (msg is ClientBye) return;
-            // A media-only peer MUST NOT dispatch an input/file/window/monitor
-            // action through PhoneSession. Hardware media commands will require
+            // An accessory peer MUST NOT dispatch input/file/window/monitor
+            // actions through PhoneSession. Hardware commands will require
             // separate capability checks when real endpoints are introduced.
             if (msg is not ClientUnknown)
             {
