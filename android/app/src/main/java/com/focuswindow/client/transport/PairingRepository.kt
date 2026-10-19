@@ -7,35 +7,33 @@ import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 
 /**
- * Remembers paired hosts so the user scans once, not every session.
+ * Remembers paired hosts so the user approves once, not every session.
  *
  * FR-TRUST-01 — this is the ONLY persistence of connection identity, it is
  * local, and it is encrypted at rest with a hardware-backed key. There is no
  * account, no cloud sync and no device list on a server we run.
+ *
+ * The secure-preferences factory is injectable so tests can prove that a
+ * keystore failure degrades to session-only pairing instead of falling back
+ * to plaintext storage.
  */
-class PairingRepository(context: Context) {
+class PairingRepository internal constructor(
+    context: Context,
+    securePrefsFactory: (Context) -> SharedPreferences,
+) {
+    constructor(context: Context) : this(context, ::createEncryptedPreferences)
 
-    // If Android Keystore fails, never write the QR pairing secret to ordinary
+    // If Android Keystore fails, never write the pairing secret to ordinary
     // SharedPreferences. The current process can still connect, but the pairing
     // is deliberately forgotten after restart until secure storage is restored.
-    private val prefs: SharedPreferences? = runCatching {
-        val key = MasterKey.Builder(context)
-            .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
-            .build()
-        EncryptedSharedPreferences.create(
-            context,
-            FILE,
-            key,
-            EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-            EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
-        ) as SharedPreferences
-    }.getOrNull()
+    private val prefs: SharedPreferences? =
+        runCatching { securePrefsFactory(context) }.getOrNull()
 
     init {
-        // Earlier development builds stored a fallback QR secret as plaintext.
+        // Earlier development builds stored a fallback pairing secret as plaintext.
         // Erase that deprecated preference file; never migrate its credentials.
         runCatching {
-            context.getSharedPreferences("focuswindow.pairing", Context.MODE_PRIVATE)
+            context.getSharedPreferences(LEGACY_FILE, Context.MODE_PRIVATE)
                 .edit().clear().apply()
         }
     }
@@ -86,7 +84,6 @@ class PairingRepository(context: Context) {
     }
 
     private companion object {
-        const val FILE = "focuswindow.pairing.enc"
         const val KEY_HOST = "host"
         const val KEY_PORT = "port"
         const val KEY_PUBKEY = "pubkey"
@@ -94,4 +91,20 @@ class PairingRepository(context: Context) {
         const val KEY_NAME = "name"
         const val KEY_RELAY = "relay"
     }
+}
+
+private const val FILE = "focuswindow.pairing.enc"
+private const val LEGACY_FILE = "focuswindow.pairing"
+
+private fun createEncryptedPreferences(context: Context): SharedPreferences {
+    val key = MasterKey.Builder(context)
+        .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+        .build()
+    return EncryptedSharedPreferences.create(
+        context,
+        FILE,
+        key,
+        EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+        EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
+    )
 }
