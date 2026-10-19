@@ -206,7 +206,17 @@ internal sealed class PhoneSession
         if (outcome is null || original is null || _backend is null) return;
         var monitor = outcome.Monitor;
         var result = _backend.TrySetScale(monitor, original.Value);
-        var readback = _backend.ReadScaleCaps(monitor);
+        ScaleCaps? readback = null;
+        if (result.Ok)
+        {
+            // -4 can return before the Windows DPI transition settles.
+            for (var retry = 0; retry < 12; retry++)
+            {
+                readback = _backend.ReadScaleCaps(monitor);
+                if (readback?.CurrentPercent == original.Value) break;
+                Thread.Sleep(150);
+            }
+        }
         if (!result.Ok || readback?.CurrentPercent != original.Value)
             throw new DisplayException("scale-restore",
                 $"Original virtual-display scale {original}% not restored: {result.Detail}; " +
