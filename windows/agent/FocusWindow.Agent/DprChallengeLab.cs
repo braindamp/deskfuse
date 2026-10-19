@@ -37,6 +37,7 @@ internal static class DprChallengeLab
         public int? RecommendedPercent { get; set; }
         public int? InitialPercent { get; set; }
         public int? PostWritePercent { get; set; }
+        public string? NativeWitnessOutput { get; set; }
         public int? ReportedMaximumPercent { get; set; }
         public int? MonitorDpiX { get; set; }
         public int? WindowDpi { get; set; }
@@ -112,6 +113,9 @@ internal static class DprChallengeLab
         var run = args.Contains("--run");
         var try350 = args.Contains("--try-350");
         var beyondCap = args.Contains("--try-above-cap");
+        var nativeWitnessExe = Option(args, "--native-witness");
+        if (nativeWitnessExe is not null && !File.Exists(nativeWitnessExe))
+            throw new ArgumentException("--native-witness must identify an existing executable.");
         var settleMs = int.TryParse(Option(args, "--settle-ms"), NumberStyles.None,
             CultureInfo.InvariantCulture, out var requestedSettle) ? requestedSettle : 1500;
         if (settleMs < 500 || settleMs > 30000)
@@ -246,6 +250,14 @@ internal static class DprChallengeLab
                     Console.WriteLine($"  -3 readback after settle: " +
                         (postSetCaps is null ? "UNAVAILABLE" :
                             $"recommended={postSetCaps.RecommendedPercent}% current={postSetCaps.CurrentPercent}% max={postSetCaps.MaxPercent}%"));
+                    if (nativeWitnessExe is not null)
+                    {
+                        row.NativeWitnessOutput = await RunNativeWitnessAsync(nativeWitnessExe,
+                            heartbeatStop.Token).ConfigureAwait(false);
+                        Console.WriteLine("  === independent native Win32 process witness ===");
+                        Console.WriteLine(row.NativeWitnessOutput);
+                        Console.WriteLine("  === end independent witness ===");
+                    }
                     WindowDensityReport? window = null;
                     for (var witness = 1; witness <= 3; witness++)
                     {
@@ -403,6 +415,39 @@ internal static class DprChallengeLab
                                               : "SWEEP INCOMPLETE/UNSAFE — " + failure);
         }
         return failure is null ? 0 : 2;
+    }
+
+    private static async Task<string> RunNativeWitnessAsync(string exe, CancellationToken ct)
+    {
+        using var child = new System.Diagnostics.Process();
+        child.StartInfo = new System.Diagnostics.ProcessStartInfo
+        {
+            FileName = Path.GetFullPath(exe),
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        };
+        try
+        {
+            if (!child.Start()) return "NATIVE_WITNESS_START_FAILED";
+            var stdout = child.StandardOutput.ReadToEndAsync();
+            var stderr = child.StandardError.ReadToEndAsync();
+            using var limited = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            limited.CancelAfter(TimeSpan.FromSeconds(15));
+            try { await child.WaitForExitAsync(limited.Token).ConfigureAwait(false); }
+            catch (OperationCanceledException)
+            {
+                if (!child.HasExited) child.Kill(entireProcessTree: true);
+                return "NATIVE_WITNESS_TIMEOUT_OR_CANCELLED";
+            }
+            return $"exit={child.ExitCode}\n{await stdout.ConfigureAwait(false)}\n" +
+                   $"stderr: {await stderr.ConfigureAwait(false)}";
+        }
+        catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or IOException)
+        {
+            return "NATIVE_WITNESS_FAILED: " + ex.Message;
+        }
     }
 
     private static void CheckPhysical(PhysicalDisplayGuard guard, DisplaySnapshot original,
