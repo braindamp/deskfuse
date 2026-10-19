@@ -69,4 +69,5 @@ public sealed record HostServices(
     IClipboardBridge? Clipboard = null,
     IWindowWorkflow? Windows = null,
     IDeviceCredentialStore? DeviceCredentials = null,
-    Func<IHostAudioCapture>? CreateAudioCapture = null);
+    Func<IHostAudioCapture>? CreateAudioCapture = null,
+    IDisplaySessionAdmission? DisplayAdmission = null);
