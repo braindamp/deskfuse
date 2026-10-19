@@ -128,7 +128,7 @@ public static class ServerMessages
     public static byte[] Serialize(JsonObject o) =>
         Encoding.UTF8.GetBytes(o.ToJsonString(new JsonSerializerOptions { WriteIndented = false }));
     public static JsonObject Hello(string hostVersion, string hostName, string channel,
-        bool pcAudioAvailable = false) => new()
+        bool pcAudioAvailable = false, bool phoneMicrophoneBridgeAvailable = false) => new()
     {
         ["type"] = "hello",
         ["protocolVersion"] = Wire.ProtocolVersion,
@@ -136,6 +136,9 @@ public static class ServerMessages
         ["hostName"] = hostName,
         ["channel"] = channel,
         ["pcAudioAvailable"] = pcAudioAvailable,
+        // A route is supported; this does not claim Windows has installed
+        // a DeskFuse-branded plug-and-play microphone device.
+        ["phoneMicrophoneBridgeAvailable"] = phoneMicrophoneBridgeAvailable,
     };
     // Text only. Never mirror the clipboard without an explicit user request.
     public static JsonObject WindowList(IReadOnlyList<WindowItem> windows)
