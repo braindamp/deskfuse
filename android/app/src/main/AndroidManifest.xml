@@ -22,9 +22,6 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
 
-    <!-- QR pairing only. Never recorded, never uploaded (FR-TRUST-02). -->
-    <uses-permission android:name="android.permission.CAMERA" />
-
     <!-- FR-REF-03 — keep the screen alive for the length of a session. -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
@@ -33,7 +30,6 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
-    <uses-feature android:name="android.hardware.camera.any" android:required="false" />
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
 
     <application

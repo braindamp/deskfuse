@@ -26,8 +26,11 @@ internal static class Program
         Host options:
           --port N (47810)   --bind IP (0.0.0.0)   --fps N (60)   --bitrate KBPS (20000)
           --ffmpeg PATH      (default: ffmpeg.exe next to the agent, else PATH)
-          --auto-approve     skip the "allow this phone?" prompt (INSECURE: anyone holding the QR gets in)
-          --new-pairing      discard the stored pairing and show a new QR
+          --auto-approve     legacy QR test-mode only; does NOT bypass first-time LAN enrollment
+          --legacy-qr       explicitly enable historical QR pairing instead of phone discovery
+          trusted-phones    list enrolled device IDs (for review and revocation)
+          trusted-phones --forget-phone ID   revoke a phone and its approvals
+          --new-pairing      rotate the host public key (all phones must re-enroll)
           --single-session   exit after one phone session
           --ruler-probe      verify rendered density with a pixel ruler at the start of every session
           --no-open-qr       do not open pairing.png automatically
@@ -62,6 +65,7 @@ internal static class Program
                 "density-probe" => await DensityProbeAsync(args, shutdown.Token),
                 "driver-status" => DriverStatus(),
                 "display-paths" => PrintDisplayPaths(),
+                "trusted-phones" => TrustedPhones(args),
                 "hold-gate-self-test" => await HoldGateSelfTestAsync(),
                 _ => Fail($"Unknown command '{command}'.\n\n{Usage}"),
             };
@@ -124,6 +128,7 @@ internal static class Program
             NewPairing = args.Contains("--new-pairing"),
             SingleSession = args.Contains("--single-session"),
             AllowFullUserFiles = !args.Contains("--auto-approve"),
+            CameraFreePairing = !args.Contains("--legacy-qr"),
         };
         log.Info($"Focus Window host agent {Version}");
         var guards = new List<PhysicalDisplayGuard>();
@@ -139,6 +144,7 @@ internal static class Program
             },
             Approval: new ConsoleApproval(args.Contains("--auto-approve"), log),
             PairingStore: new DpapiPairingStore(),
+            DeviceCredentials: new DpapiDeviceCredentialStore(),
             Clipboard: new WindowsClipboardBridge(),
             Windows: new WindowsWindowWorkflow(),
             OnNegotiated: outcome =>
@@ -149,11 +155,31 @@ internal static class Program
             });
         using var host = new SessionHost(options, services, log);
         var offer = await host.StartAsync(ct);
-        PairingQr.Show(offer, open: !args.Contains("--no-open-qr"));
+        if (!options.CameraFreePairing)
+            PairingQr.Show(offer, open: !args.Contains("--no-open-qr"));
+        else
+            Console.WriteLine("  DeskFuse is discoverable on the LAN. Approve a new phone on this PC once.");
         Console.WriteLine("  Waiting for a phone. Ctrl+C to quit.\n");
         await host.RunSessionsAsync(ct);
         return 0;
     }
+    private static int TrustedPhones(string[] args)
+    {
+        var store = new DpapiDeviceCredentialStore();
+        var forget = Opt(args, "--forget-phone");
+        if (!string.IsNullOrEmpty(forget))
+        {
+            store.Revoke(forget);
+            using var log = new ConsoleLog(null);
+            new ConsoleApproval(false, log).ForgetDevice(forget);
+            Console.WriteLine("Phone authorization revoked. Existing sessions remain active until disconnected.");
+            return 0;
+        }
+        foreach (var item in store.All())
+            Console.WriteLine(item.DeviceId);
+        return 0;
+    }
+
     // ---- driver-status ------------------------------------------------------------------------------
     // Read-only P/Invoke smoke test: check full UTF-16 CCD names on physical displays
     // BEFORE installing the virtual display. A one-character GDI/name means the

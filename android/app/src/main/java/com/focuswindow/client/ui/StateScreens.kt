@@ -64,18 +64,16 @@ fun StateScreen(
         when (state) {
             is SessionState.Idle -> Panel(
                 kicker = "READY",
-                title = "Not connected",
-                body = "Scan the pairing code shown by the host agent on your PC. " +
-                    "No account, no sign-in, nothing leaves your network.",
-                primary = "Scan pairing code" to onScan,
+                title = "Your PC, ready when you are",
+                body = "Find a Windows PC on your network. Approve this phone once on Windows; no camera or account needed.",
+                primary = "Find Windows PC" to onScan,
                 accent = Lime,
             )
 
             is SessionState.AwaitingPairing -> Panel(
                 kicker = "PAIRING",
-                title = "Point the camera at the QR",
-                body = "The code carries the host's one-time key. We complete the key " +
-                    "exchange on-device; nothing is sent to a server.",
+                title = "Waiting for your PC",
+                body = "Approve this phone from Windows to finish the first connection.",
                 accent = Lime,
             )
 
@@ -102,14 +100,8 @@ fun StateScreen(
                 progress = state.progress,
             )
 
-            is SessionState.Reconnecting -> Progress(
-                kicker = "RECONNECTING",
-                title = "Attempt ${state.attempt} of ${state.maxAttempts}",
-                body = "${state.reason}. Reattaching to the same document — " +
-                    "we will not open a second copy.",
-                progress = state.attempt.toFloat() / state.maxAttempts,
-                accent = Amber,
-            )
+            // Retry quietly over the last rendered frame; only surface terminal failure.
+            is SessionState.Reconnecting -> Unit
 
             is SessionState.Stale -> Panel(
                 kicker = "PAUSED",
@@ -135,7 +127,7 @@ fun StateScreen(
                 title = "Session closed",
                 body = "${state.reason}\n\nYour PC was restored: the source window, its DPI " +
                     "and your display arrangement are exactly as you left them.",
-                primary = "Connect again" to onScan,
+                primary = "Find Windows PC" to onScan,
                 accent = Lime,
             )
 

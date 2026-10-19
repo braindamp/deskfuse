@@ -53,6 +53,9 @@ import com.focuswindow.client.session.SessionController
 import com.focuswindow.client.session.SessionState
 import com.focuswindow.client.transport.PairingPayload
 import com.focuswindow.client.transport.PairingRepository
+import com.focuswindow.client.transport.CameraFreeDiscovery
+import com.focuswindow.client.transport.CameraFreeEnrollment
+import com.focuswindow.client.transport.DiscoveredPc
 import com.focuswindow.client.ui.SessionChrome
 import com.focuswindow.client.ui.StateScreen
 
@@ -86,19 +89,13 @@ class MainActivity : ComponentActivity() {
     // A single explicit user action sends it to the CURRENT authenticated PC.
     private var sharedDocumentUri by mutableStateOf<Uri?>(null)
     @Volatile private var appDialogVisible = false
-
-    /**
-     * Registered during creation, as AndroidX requires. The scanner returns a
-     * raw payload; parsing and validation happen in [handlePairingUri].
-     */
-    private val scanLauncher = registerForActivityResult(ScannerActivity.Contract()) { result ->
-        val payload = result.payload
-        if (payload != null) {
-            handlePairingUri(payload)
-        } else {
-            controller.stop(result.error ?: "Scan cancelled.")
-        }
-    }
+    private var discoveredPcs by mutableStateOf<List<DiscoveredPc>>(emptyList())
+    private var pcPickerVisible by mutableStateOf(false)
+    private var pcDiscoveryBusy by mutableStateOf(false)
+    private var pcPairingBusy by mutableStateOf(false)
+    private var pcPairingCode by mutableStateOf<String?>(null)
+    private var pcPairingError by mutableStateOf<String?>(null)
+    private var manualPc by mutableStateOf("")
 
     private val savePcFile = registerForActivityResult(ActivityResultContracts.CreateDocument(
         "application/octet-stream")) { uri ->
@@ -188,6 +185,64 @@ class MainActivity : ComponentActivity() {
                     onScan = { beginPairing() },
                     onDismiss = { },
                 )
+
+                if (pcPickerVisible) {
+                    AlertDialog(
+                        onDismissRequest = {
+                            if (!pcPairingBusy) pcPickerVisible = false
+                        },
+                        title = { Text(if (pcPairingCode != null) "Approve this phone on Windows"
+                            else "Your Windows PCs") },
+                        text = {
+                            Column {
+                                if (pcPairingCode != null) {
+                                    Text("Confirm this code matches the Windows dialog:")
+                                    Text(pcPairingCode!!, modifier = Modifier.padding(12.dp))
+                                    Text("Waiting for approval on your PC...")
+                                } else {
+                                    if (pcDiscoveryBusy) Text("Finding PCs on your local network...")
+                                    else if (discoveredPcs.isEmpty()) Text(
+                                        "No PCs found automatically. Make sure DeskFuse is running on Windows, or enter its address."
+                                    )
+                                    for (pc in discoveredPcs) {
+                                        TextButton(
+                                            onClick = { enrollWith(pc) },
+                                            enabled = !pcPairingBusy,
+                                        ) { Text("${pc.name}  (${pc.address})") }
+                                    }
+                                    if (pcPairingBusy) Text("Waiting for the Windows owner...")
+                                    if (!pcPairingBusy) {
+                                        OutlinedTextField(
+                                            value = manualPc,
+                                            onValueChange = { manualPc = it },
+                                            label = { Text("PC IP address or hostname") },
+                                            singleLine = true,
+                                        )
+                                        TextButton(
+                                            onClick = {
+                                                runCatching { DiscoveredPc.manual(manualPc) }
+                                                    .onSuccess(::enrollWith)
+                                                    .onFailure { pcPairingError = "Enter a valid PC address." }
+                                            },
+                                            enabled = manualPc.isNotBlank(),
+                                        ) { Text("Connect by address") }
+                                    }
+                                }
+                                pcPairingError?.let { Text(it) }
+                            }
+                        },
+                        confirmButton = {
+                            if (!pcPairingBusy) TextButton(onClick = { findPcs() }) {
+                                Text("Search again")
+                            }
+                        },
+                        dismissButton = {
+                            TextButton(onClick = {
+                                if (!pcPairingBusy) pcPickerVisible = false
+                            }, enabled = !pcPairingBusy) { Text("Close") }
+                        },
+                    )
+                }
 
                 sharedDocumentUri?.let { sharedUri ->
                     AlertDialog(
@@ -417,6 +472,12 @@ class MainActivity : ComponentActivity() {
         super.onResume()
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         refreshProfile()
+        // A previously approved PC requires no scanning or further confirmation.
+        if (controller.state.value is SessionState.Idle && !pcPickerVisible) {
+            val existing = pairings.last()
+            val current = profile
+            if (existing != null && current != null) controller.start(existing, current)
+        }
         applyPreferredRefreshRate()
     }
 
@@ -545,9 +606,47 @@ class MainActivity : ComponentActivity() {
     // ── pairing ──────────────────────────────────────────────────────────────
 
     private fun beginPairing() {
-        // Registered once in onCreate — see [scanLauncher]. Registering lazily
-        // at click time throws on modern AndroidX.
-        scanLauncher.launch(Unit)
+        pcPickerVisible = true
+        pcPairingError = null
+        findPcs()
+    }
+
+    private fun findPcs() {
+        if (pcDiscoveryBusy || pcPairingBusy) return
+        pcDiscoveryBusy = true
+        pcPairingError = null
+        lifecycleScope.launch {
+            runCatching { CameraFreeDiscovery.scan() }
+                .onSuccess { discoveredPcs = it }
+                .onFailure {
+                    pcPairingError = "Discovery unavailable. Enter the Windows PC address instead."
+                }
+            pcDiscoveryBusy = false
+        }
+    }
+
+    private fun enrollWith(pc: DiscoveredPc) {
+        if (pcPairingBusy) return
+        val p = profile ?: profiles.current(this, insets).also { profile = it }
+        pcPairingBusy = true
+        pcPairingCode = null
+        pcPairingError = null
+        lifecycleScope.launch {
+            try {
+                val pairing = CameraFreeEnrollment.enroll(
+                    pc, p.deviceId, p.deviceLabel,
+                    onCode = { pcPairingCode = it },
+                )
+                pairings.remember(pairing)
+                pcPickerVisible = false
+                controller.start(pairing, p)
+            } catch (ex: Exception) {
+                pcPairingError = "Could not pair: ${ex.message ?: "check Windows and retry"}"
+            } finally {
+                pcPairingBusy = false
+                pcPairingCode = null
+            }
+        }
     }
 
     private fun handlePairingUri(raw: String) {

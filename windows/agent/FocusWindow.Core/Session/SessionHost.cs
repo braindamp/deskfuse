@@ -18,6 +18,7 @@ public sealed class SessionHost : IDisposable
     private readonly ILog _log;
     private HostListener? _listener;
     private PairingOffer? _offer;
+    private CameraFreePairingHost? _cameraFree;
     private string _encoderName = "pending native-resolution qualification";
     public SessionHost(HostOptions options, HostServices services, ILog log)
     {
@@ -40,6 +41,13 @@ public sealed class SessionHost : IDisposable
         var address = Pairing.PickLanAddress() ?? "127.0.0.1";
         var offer = Pairing.BuildOffer(state, address, _listener.Port, _options.HostName);
         _offer = offer;
+        if (_options.CameraFreePairing)
+        {
+            if (_services.DeviceCredentials is null)
+                throw new InvalidOperationException("camera-free pairing requires a persistent credential store");
+            _cameraFree = new CameraFreePairingHost(offer, _options.HostName,
+                _services.DeviceCredentials, _services.Approval, _log);
+        }
         _log.Info($"listening on {_options.Bind}:{_listener.Port}; pairing address {address}");
         return Task.FromResult(offer);
     }
@@ -51,7 +59,8 @@ public sealed class SessionHost : IDisposable
             (PhoneConnection connection, Protocol.ClientHello hello) accepted;
             try
             {
-                accepted = await _listener.AcceptAuthenticatedAsync(_offer, ct).ConfigureAwait(false);
+                accepted = await _listener.AcceptAuthenticatedAsync(_offer,
+                        _options.CameraFreePairing ? _services.DeviceCredentials : null, ct).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
@@ -81,6 +90,7 @@ public sealed class SessionHost : IDisposable
     }
     public void Dispose()
     {
+        _cameraFree?.Dispose();
         _listener?.Dispose();
         _offer?.Dispose();
     }

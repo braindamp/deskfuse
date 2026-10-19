@@ -86,12 +86,6 @@ dependencies {
     // Pairing secrets at rest, hardware-backed where available (FR-TRUST-01).
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
 
-    // QR pairing, fully on-device (FR-TRUST-02).
-    implementation("androidx.camera:camera-camera2:1.4.0")
-    implementation("androidx.camera:camera-lifecycle:1.4.0")
-    implementation("androidx.camera:camera-view:1.4.0")
-    implementation("com.google.mlkit:barcode-scanning:17.3.0")
-
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
 
