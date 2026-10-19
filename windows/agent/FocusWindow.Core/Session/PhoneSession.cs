@@ -31,6 +31,7 @@ internal sealed class PhoneSession
     private PhoneProfile _profile = null!;
     private InputGeometry _geometry = null!;
     private IVideoEncoder? _encoder;
+    private WindowSourceCatalog? _windowCatalog;
     private FileUploadReceiver? _uploads;
     private CancellationTokenSource? _downloadStop;
     private Task? _downloadTask;
@@ -80,6 +81,9 @@ internal sealed class PhoneSession
             await Task.Delay(300, CancellationToken.None).ConfigureAwait(false);
             return;
         }
+        // Every authenticated phone gets its own opaque source IDs. The catalog
+        // never leaks raw HWNDs and cannot activate a previous phone's tokens.
+        _windowCatalog = _s.Windows is null ? null : new WindowSourceCatalog(_s.Windows);
         _guard = _s.CreateGuard();
         _before = _guard.Snapshot();
         _backend = _s.CreateBackend();
@@ -602,17 +606,17 @@ internal sealed class PhoneSession
 
     private void HandleWindows(ClientWindows request)
     {
-        if (_s.Windows is null) return;
+        if (_windowCatalog is null) return;
         try
         {
             switch (request.Action)
             {
                 case "list":
-                    _conn.SendControl(ServerMessages.WindowList(_s.Windows.ListVisible()));
+                    _conn.SendControl(ServerMessages.WindowList(_windowCatalog.List()));
                     break;
                 case "focus" when request.Id is not null:
-                    if (!_s.Windows.Activate(request.Id))
-                        _conn.SendControl(ServerMessages.Stage("window", "Windows did not allow activation of that window."));
+                    var activated = _windowCatalog.Activate(request.Id);
+                    _conn.SendControl(ServerMessages.WindowFocusResult(request.Id, activated));
                     break;
             }
         }
