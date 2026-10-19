@@ -72,7 +72,8 @@ internal sealed class PhoneSession
             await Task.Delay(300, CancellationToken.None).ConfigureAwait(false);
             return;
         }
-        conn.SendControl(ServerMessages.Hello(_o.HostVersion, _o.HostName, _o.Channel));
+        conn.SendControl(ServerMessages.Hello(_o.HostVersion, _o.HostName, _o.Channel,
+            pcAudioAvailable: _o.AllowPcAudio && _s.CreateAudioCapture is not null));
         conn.SendControl(ServerMessages.Stage("Waiting for approval", $"Confirm code {conn.VerificationCode} on the PC."));
         var approved = await _s.Approval
             .ApproveAsync(_profile.DeviceId, _profile.DeviceLabel, conn.VerificationCode, ct).ConfigureAwait(false);
