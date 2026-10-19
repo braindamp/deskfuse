@@ -51,13 +51,25 @@ internal sealed class WindowsWindowWorkflow : IWindowWorkflow
         if (!IsWindowVisible(handle) || GetWindow(handle, GwOwner) != nint.Zero) return null;
         var length = GetWindowTextLengthW(handle);
         if (length <= 0 || length > 1024) return null;
-        GetWindowThreadProcessId(handle, out var pid);
+        var threadId = GetWindowThreadProcessId(handle, out var pid);
         if (pid == 0 || !ProcessIdToSessionId(pid, out var session) || session != CurrentSession) return null;
         var title = new StringBuilder(length + 1);
         if (GetWindowTextW(handle, title, title.Capacity) <= 0) return null;
         string app;
-        try { using var process = Process.GetProcessById(checked((int)pid)); app = process.ProcessName; }
+        // Process creation timestamp distinguishes a restarted app when the kernel
+        // reuses a PID. Thread ID and HWND distinguish windows in the same process.
+        // This remains a live-session identity, not a persistent app identity.
+        long processBornUtcTicks = 0;
+        try
+        {
+            using var process = Process.GetProcessById(checked((int)pid));
+            app = process.ProcessName;
+            try { processBornUtcTicks = process.StartTime.ToUniversalTime().Ticks; }
+            catch { /* Some system processes deny start-time readback. */ }
+        }
         catch { app = "Application"; }
-        return new WindowItem(unchecked((ulong)handle.ToInt64()).ToString("X16"), title.ToString(), app);
+        var hwnd = unchecked((ulong)handle.ToInt64()).ToString("X16");
+        var instanceKey = $"{hwnd}:{pid:X8}:{threadId:X8}:{processBornUtcTicks:X16}";
+        return new WindowItem(hwnd, title.ToString(), app, instanceKey);
     }
 }
