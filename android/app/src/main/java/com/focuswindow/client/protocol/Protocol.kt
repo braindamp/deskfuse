@@ -203,6 +203,7 @@ sealed interface ClientMessage {
         val protocolVersion: Int = PROTOCOL_VERSION,
         val clientVersion: String,
         val profile: PhoneProfile,
+        val role: String = "display",
     ) : ClientMessage
 
     /** FR-DPI-09 — rotation/fold/font-scale re-derive the TARGET, nothing else. */
