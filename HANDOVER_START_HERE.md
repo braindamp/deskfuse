@@ -7,7 +7,7 @@
 
 > **Read this first — current status override.** The earlier Windows/Android integration **test campaign associated with the v0.3 return handshake is concluded**, per the project owner's update. The Phase 0–1 seven-item hardware checklist was also exercised: driver, monitor creation, physical monitor preservation, native frame capture, DPI readback, ruler and teardown were tested; the explicit 350% attempt has also been made. **The substantive unresolved acceptance requirement is genuine 350% / 336 DPI at the exact 1440×3120 Windows virtual monitor.** “Tests completed” does *not* mean every one of the handshake's 48 test IDs passed: retain individual PASS/FAIL/BLOCKED verdicts from the return evidence and do not silently promote them. The current GitHub `main` documents are historical acceptance contracts, not a verified all-PASS report. **Do not reopen the test campaign as the next task** unless a new defect or missing acceptance artifact specifically requires it.
 >
-> **The separate GPU/window-capture proof of concept is now delegated to a different agent and in progress. It is NOT the focus of this handover's recipient.** Do not implement it, take over its branch, re-run it, or merge its work pre-emptively. Evaluate its measured handback when the project owner returns with it.
+> **The GPU/window-capture proof of concept has a separate agent-ready specification and is reserved for independent ownership; do not assume it is running or completed until its branch and evidence are returned. It is NOT the focus of this handover's recipient.** Do not implement it, take over its branch, re-run it, or merge its work pre-emptively. Evaluate its measured handback when the project owner returns with it.
 
 ## 1. Mission: a superior phone-first Windows productivity workspace
 
@@ -23,7 +23,7 @@ DeskFuse (previously Desklink) aims to be a best-in-class **Windows ↔ Android 
 | v0.3 48-test Windows↔Android return handshake | **Test execution concluded, per owner.** The detailed return matrix/acceptance verdicts are not present in this handover, so no 48/48 PASS or full end-to-end certification claim. | Consult the actual returned test evidence if needed for a merge or release decision; don't rerun the campaign by default. |
 | Exact-monitor native DPI / Approach A | **Unresolved technical blocker.** 1440×3120 supports/actually delivers only 225% effective DPI in the independent native witness after attempted unsupported 350%. | Retain explicit open requirement; research only when there is a discriminating, reversible experiment. |
 | Supported high-DPI larger monitor | **Measured:** 2100×3120 virtual monitor with reported 350%; independent Win32 PMv2 window sees 336 DPI. | Foundation for a *separate* window-based research path; not Approach A success. |
-| GPU 1440×3120 HWND → WGC/D3D11 → hardware encoder POC | **Delegated, currently in progress with another coding agent.** | Wait for its own branch, native-ruler/video measurements, latency benchmarks, client-monitor identity and reconnection-scale results. **Not this agent's task.** |
+| GPU 1440×3120 HWND → WGC/D3D11 → hardware encoder POC | **Separate agent handoff prepared; execution status unverified until the agent reports back.** | Review its independent branch and returned native-ruler/video measurements, latency benchmarks, client-monitor identity and reconnection-scale results. **Not this agent's task.** |
 | Window-first workspace and browser-specialized pipelines | **Product architecture direction documented**, not implemented/validated. | Design subsequent product interfaces, priorities and user journeys, without interfering with the delegated POC. |
 | Touch/keyboard/gamepad and privileged operation architecture | **Future design hints**, not shipped requirements already tested. | Assess APIs, feasibility, security boundaries and product-stage sequencing as described below. |
 
@@ -37,13 +37,38 @@ DeskFuse (previously Desklink) aims to be a best-in-class **Windows ↔ Android 
 
 Evidence and code: [`docs/DPR_800x600_EVIDENCE_2026-10-19.md`](https://github.com/braindamp/deskfuse/blob/diagnostics/dpi-propagation-20261019/docs/DPR_800x600_EVIDENCE_2026-10-19.md), [`tools/df-density-readonly.cpp`](https://github.com/braindamp/deskfuse/blob/diagnostics/dpi-propagation-20261019/tools/df-density-readonly.cpp), [`DprChallengeLab.cs`](https://github.com/braindamp/deskfuse/blob/diagnostics/dpi-propagation-20261019/windows/agent/FocusWindow.Agent/DprChallengeLab.cs). The diagnostic experiment used a known-good driver, did not reinstall it, and checked physical-monitor preservation.
 
+### DPI boundary investigation — record and experiment status
+
+**Measured on this Windows/FocusIdd configuration (19 October 2026):**
+
+| Virtual display (physical pixels) | Windows reported maximum scale | Logical/effective size at that maximum |
+| --- | ---: | ---: |
+| 1440×3120 | 225% | 640×1386.7 DIPs |
+| 1440×3900 | 225% | 640×1733.3 DIPs |
+| 1600×3120 | 250% | 640×1248 DIPs |
+| 1920×3120 | 300% | 640×1040 DIPs |
+| 2100×3120 | 350% | 600×891.4 DIPs |
+| 3120×1440 | 225% | 1386.7×640 DIPs |
+| 2560×1080 | 175% | 1462.9×617.1 DIPs |
+| 1200×1200 | 150% | 800×800 DIPs |
+
+The observations fit the **largest offered scale step** for which `min(width,height)/(scale/100) >= approximately 600 DIPs` **and** `max(width,height)/(scale/100) >= approximately 800 DIPs`. Rotation and the square case contradict a width-only minimum. **The exact thresholds, their implementation inside Windows, and portability to another build are NOT proven by discrete scale-step data**. Do not claim that an 800×600 application UI guideline documents a kernel DPI algorithm.
+
+**Already attempted:** EDID diagonals 80/170/420 mm (recommended scaling changed but maximum did not); unsupported 350% `-4` write at 1440×3120 (stored 350%, but native PMv2 HWND measured 216 DPI); supported 350% at 2100×3120 (independent native PMv2 HWND measured 336 DPI). Historical WinForms HWND measurements sometimes incorrectly showed 96 DPI; the native window and actual captured pixel ruler are the relevant acceptance witnesses.
+
+**Prepared but not confirmed executed:** [`tools/verify-effective-desktop-boundary.ps1`](https://github.com/braindamp/deskfuse/blob/diagnostics/dpi-propagation-20261019/tools/verify-effective-desktop-boundary.ps1) on the diagnostics branch. Its optional **DPI-read-only** five-mode test compares 2100×2800 vs 2100×2798 (the 800-DIP long-side boundary at 350%) and 1200×1600 vs 1200×1598 / 1198×1600 (both dimensions around the 200% threshold). No hardware readback for those exact five modes has been provided. **This is not a dependency for the separate WGC POC and not an instruction to reopen the concluded Phase 0–1 test campaign**. Only run if future architecture decisions require extra corroboration, and only after guarding the globally shared driver.
+
+**Unmet Approach A acceptance:** Windows must expose an **exact 1440×3120 monitor**, an independent native PMv2 window on it must receive **336 DPI**, and an unresized **1440×3120 captured frame** must contain a **350×350 physical-pixel ruler for 100 DIPs**. A 2100-wide high-DPI monitor with a 1440×3120 WGC-captured window is a valuable **different pipeline**, not success on that exact-monitor gate. Browser-managed CSS DPR is likewise distinct from native Win32 DPI.
+
+**References:** [Empirical DPI evidence](https://github.com/braindamp/deskfuse/blob/diagnostics/dpi-propagation-20261019/docs/DPR_800x600_EVIDENCE_2026-10-19.md) · [Native Win32 witness](https://github.com/braindamp/deskfuse/blob/diagnostics/dpi-propagation-20261019/tools/df-density-readonly.cpp) · [WGC POC spec](docs/DeskFuse_GPU_Phone_Workspace_WGC_POC_SPEC_v1.2.md) · [Window-first/browser architecture](docs/WINDOW_FIRST_WORKSPACE_AND_RENDERING_PIPELINES.md).
+
 ## 3. Repository, branches and change boundaries
 
 **Canonical GitHub project:** https://github.com/braindamp/deskfuse — treat `main` as the shared integration branch; its README, P2 implementation and handshake contracts may lag independently completed test evidence.
 
 - `main` — shared app/product code and v0.3 plan; other agents may merge accepted work here. **Do not directly commit a speculative branch into `main`.**
 - `diagnostics/dpi-propagation-20261019` — isolated experimental DPI evidence and native-ruler work; the physical FocusIdd installation is **shared system-wide** even when Git worktrees are separate.
-- `poc/gpu-phone-workspace-wgc` — **delegated GPU/WGC POC branch name requested in its assignment**. It may be created/owned by the separate coding agent; do not assume it already exists or take it over.
+- `poc/gpu-phone-workspace-wgc` — **GPU/WGC POC branch name reserved for its separate coding agent**. It may be created/owned by that agent; do not assume it exists or take it over.
 - `docs/window-first-architecture-20261019` — product strategy and handover documentation branch. Documentation changes may be reviewed/cherry-picked independently of code.
 
 **Known Windows working folders:** `D:\Coding\DeskFuse\dpr-lab` (current testing worktree); `D:\Coding\DeskFuse\dpr-propagation` (separate diagnostic worktree); historical guarded baseline `D:\Coding\DeskFuse\DeskFuse_Phase_0_1_BuildFix_v0.2.1`; old v0.3 handoff directory `D:\Coding\DeskFuse\v0.3`. These are historical or reported locations, **not instructions to overwrite**. Never infer which folder is active without inspecting it.
@@ -117,8 +142,8 @@ The ordered P0–P5 tasks in the consolidated plan still define the implementati
 - **Don't erase 350% failure:** `DisplayConfigGetDeviceInfo(-3)` holding `350%` above a 225% cap is insufficient. Use independent native HWND DPI and captured pixel ruler as the native-rendering witness.
 - **Don't mislabel architectures:** successful HWND/WGC streaming from a 2100-wide monitor is not a true 1440-wide Windows monitor. Successful managed browser DPR is not native OS DPI for arbitrary Win32 apps. Both may be valuable product capabilities.
 - **No untrusted privileged shortcuts:** don't change physical screens, registry/global scaling, install software drivers or interact with the secure desktop during a documentation/design pass. Credential/device IDs and personal desktop imagery must be protected in tests and handbacks.
-- **Do not let parallel agents collide:** only one FocusIdd owner at a time; Git worktrees do not isolate installed Windows drivers. The delegated WGC agent owns its own branch and results until review.
+- **Do not let parallel agents collide:** only one FocusIdd owner at a time; Git worktrees do not isolate installed Windows drivers. The separate WGC agent owns its own branch and results once started, until review.
 
 ## 9. Next-session / next-agent instruction
 
-> Read this `HANDOVER_START_HERE.md` first, then `docs/WINDOW_FIRST_WORKSPACE_AND_RENDERING_PIPELINES.md` and `plans/DeskFuse_Consolidated_Build_Plan_v0.3.md`. The historical v0.3 return-handshake test campaign has **already been executed/concluded** per the owner; use its real artifacts to audit acceptance when needed, not to reopen it reflexively. The original Phase 0–1 hardware checklist was exercised, but exact **1440×3120 at genuine Windows 350%/336 DPI** remains an explicit unsatisfied requirement. A separate agent is **currently building** the 2100×3120→1440×3120 GPU/WGC phone-window POC with per-phone monitor identity and verified reconnection scaling; that POC is **not your task**. Your focus is to continue DeskFuse as a window-first phone productivity system: a spatial topic-organized desk of individual windows, an optimized per-window focused stream, browser-specific offscreen/CDP options when appropriate, and separate optional whole-desktop mode. Keep proper real touch, mouse/keyboard, gamepad feasibility, and an optional privilege-separated service for permitted OS interactions in the future design backlog; don't assume SYSTEM alone captures UAC/lock screens or Ctrl+Alt+Del. Preserve feature scope, security, honest evidence and branch/worktree isolation. Propose next architecture/product milestones from the consolidated plan without modifying the known-good driver or interfering with the delegated POC.
+> Read this `HANDOVER_START_HERE.md` first, then `docs/WINDOW_FIRST_WORKSPACE_AND_RENDERING_PIPELINES.md` and `plans/DeskFuse_Consolidated_Build_Plan_v0.3.md`. The historical v0.3 return-handshake test campaign has **already been executed/concluded** per the owner; use its real artifacts to audit acceptance when needed, not to reopen it reflexively. The original Phase 0–1 hardware checklist was exercised, but exact **1440×3120 at genuine Windows 350%/336 DPI** remains an explicit unsatisfied requirement. A separate agent has an **independent specification to build** the 2100×3120→1440×3120 GPU/WGC phone-window POC with per-phone monitor identity and verified reconnection scaling; that POC is **not your task**. Your focus is to continue DeskFuse as a window-first phone productivity system: a spatial topic-organized desk of individual windows, an optimized per-window focused stream, browser-specific offscreen/CDP options when appropriate, and separate optional whole-desktop mode. Keep proper real touch, mouse/keyboard, gamepad feasibility, and an optional privilege-separated service for permitted OS interactions in the future design backlog; don't assume SYSTEM alone captures UAC/lock screens or Ctrl+Alt+Del. Preserve feature scope, security, honest evidence and branch/worktree isolation. Propose next architecture/product milestones from the consolidated plan without modifying the known-good driver or interfering with the delegated POC.
