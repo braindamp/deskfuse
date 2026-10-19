@@ -71,6 +71,7 @@ class SessionController(
     private val _pcAudioStatus = MutableStateFlow("Off")
     val pcAudioStatus: StateFlow<String> = _pcAudioStatus.asStateFlow()
     private var pcAudioRequested = false
+    private var hostPcAudioAvailable = false
     private var pcAudioOutput: PcAudioOutput? = null
     private val transport = LanTransport(scope)
     private lateinit var decoder: VideoDecoder
@@ -100,6 +101,10 @@ class SessionController(
 
     fun togglePcAudio() {
         if (_state.value !is SessionState.Streaming) return
+        if (!hostPcAudioAvailable) {
+            _pcAudioStatus.value = "Unavailable"
+            return
+        }
         if (pcAudioRequested) {
             pcAudioRequested = false
             pcAudioOutput?.stop()
@@ -134,6 +139,7 @@ class SessionController(
     }
 
     fun start(payload: PairingPayload, profile: PhoneProfile) {
+        hostPcAudioAvailable = false
         stopPcAudioLocal()
         this.payload = payload
         this.profile = profile
@@ -226,7 +232,10 @@ class SessionController(
     private suspend fun pumpControl() {
         transport.control.collect { msg ->
             when (msg) {
-                is ServerMessage.Hello -> Unit
+                is ServerMessage.Hello -> {
+                    hostPcAudioAvailable = msg.pcAudioAvailable
+                    _pcAudioStatus.value = if (msg.pcAudioAvailable) "Off" else "Unavailable"
+                }
 
                 is ServerMessage.Stage -> {
                     if (msg.stage == "file" || msg.stage == "files") _fileStatus.emit(msg.detail)
