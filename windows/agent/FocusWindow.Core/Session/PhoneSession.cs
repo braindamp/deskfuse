@@ -164,7 +164,7 @@ internal sealed class PhoneSession
         return new InputGeometry(viewport, width, height);
     }
 
-    private async Task RestoreAdaptiveScaleAsync()
+    private void RestoreAdaptiveScale()
     {
         var original = _outcome?.RestoreScalePercent;
         if (original is null || _backend is null) return;
@@ -368,7 +368,7 @@ internal sealed class PhoneSession
             var old = _encoder;
             _encoder = null;
             if (old is not null) await old.DisposeAsync().ConfigureAwait(false);
-            await RestoreAdaptiveScaleAsync().ConfigureAwait(false);
+            RestoreAdaptiveScale();
             _outcome = await NegotiatePhoneDisplayAsync(next, ct).ConfigureAwait(false);
             _s.OnNegotiated?.Invoke(_outcome);
             _geometry = ViewportInputGeometry(_outcome);
@@ -681,7 +681,7 @@ internal sealed class PhoneSession
         }
         if (_backend is not null)
         {
-            try { await RestoreAdaptiveScaleAsync().ConfigureAwait(false); }
+            try { RestoreAdaptiveScale(); }
             catch (Exception ex) { _log.Warn("restoring the virtual monitor's original scale: " + ex.Message); }
             try { await _backend.RemoveMonitorAsync(CancellationToken.None).ConfigureAwait(false); }
             catch (Exception ex) { _log.Warn("removing the phone monitor: " + ex.Message); }
