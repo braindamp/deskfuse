@@ -10,6 +10,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
 import com.focuswindow.client.media.VideoDecoder
+import com.focuswindow.client.media.PcAudioOutput
 import com.focuswindow.client.profile.PhoneProfile
 import com.focuswindow.client.protocol.ClientMessage
 import com.focuswindow.client.protocol.DensityPreset
@@ -31,6 +32,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlin.math.min
 
 /**
@@ -66,6 +68,10 @@ class SessionController(
     private val downloadBusy = AtomicBoolean(false)
     private val _windows = MutableStateFlow<List<WindowEntry>>(emptyList())
     val windows: StateFlow<List<WindowEntry>> = _windows.asStateFlow()
+    private val _pcAudioStatus = MutableStateFlow("Off")
+    val pcAudioStatus: StateFlow<String> = _pcAudioStatus.asStateFlow()
+    private var pcAudioRequested = false
+    private var pcAudioOutput: PcAudioOutput? = null
     private val transport = LanTransport(scope)
     private lateinit var decoder: VideoDecoder
 
@@ -88,6 +94,30 @@ class SessionController(
     var densityPreset: DensityPreset = DensityPreset.LOGICAL
         private set
 
+    fun attachPcAudioOutput(output: PcAudioOutput) {
+        pcAudioOutput = output
+    }
+
+    fun togglePcAudio() {
+        if (_state.value !is SessionState.Streaming) return
+        if (pcAudioRequested) {
+            pcAudioRequested = false
+            pcAudioOutput?.stop()
+            _pcAudioStatus.value = "Off"
+            scope.launch { transport.send(ClientMessage.Audio("stop_pc")) }
+        } else {
+            pcAudioRequested = true
+            _pcAudioStatus.value = "Starting"
+            scope.launch { transport.send(ClientMessage.Audio("start_pc")) }
+        }
+    }
+
+    private fun stopPcAudioLocal() {
+        pcAudioRequested = false
+        pcAudioOutput?.stop()
+        _pcAudioStatus.value = "Off"
+    }
+
     fun attachSurface(view: PhoneSurfaceView) {
         surfaceView = view
         view.awaitSurface(
@@ -104,6 +134,7 @@ class SessionController(
     }
 
     fun start(payload: PairingPayload, profile: PhoneProfile) {
+        stopPcAudioLocal()
         this.payload = payload
         this.profile = profile
         attempt = 0
@@ -141,6 +172,7 @@ class SessionController(
         pumpJob = scope.launch {
             launch { pumpControl() }
             launch { pumpFrames() }
+            launch { pumpAudio() }
             launch { pumpEvents() }
             transport.connect(payload)
         }
@@ -169,6 +201,7 @@ class SessionController(
                 }
 
                 is LanTransport.TransportEvent.Failed -> {
+                    stopPcAudioLocal()
                     uploadJob?.cancel()
                     abortDownload("Connection lost; incomplete download discarded")
                     _state.value = SessionState.Failed(
@@ -180,6 +213,7 @@ class SessionController(
                 }
 
                 is LanTransport.TransportEvent.Closed -> {
+                    stopPcAudioLocal()
                     uploadJob?.cancel()
                     abortDownload("Connection closed; incomplete download discarded")
                     if (event.recoverable) scheduleReconnect(event.reason)
@@ -237,6 +271,27 @@ class SessionController(
                 is ServerMessage.FileData -> receiveFileData(msg)
 
                 is ServerMessage.WindowList -> _windows.value = msg.windows
+
+                is ServerMessage.AudioState -> {
+                    when (msg.state) {
+                        "started" -> {
+                            if (pcAudioRequested && pcAudioOutput?.start(
+                                    msg.streamId, msg.sampleRate, msg.channels, msg.format,
+                                ) == true) {
+                                _pcAudioStatus.value = "On"
+                            } else {
+                                stopPcAudioLocal()
+                                _pcAudioStatus.value = "Unavailable"
+                                transport.send(ClientMessage.Audio("stop_pc"))
+                            }
+                        }
+                        "stopped" -> stopPcAudioLocal()
+                        "error" -> {
+                            stopPcAudioLocal()
+                            _pcAudioStatus.value = "Unavailable"
+                        }
+                    }
+                }
 
                 is ServerMessage.Clipboard -> {
                     if (pendingClipboardRead && msg.mime == "text/plain" && msg.text != null &&
@@ -381,6 +436,14 @@ class SessionController(
                 remediation = "Check the PC is awake and on the same network, then reconnect.",
                 recoverable = true,
             )
+        }
+    }
+
+    private suspend fun pumpAudio() {
+        transport.audio.collect { chunk ->
+            if (_pcAudioStatus.value == "On") withContext(Dispatchers.IO) {
+                pcAudioOutput?.write(chunk)
+            }
         }
     }
 
@@ -532,6 +595,7 @@ class SessionController(
     }
 
     fun stop(reason: String = "user ended the session") {
+        stopPcAudioLocal()
         pendingClipboardRead = false
         uploadJob?.cancel()
         abortDownload("Disconnected; incomplete download discarded")
