@@ -102,13 +102,15 @@ public static class ServerMessages
 {
     public static byte[] Serialize(JsonObject o) =>
         Encoding.UTF8.GetBytes(o.ToJsonString(new JsonSerializerOptions { WriteIndented = false }));
-    public static JsonObject Hello(string hostVersion, string hostName, string channel) => new()
+    public static JsonObject Hello(string hostVersion, string hostName, string channel,
+        bool pcAudioAvailable = false) => new()
     {
         ["type"] = "hello",
         ["protocolVersion"] = Wire.ProtocolVersion,
         ["hostVersion"] = hostVersion,
         ["hostName"] = hostName,
         ["channel"] = channel,
+        ["pcAudioAvailable"] = pcAudioAvailable,
     };
     // Text only. Never mirror the clipboard without an explicit user request.
     public static JsonObject WindowList(IReadOnlyList<WindowItem> windows)
