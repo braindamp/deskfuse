@@ -172,6 +172,13 @@ sealed interface ServerMessage {
     @Serializable @SerialName("window_list")
     data class WindowList(val windows: List<WindowEntry>) : ServerMessage
 
+    @Serializable @SerialName("audio_state")
+    data class AudioState(
+        val state: String, val streamId: Int,
+        val sampleRate: Int = 0, val channels: Int = 0,
+        val format: String = "pcm_s16le", val detail: String? = null,
+    ) : ServerMessage
+
     @Serializable @SerialName("clipboard")
     data class Clipboard(val mime: String, val text: String? = null, val base64: String? = null) :
         ServerMessage
@@ -226,6 +233,9 @@ sealed interface ClientMessage {
 
     @Serializable @SerialName("windows")
     data class Windows(val action: String, val id: String? = null) : ClientMessage
+
+    @Serializable @SerialName("audio")
+    data class Audio(val action: String) : ClientMessage
 
     /** One explicitly selected Android document, delivered in bounded encrypted chunks. */
     @Serializable @SerialName("files")
