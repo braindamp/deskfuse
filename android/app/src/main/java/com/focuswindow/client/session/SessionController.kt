@@ -104,6 +104,7 @@ class SessionController(
     }
 
     fun start(payload: PairingPayload, profile: PhoneProfile) {
+        _windows.value = emptyList() // Never present previous-session HWNDs as live cards.
         this.payload = payload
         this.profile = profile
         attempt = 0
@@ -169,6 +170,7 @@ class SessionController(
                 }
 
                 is LanTransport.TransportEvent.Failed -> {
+                    _windows.value = emptyList()
                     uploadJob?.cancel()
                     abortDownload("Connection lost; incomplete download discarded")
                     _state.value = SessionState.Failed(
@@ -180,6 +182,7 @@ class SessionController(
                 }
 
                 is LanTransport.TransportEvent.Closed -> {
+                    _windows.value = emptyList()
                     uploadJob?.cancel()
                     abortDownload("Connection closed; incomplete download discarded")
                     if (event.recoverable) scheduleReconnect(event.reason)
@@ -532,6 +535,7 @@ class SessionController(
     }
 
     fun stop(reason: String = "user ended the session") {
+        _windows.value = emptyList()
         pendingClipboardRead = false
         uploadJob?.cancel()
         abortDownload("Disconnected; incomplete download discarded")
