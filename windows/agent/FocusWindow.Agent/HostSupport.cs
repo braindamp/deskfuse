@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text.Json;
 using System.Windows.Forms;
@@ -7,6 +8,16 @@ using FocusWindow.Core.Session;
 using FocusWindow.Core.Transport;
 using QRCoder;
 namespace FocusWindow.Agent;
+
+internal static class EnrollmentDialogNative
+{
+    internal const int SW_SHOW = 5;
+    [DllImport("user32.dll")]
+    internal static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll")]
+    internal static extern bool SetForegroundWindow(IntPtr hWnd);
+}
+
 internal static class AppData
 {
     public static string Directory
@@ -151,7 +162,16 @@ internal sealed class ConsoleApproval : IApprovalPolicy, IEnrollmentApprovalPoli
                 window.CancelButton = deny;
                 using var timeout = new System.Windows.Forms.Timer { Interval = 60_000 };
                 timeout.Tick += (_, _) => { timeout.Stop(); window.DialogResult = DialogResult.Cancel; window.Close(); };
-                window.Shown += (_, _) => timeout.Start();
+                window.Shown += (_, _) =>
+                {
+                    // A host launched with a hidden/minimized startup window also
+                    // creates its first WinForms window hidden (STARTUPINFO). Force
+                    // the consent dialog visible so a hidden launch cannot turn an
+                    // enrollment into a silent 60 s timeout denial.
+                    EnrollmentDialogNative.ShowWindow(window.Handle, EnrollmentDialogNative.SW_SHOW);
+                    EnrollmentDialogNative.SetForegroundWindow(window.Handle);
+                    timeout.Start();
+                };
                 using var cancellation = ct.Register(() =>
                 {
                     try { if (window.IsHandleCreated && !window.IsDisposed)
