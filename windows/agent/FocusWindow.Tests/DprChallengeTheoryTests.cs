@@ -22,6 +22,43 @@ public sealed class DprChallengeTheoryTests
         Assert.Equal(expected, DprChallengeTheory.PredictedMaximum(width, 3120, 640));
     }
 
+    // These are actual maximum scaling readbacks from the Windows 10 FocusIdd
+    // challenge runs (October 19, 2026). They support, but do not prove, the
+    // 800x600 effective-desktop constraint inferred from mode geometry.
+    [Theory]
+    [InlineData(1440, 3120, 225)]
+    [InlineData(1440, 3900, 225)]
+    [InlineData(1600, 3120, 250)]
+    [InlineData(1920, 3120, 300)]
+    [InlineData(2100, 3120, 350)]
+    [InlineData(3120, 1440, 225)]
+    [InlineData(2560, 1080, 175)]
+    [InlineData(1200, 1200, 150)]
+    public void Orientation_independent_800x600_hypothesis_matches_measured_scaling_caps(
+        int width, int height, int observedMax)
+    {
+        Assert.Equal(observedMax,
+            DprChallengeTheory.PredictedMaximumForLogicalDesktop(width, height));
+    }
+
+    [Fact]
+    public void Square_display_requires_800_dips_in_both_directions()
+    {
+        // A 600x600 effective desktop is NOT enough despite the short-side
+        // 600 DIP floor. With 1200x1200 source, 150% is the largest model step.
+        Assert.Equal(150, DprChallengeTheory.PredictedMaximumForLogicalDesktop(1200, 1200));
+        Assert.Equal(200, DprChallengeTheory.PredictedMaximumForLogicalDesktop(1600, 1600));
+    }
+
+    [Fact]
+    public void A_350_percent_mode_is_allowed_by_geometry_only_at_a_short_side_of_at_least_2100_px()
+    {
+        Assert.Equal(300, DprChallengeTheory.PredictedMaximumForLogicalDesktop(2098, 3120));
+        Assert.Equal(350, DprChallengeTheory.PredictedMaximumForLogicalDesktop(2100, 3120));
+        Assert.Equal(350, DprChallengeTheory.PredictedMaximumForLogicalDesktop(2102, 3120));
+        Assert.Equal(225, DprChallengeTheory.PredictedMaximumForLogicalDesktop(1440, 3120));
+    }
+
     [Theory]
     [InlineData(200, 350, 4)]
     [InlineData(100, 350, 8)]
