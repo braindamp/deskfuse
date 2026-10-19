@@ -244,6 +244,37 @@ internal static unsafe class DisplayConfigApi
             ? new ScaleSetResult(true, $"DisplayConfigSetDeviceInfo(-4) accepted relative index {packet.ScaleRel} for {percent}%")
             : new ScaleSetResult(false, $"DisplayConfigSetDeviceInfo(-4) returned {rc} ({new Win32Exception(rc).Message})");
     }
+    /// <summary>
+    /// FA challenge ONLY: issue the undocumented -4 SET even if Windows reports
+    /// the requested step above its maximum. Production SetScale remains guarded.
+    /// The caller MUST hold an explicitly identified new virtual display, capture
+    /// the original scale, read back, and restore it in a finally block.
+    /// </summary>
+    internal static ScaleSetResult TrySetScaleForChallenge(PhoneTarget t, int percent,
+        bool explicitlyAllowBeyondMaximum)
+    {
+        var caps = ReadScaleCaps(t);
+        if (caps is null)
+            return new ScaleSetResult(false, "REJECTED_PRECHECK: cannot decode virtual monitor DPI range");
+        if (WindowsScale.IndexOf(percent) < 0)
+            return new ScaleSetResult(false, $"REJECTED_PRECHECK: {percent}% is not a supported Windows step");
+        if (percent > caps.MaxPercent && !explicitlyAllowBeyondMaximum)
+            return new ScaleSetResult(false,
+                $"REJECTED_PRECHECK: {percent}% exceeds reported max {caps.MaxPercent}%; " +
+                "requires explicit challenge-only beyond-cap permission");
+        var relative = DprChallengeTheory.UnrestrictedRelativeStep(caps.RecommendedPercent, percent);
+        var packet = new Win32Layout.DpiScaleSet { ScaleRel = relative };
+        packet.Header.Type = Win32Layout.DeviceInfoSetDpiScale;
+        packet.Header.Size = (uint)sizeof(Win32Layout.DpiScaleSet);
+        packet.Header.AdapterId = t.AdapterId;
+        packet.Header.Id = t.SourceId;
+        var rc = Native.SetDpiScale(ref packet);
+        return new ScaleSetResult(rc == 0,
+            $"DisplayConfigSetDeviceInfo(-4) requested={percent}% recommended={caps.RecommendedPercent}% " +
+            $"reported-max={caps.MaxPercent}% relative-step={relative} win32-return={rc}" +
+            (rc == 0 ? " (API accepted, actual DPI still UNVERIFIED)" :
+             $" ({new Win32Exception(rc).Message})"));
+    }
     public static string DescribeAwareness(IntPtr hwnd)
     {
         var ctx = Native.GetWindowDpiAwarenessContext(hwnd);
