@@ -10,6 +10,28 @@ Status: delivery checklist, 20 October 2026. Distinguish implemented building bl
 4. Each device feature needs explicit phone permission, trusted-peer authorization, a visible on/off state, teardown on disconnect, and device-specific capability/fallback reporting. Never pretend a stream is a Windows device until an actual OS-facing endpoint is available.
 5. Preserve the existing secure LAN channel; never forward video/audio/sensor data to cloud endpoints by default.
 
+## Audio device behavior: USB-like arrival/removal (binding goal; topology undecided)
+
+**Owner correction, 20 October 2026:** A disconnected phone must **not** remain an active Windows microphone/speaker producing artificial silence. The desired experience is an ordinary **disconnected audio device**, with Windows and apps receiving native device arrival/removal events when the phone drops or returns, retaining the same recognizable endpoint identity on reconnect. The host must not replace the user's physical mic/speakers by an arbitrary fallback policy. Windows itself may choose a different active fallback while the device is away; when it returns the OS applies its remembered user and per-app preferences (actual third-party app recovery varies). The goal is native USB-like semantics, **not USB protocol emulation**.
+
+The audio topology is **NOT DECIDED**; do not implement an endpoint lifecycle or hardcode silence-on-disconnect until it is chosen:
+
+- **Option A — Per-phone endpoint pair.** Each trusted phone has its own stable Windows microphone + speaker identities and separate PnP presence, enabling simultaneous phones and per-application routing. Requires identity/provisioning and device-limit policy.
+- **Option B — One shared DeskFuse endpoint pair.** One Windows microphone + speaker; one designated phone owns it at a time. The endpoint appears when the designated phone connects and disappears when it disconnects. Simple picker, but phone handover/ownership and source priority are required.
+- **Option C — Shared default plus optional per-phone endpoints.** Extends B with advanced dedicated devices, at increased install/configuration complexity.
+
+The OS-facing endpoint must be a genuine Windows audio device (e.g. a signed virtual audio driver using supported Windows audio interfaces), with consistent device instance identity and appropriate device state notifications, not merely incoming network samples. `DEVICE_STATE_UNPLUGGED` specifically requires jack-presence detection, whereas a dynamically removed software audio device would typically be `NOTPRESENT` / reappear. Exact lifetime semantics are an engineering design item. The install/runtime privilege boundary must be established separately. Do not attempt to spoof arbitrary USB device classes.
+
+**Independent choice:** whether DeskFuse only honors Windows/app audio selection versus offering an **explicitly opted-in** 'restore my last Windows preferred default on reappearance' feature. Do not silently force or overwrite user/system/app defaults. Windows may remember preferences for previously chosen devices, but not all applications automatically reopen an invalidated audio client.
+
+**Speaker meaning:** `PC sound -> phone` currently implemented on the audio branch is *loopback mirroring*, not a selectable Windows output device. The desired Windows-render endpoint would route sound to the phone as a genuine speaker destination, without necessarily playing it from the physical PC output. These are separate capabilities.
+
+**Mic meaning:** Phone microphone PCM transport/Android permission is not equivalent to an app-selectable Windows microphone; both sender and real capture endpoint are required.
+
+**Privacy/reconnect invariant:** Restore a remembered **routing preference**, subject to the selected phone being paired, authorized, physically connected and Android microphone permissions. Losing the connection closes the active mic capture; returning may automatically resume only while the user-granted policy and phone permissions remain valid. Persistent endpoint identity does not mean always-on mic access.
+
+**Decision needed before implementing the Windows device:** A, B or C, and whether OS preference handling alone is sufficient or a user-opted explicit re-selection feature is needed. Virtual-display/rendering/grid POC remains untouched.
+
 ## Deliverables (delivery order, not test results)
 
 | ID | Priority | Deliverable | Existing / remaining |
@@ -17,10 +39,10 @@ Status: delivery checklist, 20 October 2026. Distinguish implemented building bl
 | DF-01 | P0 (POC-owned) | Native-resolution, DPI-verified virtual-monitor/window rendering and GPU capture | Delegated GPU POC. Exact 1440×3120 @ genuine Windows 336 DPI remains unproven |
 | DF-02 | P0 (main app) | Isolated per-window presentation at phone dimensions, focus routing and native Android-style activity switching | Existing desktop stream and native window listing; safe separate window copies/full-screen focus still missing |
 | DF-03 | P0 | Physical Windows desktop preservation | Existing topology guard; host window activation from old picker and draft grid is **not isolated** and must not be merged as default window-first behavior |
-| DF-04 | P1 | Windows playback audio -> Android speakers/headphones | Implement authenticated, opt-in WASAPI loopback -> bounded audio packets -> Android AudioTrack, with audio focus, mute, reset and stop |
-| DF-05 | P1 | Android microphone -> Windows application-selectable microphone | Permissioned AudioRecord and streaming, plus genuine Windows capture-device integration; OS endpoint is still missing |
+| DF-04 | P1 | Windows sound -> Android audio, plus eventual selectable Windows speakers | Existing branch implements optional *mixed-PC-output mirroring*, not native Windows render endpoint; separate PnP audio destination and remembered choice still needed |
+| DF-05 | P1 | Phone mic -> real Windows microphone with USB-like presence semantics | Permissioned phone AudioRecord + encrypted PCM path + true Windows capture endpoint; stable ID across reappearance; no silent active endpoint; topology A/B/C pending decision |
 | DF-06 | P1 | Android camera(s) -> Windows application-selectable webcam | Permissioned CameraX/Camera2 with format/frame controls, plus Windows Media Foundation virtual-camera source. Windows 11 version/build support varies |
-| DF-07 | P1 | Device Bridge media controls | Per-peer capability advertisement, stream leases, privacy/revocation controls, hotplug, errors and independent streaming lifetime |
+| DF-07 | P1 | Device Bridge control, endpoint identity and consent | Negotiated per-peer media capabilities, selected-phone ownership, user-granted routing preference, real PnP endpoint availability, hotplug notification, reconnect, revocation |
 | DF-08 | P2 | Advanced Windows interaction from phone | True mapped touch/pen, IME/text, keyboard/mouse modes, safe input ownership; no global mouse capture for workspace |
 | DF-09 | P2 | Android phone sensors in Windows | Permissioned per-sensor stream (orientation/motion, optional location), explicit Windows consumers/adapters; avoid inventing generic Windows HID mapping |
 | DF-10 | P2 | Productivity | Clipboard image/MIME, file manager mutations, OS-native open-with actions, Explorer extension, phone Sharesheet and safe write-back |
@@ -36,7 +58,7 @@ Status: delivery checklist, 20 October 2026. Distinguish implemented building bl
 
 **A.** Deliver PC -> phone audio on a separate branch (independent of virtual-monitor POC). Use system-output loopback explicitly, not an unverified per-app feed. Default OFF on the phone AND host. The host operator must opt in with `--enable-pc-audio`; the phone must request playback. PCM16 stereo, 48kHz LAN transport is an initial implementation, not a measured A/V sync or performance claim. Older hosts advertise no audio capability.
 
-**B.** Implement phone mic capture + network path after establishing actual Windows virtual capture endpoint strategy. The network path alone is not a functional virtual microphone.
+**B.** Prepare permissioned Android mic capture and encrypted packets independently of the OS endpoint. Do **not** choose device disappearance/persistent-silence behavior or assert Windows selectable-mic functionality until the owner chooses A/B/C topology. Evaluate signed Windows virtual audio device implementation and user/OS selection semantics. An existing third-party virtual cable is only a temporary development adapter, not native USB-like behavior.
 
 **C.** Integrate Windows user-visible camera using supported Media Foundation APIs plus an Android camera producer, not a fake UVC claim. Prefer current-user scope, permission-bound lifetime, safe fallback on older Windows.
 
@@ -44,6 +66,6 @@ Status: delivery checklist, 20 October 2026. Distinguish implemented building bl
 
 ## Scope boundaries
 
-The earlier draft PR #4 is **not a suitable default UX until revised**: its host focus operation calls SetForegroundWindow against ordinary Windows windows. Keep it draft/unmerged and design against DF-02/03 instead.
+The earlier draft PR #4 is **not a suitable default UX until revised**: its host focus operation calls SetForegroundWindow against ordinary Windows windows. It was closed unmerged and design against DF-02/03 instead.
 
 Acceptance and hardware/device testing may be scheduled later per owner direction. Code committed or interface added does not imply delivered hardware support.
