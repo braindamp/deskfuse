@@ -122,9 +122,9 @@ internal sealed class ConsoleApproval : IApprovalPolicy, IEnrollmentApprovalPoli
                 var safeLabel = new string(deviceLabel.Where(c => !char.IsControl(c)).Take(80).ToArray());
                 var message = new Label
                 {
-                    Text = $"Allow {safeLabel} to control this PC?\\n\\n" +
-                        $"Check that both devices show: {code}\\n\\n" +
-                        "Approval includes desktop control and access to your Windows files.\\n" +
+                    Text = $"Allow {safeLabel} to control this PC?\n\n" +
+                        $"Check that both devices show: {code}\n\n" +
+                        "Approval includes desktop control and access to your Windows files.\n" +
                         "Only accept if the code on your phone matches.",
                     Location = new System.Drawing.Point(18, 17),
                     Size = new System.Drawing.Size(415, 157),
