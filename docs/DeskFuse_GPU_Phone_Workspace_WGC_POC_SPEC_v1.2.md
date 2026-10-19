@@ -255,7 +255,9 @@ Commit on this branch in small, reviewable steps; when ready:
 
 ```powershell
 git status --short
-git add windows/poc/gpu-phone-workspace tools/  # narrow explicit paths as appropriate
+git add windows/poc/gpu-phone-workspace tools/ `
+    docs/DeskFuse_GPU_Phone_Workspace_WGC_POC_SPEC_v1.2.md `
+    docs/WINDOW_FIRST_WORKSPACE_AND_RENDERING_PIPELINES.md # narrow paths if scope differs
 git commit -m "poc: native PMv2 phone window and WGC GPU capture"
 git push -u origin poc/gpu-phone-workspace-wgc
 ```
