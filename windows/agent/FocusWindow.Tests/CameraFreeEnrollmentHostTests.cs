@@ -40,6 +40,14 @@ public sealed class CameraFreeEnrollmentHostTests
             string verificationCode, CancellationToken ct) => Task.FromResult(false);
     }
 
+    private sealed class CapturingLog : ILog
+    {
+        public List<string> Lines { get; } = new();
+        public void Info(string message) => Lines.Add(message);
+        public void Warn(string message) => Lines.Add("WARN " + message);
+        public void Error(string message) => Lines.Add("ERR " + message);
+    }
+
     private sealed record EnrollmentSession(TcpClient Client, string Code, byte[] Key, byte[] Transcript)
         : IDisposable
     {
@@ -47,7 +55,7 @@ public sealed class CameraFreeEnrollmentHostTests
     }
 
     private static (CameraFreePairingHost Host, PairingOffer Offer) StartHost(
-        ScriptedApproval approval, IDeviceCredentialStore store)
+        ScriptedApproval approval, IDeviceCredentialStore store, ILog? log = null)
     {
         for (var attempt = 0; attempt < 40; attempt++)
         {
@@ -60,7 +68,7 @@ public sealed class CameraFreeEnrollmentHostTests
             {
                 var offer = Pairing.BuildOffer(Pairing.NewState(), "127.0.0.1", port, "deskfuse-test");
                 var host = new CameraFreePairingHost(offer, "deskfuse-test", store, approval,
-                    NullLog.Instance);
+                    log ?? NullLog.Instance);
                 return (host, offer);
             }
             catch (SocketException)
@@ -138,7 +146,8 @@ public sealed class CameraFreeEnrollmentHostTests
     {
         var approval = new ScriptedApproval(allow: false);
         var store = new MemoryDeviceCredentialStore();
-        var (host, offer) = StartHost(approval, store);
+        var log = new CapturingLog();
+        var (host, offer) = StartHost(approval, store, log);
         using var offerScope = offer;
         using var hostScope = host;
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(20));
@@ -154,6 +163,30 @@ public sealed class CameraFreeEnrollmentHostTests
         Assert.False(decision.TryGetProperty("ciphertext", out _));
         Assert.False(decision.TryGetProperty("nonce", out _));
         Assert.Empty(store.All());
+        Assert.Contains(log.Lines, line => line.Contains("Denied a new phone: Denied phone"));
+        Assert.DoesNotContain(log.Lines, line => line.Contains("Approved a new phone"));
+    }
+
+    [Fact]
+    public async Task Denial_log_neutralises_control_characters_in_the_phone_label()
+    {
+        var approval = new ScriptedApproval(allow: false);
+        var log = new CapturingLog();
+        var (host, offer) = StartHost(approval, new MemoryDeviceCredentialStore(), log);
+        using var offerScope = offer;
+        using var hostScope = host;
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+
+        using var session = await EnrollAsync(host.EnrollmentPort, "phone-test-0004",
+            "Evil\nINFO forged", cts.Token);
+        var decision = await ReadDecisionAsync(session, cts.Token);
+        Assert.Equal("denied", decision.GetProperty("status").GetString());
+        Assert.Contains(log.Lines, line => line.Contains("Denied a new phone: Evil?INFO forged"));
+        Assert.All(log.Lines, line =>
+        {
+            Assert.DoesNotContain('\n', line);
+            Assert.DoesNotContain('\r', line);
+        });
     }
 
     [Fact]

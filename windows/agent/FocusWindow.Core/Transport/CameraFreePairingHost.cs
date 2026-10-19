@@ -191,10 +191,14 @@ public sealed class CameraFreePairingHost : IDisposable
         {
             // Force a NEW approval even if the presented label/id matches an older device.
             // Otherwise a spoofed id would silently mint a fresh credential.
+            var logLabel = ForLog(label);
             var approved = await _approval.ApproveNewPairingAsync(id, label, code, ct)
                 .ConfigureAwait(false);
             if (!approved)
             {
+                // Audit before replying: a peer that disconnects mid-decision must
+                // still leave a trace of the denied attempt.
+                _log.Info($"Denied a new phone: {logLabel}");
                 await WriteAsync(stream, JsonSerializer.SerializeToUtf8Bytes(new { status = "denied" }), ct)
                     .ConfigureAwait(false);
                 return;
@@ -217,9 +221,19 @@ public sealed class CameraFreePairingHost : IDisposable
                 nonce = Convert.ToBase64String(nonce),
                 ciphertext = Convert.ToBase64String(cipher),
             }), ct).ConfigureAwait(false);
-            _log.Info($"Approved a new phone: {label} (credential stored securely by the host)");
+            _log.Info($"Approved a new phone: {logLabel} (credential stored securely by the host)");
         }
         finally { CryptographicOperations.ZeroMemory(key); }
+    }
+
+    /// <summary>Device labels are peer-supplied; never let them forge log lines.</summary>
+    private static string ForLog(string value)
+    {
+        if (!value.Any(char.IsControl)) return value;
+        var chars = value.ToCharArray();
+        for (var i = 0; i < chars.Length; i++)
+            if (char.IsControl(chars[i])) chars[i] = '?';
+        return new string(chars);
     }
 
     private static async Task<byte[]> ReadAsync(Stream stream, CancellationToken ct)
