@@ -19,6 +19,9 @@ public sealed record HostOptions
     public bool AllowFullUserFiles { get; init; } = true;
     public bool SingleSession { get; init; }
     public bool CameraFreePairing { get; init; }
+    /// <summary>Opt-in per-phone exact-DPR virtual backing display calibration.
+    /// Remains experimental until real-device viewport/window UX is qualified.</summary>
+    public bool AdaptiveDpiViewport { get; init; }
 }
 /// <summary>Decides whether a phone that just authenticated may use this PC (default: ask the user).</summary>
 public interface IApprovalPolicy
