@@ -616,14 +616,17 @@ internal sealed class PhoneSession
                     break;
                 case "focus" when request.Id is not null:
                     var activated = _windowCatalog.Activate(request.Id);
-                    _conn.SendControl(ServerMessages.WindowFocusResult(request.Id, activated));
+                    // A Stage is understood by older v3 phones; no new wire message kind.
+                    _conn.SendControl(ServerMessages.Stage("window_focus", activated ? "activated" : "denied"));
                     break;
             }
         }
         catch (Exception ex)
         {
             _log.Warn("window operation rejected: " + ex.GetType().Name);
-            _conn.SendControl(ServerMessages.Stage("window", "The chosen application window is no longer available."));
+            _conn.SendControl(request.Action == "focus"
+                ? ServerMessages.Stage("window_focus", "denied")
+                : ServerMessages.Stage("window", "Application inventory is unavailable."));
         }
     }
 
