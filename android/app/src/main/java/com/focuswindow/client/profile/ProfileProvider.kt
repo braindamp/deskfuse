@@ -40,7 +40,16 @@ class ProfileProvider(private val appContext: Context) {
         val widthPx = bounds.width()
         val heightPx = bounds.height()
 
-        val density = activity.resources.displayMetrics.density
+        // Current Android configuration is authoritative for logical dp/px.
+        // Use configuration.densityDpi only if DisplayMetrics itself is invalid.
+        // Never silently substitute a phone-specific DPR such as 3.5.
+        val metricsDensity = activity.resources.displayMetrics.density
+        val configuredDpi = activity.resources.configuration.densityDpi
+        val density = when {
+            metricsDensity.isFinite() && metricsDensity > 0f -> metricsDensity
+            configuredDpi > 0 -> configuredDpi / 160f
+            else -> Float.NaN // PhoneProfile.validate() refuses calibration and connection
+        }
         val fontScale = activity.resources.configuration.fontScale
 
         // FR-MOB-03 — safe area comes from cutout + system bars, in physical px.
