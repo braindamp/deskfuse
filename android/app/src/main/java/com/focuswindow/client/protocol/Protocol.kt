@@ -122,6 +122,7 @@ sealed interface ServerMessage {
         val hostName: String,
         /** FR-OPS-01 — the build the user can pin / roll back to. */
         val channel: String,
+        val pcAudioAvailable: Boolean = false,
     ) : ServerMessage
 
     @Serializable @SerialName("target")
