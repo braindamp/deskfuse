@@ -1,4 +1,4 @@
-# DeskFuse DPR challenge: a short, interactive, NO-INSTALL Windows test runner.
+# DeskFuse DPR challenge: non-prompting, explicitly flagged, NO-INSTALL Windows test runner.
 # Never invokes pnputil, devcon, DisplayConfig on physical monitors, or registry edits.
 # Does NOT replace tools/safe-driver-proof.ps1 (driver install / independent watchdog).
 [CmdletBinding()]
@@ -44,12 +44,10 @@ if ($Run) {
     Write-Host 'The installed driver has its own 10-second no-heartbeat monitor teardown.'
     Write-Host 'There is NO independent SYSTEM rollback in this lab; use only with the known-good driver.'
     Write-Host 'Close any DeskFuse streaming session before starting.'
-    $answer = Read-Host 'Type RUN to authorize the temporary virtual-display sweep'
-    if ($answer -cne 'RUN') { throw 'Operator declined virtual monitor changes.' }
-    if ($TryAboveCap) {
-        $answer = Read-Host 'Type UNSUPPORTED to authorize the beyond-max undocumented -4 attempt'
-        if ($answer -cne 'UNSUPPORTED') { throw 'Operator declined unsupported DPI write.' }
-    }
+    # No interactive confirmation: explicit -Run / -Try350 / -TryAboveCap
+    # switches authorize only this process's guarded virtual-monitor experiment.
+    # The agent still refuses an existing FocusIdd monitor and verifies physical displays.
+    Write-Host 'Explicit flags accepted; proceeding without interactive confirmation.'
 }
 $line = 'dpi-challenge --modes "' + $Modes + '" --diag-mm ' + $DiagonalMm +
     ' --out "' + $OutDirectory + '" --settle-ms ' + $SettleMs
