@@ -19,6 +19,9 @@ public sealed class AdaptiveViewportCalibration
     private readonly IPhysicalDisplayGuard _guard;
     private readonly DisplaySnapshot _before;
     private readonly ILog _log;
+    /// <summary>Production settle delays; driver-free unit tests use zero.</summary>
+    public int InitialSettlingMs { get; init; } = 750;
+    public int RetrySettlingMs { get; init; } = 1100;
 
     public AdaptiveViewportCalibration(IDisplayBackend backend, IPhysicalDisplayGuard guard,
         DisplaySnapshot before, ILog log)
@@ -171,7 +174,7 @@ public sealed class AdaptiveViewportCalibration
                 for (var attempt = 1; attempt <= 3; attempt++)
                 {
                     ct.ThrowIfCancellationRequested();
-                    await Task.Delay(attempt == 1 ? 750 : 1100, ct).ConfigureAwait(false);
+                    await Task.Delay(attempt == 1 ? InitialSettlingMs : RetrySettlingMs, ct).ConfigureAwait(false);
                     var actualCaps = _backend.ReadScaleCaps(monitor);
                     var readback = _backend.ReadDensity(monitor);
                     // Independent crop verifies the exact 1440x3120 phone view.
@@ -179,7 +182,7 @@ public sealed class AdaptiveViewportCalibration
                     var viewport = new RectI(monitor.Bounds.X, monitor.Bounds.Y,
                         phone.PhysicalW, phone.PhysicalH);
                     var probe = await _backend.ProbeViewportAsync(monitor,
-                        viewport, drawRuler: true, ct).ConfigureAwait(false);
+                        viewport, drawRuler: true, ct: ct).ConfigureAwait(false);
                     var expectedRulerPx = (int)Math.Round(100.0 * requestedDpi / 96);
                     var ruler = probe is { RulerOk: true } &&
                         Math.Abs((probe.MeasuredRulerWidthPx ?? 0) - expectedRulerPx) <= 3 &&
