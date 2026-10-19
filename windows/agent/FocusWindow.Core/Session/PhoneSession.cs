@@ -77,7 +77,8 @@ internal sealed class PhoneSession
             pcAudioAvailable: _o.AllowPcAudio && _s.CreateAudioCapture is not null,
             phoneMicrophoneBridgeAvailable: _o.AllowPhoneMicrophone &&
                 _o.CameraFreePairing && _s.DeviceCredentials is not null &&
-                _s.CreatePhoneMicrophoneSink is not null));
+                _s.CreatePhoneMicrophoneSink is not null &&
+                _s.CanUsePhoneMicrophone?.Invoke(_profile.DeviceId) == true));
         conn.SendControl(ServerMessages.Stage("Waiting for approval", $"Confirm code {conn.VerificationCode} on the PC."));
         var approved = await _s.Approval
             .ApproveAsync(_profile.DeviceId, _profile.DeviceLabel, conn.VerificationCode, ct).ConfigureAwait(false);
