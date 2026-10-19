@@ -24,8 +24,12 @@ internal sealed class PhoneMicrophoneRoute(
     {
         if (request.Action == "stop")
         {
-            Stop();
-            connection.SendControl(ServerMessages.MicrophoneState("stopped"));
+            int stoppedId;
+            lock (_gate) {
+                stoppedId = _streamId;
+                StopLocked();
+            }
+            connection.SendControl(ServerMessages.MicrophoneState("stopped", stoppedId));
             return;
         }
         if (request.Action != "start" || !options.AllowPhoneMicrophone ||
