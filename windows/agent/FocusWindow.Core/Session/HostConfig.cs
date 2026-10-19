@@ -25,6 +25,8 @@ public sealed record HostOptions
     // Separate PC-side authorization: a paired device cannot capture mixed PC
     // output without an explicit host launch flag. Default deny.
     public bool AllowPcAudio { get; init; }
+    // Separate consent gate for forwarding Android microphone input.
+    public bool AllowPhoneMicrophone { get; init; }
 }
 /// <summary>Decides whether a phone that just authenticated may use this PC (default: ask the user).</summary>
 public interface IApprovalPolicy
@@ -59,6 +61,16 @@ public interface IWindowWorkflow
     IReadOnlyList<WindowItem> ListVisible();
     bool Activate(string id);
 }
+/// <summary>
+/// Destination for PCM16 mono, 16 kHz phone microphone data. An implementation
+/// must route to a *real* Windows capture endpoint (or an explicitly selected
+/// external virtual-cable adapter). This interface itself creates NO microphone.
+/// </summary>
+public interface IPhoneMicrophoneSink : IDisposable
+{
+    void Write(ReadOnlySpan<byte> pcm16Mono);
+}
+
 public sealed record HostServices(
     Func<IDisplayBackend> CreateBackend,
     Func<IInputSink> CreateInput,
@@ -70,4 +82,5 @@ public sealed record HostServices(
     IWindowWorkflow? Windows = null,
     IDeviceCredentialStore? DeviceCredentials = null,
     Func<IHostAudioCapture>? CreateAudioCapture = null,
-    IDisplaySessionAdmission? DisplayAdmission = null);
+    IDisplaySessionAdmission? DisplayAdmission = null,
+    Func<string, IPhoneMicrophoneSink?>? CreatePhoneMicrophoneSink = null);
