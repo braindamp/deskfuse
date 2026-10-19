@@ -63,6 +63,16 @@ internal sealed class ConsoleApproval : IApprovalPolicy, IEnrollmentApprovalPoli
         _autoApprove = autoApprove;
         _log = log;
     }
+    public void ForgetDevice(string deviceId)
+    {
+        foreach (var path in new[] { _path, _fullFilesPath })
+        {
+            var allowed = Load(path);
+            if (allowed.Remove(deviceId))
+                File.WriteAllText(path, JsonSerializer.Serialize(allowed));
+        }
+    }
+
     private HashSet<string> Load(string path)
     {
         try { return File.Exists(path) ? JsonSerializer.Deserialize<HashSet<string>>(File.ReadAllText(path)) ?? new() : new(); }
