@@ -3,6 +3,8 @@ package com.focuswindow.client
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.Manifest
+import android.content.pm.PackageManager
 import android.content.Intent
 import android.net.Uri
 import android.provider.OpenableColumns
@@ -39,6 +41,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.lifecycle.lifecycleScope
@@ -46,6 +49,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 import com.focuswindow.client.input.InputMapper
 import com.focuswindow.client.media.PcAudioOutput
+import com.focuswindow.client.media.PhoneMicrophoneCapture
 import com.focuswindow.client.profile.PhoneProfile
 import com.focuswindow.client.profile.ProfileProvider
 import com.focuswindow.client.protocol.InputEvent
@@ -112,6 +116,16 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private val phoneMicrophonePermission =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            if (granted && controller.state.value is SessionState.Streaming) {
+                controller.togglePhoneMicrophone()
+            } else if (!granted) {
+                Toast.makeText(this, "Android microphone permission is required to send voice to Windows",
+                    Toast.LENGTH_LONG).show()
+            }
+        }
+
     private val filePicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) {
             var name = "android-document"
@@ -151,6 +165,7 @@ class MainActivity : ComponentActivity() {
         }
         controller.attachSurface(surfaceView)
         controller.attachPcAudioOutput(PcAudioOutput(applicationContext))
+        controller.attachPhoneMicrophone(PhoneMicrophoneCapture(applicationContext))
         input = InputMapper(surfaceView)
         surfaceView.onCommittedText = { controller.sendInput(InputEvent.Text(it)) }
         surfaceView.onDeleteBackward = { sendSyntheticKey(KeyEvent.KEYCODE_DEL) }
@@ -172,6 +187,7 @@ class MainActivity : ComponentActivity() {
             val state by controller.state.collectAsState()
             val advisories by controller.advisories.collectAsState()
             val pcAudioStatus by controller.pcAudioStatus.collectAsState()
+            val phoneMicStatus by controller.phoneMicStatus.collectAsState()
             var modifierMask by remember { mutableIntStateOf(Modifiers.NONE) }
             var diagnostics by remember { mutableStateOf(false) }
             var showWindows by remember { mutableStateOf(false) }
@@ -390,6 +406,19 @@ class MainActivity : ComponentActivity() {
                     onSendFile = { controller.browsePc(); showPcFiles = true; appDialogVisible = true },
                     pcAudioStatus = pcAudioStatus,
                     onTogglePcAudio = { controller.togglePcAudio() },
+                    phoneMicStatus = phoneMicStatus,
+                    onTogglePhoneMic = {
+                        if (phoneMicStatus == "Unavailable") {
+                            Toast.makeText(this, "Windows has no approved phone microphone destination",
+                                Toast.LENGTH_SHORT).show()
+                        } else if (phoneMicStatus in setOf("On", "Starting") ||
+                            ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+                            == PackageManager.PERMISSION_GRANTED) {
+                            controller.togglePhoneMicrophone()
+                        } else {
+                            phoneMicrophonePermission.launch(Manifest.permission.RECORD_AUDIO)
+                        }
+                    },
                     onAdvisoryAction = { },
                 )
             }
@@ -481,6 +510,7 @@ class MainActivity : ComponentActivity() {
      */
     override fun onResume() {
         super.onResume()
+        controller.setPhoneMicrophoneForeground(true)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         refreshProfile()
         // A previously approved PC requires no scanning or further confirmation.
@@ -493,6 +523,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onPause() {
+        controller.setPhoneMicrophoneForeground(false)
         super.onPause()
         // We only release the screen lock; the SESSION keeps running in the
         // foreground service so a glance at a notification does not kill it.
