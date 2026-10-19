@@ -57,6 +57,14 @@ public interface IDisplayBackend : IAsyncDisposable
     ScaleCaps? ReadScaleCaps(MonitorInfo monitor);
     ScaleSetResult TrySetScale(MonitorInfo monitor, int percent);
     Task<WindowDensityReport?> ProbeWindowAsync(MonitorInfo monitor, bool drawRuler, CancellationToken ct);
+    /// <summary>
+    /// Must capture the named viewport as exact 1:1 physical pixels and measure
+    /// a real 100-DIP ruler drawn inside it. Returning null is NOT a proof.
+    /// A backend that does not support this cannot enable adaptive DPI.
+    /// </summary>
+    Task<WindowDensityReport?> ProbeViewportAsync(
+        MonitorInfo monitor, RectI viewport, bool drawRuler, CancellationToken ct) =>
+        Task.FromResult<WindowDensityReport?>(null);
     Task RemoveMonitorAsync(CancellationToken ct);
     DriverHealth ReadDriverHealth();
     /// <summary>Tells the driver's watchdog the agent is alive.</summary>
