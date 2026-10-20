@@ -1,6 +1,11 @@
 # START HERE — DeskFuse unified integration and development handover
 
 **Date:** 2026-10-20  
+**Mainline result:** PR #11 merged into `main` as `1b9165c` after both exact-head
+unified CI runs passed on `c26732c`. All further development starts from `main`.
+PR #5 is merged and superseded stacked PRs #6–#10 are retired. The original
+POC branch remains unchanged at `08fa683`.
+
 **Executed update:** Device Bridge is now reconciled into the GPU-first tree in
 merge `c12367c` (parents include the complete `e62f371` feature stack). Further
 implemented source/lifecycle/bandwidth work and current limitations are recorded
@@ -20,9 +25,9 @@ bandwidth/latency/color and installed-driver permissions were not exercised.
 
 **Repository:** https://github.com/braindamp/deskfuse (private; use the connected GitHub app/authorized checkout)  
 **Repository directory:** repository root `.`  
-**Primary work branch:** `integration/unified-gpu-workspace-20261020`  
+**Primary work branch:** `main` (the unified integration transaction is merged).
 **Integration PR:** https://github.com/braindamp/deskfuse/pull/11  
-**Destination:** `main`, after the unified code and software checks pass; physical acceptance follows later per the owner.
+**Destination:** achieved in `main`; physical acceptance follows later per the owner.
 **Other agent's proven POC branch:** `poc/gpu-phone-workspace-wgc`, **READ ONLY**.  
 **Functional branches:** draft PRs #5–#10, source for reconciliation, not independently maintained end products.
 

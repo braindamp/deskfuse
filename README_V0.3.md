@@ -1,6 +1,6 @@
 # DeskFuse v0.3 — START HERE
 
-The current unified integration candidate is described in
+The unified runtime now on `main` is described in
 [HANDOVER_UNIFIED_DESKFUSE.md](HANDOVER_UNIFIED_DESKFUSE.md) and
 [docs/UNIFIED_RUNTIME.md](docs/UNIFIED_RUNTIME.md). It combines the production
 WGC/D3D11/NVENC DLL, the Windows host, Device Bridge and the Android app in one

@@ -1,7 +1,9 @@
-# Unified DeskFuse runtime — implemented integration candidate
+# Unified DeskFuse runtime
 
-This describes the code now in `integration/unified-gpu-workspace-20261020`,
-not a new implementation plan or physical-hardware acceptance report.
+This describes the code consolidated into `main` by PR #11 (`1b9165c`). Both
+unified Windows/native and Android CI runs passed on its source head `c26732c`,
+including actual Kotlin/C# encrypted TCP interoperability. Physical-device
+acceptance is deferred by the owner.
 
 ## Build and packaging
 
