@@ -1,4 +1,4 @@
-using FocusWindow.Core.Display;
+using FocusWindow.Core.Protocol;
 
 namespace FocusWindow.Core.Media;
 
