@@ -59,7 +59,9 @@ internal static class Program
           --experimental-scale-write    UNSUPPORTED Windows DPI API; explicit opt-in on a test PC only
         dpi-challenge options (NO driver install/uninstall, NO physical-monitor SET):
           --modes 1440x3120,1600x3120,1920x3120,2100x3120,2240x3120,2240x3360
-          --diag-mm N --out DIR
+          --diag-mm N --refresh N --settle-ms N --out DIR
+          --same-serial                                reuse one EDID serial across modes (regression test)
+          --serial N                                   fixed 32-bit EDID serial (host identity regression)
           --run --i-accept-virtual-display-test       explicitly create temporary virtual modes
           --try-350                                    attempt undocumented -4 only if legal
           --try-above-cap --i-accept-unsupported-scale-risk   also attempt 350% beyond cap at 1440x3120
@@ -147,15 +149,11 @@ internal static class Program
         }
     }
     // ---- argument helpers ---------------------------------------------------------------------------
-    private static string? Opt(string[] args, string name)
-    {
-        var i = Array.IndexOf(args, name);
-        return i >= 0 && i + 1 < args.Length && !args[i + 1].StartsWith("--") ? args[i + 1] : null;
-    }
+    private static string? Opt(string[] args, string name) => CliArguments.Value(args, name);
     private static int Int(string[] args, string name, int fallback) =>
-        int.TryParse(Opt(args, name), CultureInfo.InvariantCulture, out var v) ? v : fallback;
+        CliArguments.Int(args, name, fallback);
     private static double Dbl(string[] args, string name, double fallback) =>
-        double.TryParse(Opt(args, name), CultureInfo.InvariantCulture, out var v) ? v : fallback;
+        CliArguments.Double(args, name, fallback);
     // ---- run ----------------------------------------------------------------------------------------
     private static async Task<int> RunHostAsync(string[] args, CancellationToken ct)
     {

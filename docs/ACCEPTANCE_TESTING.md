@@ -4,6 +4,10 @@ Start here as the PC/phone owner. Use the unified app, not the old POC.
 Allow roughly 15–20 minutes for the first session and cleanup; audio and stress
 tests come afterwards. If a step fails, keep its error and fix that step first.
 
+The first Windows 10 / Xiaomi Notepad case now passes video, typing, clean End
+and reconnect reuse. Read [the recorded result](ACCEPTANCE_RESULT_2026-10-20.md)
+before repeating it. Android status-bar overlap is the next identified UI issue.
+
 ## 1. Prepare the PC and phone
 
 - Windows with the existing compatible FocusIdd driver and a supported NVIDIA
@@ -15,11 +19,10 @@ tests come afterwards. If a step fails, keep its error and fix that step first.
   Know its absolute `.exe` path and any app-specific new-instance arguments.
   Modern Notepad/browser launchers may hand off to another process and be refused;
   that is a source-compatibility result, not proof that the decoder failed.
-- For the first session, prefer an app needing **no launch arguments**. The
-  current CLI parser rejects values starting with `--`; a source requiring
-  `--workspace-args "--new-window"` needs that parser defect fixed first. Tell the
-  coding model rather than repeatedly retrying the launch. Other argument forms
-  are also subject to the app's own new-instance support.
+- For the first session, prefer an app needing **no launch arguments**. CLI
+  values starting with `--` now work; use `--workspace-args=--version` if the
+  app argument is also a recognized host switch. The app must still support
+  launching an independent instance.
 - Note the phone model/Android version, PC Windows version, GPU model, app/version,
   phone display scaling setting, refresh setting and network type.
 

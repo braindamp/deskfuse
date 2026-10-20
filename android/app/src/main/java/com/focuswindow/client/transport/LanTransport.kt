@@ -97,7 +97,8 @@ class LanTransport(
         data class Verified(val code: String, val hostName: String) : TransportEvent
         data object Ready : TransportEvent
         data class Closed(val reason: String, val recoverable: Boolean) : TransportEvent
-        data class Failed(val stage: String, val detail: String, val remediation: String?) :
+        data class Failed(val stage: String, val detail: String, val remediation: String?,
+                          val terminal: Boolean = false) :
             TransportEvent
     }
 
@@ -154,7 +155,7 @@ class LanTransport(
                             ServerMessage.serializer(),
                             plain.decodeToString(),
                         )
-                        _control.emit(msg)
+                        if (!dispatchControl(msg)) return
                     }
 
                     KIND_FRAME -> {
@@ -197,6 +198,20 @@ class LanTransport(
                 _events.emit(TransportEvent.Closed(t.message ?: "connection lost", recoverable = true))
             }
         }
+    }
+
+    // A host-declared failure needs a manual retry, not another monitor/encoder
+    // allocation when the socket closes. Deliver it on the lifecycle stream so
+    // it cannot race a Closed event from a separate control collector.
+    internal suspend fun dispatchControl(msg: ServerMessage): Boolean {
+        if (msg is ServerMessage.Stage && msg.fatal) {
+            running.set(false)
+            closeQuietly()
+            _events.emit(TransportEvent.Failed(msg.stage, msg.detail, msg.remediation, terminal = true))
+            return false
+        }
+        _control.emit(msg)
+        return true
     }
 
     private fun parseFrame(plain: ByteArray): WireFrame {

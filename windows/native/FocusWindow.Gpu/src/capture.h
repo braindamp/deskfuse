@@ -2,6 +2,7 @@
 
 #include "common.h"
 #include "latest_frame_queue.h"
+#include "capture_region.h"
 
 #include <winrt/base.h>
 #include <winrt/Windows.Foundation.h>
@@ -20,6 +21,8 @@ struct CapturedFrame
     int slot = -1;
     uint32_t width = 0;
     uint32_t height = 0;
+    uint32_t sourceLeft = 0;
+    uint32_t sourceTop = 0;
     DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
     int64_t qpcArrival = 0;
     int64_t qpcCopyDone = 0;
@@ -105,6 +108,10 @@ private:
     ID3D11DeviceContext* context_ = nullptr;
     int width_ = 0;
     int height_ = 0;
+    int outerWidth_ = 0;
+    int outerHeight_ = 0;
+    int visibleLeft_ = 0;
+    int visibleTop_ = 0;
     DXGI_FORMAT format_ = DXGI_FORMAT_B8G8R8A8_UNORM;
 
     std::vector<Slot> slots_;

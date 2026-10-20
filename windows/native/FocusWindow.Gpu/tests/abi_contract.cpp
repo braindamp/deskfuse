@@ -1,4 +1,5 @@
 #include "focus_window_gpu.h"
+#include "capture_region.h"
 #include <iostream>
 
 int TestLatestFrameQueue();
@@ -22,6 +23,17 @@ int main() {
     if(fwgpu_read(nullptr, 0, nullptr, 0, &written, &qpc, &idr) != -1) return 9;
     fwgpu_force_idr(nullptr);
     fwgpu_close(nullptr);
+    CaptureRegion region;
+    // Actual Windows 10 Notepad observation at 288 DPI: WGC includes 17 px
+    // invisible borders, while DWM's visible frame is exactly the phone size.
+    if (!ResolveCaptureRegion(1114, 2417, 1080, 2400, 1114, 2417, 17, 0, region) ||
+        region.left != 17 || region.top != 0 || region.width != 1080 || region.height != 2400) return 10;
+    if (!ResolveCaptureRegion(1080, 2400, 1080, 2400, 1114, 2417, 17, 0, region) ||
+        region.left != 0 || region.top != 0) return 11;
+    if (!ResolveCaptureRegion(1080, 2400, 1080, 2400, 1080, 2400, 0, 0, region)) return 12;
+    if (ResolveCaptureRegion(1200, 2400, 1080, 2400, 1114, 2417, 17, 0, region)) return 13;
+    if (ResolveCaptureRegion(1114, 2417, 1080, 2400, 1114, 2417, -1, 0, region)) return 14;
+    if (ResolveCaptureRegion(1114, 2417, 1080, 2400, 1114, 2417, 35, 0, region)) return 15;
     std::cout << "GPU ABI contract passed without hardware\n";
     return TestLatestFrameQueue();
 }

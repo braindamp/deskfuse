@@ -29,7 +29,15 @@ public sealed record NegotiationOutcome(
     DensityMethod Method,
     string? DegradedReason,
     EvidenceLog Evidence,
-    int? RestoreScalePercent = null);
+    int? RestoreScalePercent = null)
+{
+    /// <summary>
+    /// The GPU workspace may run on an exact-density plan or a verified 1:1
+    /// viewport whose logical density was quantized to a Windows scale step.
+    /// Unverified/capped plans are never streamed as if they were native.
+    /// </summary>
+    public bool CanStartGpuWorkspace => Native || Plan.Kind == PlanKind.QuantizedViewport;
+}
 /// <summary>
 /// The density ladder (FR-DPI-02..04). Every rung is followed by a READ-BACK; nothing is
 /// assumed to have worked.
@@ -275,8 +283,10 @@ public sealed class DensityNegotiator
         if (!dpiMatch) reasons.Add($"Windows applied {readout.MonitorDpiX} DPI, not the planned {plan.PlannedDpi} DPI.");
         if (!windowMatch && probe is not null)
             reasons.Add($"PMv2 probe reported {probe.WindowDpi} DPI (requested {plan.PlannedDpi}); " +
-                $"awareness: {probe.Awareness}; client " +
-                $"{probe.Client.Width}x{probe.Client.Height} (target {monitor.Bounds.Width}x{monitor.Bounds.Height}).");
+                $"awareness: {probe.Awareness}; window {probe.Window}; client " +
+                $"{probe.Client.Width}x{probe.Client.Height} (target {monitor.Bounds.Width}x{monitor.Bounds.Height}); " +
+                $"probe monitor {probe.MonitorGdiName ?? "(none)"} {probe.MonitorBounds} " +
+                $"monitorDpi {probe.MonitorDpi}.");
         if (!rulerOk)
             reasons.Add(probe?.Note is { Length: > 0 } note
                 ? note : "100-DIP pixel-ruler readback was not verified.");

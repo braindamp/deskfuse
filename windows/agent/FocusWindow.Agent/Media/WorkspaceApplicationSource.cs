@@ -18,6 +18,7 @@ internal sealed class WorkspaceApplicationSource(string executable, string? argu
     [DllImport("user32.dll")] private static extern bool EnumWindows(EnumCallback callback, nint state);
     [DllImport("user32.dll")] private static extern bool IsWindowVisible(nint hwnd);
     [DllImport("user32.dll")] private static extern bool IsIconic(nint hwnd);
+    [DllImport("user32.dll")] private static extern bool ShowWindowAsync(nint hwnd, int command);
     [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(nint hwnd, out uint pid);
     [DllImport("user32.dll")] private static extern uint GetDpiForWindow(nint hwnd);
     [DllImport("user32.dll")] private static extern nint GetWindowDpiAwarenessContext(nint hwnd);
@@ -122,6 +123,15 @@ internal sealed class WorkspaceApplicationSource(string executable, string? argu
         for (var attempt = 0; attempt < 8; attempt++)
         {
             RequireOwnedWindow();
+            // A taskbar minimize survives monitor removal. On explicit retry,
+            // restore only this catalog-owned window before measuring its frame.
+            // Never activate it or adopt another Notepad window.
+            if (IsIconic(Handle))
+            {
+                ShowWindowAsync(Handle, 4 /* SW_SHOWNOACTIVATE */);
+                await Task.Delay(150, ct).ConfigureAwait(false);
+                if (IsIconic(Handle)) continue;
+            }
             var frame = ReadFrameBounds();
             if (!GetWindowRect(Handle, out var outer)) throw new DisplayException("source", "Window bounds unavailable.");
             if (!SetWindowPos(Handle, nint.Zero,

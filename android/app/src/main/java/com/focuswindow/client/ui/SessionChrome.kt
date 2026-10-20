@@ -74,10 +74,9 @@ fun SessionChrome(
 ) {
     Box(Modifier.fillMaxSize()) {
 
-        // ── Top: tier + density truth, always visible while streaming ────────
+        // Keep the workspace clear; technical details are one tap away.
         if (state is SessionState.Streaming) {
             TopStatusBar(
-                state = state,
                 onToggleDiagnostics = onToggleDiagnostics,
                 diagnosticsVisible = diagnosticsVisible,
                 modifier = Modifier.align(Alignment.TopCenter),
@@ -93,7 +92,9 @@ fun SessionChrome(
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             advisories.forEach { advisory ->
-                AdvisoryChip(advisory, onClick = { onAdvisoryAction(advisory) })
+                if (advisory.id != "density" && advisory.id != "tier" && advisory.id != "tokens") {
+                    AdvisoryChip(advisory, onClick = { onAdvisoryAction(advisory) })
+                }
             }
         }
 
@@ -130,7 +131,6 @@ fun SessionChrome(
 
 @Composable
 private fun TopStatusBar(
-    state: SessionState.Streaming,
     onToggleDiagnostics: () -> Unit,
     diagnosticsVisible: Boolean,
     modifier: Modifier = Modifier,
@@ -143,28 +143,7 @@ private fun TopStatusBar(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        // The single most important pixel in the app: is this native or not?
-        // Three honest states. "1:1" is about PIXELS; "NATIVE" additionally means the host proved the
-        // phone's exact density. 1:1 at the wrong density (Windows only offers 250%/300%, never
-        // 262.5%) is sharp but not native, and must not be labelled "SCALED".
-        StatusPill(
-            text = when {
-                state.oneToOne && state.record.native -> "1:1 NATIVE"
-                state.oneToOne -> "1:1 · OFF-DENSITY"
-                else -> "SCALED"
-            },
-            tone = if (state.oneToOne && state.record.native) Tone.Good else Tone.Warn,
-        )
-        StatusPill(text = "${state.record.dpi} DPI", tone = Tone.Neutral)
-        StatusPill(
-            text = "${"%.0f".format(state.tokenDp)} dp",
-            tone = if (state.readable) Tone.Neutral else Tone.Warn,
-        )
         Spacer(Modifier.weight(1f))
-        StatusPill(
-            text = "${state.record.codec}/${state.record.pixelFormat}",
-            tone = Tone.Neutral,
-        )
         StatusPill(
             text = if (diagnosticsVisible) "HIDE" else "STATS",
             tone = Tone.Neutral,
@@ -254,6 +233,11 @@ private fun AdvisoryChip(advisory: SessionAdvisory, onClick: () -> Unit) {
 @Composable
 private fun DiagnosticsPanel(state: SessionState.Streaming) {
     val rows = buildList {
+        add("mode" to when {
+            state.oneToOne && state.record.native -> "1:1, exact density"
+            state.oneToOne -> "1:1, quantized density"
+            else -> "scaled presentation"
+        })
         add("target" to "${state.record.widthPx}×${state.record.heightPx} px")
         add("panel" to "${state.profile.physicalW}×${state.profile.physicalH} px")
         add("density" to "${state.record.dpi} DPI · expect ${state.profile.expectedDpi}")
@@ -280,7 +264,7 @@ private fun DiagnosticsPanel(state: SessionState.Streaming) {
         shape = RoundedCornerShape(12.dp),
         modifier = Modifier
             .statusBarsPadding()
-            .padding(12.dp)
+            .padding(top = 48.dp, start = 12.dp, end = 12.dp, bottom = 12.dp)
             .width(230.dp)
             .border(1.dp, Color(0x1AFFFFFF), RoundedCornerShape(12.dp)),
     ) {
@@ -303,6 +287,10 @@ private fun DiagnosticsPanel(state: SessionState.Streaming) {
                         fontFamily = FontFamily.Monospace,
                     )
                 }
+            }
+            state.record.degradedReason?.let { detail ->
+                Spacer(Modifier.height(6.dp))
+                Text(detail, color = Color(0xFFF2C56F), fontSize = 11.sp)
             }
         }
     }

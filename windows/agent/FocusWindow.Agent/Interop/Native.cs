@@ -52,6 +52,8 @@ internal static class Native
     /// alone to certify native density; use the PMv2 probe GetDpiForWindow + ruler.</summary>
     [DllImport("shcore.dll")]
     public static extern int GetDpiForMonitor(IntPtr hMonitor, int dpiType, out uint dpiX, out uint dpiY);
+    [DllImport("user32.dll")] public static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint flags);
+    public const uint MonitorDefaultToNearest = 2;
     [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr hwnd);
     [DllImport("user32.dll")] public static extern IntPtr GetWindowDpiAwarenessContext(IntPtr hwnd);
     [DllImport("user32.dll")] public static extern IntPtr GetThreadDpiAwarenessContext();

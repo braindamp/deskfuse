@@ -50,6 +50,17 @@ public sealed class AdaptiveViewportCalibration
             ? rounded : null;
     }
 
+    /// <summary>
+    /// Nearest Windows scale step for the phone's DPR. Most Android phones report
+    /// densities such as 2.8125 that are not Windows steps; a verified 1:1
+    /// viewport at the nearest step is still sharp, with a slightly quantized layout.
+    /// </summary>
+    public static int? WindowsStepFor(PhoneProfile phone)
+    {
+        if (!float.IsFinite(phone.Dpr) || phone.Dpr is < 1f or > 5f) return null;
+        return WindowsScale.NearestStep(100.0 * phone.Dpr);
+    }
+
     public static int MaxEligibleWidth(int height)
     {
         if (height is <= 0 or > MaxDimension) return 0;
@@ -72,12 +83,12 @@ public sealed class AdaptiveViewportCalibration
         var errors = phone.Validate();
         if (errors.Length != 0)
             throw new DisplayException("profile", "Invalid phone density profile: " + errors);
-        var percent = ExactWindowsStep(phone);
+        var percent = WindowsStepFor(phone);
         if (percent is null || (phone.PhysicalW & 1) != 0 || (phone.PhysicalH & 1) != 0)
             return null;
 
         var requestedDpi = WindowsScale.DpiFor(percent.Value);
-        if (Math.Abs(requestedDpi - phone.ExpectedDpi) > 1) return null;
+        var exactDensity = Math.Abs(requestedDpi - phone.ExpectedDpi) <= 1;
         // A portrait phone usually needs extra width; after rotation the
         // restrictive axis may be height. 600/480 DIPs are search hints only.
         var expandWidth = phone.Dpr * 600.0 - phone.PhysicalW >=
@@ -90,13 +101,20 @@ public sealed class AdaptiveViewportCalibration
             return null;
 
         var refresh = Math.Min(phone.MaxRefreshHz, 120);
-        var serial = PhysicalSize.StableSerial(phone.DeviceId);
         MonitorInfo? lastMonitor = null;
         int? lastExtent = null;
         ScaleCaps? lastCaps = null;
 
         (int Width, int Height) Backing(int extent) =>
             expandWidth ? (extent, phone.PhysicalH) : (phone.PhysicalW, extent);
+
+        // Windows 10 restores the mode it remembers for an EDID serial. A single
+        // phone serial reused across backing changes can force 1080x2400 or
+        // 1920x1080 instead of the requested timing. Scope the serial to the
+        // backing mode; the session identity remains phone.DeviceId.
+        uint SerialFor(int width, int height) =>
+            PhysicalSize.StableSerial(
+                $"{phone.DeviceId}:adaptive:{width}x{height}@{refresh}");
 
         async Task<ScaleCaps?> AtExtent(int extent)
         {
@@ -111,7 +129,7 @@ public sealed class AdaptiveViewportCalibration
                 width, height);
             lastMonitor = await _backend.CreateMonitorAsync(
                 new MonitorRequest(width, height, refresh, mmW, mmH,
-                    serial, percent.Value), ct).ConfigureAwait(false);
+                    SerialFor(width, height), percent.Value), ct).ConfigureAwait(false);
             lastExtent = extent;
             lastCaps = _backend.ReadScaleCaps(lastMonitor);
             var safety = _guard.Verify(_before);
@@ -136,44 +154,56 @@ public sealed class AdaptiveViewportCalibration
             _log.Info($"adaptive DPI reusing verified {candidate} px " +
                 (expandWidth ? "width" : "height"));
         }
+        // 600/480 DIPs is a SEARCH SEED, not a Windows rule.
+        var hintDips = expandWidth ? 600.0 : 480.0;
+        var estimated = Math.Max(phoneExtent + 2,
+            (int)Math.Ceiling(hintDips * percent.Value / 100.0 / 2.0) * 2);
+        var upper = Math.Min(extentMax, estimated);
         if (candidate == 0)
         {
-            // Windows' reported cap is a cheap eligibility test only.
-            // Never infer rendered DPI from the cap (see 2240 observation).
-            var initial = await AtExtent(phoneExtent).ConfigureAwait(false);
-            if (initial is null) return null;
-            if (initial.MaxPercent >= percent.Value)
+            if (!exactDensity && upper > phoneExtent)
             {
-                candidate = phoneExtent;
+                // A nonstandard DPR needs a larger backing to reach the nearest
+                // Windows step. Ask for that size first: changing modes on one
+                // Windows 10 virtual monitor can select a 1920x1080 fallback.
+                var seed = await AtExtent(upper).ConfigureAwait(false);
+                if (seed is { MaxPercent: var seedMax } && seedMax >= percent.Value)
+                    candidate = upper;
             }
-            else
+            if (candidate == 0)
             {
-                // 600-DIP is a SEARCH SEED, not a Windows rule.
-                var hintDips = expandWidth ? 600.0 : 480.0;
-                var estimated = Math.Max(phoneExtent + 2,
-                    (int)Math.Ceiling(hintDips * percent.Value / 100.0 / 2.0) * 2);
-                var upper = Math.Min(extentMax, estimated);
-                var upperCaps = await AtExtent(upper).ConfigureAwait(false);
-                if (upperCaps is null || upperCaps.MaxPercent < percent.Value)
+                // Windows' reported cap is a cheap eligibility test only.
+                // Never infer rendered DPI from the cap (see 2240 observation).
+                var initial = await AtExtent(phoneExtent).ConfigureAwait(false);
+                if (initial is null) return null;
+                if (initial.MaxPercent >= percent.Value)
                 {
-                    upper = extentMax;
-                    upperCaps = await AtExtent(upper).ConfigureAwait(false);
+                    candidate = phoneExtent;
                 }
-                if (upperCaps is null || upperCaps.MaxPercent < percent.Value)
-                    return null;
+                else
+                {
+                    var upperCaps = await AtExtent(upper).ConfigureAwait(false);
+                    if (upperCaps is null || upperCaps.MaxPercent < percent.Value)
+                    {
+                        upper = extentMax;
+                        upperCaps = await AtExtent(upper).ConfigureAwait(false);
+                    }
+                    if (upperCaps is null || upperCaps.MaxPercent < percent.Value)
+                        return null;
 
-                var lower = phoneExtent;
-                while (upper - lower > 2)
-                {
-                    var mid = ((lower + upper) / 4) * 2;
-                    if (mid <= lower) mid = lower + 2;
-                    var caps = await AtExtent(mid).ConfigureAwait(false);
-                    if (caps is { MaxPercent: var max } && max >= percent.Value)
-                        upper = mid;
-                    else
-                        lower = mid;
+                    var lower = phoneExtent;
+                    while (upper - lower > 2)
+                    {
+                        var mid = ((lower + upper) / 4) * 2;
+                        if (mid <= lower) mid = lower + 2;
+                        var caps = await AtExtent(mid).ConfigureAwait(false);
+                        if (caps is { MaxPercent: var max } && max >= percent.Value)
+                            upper = mid;
+                        else
+                            lower = mid;
+                    }
+                    candidate = upper;
                 }
-                candidate = upper;
             }
         }
 
@@ -230,8 +260,33 @@ public sealed class AdaptiveViewportCalibration
                     _log.Info($"adaptive DPI {width}x{height} attempt {attempt}: " +
                         $"caps current={actualCaps?.CurrentPercent}, monitor={readback.MonitorDpiX}, " +
                         $"PMv2={probe?.WindowDpi} [{probe?.Awareness}], " +
+                        $"window={probe?.Window} client={probe?.Client} " +
+                        $"probeMonitor={probe?.MonitorGdiName} {probe?.MonitorBounds} " +
+                        $"probeMonitorDpi={probe?.MonitorDpi}, " +
                         $"ruler={probe?.MeasuredRulerWidthPx}x{probe?.MeasuredRulerHeightPx}, " +
                         $"verified={verified}");
+                    // Windows 10 can leave a PMv2 window at 96 DPI even though
+                    // the monitor reads the requested effective DPI. A real
+                    // scale transition (not another read) forces the per-monitor
+                    // DPI change to propagate before the next probe.
+                    if (!verified && attempt == 1 && probe is not null &&
+                        probe.WindowDpi != requestedDpi &&
+                        actualCaps?.CurrentPercent == percent.Value &&
+                        Math.Abs(readback.MonitorDpiX - requestedDpi) <= 1)
+                    {
+                        var lower = percent.Value == 250 ? 200 : 250;
+                        var off = _backend.TrySetScale(monitor, lower);
+                        _log.Warn($"adaptive DPI {width}x{height}: PMv2 stayed {probe.WindowDpi} " +
+                            $"while monitor={readback.MonitorDpiX}; forcing {percent.Value}% -> {lower}% -> {percent.Value}% " +
+                            $"({off.Detail})");
+                        if (off.Ok)
+                        {
+                            await Task.Delay(500, ct).ConfigureAwait(false);
+                            var on = _backend.TrySetScale(monitor, percent.Value);
+                            _log.Info($"adaptive DPI forced return to {percent.Value}%: {on.Detail}");
+                            await Task.Delay(800, ct).ConfigureAwait(false);
+                        }
+                    }
                     if (!verified) continue;
                     var physical = _guard.Verify(_before);
                     if (!physical.Clean)
@@ -246,27 +301,47 @@ public sealed class AdaptiveViewportCalibration
                         $"{extent} px {(expandWidth ? "width" : "height")} candidate at {percent}%",
                         $"{extent} px", 
                         "Measured -3 cap boundary; each session rechecks rendered DPI and pixels.");
-                    ev.Pass("adaptive-dpi", "True phone density in captured 1:1 viewport",
-                        $"{requestedDpi} DPI; {expectedRulerPx}px ruler",
-                        $"{probe!.WindowDpi} DPI; {probe.MeasuredRulerWidthPx}x{probe.MeasuredRulerHeightPx}px");
-                    ev.Pass("adaptive-viewport", "Native phone frame without resampling",
+                    if (exactDensity)
+                        ev.Pass("adaptive-dpi", "True phone density in captured 1:1 viewport",
+                            $"{requestedDpi} DPI; {expectedRulerPx}px ruler",
+                            $"{probe!.WindowDpi} DPI; {probe.MeasuredRulerWidthPx}x{probe.MeasuredRulerHeightPx}px");
+                    else
+                        ev.Warn("adaptive-density-quantized",
+                            "Phone density mapped to the nearest Windows step",
+                            $"{phone.ExpectedDpi} DPI", $"{requestedDpi} DPI",
+                            $"Android reports {phone.Dpr:0.####}x, which is not a Windows step; " +
+                            "pixels remain 1:1 at the nearest available scale.");
+                    ev.Pass("adaptive-viewport", "Phone frame without resampling",
                         $"{phone.PhysicalW}x{phone.PhysicalH} px",
                         $"{viewport.Width}x{viewport.Height} px at backing {width}x{height}");
                     var crop = width > phone.PhysicalW || height > phone.PhysicalH;
-                    var plan = new DensityPlan(crop ? PlanKind.VerifiedViewport : PlanKind.Exact,
+                    var quantizedNote = exactDensity ? null :
+                        $"Windows offers {percent}% ({requestedDpi} DPI) instead of the phone's " +
+                        $"{phone.ExpectedDpi} DPI; pixels remain 1:1 and the app layout is " +
+                        $"{Math.Abs((double)requestedDpi / phone.ExpectedDpi - 1.0) * 100:0.#}% " +
+                        $"{(requestedDpi > phone.ExpectedDpi ? "larger" : "smaller")}.";
+                    var viewportNote = crop
+                        ? $"Verified high-density {width}x{height} backing desktop with a 1:1 " +
+                          $"{phone.PhysicalW}x{phone.PhysicalH} phone viewport."
+                        : null;
+                    var reason = string.Join(" ", new[] { viewportNote, quantizedNote }
+                        .Where(note => note is not null));
+                    var plan = new DensityPlan(
+                        exactDensity
+                            ? (crop ? PlanKind.VerifiedViewport : PlanKind.Exact)
+                            : PlanKind.QuantizedViewport,
                         phone.PhysicalW, phone.PhysicalH, percent.Value, percent.Value,
                         true, phone.PhysicalW * 100.0 / percent.Value,
                         phone.PhysicalH * 100.0 / percent.Value,
                         DensityPolicy.TokenDp(percent.Value, phone.Dpr),
-                        crop ? $"Verified high-density {width}x{height} backing desktop " +
-                               $"with an exact {phone.PhysicalW}x{phone.PhysicalH} phone viewport." : null);
+                        reason.Length == 0 ? null : reason);
                     progress?.Invoke("Display density verified",
                         $"{requestedDpi} DPI, {width}x{height} backing, " +
                         $"{phone.PhysicalW}x{phone.PhysicalH} visible");
                     return new NegotiationOutcome(monitor, plan, readback, actualCaps,
-                        probe, readback.MonitorDpiX, true,
+                        probe, readback.MonitorDpiX, exactDensity,
                         beforeScale == percent.Value ? DensityMethod.AlreadyCorrect :
-                        DensityMethod.PerMonitorOverride, null, ev,
+                        DensityMethod.PerMonitorOverride, quantizedNote, ev,
                         RestoreScalePercent: attemptedScale ? beforeScale : null);
                 }
                 _log.Warn($"adaptive DPI {width}x{height}: available according to Windows, " +

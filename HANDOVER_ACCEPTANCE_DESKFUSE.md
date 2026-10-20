@@ -2,6 +2,53 @@
 
 Updated 2026-10-20. This is the short handover for a fast/flash model.
 
+## Latest live checkpoint — read this before the historical baseline
+
+**The unified application now streams real Notepad and accepts phone typing.**
+The owner confirmed both on 2026-10-20. See
+[the measured result](docs/ACCEPTANCE_RESULT_2026-10-20.md) for artifacts and limits.
+
+- Run the host as the logged-in desktop user **Arne**, without elevation. The
+  installed FocusIdd protocol-2 driver works in this context. Do not migrate
+  codexlab enrollment/DPAPI state or create another host account.
+- WGC on this Windows 10 machine includes invisible window borders: its
+  `1114x2417` capture contains the measured `1080x2400` DWM visible frame at
+  offset `(17,0)`. Production capture now copies that ROI on the GPU, without
+  resizing, CPU readback or encoding the unused backing desktop.
+- This phone requests 270 DPI; Windows renders at the verified nearest step,
+  288 DPI (300%). The app layout is 6.7% larger, with **1:1 pixels**. This size
+  difference introduces no resampling blur. Never label it exact native density.
+- Native PMv2 probe and per-backing EDID serial changes from the previous model
+  are retained. CLI values such as `--workspace-args "--new-window"` now parse;
+  `--workspace-args=--version` handles ambiguity with a host switch.
+- Updated phone UI is installed: STATS/HIDE instead of persistent technical
+  cards. End removes the owned monitor; physical displays remain unchanged.
+  Reopening Android against the same running host reuses its Notepad process.
+  The earlier unsaved test document remains open separately; preserve it.
+- Local checks: 184 .NET passed, 10 optional/historical skipped; 21 Android
+  tests; native capture/pacing contracts; Kotlin crypto and actual C#/Kotlin TCP.
+- Minimizing the source exposed a fatal-error reconnect loop. Android now
+  routes fatal host stages through its lifecycle events and cancels automatic
+  retry; late decoder stats cannot revive the failed target. Explicit retry
+  restores only the catalog-owned minimized window without activation. Two
+  transport regression tests pass; live minimize/retry retest is in progress.
+- A debug APK built under Arne has a different signer from the installed build.
+  The owner explicitly authorized using codexlab's **default Android debug key**
+  for this update. The installed signed APK is under ignored
+  `out/acceptance/continuation/app-debug-signed.apk`. Preserve enrollment; do not
+  uninstall as a signature-mismatch shortcut or commit signing material.
+
+**Next focused work:** the owner identified Android's status bar covering the
+Windows title bar. Measure a usable workspace below system bars/cutout and
+reserve room for controls; size the app and encoded frame to that area, with
+integer offsets and matching touch mapping. The profile already carries safe
+insets, but current adaptive calibration still uses full-panel dimensions.
+Do not merely shrink the existing full-panel stream. Immersive fullscreen can
+be a later option. Smaller frame area does not remove Windows' density-step
+constraint. Also investigate continued capture/encode activity on a static
+document before claiming idle-bandwidth optimization. Preserve the working
+video/input case while making these changes.
+
 ## Immediate assignment
 
 Help the owner run [the acceptance guide](docs/ACCEPTANCE_TESTING.md), collect
@@ -31,10 +78,9 @@ next task, not a reason to undo that merge.
 | PRs | #5 merged; superseded #6–#10 closed; #11 merged |
 | Original POC | `poc/gpu-phone-workspace-wgc`, unchanged at `08fa683ab242459440388ff56d20e1ddeb97c318`; read-only |
 
-These results prove software checks, not a working physical phone session.
-Verify current refs and artifact availability; never reset or overwrite new work
-to reproduce this snapshot. No real hardware acceptance was performed in the
-integration chat.
+This table records the earlier integration baseline; the live checkpoint above
+supersedes its test counts and hardware status. Verify current refs and artifact
+availability; never reset or overwrite new work to reproduce this snapshot.
 
 ## Read only these first
 
@@ -76,11 +122,8 @@ steps. Use them only when a particular technical detail is needed.
    exact size. Child-process launchers, single-instance handoff, separate modal
    popup composition and general source switching are not completed. Do not
    assume modern Notepad/browser launcher executables qualify without testing.
-   **Startup issue found while writing this handover:** `Program.Opt` currently
-   rejects option values starting with `--`, including a `--workspace-args` value
-   such as `--new-window`. This is a code-inspection finding, not a live test.
-   Fix and test argument parsing before using a source that requires such flags;
-   for a first session, select an app that needs no launch arguments.
+   Argument parsing now accepts values starting with `--`; source compatibility
+   still depends on the application itself.
 4. One exclusive display owner with the current host-global FocusIdd backend.
    Accessory-only peers do not acquire display/input/file privileges.
 5. PC sound and temporary microphone-cable routing are not Windows PnP speaker
@@ -89,6 +132,22 @@ steps. Use them only when a particular technical detail is needed.
 6. TCP record head-of-line blocking and uncompressed PCM bandwidth remain.
    Do not describe advertised fps, UI latency estimates or host outbound kbit/s
    as measured end-to-end performance or video-only bitrate.
+
+## 2026-10-20 display-density addendum
+
+- Windows 10 restores the last mode it remembers per EDID serial. Reusing the
+  phone's single stable serial across `1080x2400 -> 1800x2400` forced
+  `1080x2400` (and earlier `1920x1080`), even when `1800x2400` was created first.
+- Adaptive calibration now scopes the EDID serial to phone + backing size +
+  refresh. The session identity remains `phone.DeviceId`; this is a display
+  cache key, not a second session identity. See `docs/DESIGN_DISPLAY_STATUS.md`
+  and the hardware update in GPU plan section 4.1.
+- Lab evidence: `out/acceptance/mode-matrix/host-serial-120-settle0` fails with
+  the host's stable serial; `out/acceptance/mode-matrix/perbacking-1800-first`
+  succeeds with the per-backing serial.
+- Published host: `out/unified-windows` (rebuilt 2026-10-20). Live host
+  acceptance with Xiaomi 24117RN76E passed for Notepad video, input and clean
+  disconnect; see the latest checkpoint above.
 
 ## Continue with evidence, then code
 

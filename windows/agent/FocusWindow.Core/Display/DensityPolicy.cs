@@ -91,6 +91,12 @@ public enum PlanKind
     /// <summary>A larger backing desktop was measured at exact DPI; the phone sees
     /// a 1:1 pixel viewport with its native logical and physical dimensions.</summary>
     VerifiedViewport,
+    /// <summary>
+    /// A larger backing desktop was measured at the nearest Windows scale step.
+    /// The phone still receives a 1:1 physical-pixel viewport, but the app layout
+    /// is quantized to that step rather than the phone's exact DPR.
+    /// </summary>
+    QuantizedViewport,
 }
 public sealed record DensityPlan(
     PlanKind Kind,

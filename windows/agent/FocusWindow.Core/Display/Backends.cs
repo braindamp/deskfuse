@@ -26,7 +26,10 @@ public sealed record WindowDensityReport(
     int? MeasuredRulerWidthPx,
     int? MeasuredRulerHeightPx,
     bool? RulerOk,
-    string? Note);
+    string? Note,
+    RectI MonitorBounds = default,
+    int MonitorDpi = 0,
+    string? MonitorGdiName = null);
 public sealed record DriverHealth(
     bool Reachable,
     int ProtocolVersion,

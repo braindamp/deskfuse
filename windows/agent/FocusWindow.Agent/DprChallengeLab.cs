@@ -31,6 +31,8 @@ internal static class DprChallengeLab
     private sealed record Observation
     {
         public string Mode { get; init; } = "";
+        public int RefreshHz { get; init; }
+        public string SerialStrategy { get; init; } = "";
         public int EdidDiagonalMm { get; init; }
         public int Predicted640Max { get; init; }
         public int Predicted600Max { get; init; }
@@ -57,12 +59,7 @@ internal static class DprChallengeLab
         public string? Error { get; set; }
     }
 
-    private static string? Option(string[] args, string name)
-    {
-        var index = Array.IndexOf(args, name);
-        return index >= 0 && index + 1 < args.Length && !args[index + 1].StartsWith("--")
-            ? args[index + 1] : null;
-    }
+    private static string? Option(string[] args, string name) => CliArguments.Value(args, name);
 
     private static List<Mode> ParseModes(string? text)
     {
@@ -107,7 +104,20 @@ internal static class DprChallengeLab
         var diag = int.TryParse(Option(args, "--diag-mm"), NumberStyles.None,
             CultureInfo.InvariantCulture, out var parsed) ? parsed : 170;
         if (diag is < 60 or > 500)
-            throw new ArgumentException("--diag-mm must be 60–500.");
+            throw new ArgumentException("--diag-mm must be 60-500.");
+        var refresh = int.TryParse(Option(args, "--refresh"), NumberStyles.None,
+            CultureInfo.InvariantCulture, out var parsedRefresh) ? parsedRefresh : 60;
+        if (refresh is < 30 or > 240)
+            throw new ArgumentException("--refresh must be 30-240 Hz.");
+        var sameSerial = args.Contains("--same-serial");
+        var serialOverride = uint.TryParse(Option(args, "--serial"), NumberStyles.None,
+            CultureInfo.InvariantCulture, out var parsedSerial) ? parsedSerial : (uint?)null;
+        if (serialOverride == 0)
+            throw new ArgumentException("--serial must be a nonzero 32-bit EDID serial.");
+        var settleMs = int.TryParse(Option(args, "--settle-ms"), NumberStyles.None,
+            CultureInfo.InvariantCulture, out var parsedSettle) ? parsedSettle : 900;
+        if (settleMs is < 0 or > 10000)
+            throw new ArgumentException("--settle-ms must be 0-10000.");
         var run = args.Contains("--run");
         var try350 = args.Contains("--try-350");
         var beyondCap = args.Contains("--try-above-cap");
@@ -126,6 +136,13 @@ internal static class DprChallengeLab
             Console.WriteLine($"  {m}: 640-DIP hypothesis max " +
                 $"{DprChallengeTheory.PredictedMaximum(m.Width, m.Height, 640)}%, " +
                 $"600-DIP hypothesis max {DprChallengeTheory.PredictedMaximum(m.Width, m.Height, 600)}%");
+        Console.WriteLine($"  Mode timing: {refresh} Hz; serial strategy: " +
+            (serialOverride is { } fixedSerial
+                ? $"FIXED serial {fixedSerial} (host-identity regression)"
+                : sameSerial
+                    ? "SAME serial across modes (mode-switch regression)"
+                    : "DISTINCT serial per mode (new monitor each time)") +
+            $"; inter-mode settle: {settleMs} ms");
         Console.WriteLine("  Requested target: genuine 336 DPI; 350 physical pixels for a 100-DIP square.");
         Console.WriteLine("  Independent PMv2 witness: tools/df-density-readonly.cpp, run while a mode is attached.");
         Console.WriteLine("  A full 1440x3120 GPU/NVENC crop is NOT implemented by this lab.");
@@ -192,6 +209,10 @@ internal static class DprChallengeLab
                 var row = new Observation
                 {
                     Mode = mode.ToString(),
+                    RefreshHz = refresh,
+                    SerialStrategy = serialOverride is { } rowSerial
+                        ? $"FIXED:{rowSerial}"
+                        : sameSerial ? "SAME" : "DISTINCT_PER_MODE",
                     EdidDiagonalMm = diag,
                     Predicted640Max = DprChallengeTheory.PredictedMaximum(mode.Width, mode.Height, 640),
                     Predicted600Max = DprChallengeTheory.PredictedMaximum(mode.Width, mode.Height, 600)
@@ -204,8 +225,12 @@ internal static class DprChallengeLab
                 try
                 {
                     var (mmW, mmH) = PhysicalSize.FromDiagonal(diag, mode.Width, mode.Height);
-                    var request = new MonitorRequest(mode.Width, mode.Height, 60, mmW, mmH,
-                        PhysicalSize.StableSerial("DeskFuse.DprChallenge." + mode), TargetScale);
+                    var serial = serialOverride ??
+                        (sameSerial
+                            ? PhysicalSize.StableSerial("DeskFuse.DprChallenge.SameSerial")
+                            : PhysicalSize.StableSerial("DeskFuse.DprChallenge." + mode));
+                    var request = new MonitorRequest(mode.Width, mode.Height, refresh, mmW, mmH,
+                        serial, TargetScale);
                     monitor = await backend.CreateMonitorAsync(request, heartbeatStop.Token)
                         .ConfigureAwait(false);
                     CheckPhysical(guard, before, row, "arrival");
@@ -333,7 +358,8 @@ internal static class DprChallengeLab
                     try
                     {
                         await backend.RemoveMonitorAsync(CancellationToken.None).ConfigureAwait(false);
-                        await Task.Delay(900, CancellationToken.None).ConfigureAwait(false);
+                        if (settleMs > 0)
+                            await Task.Delay(settleMs, CancellationToken.None).ConfigureAwait(false);
                         row.DriverMonitorRemoved = !backend.ReadDriverHealth().MonitorArrived;
                         if (!row.DriverMonitorRemoved)
                             failure ??= $"{mode}: virtual monitor did not depart";
@@ -363,6 +389,10 @@ internal static class DprChallengeLab
                 TimestampUtc = DateTimeOffset.UtcNow,
                 WindowsBuild = Environment.OSVersion.Version.ToString(),
                 InitialPhysicalMonitors = before.Monitors,
+                RefreshHz = refresh,
+                SerialStrategy = serialOverride is { } outputSerial
+                    ? $"FIXED:{outputSerial}"
+                    : sameSerial ? "SAME" : "DISTINCT_PER_MODE",
                 OptInWrite = try350,
                 OptInAboveCap = beyondCap,
                 Failure = failure,
@@ -372,11 +402,12 @@ internal static class DprChallengeLab
                 new JsonSerializerOptions { WriteIndented = true }), CancellationToken.None)
                 .ConfigureAwait(false);
             var csv = new StringBuilder();
-            csv.AppendLine("mode,diag_mm,predicted_640_max,predicted_600_max,recommended,initial,max,monitor_dpi,window_dpi,ruler_w,ruler_h,write_verdict,crop_verdict,restored,physical_unchanged,monitor_removed,error");
+            csv.AppendLine("mode,refresh_hz,serial_strategy,diag_mm,predicted_640_max,predicted_600_max,recommended,initial,max,monitor_dpi,window_dpi,ruler_w,ruler_h,write_verdict,crop_verdict,restored,physical_unchanged,monitor_removed,error");
             foreach (var o in observations)
             {
                 string Escape(object? v) => "\"" + Convert.ToString(v, CultureInfo.InvariantCulture)?.Replace("\"", "\"\"") + "\"";
-                csv.AppendLine(string.Join(",", new object?[] { o.Mode, o.EdidDiagonalMm,
+                csv.AppendLine(string.Join(",", new object?[] { o.Mode, o.RefreshHz,
+                    o.SerialStrategy, o.EdidDiagonalMm,
                     o.Predicted640Max, o.Predicted600Max, o.RecommendedPercent, o.InitialPercent,
                     o.ReportedMaximumPercent, o.MonitorDpiX, o.WindowDpi, o.RulerWidthPx,
                     o.RulerHeightPx, o.WriteVerdict, o.CropVerdict, o.RestoreResult,

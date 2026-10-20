@@ -309,6 +309,15 @@ to `CreateMonitorAsync`. Do not create a second identity scheme in the GPU pipel
 POC helper's profile/serial code is useful for sequential hardware tests, but the session's
 identity is the enrolled phone's stable ID.
 
+> **2026-10-20 hardware update.** Windows 10 restores the mode it remembers per EDID serial.
+> Using `StableSerial(phone.DeviceId)` while changing a backing from `1080x2400` to
+> `1800x2400` forced the old mode (`1080x2400`, and earlier `1920x1080`). The adaptive
+> calibration path therefore scopes the EDID serial to
+> `StableSerial($"{phone.DeviceId}:adaptive:{width}x{height}@{refresh}")`: stable for the same
+> phone+backing+refresh, distinct across backing modes. This is a display cache key, not a
+> second session identity; the session and GPU pipeline still use `phone.DeviceId`. See
+> `DESIGN_DISPLAY_STATUS.md`.
+
 ### 4.2 Add a production `ScaleEnforcer`
 
 On every attach, including reconnect and agent restart:

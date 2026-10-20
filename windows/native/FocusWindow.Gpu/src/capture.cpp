@@ -8,6 +8,7 @@
 #include <winrt/Windows.Graphics.DirectX.Direct3D11.h>
 #include <windows.graphics.capture.interop.h>
 #include <windows.graphics.directx.direct3d11.interop.h>
+#include <dwmapi.h>
 
 #include <algorithm>
 #include <iostream>
@@ -106,19 +107,54 @@ bool WgcCapture::Start(HWND hwnd, std::wstring& error)
         {
             createHr = interop->CreateForWindow(
                 hwnd, winrt::guid_of<GraphicsCaptureItem>(), winrt::put_abi(item_));
-            if (SUCCEEDED(createHr)) break;
-            if (createHr != E_INVALIDARG) break;
+            if (SUCCEEDED(createHr))
+            {
+                const auto size = item_.Size();
+                if (size.Width > 0 && size.Height > 0) break;
+                // The just-placed app can be registered with DWM before its
+                // capture extent is published. Retry the item, never encode 0x0.
+                item_ = nullptr;
+            }
+            else if (createHr != E_INVALIDARG) break;
             Sleep(100);
         }
         winrt::check_hresult(createHr);
+        if (!item_)
+        {
+            error = L"WGC source has no published capture extent after startup.";
+            return false;
+        }
 
         stage = L"item.Size";
         const auto itemSize = item_.Size();
-        if (itemSize.Width != width_ || itemSize.Height != height_)
+        RECT outer{}, visible{};
+        GetWindowRect(hwnd, &outer);
+        const auto boundsHr = DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS,
+            &visible, sizeof(visible));
+        outerWidth_ = outer.right - outer.left;
+        outerHeight_ = outer.bottom - outer.top;
+        visibleLeft_ = visible.left - outer.left;
+        visibleTop_ = visible.top - outer.top;
+        CaptureRegion region;
+        if (FAILED(boundsHr) || visible.right - visible.left != width_ ||
+            visible.bottom - visible.top != height_ ||
+            !ResolveCaptureRegion(itemSize.Width, itemSize.Height, width_, height_,
+                outerWidth_, outerHeight_, visibleLeft_, visibleTop_, region))
         {
+            wchar_t geometry[512]{};
+            swprintf_s(geometry,
+                L" HWND=%p windowDpi=%u threadPMv2=%d windowPMv2=%d visible=%d iconic=%d "
+                L"outer=%ldx%ld@(%ld,%ld) DWM=%ldx%ld@(%ld,%ld) boundsHr=0x%08X",
+                hwnd, GetDpiForWindow(hwnd),
+                AreDpiAwarenessContextsEqual(GetThreadDpiAwarenessContext(), DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2),
+                AreDpiAwarenessContextsEqual(GetWindowDpiAwarenessContext(hwnd), DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2),
+                IsWindowVisible(hwnd), IsIconic(hwnd),
+                outer.right - outer.left, outer.bottom - outer.top, outer.left, outer.top,
+                visible.right - visible.left, visible.bottom - visible.top, visible.left, visible.top,
+                static_cast<unsigned>(boundsHr));
             error = L"WGC item size is " + std::to_wstring(itemSize.Width) + L"x" +
                 std::to_wstring(itemSize.Height) + L", expected " + std::to_wstring(width_) +
-                L"x" + std::to_wstring(height_) + L" (no resize is allowed).";
+                L"x" + std::to_wstring(height_) + L" (no resize is allowed)." + geometry;
             return false;
         }
 
@@ -252,7 +288,9 @@ void WgcCapture::OnFrameArrived()
             ++skippedEmpty_;
             return;
         }
-        if (content.Width != width_ || content.Height != height_)
+        CaptureRegion region;
+        if (!ResolveCaptureRegion(content.Width, content.Height, width_, height_,
+                outerWidth_, outerHeight_, visibleLeft_, visibleTop_, region))
         {
             ++wrongSize_;
             frame.Close();
@@ -265,8 +303,10 @@ void WgcCapture::OnFrameArrived()
         // producer and deadlock the copy. Keep the frame alive and materialize
         // it on the caller's thread.
         CapturedFrame captured{};
-        captured.width = static_cast<uint32_t>(content.Width);
-        captured.height = static_cast<uint32_t>(content.Height);
+        captured.width = static_cast<uint32_t>(width_);
+        captured.height = static_cast<uint32_t>(height_);
+        captured.sourceLeft = static_cast<uint32_t>(region.left);
+        captured.sourceTop = static_cast<uint32_t>(region.top);
         captured.qpcArrival = QpcNow();
         captured.systemRelativeTime = frame.SystemRelativeTime().count();
         captured.frame = frame;
@@ -339,7 +379,8 @@ bool WgcCapture::MaterializeFrame(CapturedFrame& frame, std::wstring& error)
             error = L"WGC frame texture belongs to a different D3D11 device.";
             return false;
         }
-        if (sourceDesc.Width != static_cast<UINT>(width_) || sourceDesc.Height != static_cast<UINT>(height_) ||
+        if (sourceDesc.Width < frame.sourceLeft + frame.width ||
+            sourceDesc.Height < frame.sourceTop + frame.height ||
             sourceDesc.MipLevels != 1 || sourceDesc.ArraySize != 1 || sourceDesc.SampleDesc.Count != 1)
         {
             closeFrame();
@@ -371,7 +412,9 @@ bool WgcCapture::MaterializeFrame(CapturedFrame& frame, std::wstring& error)
         {
             std::lock_guard<std::mutex> copyLock(copyMutex_);
             auto& slot = slots_[static_cast<size_t>(slotIndex)];
-            context_->CopyResource(slot.texture.Get(), source.get());
+            const D3D11_BOX region{frame.sourceLeft, frame.sourceTop, 0,
+                frame.sourceLeft + frame.width, frame.sourceTop + frame.height, 1};
+            context_->CopySubresourceRegion(slot.texture.Get(), 0, 0, 0, 0, source.get(), 0, &region);
             context_->Flush();
         }
 

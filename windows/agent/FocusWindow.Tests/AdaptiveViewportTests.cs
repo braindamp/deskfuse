@@ -30,6 +30,78 @@ public sealed class AdaptiveViewportTests
             TestProfiles.Flagship(dpr)));
     }
 
+    [Theory]
+    [InlineData(3.5f, 350)]
+    [InlineData(2.0f, 200)]
+    [InlineData(2.8125f, 300)]
+    [InlineData(2.625f, 250)]
+    [InlineData(3.4f, 350)]
+    [InlineData(float.NaN, null)]
+    public void Nonstandard_dpr_maps_to_the_nearest_windows_step(float dpr, int? scale)
+    {
+        Assert.Equal(scale, AdaptiveViewportCalibration.WindowsStepFor(
+            TestProfiles.Flagship(dpr)));
+    }
+
+    [Fact]
+    public async Task Nonstandard_dpr_gets_a_verified_1to1_quantized_viewport()
+    {
+        await using var backend = new FakeDisplayBackend(2048, 3200)
+        {
+            RecommendedPercent = 100,
+            CurrentPercent = 100,
+            MaxPercentFor = (width, _) => width >= 1800 ? 300 : 175
+        };
+        var phone = TestProfiles.Flagship(2.8125f, 1080, 2400, 169);
+
+        var result = await NewCalibration(backend).TryRunAsync(
+            phone, null, CancellationToken.None);
+
+        Assert.NotNull(result);
+        Assert.False(result!.Native);
+        Assert.True(result.CanStartGpuWorkspace);
+        Assert.Equal(PlanKind.QuantizedViewport, result.Plan.Kind);
+        Assert.Equal(1080, result.Plan.PixelW);
+        Assert.Equal(2400, result.Plan.PixelH);
+        Assert.Equal(1800, result.Monitor.Bounds.Width);
+        Assert.Equal(288, result.EffectiveDpi);
+        Assert.Contains("288", result.DegradedReason!);
+        // Do not create the native width first: on Windows 10 a mode change on
+        // the same virtual monitor can be replaced by an unrelated 1920x1080 mode.
+        Assert.DoesNotContain(backend.Created,
+            r => r.Width == phone.PhysicalW && r.Height == phone.PhysicalH);
+        var expectedSerial = PhysicalSize.StableSerial(
+            $"{phone.DeviceId}:adaptive:1800x2400@120");
+        Assert.All(backend.Created, r => Assert.Equal(expectedSerial, r.Serial));
+    }
+
+    [Fact]
+    public async Task Nonstandard_quantized_falls_back_when_the_seed_is_too_narrow()
+    {
+        await using var backend = new FakeDisplayBackend(3456, 2400)
+        {
+            RecommendedPercent = 100,
+            CurrentPercent = 100,
+            MaxPercentFor = (width, _) => width >= 2000 ? 300 : 175
+        };
+        var phone = TestProfiles.Flagship(2.8125f, 1080, 2400, 169);
+
+        var result = await NewCalibration(backend).TryRunAsync(
+            phone, null, CancellationToken.None);
+
+        Assert.NotNull(result);
+        Assert.Equal(PlanKind.QuantizedViewport, result!.Plan.Kind);
+        Assert.True(result.CanStartGpuWorkspace);
+        Assert.Equal(2000, result.Monitor.Bounds.Width);
+        Assert.Contains(backend.Created, r => r.Width == 1080);
+        Assert.Contains(backend.Created, r => r.Width == 2000);
+        Assert.All(backend.Created, r => Assert.Equal(
+            PhysicalSize.StableSerial(
+                $"{phone.DeviceId}:adaptive:{r.Width}x{r.Height}@120"),
+            r.Serial));
+        Assert.True(backend.Created.Select(r => r.Serial).Distinct().Count() > 1);
+    }
+
     [Fact]
     public async Task Binary_boundary_search_finds_minimum_even_width_not_fixed_2100()
     {

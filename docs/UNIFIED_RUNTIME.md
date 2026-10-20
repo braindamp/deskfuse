@@ -3,7 +3,8 @@
 This describes the code consolidated into `main` by PR #11 (`1b9165c`). Both
 unified Windows/native and Android CI runs passed on its source head `c26732c`,
 including actual Kotlin/C# encrypted TCP interoperability. Physical-device
-acceptance is deferred by the owner.
+acceptance has now passed the first Notepad video/input/cleanup case; see
+`ACCEPTANCE_RESULT_2026-10-20.md`. Broader feature acceptance remains open.
 
 ## Build and packaging
 
@@ -49,8 +50,11 @@ before monitor allocation. Single-instance handoff, child-process launchers and
 applications unable to provide the requested PMv2 window are explicitly refused.
 
 The host positions only a new window in the launched process, verifies the
-identified virtual monitor, actual DPI, DWM frame bounds and exact WGC size, and
-streams that HWND. Original physical desktop windows are not moved or resized.
+identified virtual monitor, actual DPI and exact DWM frame bounds, and streams
+that HWND. When Windows 10 WGC includes the measured invisible outer borders,
+the GPU copies only the visible-frame ROI into the registered encode texture.
+This introduces no scaling or CPU readback. Original physical desktop windows
+are not moved or resized.
 The source catalog retains one owned app per enrollment across reconnects within
 the host process. An independent attachment lease prevents competing capture
 owners. Disconnect releases GPU resources and the owned virtual display, but
@@ -101,7 +105,10 @@ CPU/GPU/memory load and especially bandwidth, not source-code size.
   nonce ordering and replay protection.
 - Five-second host diagnostics report measured delivered video fps and total
   encrypted outbound kbit/s, including control/audio/files. No bandwidth,
-  fidelity or latency improvement is claimed as measured on physical hardware.
+  fidelity or latency improvement is claimed from those counters alone. The
+  first hardware session measured roughly 110–305 kbit/s total outbound and
+  32–45 delivered video fps; continued activity on a static document still
+  needs investigation. These are not video-only bitrate or end-to-end latency.
 
 ## Device Bridge and retained mainline behavior
 

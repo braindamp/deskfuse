@@ -135,9 +135,14 @@ internal sealed class PhoneSession
         _outcome = await NegotiatePhoneDisplayAsync(_profile, ct).ConfigureAwait(false);
         _s.OnNegotiated?.Invoke(_outcome);
         // WGC/D3D11/NVENC is authoritative. No CPU surface or FFmpeg video loop.
-        if (!_outcome.Native)
+        // Exact density is preferred; a verified 1:1 viewport at the nearest
+        // Windows step is still sharp and usable, and is never labelled native.
+        if (!_outcome.CanStartGpuWorkspace)
             throw new DisplayException("density", "Verified native DPI is required for the GPU workspace.",
                 "This display profile is not yet supported by the native-density host.");
+        if (!_outcome.Native)
+            _log.Warn("Streaming a quantized 1:1 phone viewport: " +
+                (_outcome.DegradedReason ?? "density differs from the phone's exact DPR"));
         // POC-proven per-client scale enforcement: Windows may reset the
         // virtual monitor to 100% on reattach. No capture before readback.
         var beforeScale = _backend.ReadScaleCaps(_outcome.Monitor);
@@ -191,9 +196,12 @@ internal sealed class PhoneSession
     {
         void Progress(string stage, string detail)
         {
-            // Repeated resolution-search updates are diagnostics, not useful phone UI.
-            if (stage == "Calibrating display density") _log.Info(detail);
-            else _conn.SendControl(ServerMessages.Stage(stage, detail));
+            // Density calibration and DPI proof are host-internal quality checks.
+            // The phone only gets one stable, non-technical preparation status;
+            // the measured details remain in host.log and the density evidence.
+            _log.Info($"{stage}: {detail}");
+            _conn.SendControl(ServerMessages.Stage(
+                "Preparing your display", "Setting up the phone-sized workspace."));
         }
 
         // Initialize the driver interface on this thread BEFORE starting
@@ -361,7 +369,7 @@ internal sealed class PhoneSession
                         "Choose a new application instance with --workspace-app on the PC."));
                     break;
                 case ClientDensity d:
-                    _log.Info($"density preset '{d.Preset}' noted; this host always uses the phone's exact density");
+                    _log.Info($"density preset '{d.Preset}' noted; verified source density is {_outcome.EffectiveDpi} DPI, native={_outcome.Native}");
                     break;
                 case ClientClipboard clip:
                     await HandleClipboardAsync(clip, ct).ConfigureAwait(false);

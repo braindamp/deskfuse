@@ -396,9 +396,8 @@ class SessionController(
 
                 is LanTransport.TransportEvent.Ready -> {
                     _state.value = SessionState.PreparingTarget(
-                        stage = "Negotiating density",
-                        detail = "Asking the host for a ${profile?.requestedScaleFactor}% display " +
-                            "at ${profile?.physicalW}×${profile?.physicalH}.",
+                        stage = "Preparing your display",
+                        detail = "Setting up the phone-sized workspace.",
                         progress = 0.35f,
                     )
                     profile?.let {
@@ -408,6 +407,12 @@ class SessionController(
                 }
 
                 is LanTransport.TransportEvent.Failed -> {
+                    if (event.terminal) {
+                        reconnectJob?.cancel()
+                        staleJob?.cancel()
+                        record = null // late decoder stats must not revive a failed session
+                        decoderOrNull()?.stop()
+                    }
                     hostMicAvailable = false
                     phoneMicFailed = false
                     stopPhoneMicrophoneLocal()

@@ -222,9 +222,14 @@ internal sealed class WindowsDisplayBackend : IDisplayBackend
     {
         var driver = _driver;
         if (driver is null || !_ownsMonitor) return;
+        var gdiName = _target?.GdiName;
         driver.RemoveMonitor();
-        if (!await WaitAsync(() => driver.GetStatus().MonitorArrived == 0, TimeSpan.FromSeconds(6), ct).ConfigureAwait(false))
-            throw new DisplayException("display-remove", "FocusIdd did not confirm virtual monitor departure.");
+        // IddCx can acknowledge removal before Windows finishes detaching the
+        // desktop target. Do not run the restore check against that stale target.
+        if (!await WaitAsync(() => driver.GetStatus().MonitorArrived == 0 &&
+                (gdiName is null || DisplayConfigApi.FindMonitor(gdiName) is null),
+                TimeSpan.FromSeconds(6), ct).ConfigureAwait(false))
+            throw new DisplayException("display-remove", "Windows did not confirm virtual monitor departure.");
         _ownsMonitor = false;
         _target = null;
     }
