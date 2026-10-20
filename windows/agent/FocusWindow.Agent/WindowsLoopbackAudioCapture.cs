@@ -132,7 +132,10 @@ internal sealed class WindowsLoopbackAudioCapture : IHostAudioCapture
                                 var v = left[ch];
                                 if (bit == 0x1) l += v;
                                 else if (bit == 0x2) r += v;
-                                else if (bit == Center) { l += 0.707f * v; r += 0.707f * v; }
+                                else if (bit == Center) {
+                                    var centerGain = _sourceFormat.Channels == 1 ? 1f : 0.707f;
+                                    l += centerGain * v; r += centerGain * v;
+                                }
                                 else if (bit == Lfe) { l += 0.25f * v; r += 0.25f * v; }
                                 else if (bit is BackLeft or SideLeft) l += 0.707f * v;
                                 else if (bit is BackRight or SideRight) r += 0.707f * v;
