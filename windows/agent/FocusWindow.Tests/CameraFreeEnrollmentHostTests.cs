@@ -59,20 +59,21 @@ public sealed class CameraFreeEnrollmentHostTests
     {
         for (var attempt = 0; attempt < 40; attempt++)
         {
-            var probe = new TcpListener(IPAddress.Loopback, 0);
-            probe.Start();
-            var port = ((IPEndPoint)probe.LocalEndpoint).Port;
-            probe.Stop();
-            if (port is < 1024 or > 65530) continue;
+            // Releasing an ephemeral-port probe can repeatedly return the same
+            // base port whose +1/+2 is reserved on hosted Windows runners.
+            // Choose independent candidates and let the REAL sockets bind them.
+            var port = RandomNumberGenerator.GetInt32(12000, 45000);
+            PairingOffer? offer = null;
             try
             {
-                var offer = Pairing.BuildOffer(Pairing.NewState(), "127.0.0.1", port, "deskfuse-test");
+                offer = Pairing.BuildOffer(Pairing.NewState(), "127.0.0.1", port, "deskfuse-test");
                 var host = new CameraFreePairingHost(offer, "deskfuse-test", store, approval,
                     log ?? NullLog.Instance);
                 return (host, offer);
             }
             catch (SocketException)
             {
+                offer?.Dispose();
                 // Adjacent ports were taken; try another trio.
             }
         }

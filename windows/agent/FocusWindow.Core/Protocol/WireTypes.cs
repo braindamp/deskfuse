@@ -82,7 +82,9 @@ public sealed record TargetRecord(
     string? DegradedReason,
     StateModel State,
     string AppLabel,
-    string? DocumentLabel)
+    string? DocumentLabel,
+    string? ColorRange = null,
+    string? SourceId = null)
 {
     public JsonObject ToJson() => new()
     {
@@ -120,6 +122,8 @@ public sealed record TargetRecord(
         },
         ["appLabel"] = AppLabel,
         ["documentLabel"] = DocumentLabel,
+        ["colorRange"] = ColorRange,
+        ["sourceId"] = SourceId,
     };
 }
 /// <summary>Client input. Coordinates are in TARGET CLIENT PIXELS (== stream pixels).</summary>

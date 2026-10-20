@@ -55,6 +55,10 @@ data class TargetRecord(
     /** Human-readable app/document identity for the session chrome. */
     val appLabel: String,
     val documentLabel: String? = null,
+    /** Actual encoded VUI contract; end-to-end display fidelity is separately measured. */
+    val colorRange: String? = null,
+    /** Ephemeral source identity, never a reusable raw Windows HWND. */
+    val sourceId: String? = null,
 ) {
     @Serializable
     enum class Occupant {

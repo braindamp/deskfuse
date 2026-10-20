@@ -72,7 +72,7 @@ class LanTransport(
         extraBufferCapacity = 8,
         // H.264 inter frames depend on preceding frames. Silent DROP_OLDEST causes
         // decode corruption: MediaCodec cannot detect which reference was lost.
-        // Backpressure the reader instead; the host's four-frame send gate then
+        // Backpressure the reader instead; the host's bounded send gate then
         // forces an IDR resync rather than hiding a loss.
         onBufferOverflow = BufferOverflow.SUSPEND,
     )

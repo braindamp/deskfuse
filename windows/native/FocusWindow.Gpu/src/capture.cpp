@@ -30,6 +30,7 @@ WgcCapture::WgcCapture(ID3D11Device* device, ID3D11DeviceContext* context, int w
     : device_(device), context_(context), width_(width), height_(height)
 {
     slots_.resize(static_cast<size_t>(std::max(2, slotCount)));
+    callbacks_->owner = this;
 }
 
 WgcCapture::~WgcCapture()
@@ -139,9 +140,9 @@ bool WgcCapture::Start(HWND hwnd, std::wstring& error)
         try { session_.IsBorderRequired(false); } catch (...) {}
 
         stage = L"FrameArrived";
-        frameArrivedToken_ = pool_.FrameArrived([this](auto&&, auto&&) { OnFrameArrived(); });
+        frameArrivedToken_ = pool_.FrameArrived([state = callbacks_](auto&&, auto&&) { Dispatch(state, false); });
         stage = L"ItemClosed";
-        itemClosedToken_ = item_.Closed([this](auto&&, auto&&) { OnClosed(L"capture item closed"); });
+        itemClosedToken_ = item_.Closed([state = callbacks_](auto&&, auto&&) { Dispatch(state, true); });
 
         stage = L"StartCapture";
         session_.StartCapture();
@@ -162,6 +163,12 @@ bool WgcCapture::Start(HWND hwnd, std::wstring& error)
 
 void WgcCapture::Stop()
 {
+    // Queued WinRT callbacks may run after handler revocation. They hold only
+    // this shared state, never an unguarded `this` after destruction begins.
+    {
+        std::lock_guard<std::mutex> lock(callbacks_->gate);
+        callbacks_->owner = nullptr;
+    }
     if (!started_)
     {
         // Still revoke handlers if Start failed halfway through.
@@ -177,6 +184,10 @@ void WgcCapture::Stop()
         if (item_) item_.Closed(itemClosedToken_);
     }
     catch (...) {}
+    {
+        std::unique_lock<std::mutex> lock(callbacks_->gate);
+        callbacks_->drained.wait(lock, [this] { return callbacks_->active == 0; });
+    }
     try
     {
         if (session_) session_.Close();
@@ -187,11 +198,6 @@ void WgcCapture::Stop()
         if (pool_) pool_.Close();
     }
     catch (...) {}
-
-    // FrameArrived may already be running on the WinRT thread pool. Do not
-    // release the frame pool/device while a callback still references them.
-    for (int i = 0; i < 300 && callbacks_.load() > 0; ++i)
-        Sleep(10);
 
     std::deque<CapturedFrame> pending;
     {
@@ -220,19 +226,37 @@ void WgcCapture::Stop()
 
 void WgcCapture::OnClosed(const wchar_t* why)
 {
-    ++callbacks_;
     SetError(why);
-    --callbacks_;
+}
+
+void WgcCapture::Dispatch(const std::shared_ptr<CallbackState>& state, bool closed)
+{
+    WgcCapture* owner;
+    {
+        std::lock_guard<std::mutex> lock(state->gate);
+        owner = state->owner;
+        if (!owner) return;
+        ++state->active;
+    }
+    struct Scope
+    {
+        std::shared_ptr<CallbackState> state;
+        ~Scope()
+        {
+            std::lock_guard<std::mutex> lock(state->gate);
+            if (--state->active == 0) state->drained.notify_all();
+        }
+    } scope{state};
+    try
+    {
+        if (closed) owner->OnClosed(L"capture item closed");
+        else owner->OnFrameArrived();
+    }
+    catch (...) { owner->SetError(L"WGC callback failed"); }
 }
 
 void WgcCapture::OnFrameArrived()
 {
-    ++callbacks_;
-    struct CallbackScope
-    {
-        std::atomic<int>& count;
-        ~CallbackScope() { --count; }
-    } scope{ callbacks_ };
     try
     {
         auto frame = pool_.TryGetNextFrame();
@@ -247,6 +271,8 @@ void WgcCapture::OnFrameArrived()
         if (content.Width != width_ || content.Height != height_)
         {
             ++wrongSize_;
+            frame.Close();
+            SetError(L"WGC source changed size; reconfigure the session before sending more frames.");
             return;
         }
 
@@ -256,10 +282,14 @@ void WgcCapture::OnFrameArrived()
         // it on the caller's thread.
         std::lock_guard<std::mutex> lock(stateMutex_);
         if (closed_) return;
-        if (queue_.size() >= slots_.size())
+        // Keep ONE latest capture, not a FIFO of stale frames. Dropping before
+        // encode does not damage an H.264 GOP. Explicit Close returns the WGC
+        // pool surface immediately instead of retaining all three pool frames.
+        if (!queue_.empty())
         {
             ++droppedNoSlot_;
-            return;
+            try { if (queue_.front().frame) queue_.front().frame.Close(); } catch (...) {}
+            queue_.pop_front();
         }
 
         CapturedFrame captured{};
@@ -275,7 +305,7 @@ void WgcCapture::OnFrameArrived()
     catch (...)
     {
         ++copyErrors_;
-        // A WinRT exception must never escape the event handler.
+        SetError(L"WGC frame acquisition failed");
     }
 }
 
@@ -331,23 +361,17 @@ bool WgcCapture::MaterializeFrame(CapturedFrame& frame, std::wstring& error)
         source->GetDevice(&sourceDevice);
         if (sourceDevice.Get() != device_)
         {
-            std::wcout << L"POC-WGC source texture is on a different D3D11 device; source=" <<
-                sourceDevice.Get() << L" ours=" << device_ << L"\n" << std::flush;
             ++copyErrors_;
             closeFrame();
             error = L"WGC frame texture belongs to a different D3D11 device.";
             return false;
         }
-        static std::atomic<int> sourceLogs{ 0 };
-        if (sourceLogs.fetch_add(1) < 1)
+        if (sourceDesc.Width != static_cast<UINT>(width_) || sourceDesc.Height != static_cast<UINT>(height_) ||
+            sourceDesc.MipLevels != 1 || sourceDesc.ArraySize != 1 || sourceDesc.SampleDesc.Count != 1)
         {
-            std::wcout << L"POC-WGC source desc " << sourceDesc.Width << L"x" << sourceDesc.Height <<
-                L" fmt=" << static_cast<unsigned>(sourceDesc.Format) <<
-                L" mips=" << sourceDesc.MipLevels << L" array=" << sourceDesc.ArraySize <<
-                L" samples=" << sourceDesc.SampleDesc.Count <<
-                L" usage=" << static_cast<unsigned>(sourceDesc.Usage) <<
-                L" bind=0x" << std::hex << sourceDesc.BindFlags << std::dec <<
-                L" misc=0x" << std::hex << sourceDesc.MiscFlags << std::dec << L"\n" << std::flush;
+            closeFrame();
+            error = L"WGC surface texture geometry differs from the negotiated source.";
+            return false;
         }
 
         int slotIndex = -1;
@@ -406,7 +430,7 @@ bool WgcCapture::MaterializeFrame(CapturedFrame& frame, std::wstring& error)
     }
 }
 
-bool WgcCapture::WaitFrame(CapturedFrame& frame, int timeoutMs)
+bool WgcCapture::WaitFrame(CapturedFrame& frame, int timeoutMs, int64_t minimumQpc, int64_t afterSourceTime)
 {
     CapturedFrame pending;
     {
@@ -417,6 +441,15 @@ bool WgcCapture::WaitFrame(CapturedFrame& frame, int timeoutMs)
         if (queue_.empty()) return false;
         pending = std::move(queue_.front());
         queue_.pop_front();
+    }
+
+    // Pace and reject repeated compositor timestamps BEFORE any GPU copy.
+    // A different picture is never guessed from frame arrival cadence alone.
+    if (pending.qpcArrival < minimumQpc ||
+        (afterSourceTime != 0 && pending.systemRelativeTime <= afterSourceTime))
+    {
+        try { if (pending.frame) pending.frame.Close(); } catch (...) {}
+        return false;
     }
 
     std::wstring materializeError;

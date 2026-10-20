@@ -618,6 +618,8 @@ class SessionController(
             widthPx = target.widthPx,
             heightPx = target.heightPx,
             targetVersion = target.version,
+            colorRange = target.colorRange,
+            framesPerSecond = target.refreshHz,
         )
     }
 

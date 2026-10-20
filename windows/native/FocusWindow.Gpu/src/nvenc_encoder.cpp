@@ -183,9 +183,13 @@ bool NvEncoder::Initialize(ID3D11Device* device, ID3D11Texture2D* const* slotTex
     encodeConfig_ = preset.presetCfg;
     encodeConfig_.version = NV_ENC_CONFIG_VER;
     encodeConfig_.profileGUID = NV_ENC_H264_PROFILE_HIGH_GUID;
-    encodeConfig_.gopLength = 60;
+    // Avoid periodic full-screen keyframes on an ordered authenticated stream.
+    // Connect/reconfigure/decoder recovery explicitly requests SPS/PPS + IDR.
+    encodeConfig_.gopLength = NVENC_INFINITE_GOPLENGTH;
     encodeConfig_.frameIntervalP = 1;
-    encodeConfig_.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR;
+    // Preserve the configured scene bitrate budget without paying a constant
+    // transport rate for sparse desktop updates. No lookahead or B-frame queue.
+    encodeConfig_.rcParams.rateControlMode = NV_ENC_PARAMS_RC_VBR;
     encodeConfig_.rcParams.averageBitRate = static_cast<uint32_t>(config.bitrate);
     encodeConfig_.rcParams.maxBitRate = static_cast<uint32_t>(config.bitrate);
     encodeConfig_.rcParams.vbvBufferSize = static_cast<uint32_t>(config.bitrate);
@@ -194,7 +198,8 @@ bool NvEncoder::Initialize(ID3D11Device* device, ID3D11Texture2D* const* slotTex
     encodeConfig_.rcParams.zeroReorderDelay = 1;
     encodeConfig_.rcParams.enableAQ = 0;
     encodeConfig_.rcParams.enableTemporalAQ = 0;
-    encodeConfig_.encodeCodecConfig.h264Config.idrPeriod = 60;
+    encodeConfig_.encodeCodecConfig.h264Config.idrPeriod = NVENC_INFINITE_GOPLENGTH;
+    encodeConfig_.encodeCodecConfig.h264Config.enableFillerDataInsertion = 0;
     encodeConfig_.encodeCodecConfig.h264Config.repeatSPSPPS = 1;
     encodeConfig_.encodeCodecConfig.h264Config.level = NV_ENC_LEVEL_AUTOSELECT;
     encodeConfig_.encodeCodecConfig.h264Config.chromaFormatIDC = 1;
@@ -311,6 +316,12 @@ bool NvEncoder::Encode(int slot, uint64_t timestamp, uint32_t frameIndex, uint32
         error = L"ENCODER_BLOCKED: " + StatusText(L"NvEncMapInputResource", status);
         return Fail(error);
     }
+    struct MappedInputScope {
+        NV_ENCODE_API_FUNCTION_LIST* functions;
+        void* session;
+        NV_ENC_INPUT_PTR mapped;
+        ~MappedInputScope() { functions->nvEncUnmapInputResource(session, mapped); }
+    } mappedInput{functions_, session_, map.mappedResource};
 
     NV_ENC_PIC_PARAMS picture{};
     picture.version = NV_ENC_PIC_PARAMS_VER;
@@ -329,7 +340,6 @@ bool NvEncoder::Encode(int slot, uint64_t timestamp, uint32_t frameIndex, uint32
 
     status = functions_->nvEncEncodePicture(session_, &picture);
     submitMs = QpcDeltaMs(submitStart, QpcNow());
-    functions_->nvEncUnmapInputResource(session_, map.mappedResource);
     if (status != NV_ENC_SUCCESS)
     {
         error = L"ENCODER_BLOCKED: " + StatusText(L"NvEncEncodePicture", status);
@@ -346,6 +356,12 @@ bool NvEncoder::Encode(int slot, uint64_t timestamp, uint32_t frameIndex, uint32
     lockMs = QpcDeltaMs(lockStart, QpcNow());
     if (status == NV_ENC_SUCCESS)
     {
+        struct BitstreamScope {
+            NV_ENCODE_API_FUNCTION_LIST* functions;
+            void* session;
+            NV_ENC_OUTPUT_PTR bitstream;
+            ~BitstreamScope() { functions->nvEncUnlockBitstream(session, bitstream); }
+        } lockedBitstream{functions_, session_, bitstream_};
         if (lock.bitstreamSizeInBytes > 0 && lock.bitstreamBufferPtr)
         {
             const auto* ptr = static_cast<const uint8_t*>(lock.bitstreamBufferPtr);
@@ -354,7 +370,6 @@ bool NvEncoder::Encode(int slot, uint64_t timestamp, uint32_t frameIndex, uint32
             bytesWritten_ += bitstreamBytes;
             ++framesEncoded_;
         }
-        functions_->nvEncUnlockBitstream(session_, bitstream_);
     }
     else if (status != NV_ENC_ERR_NEED_MORE_INPUT)
     {

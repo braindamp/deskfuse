@@ -2,6 +2,7 @@ using System.Buffers;
 using System.Buffers.Binary;
 using System.Runtime.InteropServices;
 using FocusWindow.Core.Session;
+using FocusWindow.Core.Media;
 using NAudio.Dmo;
 using NAudio.Wave;
 
@@ -77,19 +78,9 @@ internal sealed class WindowsLoopbackAudioCapture : IHostAudioCapture
             // Select the best real output layout. A 7.1 Windows mix may be
             // rendered on genuine Android 5.1 hardware with explicit rear
             // fold-down, not thrown all the way back to stereo.
-            Layout = _sourceFormat.Channels switch
-            {
-                8 when _sourceMask == SevenOne &&
-                    supportedPhoneLayouts.Contains("7.1_surround") => "7.1_surround",
-                6 or 8 when supportedPhoneLayouts.Contains("5.1_back") &&
-                    (_sourceMask == FiveOneBack || _sourceMask == FiveOneSide ||
-                        _sourceMask == SevenOne) => "5.1_back",
-                6 or 8 when supportedPhoneLayouts.Contains("5.1_side") &&
-                    (_sourceMask == FiveOneBack || _sourceMask == FiveOneSide ||
-                        _sourceMask == SevenOne) => "5.1_side",
-                _ => "stereo",
-            };
-            Channels = Layout == "stereo" ? 2 : Layout == "7.1_surround" ? 8 : 6;
+            var negotiated = PcmSpeakerLayout.Select(_sourceMask, supportedPhoneLayouts);
+            Layout = negotiated.Name;
+            Channels = negotiated.Channels;
             // Older v3 phones only understand 3840-byte PCM chunks. A new
             // client explicitly advertises a larger packet budget. Never
             // issue an oversized packet just because Windows runs at 192kHz.

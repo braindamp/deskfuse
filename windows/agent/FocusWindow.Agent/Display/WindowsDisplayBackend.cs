@@ -17,39 +17,68 @@ internal sealed class WindowsDisplayBackend : IDisplayBackend
     private DriverDevice? _driver;
     private WindowsSurface? _surface;
     private PhoneTarget? _target;
+    private FileStream? _displayLock;
+    private readonly object _driverGate = new();
+    private bool _ownsMonitor;
     public WindowsDisplayBackend(ILog log) => _log = log;
     public string? PhoneGdiName => _target?.GdiName;
     private DriverDevice Driver()
     {
-        if (_driver is not null) return _driver;
-        var d = DriverDevice.Open();
-        var version = d.Ping();
-        if (version != DriverContract.ProtocolVersion)
+        lock (_driverGate)
         {
-            d.Dispose();
-            throw new DisplayException("driver",
-                $"The installed display driver speaks protocol {version}; this agent needs {DriverContract.ProtocolVersion}.",
-                "Install the driver build that ships with this agent (windows/driver).");
+            if (_driver is not null) return _driver;
+            try
+            {
+                _displayLock = new FileStream(Path.Combine(AppData.Directory, "virtual-display.lock"),
+                    FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+            }
+            catch (IOException ex)
+            {
+                throw new DisplayException("display-owned", "Another DeskFuse process owns virtual-display control.",
+                    "Disconnect the other host normally before starting another display session.", ex);
+            }
+            DriverDevice? d = null;
+            try
+            {
+                d = DriverDevice.Open();
+                var status = d.GetStatus(); // read-only; do not heartbeat an unowned display
+                var version = (int)status.ProtocolVersion;
+                if (version != DriverContract.ProtocolVersion)
+                    throw new DisplayException("driver",
+                        $"The installed display driver speaks protocol {version}; this agent needs {DriverContract.ProtocolVersion}.",
+                        "Install the driver build that ships with this agent (windows/driver).");
+                if (status.MonitorArrived != 0)
+                    throw new DisplayException("display-owned", "FocusIdd already has a display that this host does not own.",
+                        "Let the owning session disconnect or its watchdog expire. This host will not remove an unowned monitor.");
+                _driver = d;
+                _log.Info($"display driver found: {d.DevicePath} (protocol {version})");
+                return d;
+            }
+            catch
+            {
+                d?.Dispose();
+                _displayLock.Dispose();
+                _displayLock = null;
+                throw;
+            }
         }
-        _driver = d;
-        _log.Info($"display driver found: {d.DevicePath} (protocol {version})");
-        return d;
     }
     public async Task<MonitorInfo> CreateMonitorAsync(MonitorRequest request, CancellationToken ct)
     {
         var driver = Driver();
         _surface ??= WindowsSurface.Open();
-        // A deterministic start: if a monitor is already up (from a previous target), remove it and
-        // wait for the departure, so "MonitorArrived == 1" below can only mean the NEW monitor.
+        // Calibration can replace OUR target. Never adopt or remove a monitor
+        // discovered at startup: the process lease and Driver() preflight deny it.
         if (driver.GetStatus().MonitorArrived == 1)
         {
-            driver.RemoveMonitor();
-            await WaitAsync(() => driver.GetStatus().MonitorArrived == 0, TimeSpan.FromSeconds(6), ct).ConfigureAwait(false);
+            if (!_ownsMonitor) throw new DisplayException("display-owned", "An unowned virtual display is active.");
+            await RemoveMonitorAsync(ct).ConfigureAwait(false);
         }
         // Snapshot the ACTUAL active desktop topology BEFORE asking IddCx to attach.
         // Windows 10 may omit the EDID name/path even for a visible virtual display.
         var topologyBefore = DisplayConfigApi.CaptureTopology();
         _log.Info("DeskFuse topology-delta detection v0.2.20 enabled");
+        _ownsMonitor = true; // also clean up a partially completed SetTarget
         driver.SetTarget(new DriverContract.SetTarget
         {
             WidthPx = (uint)request.Width,
@@ -192,34 +221,24 @@ internal sealed class WindowsDisplayBackend : IDisplayBackend
     public async Task RemoveMonitorAsync(CancellationToken ct)
     {
         var driver = _driver;
-        if (driver is null) return;
-        try
-        {
-            driver.RemoveMonitor();
-            await WaitAsync(() => driver.GetStatus().MonitorArrived == 0, TimeSpan.FromSeconds(6), ct).ConfigureAwait(false);
-        }
-        catch (DisplayException ex)
-        {
-            _log.Warn("removing the phone monitor: " + ex.Message);
-        }
+        if (driver is null || !_ownsMonitor) return;
+        driver.RemoveMonitor();
+        if (!await WaitAsync(() => driver.GetStatus().MonitorArrived == 0, TimeSpan.FromSeconds(6), ct).ConfigureAwait(false))
+            throw new DisplayException("display-remove", "FocusIdd did not confirm virtual monitor departure.");
+        _ownsMonitor = false;
         _target = null;
     }
     public DriverHealth ReadDriverHealth()
     {
-        try
-        {
-            var s = Driver().GetStatus();
-            return new DriverHealth(true, (int)s.ProtocolVersion, s.MonitorArrived == 1, (int)s.WidthPx, (int)s.HeightPx,
-                (int)s.RefreshHz, s.FramesPublished, s.FramesDropped, s.LastError, s.SurfaceWin32Error);
-        }
-        catch (DisplayException)
-        {
-            return new DriverHealth(false, 0, false, 0, 0, 0, 0, 0, 0, 0);
-        }
+        // Preserve ownership/ACL/protocol failure stages and remediation. A
+        // fabricated all-zero status hid the reason behind a generic timeout.
+        var s = Driver().GetStatus();
+        return new DriverHealth(true, (int)s.ProtocolVersion, s.MonitorArrived == 1, (int)s.WidthPx, (int)s.HeightPx,
+            (int)s.RefreshHz, s.FramesPublished, s.FramesDropped, s.LastError, s.SurfaceWin32Error);
     }
     public void Heartbeat()
     {
-        try { _driver?.Ping(); }
+        try { if (_ownsMonitor) _driver?.Ping(); }
         catch (DisplayException ex) { _log.Warn("driver heartbeat failed: " + ex.Message); }
     }
     public IFrameSource OpenFrameSource() =>
@@ -236,10 +255,15 @@ internal sealed class WindowsDisplayBackend : IDisplayBackend
     }
     public async ValueTask DisposeAsync()
     {
-        await RemoveMonitorAsync(CancellationToken.None).ConfigureAwait(false);
-        _surface?.Dispose();
-        _driver?.Dispose();
-        _surface = null;
-        _driver = null;
+        try { await RemoveMonitorAsync(CancellationToken.None).ConfigureAwait(false); }
+        finally
+        {
+            _surface?.Dispose();
+            _driver?.Dispose();
+            _displayLock?.Dispose();
+            _surface = null;
+            _driver = null;
+            _displayLock = null;
+        }
     }
 }

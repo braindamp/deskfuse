@@ -1,6 +1,20 @@
 # START HERE — DeskFuse unified integration and development handover
 
 **Date:** 2026-10-20  
+**Executed update:** Device Bridge is now reconciled into the GPU-first tree in
+merge `c12367c` (parents include the complete `e62f371` feature stack). Further
+implemented source/lifecycle/bandwidth work and current limitations are recorded
+in [`docs/UNIFIED_RUNTIME.md`](docs/UNIFIED_RUNTIME.md). Sections 3–7 below describe
+the original handoff state and work order; they are retained as historical context.
+The integrated candidate is not physically accepted and must not merge solely
+because software checks pass.
+
+**Local software verification for the executed increment:** Windows x64
+self-contained publish with bundled native DLL; hardware-free native ABI test;
+.NET **171 passed / 10 legacy or optional skipped**; Android **19 unit tests**
+and debug APK; plan-only PowerShell 5.1 smoke. Real WGC/NVENC/Android decode,
+bandwidth/latency/color and installed-driver permissions were not exercised.
+
 **Repository:** https://github.com/braindamp/deskfuse (private; use the connected GitHub app/authorized checkout)  
 **Repository directory:** repository root `.`  
 **Primary work branch:** `integration/unified-gpu-workspace-20261020`  

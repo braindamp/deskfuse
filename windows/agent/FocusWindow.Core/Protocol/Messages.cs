@@ -130,8 +130,10 @@ public static class ClientMessageParser
 /// <summary>Host -> client message builders (ServerMessage in Protocol.kt).</summary>
 public static class ServerMessages
 {
+    private static readonly JsonSerializerOptions WireJson = new(JsonSerializerOptions.Default)
+        { WriteIndented = false };
     public static byte[] Serialize(JsonObject o) =>
-        Encoding.UTF8.GetBytes(o.ToJsonString(new JsonSerializerOptions { WriteIndented = false }));
+        JsonSerializer.SerializeToUtf8Bytes(o, WireJson);
     public static JsonObject Hello(string hostVersion, string hostName, string channel,
         bool pcAudioAvailable = false, bool phoneMicrophoneBridgeAvailable = false) => new()
     {

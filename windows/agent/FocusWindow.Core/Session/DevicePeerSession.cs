@@ -71,19 +71,26 @@ internal sealed class DevicePeerSession(
         using var mic = new PhoneMicrophoneRoute(
             conn, options, services, lease.Peer.DeviceId, log);
         var microphonePump = mic.PumpAsync(linked.Token);
+        var keepAlive = KeepAliveAsync(conn, linked.Token);
         var control = ReadControlsAsync(conn, mic, requested, linked.Token);
         try
         {
-            await Task.WhenAny(control, conn.Completion).ConfigureAwait(false);
+            await Task.WhenAny(control, microphonePump, keepAlive, conn.Completion).ConfigureAwait(false);
         }
         finally
         {
             linked.Cancel();
             await conn.DisposeAsync().ConfigureAwait(false);
-            try { await Task.WhenAll(control, microphonePump).ConfigureAwait(false); }
+            try { await Task.WhenAll(control, microphonePump, keepAlive).ConfigureAwait(false); }
             catch (OperationCanceledException) when (linked.IsCancellationRequested) { }
             log.Info("Accessory peer detached: " + lease.Peer.DeviceId);
         }
+    }
+
+    private static async Task KeepAliveAsync(PhoneConnection conn, CancellationToken ct)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(2));
+        while (await timer.WaitForNextTickAsync(ct).ConfigureAwait(false)) conn.SendPing();
     }
 
     private static async Task ReadControlsAsync(PhoneConnection conn,

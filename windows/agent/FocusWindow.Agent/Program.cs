@@ -28,7 +28,9 @@ internal static class Program
           FocusWindow.Agent --version
         Host options:
           --port N (47810)   --bind IP (0.0.0.0)   --fps N (60)   --bitrate KBPS (20000)
-          --ffmpeg PATH      (default: ffmpeg.exe next to the agent, else PATH)
+          --workspace-app EXE  absolute path to a NEW application instance for GPU sessions
+          --workspace-args TEXT  local launch arguments (for example, an app's new-instance flag)
+                             Existing physical windows are never moved; app documents survive disconnect.
           --auto-approve     legacy QR test-mode only; does NOT bypass first-time LAN enrollment
           --legacy-qr       explicitly enable historical QR pairing instead of phone discovery
           trusted-phones    list enrolled device IDs (for review and revocation)
@@ -157,8 +159,11 @@ internal static class Program
     // ---- run ----------------------------------------------------------------------------------------
     private static async Task<int> RunHostAsync(string[] args, CancellationToken ct)
     {
+        using var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
+        if (new System.Security.Principal.WindowsPrincipal(identity).IsInRole(
+            System.Security.Principal.WindowsBuiltInRole.Administrator))
+            return Fail("Run the network host as a normal Windows user. Installed driver access must be resolved through an approved local boundary, not an elevated LAN host.");
         using var log = new ConsoleLog(Opt(args, "--log"));
-        var bundled = Path.Combine(AppContext.BaseDirectory, "ffmpeg.exe");
         // The cable adapter is deliberately unavailable without both flags.
         // A Windows render-endpoint ID is not a DeskFuse PnP mic identity.
         var microphoneOutputId = Opt(args, "--phone-mic-output-id");
@@ -172,7 +177,6 @@ internal static class Program
             Bind = Opt(args, "--bind") ?? "0.0.0.0",
             Fps = Int(args, "--fps", 60),
             BitrateKbps = Int(args, "--bitrate", 20_000),
-            FfmpegPath = Opt(args, "--ffmpeg") ?? (File.Exists(bundled) ? bundled : "ffmpeg"),
             HostVersion = Version,
             DrawRulerProbe = args.Contains("--ruler-probe"),
             NewPairing = args.Contains("--new-pairing"),
@@ -190,6 +194,7 @@ internal static class Program
             log.Warn("Development microphone bridge ENABLED for one explicitly selected Windows playback endpoint. " +
                 "Use a virtual audio cable only; a physical endpoint would play the phone microphone aloud.");
         var guards = new List<PhysicalDisplayGuard>();
+        using var sources = new WorkspaceApplicationCatalog();
         WindowsDisplayBackend? backend = null;
         var services = new HostServices(
             CreateBackend: () => backend = new WindowsDisplayBackend(log),
@@ -205,7 +210,7 @@ internal static class Program
             DeviceCredentials: new DpapiDeviceCredentialStore(),
             Clipboard: new WindowsClipboardBridge(),
             Windows: new WindowsWindowWorkflow(),
-            CreateVideoPipeline: () => new NativeGpuPipeline(),
+            CreateVideoPipeline: () => new NativeGpuPipeline(Opt(args, "--workspace-app"), Opt(args, "--workspace-args"), sources),
             CreateAudioCapture: (layouts, maxBytes) => new WindowsLoopbackAudioCapture(layouts, maxBytes),
             CreatePhoneMicrophoneSink: allowMicrophone
                 ? id => string.Equals(id, microphoneDeviceId, StringComparison.Ordinal)

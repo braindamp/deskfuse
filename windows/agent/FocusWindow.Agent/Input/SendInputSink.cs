@@ -22,6 +22,8 @@ namespace FocusWindow.Agent.Input;
 /// </summary>
 internal sealed class SendInputSink : IInputSink
 {
+    [StructLayout(LayoutKind.Sequential)] private struct CursorPoint { public int X, Y; }
+    [DllImport("user32.dll")] private static extern bool GetCursorPos(out CursorPoint point);
     private const uint MouseMove = 0x0001, MouseLeftDown = 0x0002, MouseLeftUp = 0x0004,
         MouseRightDown = 0x0008, MouseRightUp = 0x0010, MouseMiddleDown = 0x0020, MouseMiddleUp = 0x0040,
         MouseWheel = 0x0800, MouseHWheel = 0x1000, MouseVirtualDesk = 0x4000, MouseAbsolute = 0x8000;
@@ -46,7 +48,7 @@ internal sealed class SendInputSink : IInputSink
             switch (e.Kind)
             {
                 case "pointer": Pointer(e, geometry); break;
-                case "relative": Send(Mouse(e.Dx, e.Dy, 0, MouseMove)); break;
+                case "relative": Relative(e, geometry); break;
                 case "scroll": Scroll(e, geometry); break;
                 case "key": Key(e); break;
                 case "text": Text(e.Text); break;
@@ -55,6 +57,15 @@ internal sealed class SendInputSink : IInputSink
         }
     }
     // ---- pointer -----------------------------------------------------------------------------------
+    private void Relative(InputEventDto e, InputGeometry geometry)
+    {
+        if (!GetCursorPos(out var cursor)) return;
+        var bounds = geometry.MonitorBounds;
+        var x = (int)Math.Clamp((long)cursor.X + e.Dx, bounds.X, (long)bounds.Right - 1);
+        var y = (int)Math.Clamp((long)cursor.Y + e.Dy, bounds.Y, (long)bounds.Bottom - 1);
+        var (nx, ny) = Normalise(x, y);
+        Send(Mouse(nx, ny, 0, MouseMove | MouseAbsolute | MouseVirtualDesk));
+    }
     private static (uint Down, uint Up) ButtonFlags(string button) => button switch
     {
         "right" => (MouseRightDown, MouseRightUp),

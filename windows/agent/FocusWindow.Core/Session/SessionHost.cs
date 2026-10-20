@@ -22,7 +22,8 @@ public sealed class SessionHost : IDisposable
     private PairingOffer? _offer;
     private CameraFreePairingHost? _cameraFree;
     private DevicePeerRegistry? _devicePeers;
-    private string _encoderName = "pending native-resolution qualification";
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, int> _preferredFrameRates = new(StringComparer.Ordinal);
+    private readonly string _encoderName = "WGC / NVENC (qualified per source)";
     public SessionHost(HostOptions options, HostServices services, ILog log)
     {
         _options = options;
@@ -32,13 +33,13 @@ public sealed class SessionHost : IDisposable
     public PairingOffer? Offer => _offer;
     public int Port => _listener?.Port ?? 0;
     public string EncoderName => _encoderName;
-    /// <summary>Binds the port, picks a working encoder, and builds the QR offer.</summary>
+    /// <summary>Binds the port and builds the enrollment offer; video is qualified per source.</summary>
     public Task<PairingOffer> StartAsync(CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
         // The phone's native dimensions are unknown here. Selecting a GPU based
         // on a tiny startup probe can produce a black screen at 1440x3120.
-        // PhoneSession qualifies NVENC/QSV/AMF/software after density negotiation.
+        // PhoneSession qualifies the native WGC/NVENC pipeline after density negotiation.
         _listener = new HostListener(IPAddress.Parse(_options.Bind), _options.Port, _log);
         var state = Pairing.LoadOrCreate(_services.PairingStore, _options.NewPairing);
         var address = Pairing.PickLanAddress() ?? "127.0.0.1";
@@ -149,7 +150,7 @@ public sealed class SessionHost : IDisposable
                     {
                         try
                         {
-                            await new PhoneSession(_options, _services, _encoderName, _log)
+                            await new PhoneSession(_options, _services, _encoderName, _log, _preferredFrameRates)
                                 .RunAsync(displayConnection, displayHello, ct).ConfigureAwait(false);
                         }
                         catch (OperationCanceledException) when (ct.IsCancellationRequested) { }

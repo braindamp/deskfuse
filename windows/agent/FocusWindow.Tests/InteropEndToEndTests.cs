@@ -145,7 +145,7 @@ public class InteropEndToEndTests
         return (report, outDir, output);
     }
     private static int Int(JsonNode? n) => n!.GetValue<int>();
-    [FactIfFfmpegAndNode]
+    [HistoricalCpuSession]
     public async Task Full_pipeline_at_1440x3120_from_driver_surface_to_an_independent_phone_client()
     {
         await using var rig = await StartRig();
@@ -231,7 +231,7 @@ public class InteropEndToEndTests
         Assert.InRange(band.Y, expectedY - 2, expectedY + 2);
         Assert.InRange(band.Height, FrameArtist.Band - 3, FrameArtist.Band + 3);
     }
-    [FactIfFfmpegAndNode]
+    [HistoricalCpuSession]
     public async Task A_peer_without_the_pairing_secret_is_rejected_and_the_real_phone_can_still_connect_afterwards()
     {
         await using var rig = await StartRig();
@@ -249,7 +249,7 @@ public class InteropEndToEndTests
         Assert.True(Int(legit["frames"]!["accepted"]) >= 3);
         Assert.Contains(rig.Log.Lines, l => l.Contains("rejected"));
     }
-    [FactIfFfmpegAndNode]
+    [FactIfNode]
     public async Task A_declined_approval_gives_the_phone_a_named_fatal_stage_and_creates_no_monitor()
     {
         await using var rig = await StartRig(approve: false);
@@ -259,7 +259,7 @@ public class InteropEndToEndTests
         Assert.NotNull(r["fatalStage"]!["remediation"]);
         Assert.Empty(rig.Backend.Created);
     }
-    [FactIfFfmpegAndNode]
+    [FactIfNode]
     public async Task A_protocol_mismatch_is_a_named_fatal_stage_not_a_silent_hang()
     {
         await using var rig = await StartRig();
@@ -269,7 +269,7 @@ public class InteropEndToEndTests
         Assert.Contains("protocol 2", (string)r["fatalStage"]!["detail"]!);
         Assert.Empty(rig.Backend.Created);
     }
-    [FactIfFfmpegAndNode]
+    [HistoricalCpuSession]
     public async Task A_dpi_virtualised_window_reaches_the_phone_as_not_native_with_the_reason()
     {
         await using var rig = await StartRig(b => { b.ProbeWindowDpi = 96; b.ProbeAwareness = "Unaware (DPI-virtualised)"; });
@@ -284,7 +284,7 @@ public class InteropEndToEndTests
         Assert.Contains("Unaware", (string)t["degradedReason"]!);
         Assert.Empty(r["violations"]!.AsArray());               // and it is still valid wire protocol
     }
-    [FactIfFfmpegAndNode]
+    [HistoricalCpuSession]
     public async Task A_windows_scale_cap_reaches_the_phone_as_a_wider_layout_with_the_real_numbers()
     {
         await using var rig = await StartRig(b =>
@@ -317,7 +317,7 @@ public class InteropEndToEndTests
     /// same machine, Node client, no Android MediaCodec) - it does not satisfy the E3
     /// 10-minute hardware gate, which needs the installed FocusIdd driver.
     /// </summary>
-    [FactIfSoak]
+    [HistoricalCpuSession]
     public async Task Soak_measures_native_pixels_fps_bytes_and_publish_to_receive_latency()
     {
         var minutes = int.Parse(Environment.GetEnvironmentVariable("FOCUS_SOAK_MINUTES")!, CultureInfo.InvariantCulture);

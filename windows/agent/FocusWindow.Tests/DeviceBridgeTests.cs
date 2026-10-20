@@ -1,10 +1,21 @@
 using FocusWindow.Core.Session;
+using FocusWindow.Core.Media;
 using Xunit;
 
 namespace FocusWindow.Tests;
 
 public sealed class DeviceBridgeTests
 {
+    [Fact]
+    public void Surround_negotiation_uses_receiver_channel_count_and_exact_speaker_masks()
+    {
+        Assert.Equal(PcmSpeakerLayout.FiveOneBack,
+            PcmSpeakerLayout.Select(0x63f, ["5.1_back", "stereo"]));
+        Assert.Equal(6, PcmSpeakerLayout.Select(0x63f, ["5.1_side"]).Channels);
+        Assert.Equal(PcmSpeakerLayout.SevenOne, PcmSpeakerLayout.Select(0x63f, ["7.1_surround"]));
+        Assert.Equal(PcmSpeakerLayout.Stereo, PcmSpeakerLayout.Select(0x3, ["7.1_surround", "stereo"]));
+        Assert.Equal(PcmSpeakerLayout.Stereo, PcmSpeakerLayout.Select(0x3f, []));
+    }
     [Fact]
     public void Multiple_accessories_compose_capabilities_while_display_admission_remains_exclusive()
     {

@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include <deque>
 #include <mutex>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -40,7 +41,7 @@ public:
     bool Start(HWND hwnd, std::wstring& error);
     void Stop();
 
-    bool WaitFrame(CapturedFrame& frame, int timeoutMs);
+    bool WaitFrame(CapturedFrame& frame, int timeoutMs, int64_t minimumQpc = 0, int64_t afterSourceTime = 0);
     void ReleaseFrame(const CapturedFrame& frame);
     bool Readback(int slot, std::vector<uint8_t>& bgra, int& width, int& height, std::wstring& error);
 
@@ -72,6 +73,14 @@ private:
     bool MaterializeFrame(CapturedFrame& frame, std::wstring& error);
     bool EnsureStaging(std::wstring& error);
     void SetError(const std::wstring& error);
+    struct CallbackState
+    {
+        std::mutex gate;
+        std::condition_variable drained;
+        WgcCapture* owner = nullptr;
+        unsigned active = 0;
+    };
+    static void Dispatch(const std::shared_ptr<CallbackState>& state, bool closed);
 
     ID3D11Device* device_ = nullptr;
     ID3D11DeviceContext* context_ = nullptr;
@@ -96,7 +105,7 @@ private:
     winrt::event_token frameArrivedToken_{};
     winrt::event_token itemClosedToken_{};
     bool started_ = false;
-    std::atomic<int> callbacks_{ 0 };
+    std::shared_ptr<CallbackState> callbacks_ = std::make_shared<CallbackState>();
 
     std::atomic<uint64_t> arrived_{ 0 };
     std::atomic<uint64_t> wrongSize_{ 0 };
