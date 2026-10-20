@@ -491,7 +491,7 @@ internal sealed class PhoneSession
                     HandleWindows(windows);
                     break;
                 case ClientAudio audio:
-                    HandlePcAudio(audio.Action);
+                    HandlePcAudio(audio);
                     break;
                 case ClientMicrophone mic:
                     _phoneMic?.Handle(mic);
@@ -626,15 +626,15 @@ internal sealed class PhoneSession
         }
     }
 
-    private void HandlePcAudio(string action)
+    private void HandlePcAudio(ClientAudio request)
     {
-        if (action == "stop_pc")
+        if (request.Action == "stop_pc")
         {
             StopPcAudio();
             _conn.SendControl(ServerMessages.AudioState("stopped", _pcAudioStreamId));
             return;
         }
-        if (action != "start_pc" || !_o.AllowPcAudio || _s.CreateAudioCapture is null)
+        if (request.Action != "start_pc" || !_o.AllowPcAudio || _s.CreateAudioCapture is null)
         {
             _conn.SendControl(ServerMessages.AudioState("error", _pcAudioStreamId,
                 detail: "Windows playback capture unavailable."));
@@ -644,11 +644,11 @@ internal sealed class PhoneSession
         _log.Info("Approved phone requested mixed PC playback audio (host opted in).");
         try
         {
-            var capture = _s.CreateAudioCapture();
+            var capture = _s.CreateAudioCapture(request.Layouts ?? Array.Empty<string>());
             _pcAudio = capture;
             var streamId = ++_pcAudioStreamId;
             _conn.SendControl(ServerMessages.AudioState("started", streamId,
-                capture.SampleRate, capture.Channels));
+                capture.SampleRate, capture.Channels, layout: capture.Layout));
             capture.Start(samples => _conn.TrySendAudio(samples.Span, streamId));
         }
         catch (Exception ex)
