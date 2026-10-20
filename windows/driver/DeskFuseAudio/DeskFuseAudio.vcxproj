@@ -1,0 +1,165 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  DeskFuse Audio: one installed driver package, one render endpoint per
+  enrolled phone.
+
+  Requirements: Visual Studio 2022 + Windows Driver Kit (WDK) 10.0.26100.0
+  with the "Windows Driver Kit" VS workload.
+
+  Build:
+      msbuild DeskFuseAudio.vcxproj /p:Configuration=Release /p:Platform=x64
+
+  The driver cannot be built with the plain Windows SDK: portcls.h, the
+  WaveRT miniport headers and the KMDF framework libraries ship only in the
+  WDK.
+
+  KMDF contract: 1.27. That is the newest contract that is both present in
+  this WDK and available on the supported Windows 10 19045 baseline (which
+  ships the 1.29 runtime). Do not raise this without raising the supported
+  Windows baseline too.
+-->
+<Project DefaultTargets="Build" ToolsVersion="12.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{3F0C6A72-6D4B-4C0E-9A18-5B7C2E4D8F31}</ProjectGuid>
+    <TemplateGuid>{dd38f7fc-d7bd-488b-9242-7d8754cde80d}</TemplateGuid>
+    <TargetFrameworkVersion>v4.5</TargetFrameworkVersion>
+    <MinimumVisualStudioVersion>12.0</MinimumVisualStudioVersion>
+    <Configuration>Debug</Configuration>
+    <Platform Condition="'$(Platform)' == ''">x64</Platform>
+    <RootNamespace>DeskFuseAudio</RootNamespace>
+    <DriverTargetPlatform>Universal</DriverTargetPlatform>
+    <WindowsTargetPlatformVersion>$(LatestTargetPlatformVersion)</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Label="PropertySheets">
+  </PropertyGroup>
+
+  <PropertyGroup Label="Configuration" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <TargetVersion>Windows10</TargetVersion>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
+    <ConfigurationType>Driver</ConfigurationType>
+    <DriverType>KMDF</DriverType>
+    <KMDF_VERSION_MAJOR>1</KMDF_VERSION_MAJOR>
+    <KMDF_VERSION_MINOR>27</KMDF_VERSION_MINOR>
+  </PropertyGroup>
+  <PropertyGroup Label="Configuration" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <TargetVersion>Windows10</TargetVersion>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
+    <ConfigurationType>Driver</ConfigurationType>
+    <DriverType>KMDF</DriverType>
+    <KMDF_VERSION_MAJOR>1</KMDF_VERSION_MAJOR>
+    <KMDF_VERSION_MINOR>27</KMDF_VERSION_MINOR>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+
+  <PropertyGroup>
+    <!--
+      Test signing matches the already installed FocusIdd driver on the
+      development machine. Production distribution needs WHQL/attestation
+      signing through the Windows Hardware Dev Center; that is a process and
+      cost decision, not a code one.
+    -->
+    <SignMode>TestSign</SignMode>
+    <!--
+      The WDK installed on the development machine ships InfVerif.dll for
+      x64 and arm64 only, and the package verifier unconditionally loads
+      the x86 copy. Without this the build fails on a missing verifier
+      rather than on the driver. The INF is still checked by Inf2Cat when
+      the catalog is produced, and by pnputil at install time.
+    -->
+    <SkipPackageVerification>true</SkipPackageVerification>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <WarningLevel>Level3</WarningLevel>
+      <!-- The upstream sample disables a handful of noisy analyser warnings. -->
+      <DisableSpecificWarnings>4127;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+      <PreprocessorDefinitions>WIN32;_WINDOWS;AMD64;_USE_WAVERT_;_NEW_DELETE_OPERATORS_;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir)src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <!--
+        PortCls and the audio engine node live in portcls.lib; stdunk and
+        cntpr come with the WDK, exactly as the upstream sample links them.
+      -->
+      <AdditionalDependencies>%(AdditionalDependencies);$(DDK_LIB_PATH)portcls.lib;$(DDK_LIB_PATH)stdunk.lib;$(DDK_LIB_PATH)libcntpr.lib</AdditionalDependencies>
+    </Link>
+    <!-- Required by the modern WDK SignTool: use SHA-256 for test signing. -->
+    <DriverSign>
+      <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
+    </DriverSign>
+  </ItemDefinitionGroup>
+
+  <ItemGroup>
+    <ClInclude Include="src\DeskFuseAudio.h" />
+    <ClInclude Include="src\basetopo.h" />
+    <ClInclude Include="src\hw.h" />
+    <ClInclude Include="src\kshelper.h" />
+    <ClInclude Include="src\savedata.h" />
+    <ClInclude Include="src\tonegenerator.h" />
+    <ClInclude Include="src\minipairs.h" />
+    <ClInclude Include="src\AudioModule0.h" />
+    <ClInclude Include="src\AudioModule1.h" />
+    <ClInclude Include="src\AudioModuleHelper.h" />
+    <ClInclude Include="src\ContosoKeywordDetector.h" />
+    <ClInclude Include="src\IHVPrivatePropertySet.h" />
+    <ClInclude Include="src\mintopo.h" />
+    <ClInclude Include="src\minwavert.h" />
+    <ClInclude Include="src\minwavertstream.h" />
+    <ClInclude Include="src\NewDelete.h" />
+    <ClInclude Include="src\simple.h" />
+    <ClInclude Include="src\speakertopo.h" />
+    <ClInclude Include="src\speakertoptable.h" />
+    <ClInclude Include="src\speakerwavtable.h" />
+    <ClInclude Include="src\SysVadShared.h" />
+    <ClInclude Include="src\UnittestData.h" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ClCompile Include="src\adapter.cpp" />
+    <ClCompile Include="src\common.cpp" />
+    <ClCompile Include="src\hw.cpp" />
+    <ClCompile Include="src\kshelper.cpp" />
+    <ClCompile Include="src\savedata.cpp" />
+    <ClCompile Include="src\tonegenerator.cpp" />
+    <ClCompile Include="src\basetopo.cpp" />
+    <ClCompile Include="src\mintopo.cpp" />
+    <ClCompile Include="src\minwavert.cpp" />
+    <ClCompile Include="src\minwavertstream.cpp" />
+    <ClCompile Include="src\AudioModuleHelper.cpp" />
+    <ClCompile Include="src\NewDelete.cpp" />
+    <ClCompile Include="src\speakertopo.cpp" />
+    <ClCompile Include="src\MiniportAudioEngineNode.cpp" />
+    <ClCompile Include="src\MiniportStreamAudioEngineNode.cpp" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Inf Include="DeskFuseAudio.inf" />
+  </ItemGroup>
+
+  <!-- Stage the built driver next to the INF so Inf2Cat can build the catalog. -->
+  <ItemGroup>
+    <FilesToPackage Include="$(TargetPath)" />
+  </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

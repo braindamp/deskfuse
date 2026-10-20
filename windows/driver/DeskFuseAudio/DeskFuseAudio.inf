@@ -1,0 +1,149 @@
+;
+; DeskFuseAudio.inf
+;
+; DeskFuse Audio: one installed driver package, one render endpoint per
+; enrolled phone.
+;
+; The package is deliberately NOT the upstream SysVad componentized .inx:
+; that model requires Windows 11 21H2 (22621) and would not install on the
+; supported Windows 10 19045 baseline. This is a classic (non-componentized)
+; KMDF driver INF with an explicit 19045 model.
+;
+; The driver itself is a render-only WaveRT miniport (one speaker endpoint).
+; Per-phone endpoints are NOT separate drivers or separate packages: the
+; broker creates one *software device* per enrolled phone with the hardware
+; id below, and Windows starts one instance of this driver for each of them.
+; The instance id supplied at creation time ("deskfuse-speakers-<hash>")
+; becomes part of the device instance path, so every phone gets its own
+; endpoint with its own identity and its own removal.
+;
+
+[Version]
+Signature="$Windows NT$"
+Class=MEDIA
+ClassGuid={4d36e96c-e325-11ce-bfc1-08002be10318}
+Provider=%ManufacturerName%
+CatalogFile=DeskFuseAudio.cat
+DriverVer=01/01/2026,1.0.0.0
+PnpLockDown=1
+
+[Manufacturer]
+%ManufacturerName%=DeskFuseAudio,NT$ARCH$.10.0...19045
+
+[DeskFuseAudio.NT$ARCH$.10.0...19045]
+%DeviceName%=DeskFuseAudio_Device, Root\DeskFuseAudio
+%DeviceName%=DeskFuseAudio_Device, DeskFuse\AudioEndpoint
+
+;==========================================================================
+; Device install
+;==========================================================================
+[DeskFuseAudio_Device.NT]
+CopyFiles=DeskFuseAudio_CopyFiles
+AddInterface=%KSCATEGORY_AUDIO%,%KSNAME_WaveSpeaker%,DeskFuseAudio.I.WaveSpeaker
+AddInterface=%KSCATEGORY_RENDER%,%KSNAME_WaveSpeaker%,DeskFuseAudio.I.WaveSpeaker
+AddInterface=%KSCATEGORY_REALTIME%,%KSNAME_WaveSpeaker%,DeskFuseAudio.I.WaveSpeaker
+AddInterface=%KSCATEGORY_AUDIO%,%KSNAME_TopologySpeaker%,DeskFuseAudio.I.TopologySpeaker
+AddInterface=%KSCATEGORY_TOPOLOGY%,%KSNAME_TopologySpeaker%,DeskFuseAudio.I.TopologySpeaker
+
+[DeskFuseAudio_CopyFiles]
+DeskFuseAudio.sys
+
+[DestinationDirs]
+DeskFuseAudio_CopyFiles=12
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+DeskFuseAudio.sys = 1,,
+
+;==========================================================================
+; Service
+;==========================================================================
+[DeskFuseAudio_Device.NT.Services]
+AddService=DeskFuseAudio,0x00000002,DeskFuseAudio_Service_Install
+
+[DeskFuseAudio_Service_Install]
+DisplayName=%DeskFuseAudio_ServiceDesc%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%12%\DeskFuseAudio.sys
+
+;==========================================================================
+; WDF
+;==========================================================================
+[DeskFuseAudio_Device.NT.Wdf]
+KmdfService=DeskFuseAudio,DeskFuseAudio_Service_Install
+
+[DeskFuseAudio_Service_Install.Wdf]
+; 1.27 is the newest KMDF contract that is present on the supported
+; Windows 10 19045 baseline and still shipped in the WDK. A driver built
+; against 1.27 runs unchanged on the 1.29 runtime that 19045 ships.
+KmdfLibraryVersion=1.27
+
+;==========================================================================
+; Device properties
+;==========================================================================
+[DeskFuseAudio_Device.NT.HW]
+AddReg=DeskFuseAudio_Device.AddReg
+
+[DeskFuseAudio_Device.AddReg]
+; FILE_DEVICE_SOUND
+HKR,,DeviceType,0x10001,0x0000001D
+; SDDL_DEVOBJ_SYS_ALL_ADM_RWX_WORLD_RWX_RES_RWX
+HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GRGWGX;;;BA)(A;;GRGWGX;;;WD)(A;;GRGWGX;;;RC)"
+
+;==========================================================================
+; Filter interfaces
+;
+; The reference string of each interface must match the filter name used by
+; the miniport (L"WaveSpeaker" / L"TopologySpeaker" in minipairs.h), because
+; that is how PortCls finds the interface it must publish.
+;
+; There is deliberately NO static FriendlyName here. The name in brackets in
+; the Windows sound list is the endpoint's own name, and it has to differ
+; per phone: the driver copies the phone's name from the device instance
+; (DEVPKEY_Device_FriendlyName) onto this interface. A fixed string here
+; would name every phone's endpoint the same.
+;==========================================================================
+[DeskFuseAudio.I.WaveSpeaker]
+AddReg=DeskFuseAudio.I.WaveSpeaker.AddReg
+
+[DeskFuseAudio.I.WaveSpeaker.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+
+[DeskFuseAudio.I.TopologySpeaker]
+AddReg=DeskFuseAudio.I.TopologySpeaker.AddReg
+
+[DeskFuseAudio.I.TopologySpeaker.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+
+;==========================================================================
+; Strings
+;==========================================================================
+[Strings]
+ManufacturerName="DeskFuse"
+DiskName="DeskFuse Audio Installation Disk"
+DeviceName="DeskFuse Phone Speakers"
+DeskFuseAudio_ServiceDesc="DeskFuse Phone Speakers"
+
+; Non-localizable
+KSNAME_WaveSpeaker="WaveSpeaker"
+KSNAME_TopologySpeaker="TopologySpeaker"
+
+Proxy.CLSID="{17CCA71B-ECD7-11D0-B908-00A0C9223196}"
+KSCATEGORY_AUDIO="{6994AD04-93EF-11D0-A3CC-00A0C9223196}"
+KSCATEGORY_RENDER="{65E8773E-8F56-11D0-A3B9-00A0C9223196}"
+KSCATEGORY_REALTIME="{EB115FFC-10C8-4964-831D-6DCB02E6F23F}"
+KSCATEGORY_TOPOLOGY="{DDA54A40-1E4C-11D1-A050-405705C10000}"
+
+REG_MULTI_SZ = 0x00010000
+REG_SZ       = 0x00000000
+REG_DWORD    = 0x00010001
+
+; Localizable
+; The device description is the fallback name. The per-phone name comes
+; from the device instance itself.
+DeskFuseAudio.WaveSpeaker.szPname="DeskFuse Phone Speakers"
+DeskFuseAudio.TopologySpeaker.szPname="DeskFuse Phone Speakers"
