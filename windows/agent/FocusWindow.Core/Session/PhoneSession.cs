@@ -644,7 +644,8 @@ internal sealed class PhoneSession
         _log.Info("Approved phone requested mixed PC playback audio (host opted in).");
         try
         {
-            var capture = _s.CreateAudioCapture(request.Layouts ?? Array.Empty<string>());
+            var capture = _s.CreateAudioCapture(
+                request.Layouts ?? Array.Empty<string>(), request.MaxPcmBytes);
             _pcAudio = capture;
             var streamId = ++_pcAudioStreamId;
             _conn.SendControl(ServerMessages.AudioState("started", streamId,
