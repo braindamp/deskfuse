@@ -17,7 +17,6 @@ Abstract:
 #include <initguid.h>
 #include <DeskFuseAudio.h>
 #include "hw.h"
-#include "savedata.h"
 #include "IHVPrivatePropertySet.h"
 #include "simple.h"
 
@@ -46,11 +45,6 @@ Abstract:
 #include "A2dpHpDevice.h"
 #endif // SYSVAD_A2DP_SIDEBAND
 
-//-----------------------------------------------------------------------------
-// CSaveData statics
-//-----------------------------------------------------------------------------
-
-PDEVICE_OBJECT          CSaveData::m_pDeviceObject = NULL;
 //=============================================================================
 // Classes
 //=============================================================================
@@ -83,8 +77,6 @@ class CAdapterCommon :
 
         PCSYSVADHW              m_pHW;                  // Virtual SYSVAD HW object
         PPORTCLSETWHELPER       m_pPortClsEtwHelper;
-
-        static LONG             m_AdapterInstances;     // # of adapter objects.
 
         DWORD                   m_dwIdleRequests;
 
@@ -497,11 +489,6 @@ typedef struct _MINIPAIR_UNKNOWN
 
 #define MAX_DEVICE_REG_KEY_LENGTH 0x100
 
-//
-// Used to implement the singleton pattern.
-//
-LONG  CAdapterCommon::m_AdapterInstances = 0;
-
 
 
 //-----------------------------------------------------------------------------
@@ -581,18 +568,8 @@ Return Value:
     NTSTATUS ntStatus;
 
     //
-    // This sample supports only one instance of this object.
-    // (b/c of CSaveData's static members and Bluetooth HFP logic). 
-    //
-    if (InterlockedCompareExchange(&CAdapterCommon::m_AdapterInstances, 1, 0) != 0)
-    {
-        ntStatus = STATUS_DEVICE_BUSY;
-        DPF(D_ERROR, ("NewAdapterCommon failed, only one instance is allowed"));
-        goto Done;
-    }
-    
-    //
-    // Allocate an adapter object.
+    // Each enrolled phone owns an independent adapter. The sample's shared
+    // render-to-file state is not part of this driver.
     //
     CAdapterCommon *p = new(PoolFlags, MINADAPTER_POOLTAG) CAdapterCommon(UnknownOuter);
     if (p == NULL)
@@ -650,8 +627,6 @@ Return Value:
         m_WdfDevice = NULL;
     }
 
-    InterlockedDecrement(&CAdapterCommon::m_AdapterInstances);
-    ASSERT(CAdapterCommon::m_AdapterInstances == 0);
 #ifdef SYSVAD_USB_SIDEBAND
     ASSERT(IsListEmpty(&m_PowerRelations));
 #endif // SYSVAD_USB_SIDEBAND
@@ -834,10 +809,6 @@ Return Value:
     
     m_pHW->MixerReset();
 
-    //
-    // Initialize SaveData class.
-    //
-    CSaveData::SetDeviceObject(DeviceObject);   //device object is needed by CSaveData
 Done:
 
     return ntStatus;

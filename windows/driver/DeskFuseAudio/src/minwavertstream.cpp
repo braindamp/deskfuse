@@ -414,23 +414,6 @@ Return Value:
             return ntStatus;
         }
     }
-    else if (!g_DoNotCreateDataFiles)
-    {
-        //
-        // Create an output file for the render data.
-        //
-        DPF(D_TERSE, ("SaveData %p", &m_SaveData));
-        ntStatus = m_SaveData.SetDataFormat(DataFormat_);
-        if (NT_SUCCESS(ntStatus))
-        {
-            ntStatus = m_SaveData.Initialize(m_pMiniport->IsOffloadPin(Pin_));
-        }
-    
-        if (!NT_SUCCESS(ntStatus))
-        {
-            return ntStatus;
-        }
-    }
 
     //
     // Register this stream.
@@ -551,19 +534,6 @@ NTSTATUS CMiniportWaveRTStream::AllocateBufferWithNotification
 
     RequestedSize_ -= RequestedSize_ % (m_pWfExt->Format.nBlockAlign);
     
-    if (!m_bCapture && !g_DoNotCreateDataFiles)
-    {
-        NTSTATUS ntStatus;
-        
-        // Sysvad uses following buffer to hold data before writing to a file.
-        // Allocating larger buffer will reduce File I/O operations.
-        ntStatus = m_SaveData.SetMaxWriteSize(RequestedSize_ * 4);
-        if (!NT_SUCCESS(ntStatus))
-        {
-            return ntStatus;
-        }
-    }
-
     PHYSICAL_ADDRESS highAddress;
     highAddress.HighPart = 0;
     highAddress.LowPart = MAXULONG;
@@ -1211,11 +1181,6 @@ NTSTATUS CMiniportWaveRTStream::SetState
 
             KeReleaseSpinLock(&m_PositionSpinLock, oldIrql);
 
-            // Wait until all work items are completed.
-            if (!m_bCapture && !g_DoNotCreateDataFiles)
-            {
-                m_SaveData.WaitAllWorkItems();
-            }
             break;
 
         case KSSTATE_ACQUIRE:
@@ -1382,11 +1347,6 @@ NTSTATUS CMiniportWaveRTStream::SetFormat
 
     PAGED_CODE();
 
-    //if (!m_fCapture && !g_DoNotCreateDataFiles)
-    //{
-    //    ntStatus = m_SaveData.SetDataFormat(Format);
-    //}
-
     return STATUS_NOT_SUPPORTED;
 }
 
@@ -1469,11 +1429,6 @@ VOID CMiniportWaveRTStream::UpdatePosition
                                         0);
         }
 
-        if (!g_DoNotCreateDataFiles)
-        {
-            // Read from buffer and write to a file.
-            ReadBytes(ByteDisplacement);
-        }
     }
     
     // Increment the DMA position by the number of bytes displaced since the last
@@ -1523,37 +1478,6 @@ ByteDisplacement - # of bytes to process.
 }
 
 //=============================================================================
-#pragma code_seg()
-VOID CMiniportWaveRTStream::ReadBytes
-(
-    _In_ ULONG ByteDisplacement
-)
-/*++
-
-Routine Description:
-
-This function reads the audio buffer and saves the data in a file.
-
-Arguments:
-
-ByteDisplacement - # of bytes to process.
-
---*/
-{
-    ULONG bufferOffset = m_ullLinearPosition % m_ulDmaBufferSize;
-
-    // Normally this will loop no more than once for a single wrap, but if
-    // many bytes have been displaced then this may loops many times.
-    while (ByteDisplacement > 0)
-    {
-        ULONG runWrite = min(ByteDisplacement, m_ulDmaBufferSize - bufferOffset);
-        m_SaveData.WriteData(m_pDmaBuffer + bufferOffset, runWrite);
-        bufferOffset = (bufferOffset + runWrite) % m_ulDmaBufferSize;
-        ByteDisplacement -= runWrite;
-    }
-}
-
-//=============================================================================
 #pragma code_seg("PAGE")
 STDMETHODIMP_(NTSTATUS) 
 CMiniportWaveRTStream::SetContentId
@@ -1583,6 +1507,8 @@ Return Value:
 
     DPF_ENTER(("[CMiniportWaveRT::SetContentId]"));
 
+    UNREFERENCED_PARAMETER(drmRights);
+
     NTSTATUS    ntStatus;
     ULONG       ulOldContentId = contentId;
 
@@ -1600,12 +1526,6 @@ Return Value:
     {
         m_ulContentId = ulOldContentId;
     }
-
-    //
-    // SYSVAD writes each stream seperately to disk. If the rights for this
-    // stream indicates that the stream is CopyProtected, stop writing to disk.
-    //
-    m_SaveData.Disable(drmRights->CopyProtect);
 
     //
     // From MSDN:

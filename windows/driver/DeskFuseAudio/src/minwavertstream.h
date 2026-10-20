@@ -15,7 +15,6 @@ Abstract:
 #ifndef _SYSVAD_MINWAVERTSTREAM_H_
 #define _SYSVAD_MINWAVERTSTREAM_H_
 
-#include "savedata.h"
 #include "tonegenerator.h"
 
 
@@ -119,7 +118,6 @@ protected:
     PLONG                       m_plPeakMeter;
     PWAVEFORMATEXTENSIBLE       m_pWfExt;
     ULONG                       m_ulContentId;
-    CSaveData                   m_SaveData;
     ToneGenerator               m_ToneGenerator;
     GUID                        m_SignalProcessingMode;
     BOOLEAN                     m_bEoSReceived;
@@ -282,11 +280,6 @@ private:
     }
         
     VOID WriteBytes
-    (
-        _In_ ULONG ByteDisplacement
-    );
-    
-    VOID ReadBytes
     (
         _In_ ULONG ByteDisplacement
     );
