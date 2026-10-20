@@ -68,7 +68,7 @@ internal static class Program
             try
             {
                 var device = DeviceInstance.Create(
-                    PhoneEndpointContract.InstanceId("00112233445566778899aabbccddeeff"),
+                    PhoneEndpointContract.InstancePath("00112233445566778899aabbccddeeff"),
                     PhoneEndpointContract.HardwareId, "DeskFuse Test Phone", "DeskFuse testpeer");
                 Console.WriteLine($"created: {device.InstancePath} (friendly '{device.FriendlyName}')");
                 Console.WriteLine("leaving it in place");
@@ -135,10 +135,12 @@ internal sealed class EndpointBroker
         public required PhoneDevice Device { get; init; }
         public required string EndpointId { get; init; }
         public required string FriendlyName { get; init; }
+        public string? InstancePath { get; init; }
     }
 
     private readonly Dictionary<string, Instance> _instances = new(StringComparer.Ordinal);
     private readonly object _gate = new();
+    private readonly SemaphoreSlim _deviceGate = new(1, 1);
     private long _generation;
 
     public async Task RunAsync(CancellationToken cancellationToken)
@@ -224,7 +226,7 @@ internal sealed class EndpointBroker
         }
         finally
         {
-            ReleaseOwned(owned);
+            await ReleaseOwnedAsync(owned).ConfigureAwait(false);
         }
     }
 
@@ -249,10 +251,13 @@ internal sealed class EndpointBroker
             case BrokerOps.List:
                 return new BrokerResponse(true, Endpoints: Snapshot());
             case BrokerOps.Release:
-                Release(request.PeerId);
-                return new BrokerResponse(true, PeerId: request.PeerId);
+                return await ReleaseAsync(request.PeerId, owned, cancellationToken).ConfigureAwait(false);
             case BrokerOps.Create:
-                return await CreateAsync(request, owned, cancellationToken).ConfigureAwait(false);
+                // Device creation, lease takeover and removal must not race
+                // with another connection for the same stable PnP path.
+                await _deviceGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+                try { return await CreateAsync(request, owned, cancellationToken).ConfigureAwait(false); }
+                finally { _deviceGate.Release(); }
             default:
                 return new BrokerResponse(false, "Unknown broker operation.");
         }
@@ -265,6 +270,7 @@ internal sealed class EndpointBroker
             return new BrokerResponse(false, "The phone speaker identity is not a valid enrollment hash.");
         var peerId = request.PeerId!.ToLowerInvariant();
         var label = PhoneEndpointContract.NormalizeLabel(request.Label);
+        var friendlyName = PhoneEndpointContract.DeviceFriendlyName(label);
 
         Instance? existing;
         lock (_gate) existing = _instances.GetValueOrDefault(peerId);
@@ -272,7 +278,14 @@ internal sealed class EndpointBroker
         {
             // The phone reconnected while its endpoint was still alive.
             // Reuse it; the newer connection takes ownership of the lease.
+            // The endpoint id is resolved again: Windows gives an endpoint a
+            // new id when the device is re-enumerated, and a stale id would
+            // point at a device that no longer exists.
             long existingLease;
+            var refreshed = await ResolveAsync(existing, cancellationToken)
+                .ConfigureAwait(false);
+            if (refreshed is null)
+                return new BrokerResponse(false, "The phone's playback endpoint is not active.");
             lock (_gate)
             {
                 existingLease = ++_generation;
@@ -281,16 +294,16 @@ internal sealed class EndpointBroker
                     PeerId = peerId,
                     Generation = existingLease,
                     Device = existing.Device,
-                    EndpointId = existing.EndpointId,
+                    EndpointId = refreshed,
                     FriendlyName = existing.FriendlyName,
+                    InstancePath = existing.InstancePath,
                 };
             }
             owned.Add((peerId, existingLease));
-            return new BrokerResponse(true, peerId, existing.EndpointId, existing.FriendlyName);
+            return new BrokerResponse(true, PeerId: peerId, EndpointId: refreshed,
+                DeviceFriendlyName: existing.FriendlyName, DeviceInstanceId: existing.Device.InstancePath);
         }
 
-        var instanceId = PhoneEndpointContract.InstanceId(peerId);
-        var friendlyName = PhoneEndpointContract.DeviceFriendlyName(label);
         PhoneDevice device;
         try
         {
@@ -300,25 +313,23 @@ internal sealed class EndpointBroker
         }
         catch (Exception ex) when (ex is InvalidOperationException or UnauthorizedAccessException)
         {
-            // A device instance for this phone could not be created. The
-            // endpoint the driver already publishes is then used for this
-            // phone, and renamed after it. This is a shared endpoint: it can
-            // carry one phone at a time until device instance creation works
-            // on this Windows build.
-            var shared = await ClaimSharedAsync(friendlyName, cancellationToken).ConfigureAwait(false);
-            if (shared is null)
-                return new BrokerResponse(false, ex.Message);
-            Console.WriteLine("The phone speaker device instance could not be created; " +
-                "this phone is using the shared DeskFuse endpoint for now.");
-            return new BrokerResponse(true, peerId, shared, friendlyName, "shared");
+            return new BrokerResponse(false, ex.Message);
         }
 
-        var endpointId = await EndpointResolver.ResolveAsync(friendlyName, instanceId, TimeSpan.FromSeconds(20),
-
-            cancellationToken, device.InstancePath).ConfigureAwait(false);
+        string? endpointId;
+        try
+        {
+            endpointId = await EndpointResolver.ResolveAsync(device.InstancePath, TimeSpan.FromSeconds(20),
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch
+        {
+            await DeviceInstance.RemoveAsync(device.InstancePath).ConfigureAwait(false);
+            throw;
+        }
         if (endpointId is null)
         {
-            DeviceInstance.Remove(device.InstancePath);
+            await DeviceInstance.RemoveAsync(device.InstancePath).ConfigureAwait(false);
             return new BrokerResponse(false,
                 "Windows created the phone speaker device but no audio endpoint appeared for it. " +
                 "Check the DeskFuse Audio driver in Device Manager.");
@@ -335,62 +346,74 @@ internal sealed class EndpointBroker
                 Device = device,
                 EndpointId = endpointId,
                 FriendlyName = friendlyName,
+                InstancePath = device.InstancePath,
             };
         }
         owned.Add((peerId, lease));
-        return new BrokerResponse(true, peerId, endpointId, friendlyName, device.InstancePath);
+        return new BrokerResponse(true, PeerId: peerId, EndpointId: endpointId,
+            DeviceFriendlyName: friendlyName, DeviceInstanceId: device.InstancePath);
     }
 
     /// <summary>
-    /// Removes the instances this connection created, unless a newer
-    /// connection has already taken the lease over. A stale teardown must
-    /// never remove the endpoint of a phone that has just reconnected.
+    /// Finds the endpoint of an existing instance again, so a reconnected
+    /// phone never receives the id of an endpoint that has been replaced.
     /// </summary>
+    private async Task<string?> ResolveAsync(Instance instance, CancellationToken cancellationToken)
+    {
+        return await EndpointResolver.ResolveAsync(instance.Device.InstancePath,
+            TimeSpan.FromSeconds(5), cancellationToken).ConfigureAwait(false);
+    }
 
     /// <summary>
-    /// Finds the endpoint the driver already publishes and names it after
-    /// the phone that is using it.
+    /// Removes this pipe's devices unless a newer connection took over.
     /// </summary>
-    private async Task<string?> ClaimSharedAsync(string friendlyName, CancellationToken cancellationToken)
+    private async Task ReleaseOwnedAsync(List<(string PeerId, long Generation)> owned)
     {
-        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(15);
-        while (DateTime.UtcNow < deadline && !cancellationToken.IsCancellationRequested)
+        await _deviceGate.WaitAsync().ConfigureAwait(false);
+        try
         {
-            var (endpointId, instancePath) = await EndpointResolver
-                .FindDeskFuseAsync(cancellationToken).ConfigureAwait(false);
-            if (endpointId is null) { await Task.Delay(500, cancellationToken).ConfigureAwait(false); continue; }
-            if (instancePath is not null) DeviceInstance.RenameDevice(instancePath, friendlyName);
-            return endpointId;
+            foreach (var (peerId, generation) in owned)
+            {
+                Instance? removed = null;
+                lock (_gate)
+                {
+                    if (_instances.TryGetValue(peerId, out var current) && current.Generation == generation)
+                    {
+                        _instances.Remove(peerId);
+                        removed = current;
+                    }
+                }
+                if (removed is not null) await DeviceInstance.RemoveAsync(removed.Device.InstancePath).ConfigureAwait(false);
+            }
         }
-        return null;
+        finally { _deviceGate.Release(); }
     }
 
-    private void ReleaseOwned(List<(string PeerId, long Generation)> owned)
+    private async Task<BrokerResponse> ReleaseAsync(string? peerId,
+        List<(string PeerId, long Generation)> owned, CancellationToken cancellationToken)
     {
-        foreach (var (peerId, generation) in owned)
+        if (!PhoneEndpointContract.IsPeerId(peerId))
+            return new BrokerResponse(false, "The phone speaker identity is not a valid enrollment hash.");
+        peerId = peerId!.ToLowerInvariant();
+        await _deviceGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
         {
             Instance? removed = null;
             lock (_gate)
             {
-                if (_instances.TryGetValue(peerId, out var current) && current.Generation == generation)
+                if (_instances.TryGetValue(peerId, out var current))
                 {
+                    if (!owned.Contains((peerId, current.Generation)))
+                        return new BrokerResponse(false, "This connection does not own the phone endpoint lease.",
+                            PeerId: peerId);
                     _instances.Remove(peerId);
                     removed = current;
                 }
             }
-            if (removed is not null) DeviceInstance.Remove(removed.Device.InstancePath);
+            if (removed is not null) await DeviceInstance.RemoveAsync(removed.Device.InstancePath).ConfigureAwait(false);
+            return new BrokerResponse(true, PeerId: peerId);
         }
-    }
-
-    private void Release(string? peerId)
-    {
-        if (!PhoneEndpointContract.IsPeerId(peerId)) return;
-        Instance? removed = null;
-        lock (_gate)
-        {
-            _instances.Remove(peerId!.ToLowerInvariant(), out removed);
-        }
-        if (removed is not null) DeviceInstance.Remove(removed.Device.InstancePath);
+        finally { _deviceGate.Release(); }
     }
 
     private IReadOnlyList<BrokerResponse> Snapshot()
@@ -398,7 +421,8 @@ internal sealed class EndpointBroker
         lock (_gate)
         {
             return _instances.Values
-                .Select(i => new BrokerResponse(true, i.PeerId, i.EndpointId, i.FriendlyName))
+                .Select(i => new BrokerResponse(true, PeerId: i.PeerId, EndpointId: i.EndpointId,
+                    DeviceFriendlyName: i.FriendlyName, DeviceInstanceId: i.Device.InstancePath))
                 .ToArray();
         }
     }
@@ -413,51 +437,22 @@ internal sealed class EndpointBroker
 /// </summary>
 internal static class EndpointResolver
 {
-    internal static async Task<string?> ResolveAsync(string friendlyName, string instanceId,
-        TimeSpan timeout, CancellationToken cancellationToken, string? instancePath = null)
+    internal static async Task<string?> ResolveAsync(string instancePath,
+        TimeSpan timeout, CancellationToken cancellationToken)
     {
         var deadline = DateTime.UtcNow + timeout;
         while (DateTime.UtcNow < deadline && !cancellationToken.IsCancellationRequested)
         {
-            var found = TryResolve(friendlyName, instancePath);
+            var found = TryResolve(instancePath);
             if (found is not null) return found;
             await Task.Delay(250, cancellationToken).ConfigureAwait(false);
         }
         return null;
     }
 
-    private static string? TryResolve(string friendlyName, string? instancePath)
+    private static string? TryResolve(string instancePath)
     {
-        try
-        {
-            using var enumerator = new MMDeviceEnumerator();
-            var deskfuseCandidates = new List<string>();
-            foreach (var state in new[] { DeviceState.Active, DeviceState.Unplugged, DeviceState.NotPresent })
-            {
-                foreach (var device in enumerator.EnumerateAudioEndPoints(DataFlow.Render, state))
-                {
-                    using (device)
-                    {
-                        try
-                        {
-                            // Identity first: the endpoint belongs to the
-                            // device instance the broker created.
-                            if (instancePath is not null && Mentions(device, instancePath))
-                                return device.ID;
-                            if (device.FriendlyName.Contains(friendlyName, StringComparison.OrdinalIgnoreCase))
-                                return device.ID;
-                            if (device.FriendlyName.Contains("DeskFuse", StringComparison.OrdinalIgnoreCase))
-                                deskfuseCandidates.Add(device.ID);
-                        }
-                        catch (System.Runtime.InteropServices.COMException)
-                        {
-                            // A device can depart while it is being inspected.
-                        }
-                    }
-                }
-            }
-            if (deskfuseCandidates.Count == 1) return deskfuseCandidates[0];
-        }
+        try { return FindActiveEndpoint(instancePath); }
         catch (System.Runtime.InteropServices.COMException)
         {
             // The audio service can be busy; try again on the next tick.
@@ -465,47 +460,17 @@ internal static class EndpointResolver
         return null;
     }
 
-    /// <summary>
-    /// Finds the endpoint the DeskFuse driver publishes, and the device
-    /// instance it belongs to.
-    /// </summary>
-    internal static Task<(string? EndpointId, string? InstancePath)> FindDeskFuseAsync(
-        CancellationToken cancellationToken)
+    // Removal requires a successful scan. A COM failure must never be
+    // mistaken for proof that the old endpoint has departed.
+    internal static string? FindActiveEndpoint(string instancePath)
     {
         using var enumerator = new MMDeviceEnumerator();
         foreach (var device in enumerator.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active))
         {
             using (device)
             {
-                if (!device.FriendlyName.Contains("DeskFuse", StringComparison.OrdinalIgnoreCase))
-                    continue;
-                return Task.FromResult<(string?, string?)>((device.ID, InstancePathOf(device)));
+                if (Mentions(device, instancePath)) return device.ID;
             }
-        }
-        return Task.FromResult<(string?, string?)>((null, null));
-    }
-
-    /// <summary>The device instance path an endpoint belongs to, if it has one.</summary>
-    private static string? InstancePathOf(MMDevice device)
-    {
-        try
-        {
-            var store = device.Properties;
-            for (var i = 0; i < store.Count; i++)
-            {
-                string? text;
-                try { text = store.GetValue(i).Value as string; }
-                catch (NotImplementedException) { continue; }
-                if (text is null) continue;
-                var marker = text.IndexOf("}.", StringComparison.Ordinal);
-                if (marker < 0) continue;
-                var path = text[(marker + 2)..];
-                if (path.Contains('\\'))
-                    return path;
-            }
-        }
-        catch (Exception ex) when (ex is System.Runtime.InteropServices.COMException or NotSupportedException)
-        {
         }
         return null;
     }
@@ -513,20 +478,19 @@ internal static class EndpointResolver
     /// <summary>True when one of the endpoint's properties names the device.</summary>
     private static bool Mentions(MMDevice device, string instancePath)
     {
-        try
+        var store = device.Properties;
+        for (var i = 0; i < store.Count; i++)
         {
-            var store = device.Properties;
-            for (var i = 0; i < store.Count; i++)
-            {
-                string? text;
-                try { text = store.GetValue(i).Value as string; }
-                catch (NotImplementedException) { continue; }
-                if (text is not null && text.Contains(instancePath, StringComparison.OrdinalIgnoreCase))
-                    return true;
-            }
-        }
-        catch (Exception ex) when (ex is System.Runtime.InteropServices.COMException or NotSupportedException)
-        {
+            string? text;
+            try { text = store.GetValue(i).Value as string; }
+            catch (Exception ex) when (ex is NotImplementedException or NotSupportedException) { continue; }
+            if (text is null) continue;
+            if (text.Equals(instancePath, StringComparison.OrdinalIgnoreCase)) return true;
+            // Windows audio properties carry e.g. {1}.ROOT\\MEDIA\\id.
+            // Compare the complete suffix, never a device-id prefix.
+            var marker = text.IndexOf("}.", StringComparison.Ordinal);
+            if (marker >= 0 && text[(marker + 2)..].Equals(instancePath,
+                    StringComparison.OrdinalIgnoreCase)) return true;
         }
         return false;
     }
