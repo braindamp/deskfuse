@@ -83,7 +83,7 @@ class ProfileProvider(private val appContext: Context) {
             safeRight = safe.right,
             fontScale = fontScale,
             maxRefreshHz = maxRefresh,
-            diagonalMm = estimateDiagonalMm(activity, widthPx, heightPx),
+            diagonalMm = estimateDiagonalMm(widthPx, heightPx),
             orientation = if (heightPx >= widthPx) {
                 PhoneProfile.Orientation.PORTRAIT
             } else {
@@ -94,12 +94,46 @@ class ProfileProvider(private val appContext: Context) {
     }
 
     /**
+     * The profile of a session that does not own a display, such as the
+     * phone speaker. The stable device id is the same one the workspace
+     * session uses, so the phone keeps its single identity and its single
+     * enrollment.
+     */
+    fun currentWithoutDisplay(): PhoneProfile {
+        val metrics = appContext.resources.displayMetrics
+        val widthPx = metrics.widthPixels
+        val heightPx = metrics.heightPixels
+        val density = metrics.density
+        val fontScale = appContext.resources.configuration.fontScale
+        return PhoneProfile(
+            deviceId = deviceId,
+            deviceLabel = "${Build.MANUFACTURER} ${Build.MODEL}".trim(),
+            physicalW = widthPx,
+            physicalH = heightPx,
+            dpr = density,
+            safeTop = 0,
+            safeBottom = 0,
+            safeLeft = 0,
+            safeRight = 0,
+            fontScale = fontScale,
+            maxRefreshHz = 60,
+            diagonalMm = estimateDiagonalMm(widthPx, heightPx),
+            orientation = if (heightPx >= widthPx) {
+                PhoneProfile.Orientation.PORTRAIT
+            } else {
+                PhoneProfile.Orientation.LANDSCAPE
+            },
+            formFactor = PhoneProfile.FormFactor.PHONE,
+        )
+    }
+
+    /**
      * FR-DPI-02 — the host needs a plausible physical size for the virtual
      * monitor's EDID. Derive it from the real panel density rather than
      * guessing, so Windows' own DPI arithmetic stays self-consistent.
      */
-    private fun estimateDiagonalMm(activity: Activity, wPx: Int, hPx: Int): Int {
-        val dm = activity.resources.displayMetrics
+    private fun estimateDiagonalMm(wPx: Int, hPx: Int): Int {
+        val dm = appContext.resources.displayMetrics
         val xdpi = if (dm.xdpi > 1f) dm.xdpi else dm.densityDpi.toFloat()
         val ydpi = if (dm.ydpi > 1f) dm.ydpi else dm.densityDpi.toFloat()
         val wIn = wPx / xdpi

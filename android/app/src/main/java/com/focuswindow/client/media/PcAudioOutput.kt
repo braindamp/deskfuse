@@ -70,6 +70,7 @@ class PcAudioOutput(context: Context) {
     fun start(
         id: Int, sampleRate: Int, channels: Int, format: String,
         layout: String = "stereo",
+        device: AudioDeviceInfo? = null,
     ): Boolean {
         stop()
         val selected = (listOf(stereo) + surroundLayouts).firstOrNull { it.name == layout }
@@ -77,8 +78,11 @@ class PcAudioOutput(context: Context) {
         if (sampleRate !in 8_000..192_000 || channels != selected.channels ||
             format != "pcm_s16le" || id <= 0) return false
 
-        val route = if (layout == "stereo") null
-            else (supportingDevice(selected, sampleRate) ?: return false)
+        val route = when {
+            device != null -> device
+            layout == "stereo" -> null
+            else -> supportingDevice(selected, sampleRate) ?: return false
+        }
         val encoding = AudioFormat.ENCODING_PCM_16BIT
         val min = AudioTrack.getMinBufferSize(sampleRate, selected.mask, encoding)
         if (min <= 0) return false
@@ -141,6 +145,31 @@ class PcAudioOutput(context: Context) {
         if (routed == null)
             return SystemClock.elapsedRealtime() - routingRequestedAtMs < 500
         return routed.id == route.id && routed.channelMasks.contains(selected.mask)
+    }
+
+    /**
+     * The phone's own speaker, chosen explicitly. When the PC's sound is
+     * sent to the phone, the phone must play it on its own speaker and not
+     * hand it back to the PC over Bluetooth.
+     */
+    fun builtInSpeaker(): AudioDeviceInfo? =
+        manager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+            .firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
+
+    /**
+     * True when the audio is really leaving through the requested device.
+     * Android resolves the route asynchronously, so this is checked after
+     * playback has started rather than at creation time.
+     */
+    fun isRoutedTo(device: AudioDeviceInfo): Boolean {
+        val routed = track?.routedDevice ?: return false
+        return routed.id == device.id
+    }
+
+    /** The playback level, 0..100, as the user set it on the PC. */
+    fun setVolume(level: Int) {
+        val current = track ?: return
+        runCatching { current.setVolume(level.coerceIn(0, 100) / 100f) }
     }
 
     /**

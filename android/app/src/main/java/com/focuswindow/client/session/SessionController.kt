@@ -508,6 +508,8 @@ class SessionController(
 
                 is ServerMessage.BridgeState -> _bridgeState.value = msg
 
+                is ServerMessage.AudioVolume -> Unit
+
                 is ServerMessage.AudioState -> {
                     when (msg.state) {
                         "started" -> {

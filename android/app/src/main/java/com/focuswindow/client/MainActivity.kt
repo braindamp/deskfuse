@@ -56,6 +56,8 @@ import com.focuswindow.client.protocol.InputEvent
 import com.focuswindow.client.protocol.Modifiers
 import com.focuswindow.client.render.PhoneSurfaceView
 import com.focuswindow.client.session.SessionController
+import com.focuswindow.client.session.SpeakerController
+import com.focuswindow.client.session.SpeakerService
 import com.focuswindow.client.session.SessionState
 import com.focuswindow.client.transport.PairingPayload
 import com.focuswindow.client.transport.PairingRepository
@@ -187,6 +189,14 @@ class MainActivity : ComponentActivity() {
             val state by controller.state.collectAsState()
             val advisories by controller.advisories.collectAsState()
             val pcAudioStatus by controller.pcAudioStatus.collectAsState()
+            val speakerState by SpeakerService.state.collectAsState()
+            val speakerStatus = when (val current = speakerState) {
+                is SpeakerController.State.Playing -> "On"
+                is SpeakerController.State.Waiting -> "Starting"
+                is SpeakerController.State.Connecting -> "Starting"
+                is SpeakerController.State.Failed -> "Unavailable"
+                SpeakerController.State.Idle -> "Off"
+            }
             val phoneMicStatus by controller.phoneMicStatus.collectAsState()
             var modifierMask by remember { mutableIntStateOf(Modifiers.NONE) }
             var diagnostics by remember { mutableStateOf(false) }
@@ -209,6 +219,14 @@ class MainActivity : ComponentActivity() {
                     onRetry = { retry() },
                     onScan = { beginPairing() },
                     onDismiss = { },
+                    onUseAsSpeaker = {
+                        // The phone becomes a speaker for this PC: the host
+                        // creates a Windows playback endpoint for it and the
+                        // PC's sound follows to this phone.
+                        profile?.let { current ->
+                            SpeakerService.start(this@MainActivity, current)
+                        }
+                    },
                 )
 
                 if (pcPickerVisible) {
@@ -406,6 +424,8 @@ class MainActivity : ComponentActivity() {
                     onSendFile = { controller.browsePc(); showPcFiles = true; appDialogVisible = true },
                     pcAudioStatus = pcAudioStatus,
                     onTogglePcAudio = { controller.togglePcAudio() },
+                    speakerStatus = speakerStatus,
+                    onToggleSpeaker = { togglePhoneSpeaker() },
                     phoneMicStatus = phoneMicStatus,
                     onTogglePhoneMic = {
                         if (phoneMicStatus == "Unavailable") {
@@ -649,6 +669,20 @@ class MainActivity : ComponentActivity() {
     }
 
     // ── pairing ──────────────────────────────────────────────────────────────
+
+    /**
+     * The phone becomes a speaker for this PC. The host creates a Windows
+     * playback endpoint for it; the PC's sound follows to this phone.
+     */
+    private fun togglePhoneSpeaker() {
+        val current = profile ?: return
+        val running = SpeakerService.state.value
+        if (running is SpeakerController.State.Playing || running is SpeakerController.State.Waiting) {
+            SpeakerService.stop(this)
+        } else {
+            SpeakerService.start(this, current)
+        }
+    }
 
     private fun beginPairing() {
         pcPickerVisible = true

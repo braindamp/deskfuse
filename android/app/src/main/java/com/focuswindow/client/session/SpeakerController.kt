@@ -1,0 +1,179 @@
+package com.focuswindow.client.session
+
+import com.focuswindow.client.media.PcAudioOutput
+import com.focuswindow.client.profile.PhoneProfile
+import com.focuswindow.client.protocol.ClientMessage
+import com.focuswindow.client.protocol.ServerMessage
+import com.focuswindow.client.transport.LanTransport
+import com.focuswindow.client.transport.PairingPayload
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+
+/**
+ * The phone speaker client.
+ *
+ * It authenticates with the same per-device credentials as any other
+ * session, but asks for one capability only: speakers. There is no virtual
+ * monitor, no surface and no video: the phone is a speaker.
+ *
+ * The host provisions a real Windows playback endpoint for this phone. The
+ * user selects that endpoint in Windows, and whatever the PC plays into it
+ * arrives here and is played on the phone's own speaker. The Windows volume
+ * control is mirrored onto the phone.
+ */
+class SpeakerController(
+    private val scope: CoroutineScope,
+    private val clientVersion: String,
+    private val output: PcAudioOutput,
+    private val transport: LanTransport = LanTransport(scope),
+) {
+    sealed interface State {
+        data object Idle : State
+        data class Connecting(val host: String) : State
+        data class Waiting(val detail: String) : State
+        data class Playing(val endpoint: String) : State
+        data class Failed(val detail: String) : State
+    }
+
+    private val _state = MutableStateFlow<State>(State.Idle)
+    val state: StateFlow<State> = _state.asStateFlow()
+
+    private var pumpJob: Job? = null
+    private var audioJob: Job? = null
+    private var profile: PhoneProfile? = null
+
+    fun start(payload: PairingPayload, phoneProfile: PhoneProfile) {
+        profile = phoneProfile
+        pumpJob?.cancel()
+        audioJob?.cancel()
+        pumpJob = scope.launch {
+            launch { pumpControl() }
+            launch { pumpAudio() }
+            launch { pumpEvents() }
+            transport.connect(payload)
+        }
+    }
+
+    fun stop() {
+        pumpJob?.cancel()
+        audioJob?.cancel()
+        pumpJob = null
+        audioJob = null
+        output.stop()
+        _state.value = State.Idle
+    }
+
+    private suspend fun pumpEvents() {
+        transport.events.collect { event ->
+            when (event) {
+                is LanTransport.TransportEvent.Connecting ->
+                    _state.value = State.Connecting(event.host)
+
+                is LanTransport.TransportEvent.Ready -> {
+                    // The accessory hello: no display is acquired, and the
+                    // only capability requested is the phone's speakers.
+                    val current = profile ?: return@collect
+                    transport.send(
+                        ClientMessage.BridgeHello(
+                            clientVersion = clientVersion,
+                            profile = current,
+                            capabilities = listOf("speakers"),
+                        )
+                    )
+                    _state.value = State.Waiting("Waiting for the PC to create the phone speaker endpoint.")
+                }
+
+                is LanTransport.TransportEvent.Closed ->
+                    _state.value = State.Failed(event.reason)
+
+                is LanTransport.TransportEvent.Failed ->
+                    _state.value = State.Failed(event.detail)
+
+                else -> Unit
+            }
+        }
+    }
+
+    private suspend fun pumpControl() {
+        transport.control.collect { message ->
+            when (message) {
+                is ServerMessage.BridgeState -> {
+                    if (message.activeCapabilities.contains("speakers")) {
+                        transport.send(ClientMessage.Audio("start_phone_speakers"))
+                        _state.value = State.Waiting("The PC is sending sound to this phone.")
+                    } else {
+                        _state.value = State.Waiting(
+                            "The PC has not created a phone speaker endpoint yet.",
+                        )
+                    }
+                }
+
+                is ServerMessage.AudioState -> handleAudioState(message)
+
+                is ServerMessage.AudioVolume -> output.setVolume(message.level)
+
+                is ServerMessage.Stage ->
+                    if (message.stage == "speakers") _state.value = State.Failed(message.detail)
+
+                else -> Unit
+            }
+        }
+    }
+
+    private fun handleAudioState(message: ServerMessage.AudioState) {
+        when (message.state) {
+            "started" -> {
+                val speaker = output.builtInSpeaker()
+                if (speaker == null) {
+                    _state.value = State.Failed("This phone has no built-in speaker to play on.")
+                    return
+                }
+                val started = output.start(
+                    id = message.streamId,
+                    sampleRate = message.sampleRate,
+                    channels = message.channels,
+                    format = message.format,
+                    layout = message.layout,
+                    device = speaker,
+                )
+                if (!started) {
+                    _state.value = State.Failed("The phone could not start the audio output.")
+                    return
+                }
+                _state.value = State.Playing("Playing the PC's sound on this phone.")
+                // Android resolves the route asynchronously: confirm after a
+                // moment that the sound really leaves through the speaker.
+                scope.launch {
+                    kotlinx.coroutines.delay(600)
+                    if (!output.isRoutedTo(speaker)) {
+                        _state.value = State.Failed(
+                            "The phone's sound is not leaving through its speaker.",
+                        )
+                    }
+                }
+            }
+
+            "stopped" -> {
+                output.stop()
+                _state.value = State.Waiting("The PC stopped sending sound.")
+            }
+
+            "error" -> {
+                output.stop()
+                _state.value = State.Failed(message.detail ?: "The PC could not send sound to this phone.")
+            }
+        }
+    }
+
+    private suspend fun pumpAudio() {
+        transport.audio.collect { chunk ->
+            if (!output.write(chunk)) {
+                _state.value = State.Failed("The phone lost the audio route.")
+            }
+        }
+    }
+}

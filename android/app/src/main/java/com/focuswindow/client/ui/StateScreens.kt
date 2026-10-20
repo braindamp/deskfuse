@@ -52,6 +52,7 @@ fun StateScreen(
     onRetry: () -> Unit,
     onScan: () -> Unit,
     onDismiss: () -> Unit,
+    onUseAsSpeaker: (() -> Unit)? = null,
 ) {
     // Streaming/reconnecting content is owned by the underlying decoder surface.
     // Drawing an opaque empty screen here obscures real video and last-frame hold.
@@ -71,6 +72,11 @@ fun StateScreen(
                 body = "Find a Windows PC on your network. Approve this phone once on Windows; no camera or account needed.",
                 primary = "Find Windows PC" to onScan,
                 accent = Lime,
+                secondary = if (onUseAsSpeaker != null) {
+                    "Use this phone as a speaker" to onUseAsSpeaker
+                } else {
+                    null
+                },
             )
 
             is SessionState.AwaitingPairing -> Panel(
@@ -193,6 +199,7 @@ private fun Panel(
     title: String,
     body: String,
     primary: Pair<String, () -> Unit>? = null,
+    secondary: Pair<String, () -> Unit>? = null,
     accent: Color = Lime,
     mono: Boolean = false,
 ) {
@@ -222,6 +229,7 @@ private fun Panel(
         )
         Text(body, color = Muted, fontSize = 13.sp, lineHeight = 20.sp)
         primary?.let { (label, action) -> ActionButton(label, action) }
+        secondary?.let { (label, action) -> ActionButton(label, action) }
     }
 }
 

@@ -202,6 +202,14 @@ sealed interface ServerMessage {
         val layout: String = "stereo",
     ) : ServerMessage
 
+    /**
+     * The playback volume of the phone's Windows endpoint, 0..100. The
+     * phone applies it to its own output, so the Windows volume control and
+     * the phone volume control are the same control.
+     */
+    @Serializable @SerialName("audio_volume")
+    data class AudioVolume(val level: Int) : ServerMessage
+
     @Serializable @SerialName("clipboard")
     data class Clipboard(val mime: String, val text: String? = null, val base64: String? = null) :
         ServerMessage

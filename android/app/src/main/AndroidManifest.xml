@@ -28,6 +28,8 @@
     <!-- Foreground service so a session survives the app going background. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- Sustained playback of the PC's sound on this phone. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <!-- Only explicitly enabled while DeskFuse is foreground. Android displays
@@ -95,6 +97,17 @@
             android:name=".session.SessionService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+
+        <!--
+          The phone speaker session is sustained media playback, so it is
+          declared as a media playback foreground service. The data sync
+          service above belongs to the workspace session and is not reused
+          for playing sound.
+        -->
+        <service
+            android:name=".session.SpeakerService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback" />
 
         <!-- No ADB, no root, no accessibility service. Asserted by CI. -->
         <meta-data android:name="com.focuswindow.posture.accessibility" android:value="none" />
