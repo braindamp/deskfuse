@@ -120,6 +120,13 @@ internal sealed class PhoneSession
         if (!_outcome.Native)
             throw new DisplayException("density", "Verified native DPI is required for the GPU workspace.",
                 "This display profile is not yet supported by the native-density host.");
+        // POC-proven per-client scale enforcement: Windows may reset the
+        // virtual monitor to 100% on reattach. No capture before readback.
+        var beforeScale = _backend.ReadScaleCaps(_outcome.Monitor);
+        var enforced = await ScaleEnforcer.RequireAsync(
+            _backend, _outcome.Monitor, _outcome.Plan.ScalePercent, ct).ConfigureAwait(false);
+        if (enforced.Changed && _outcome.RestoreScalePercent is null)
+            _outcome = _outcome with { RestoreScalePercent = beforeScale?.CurrentPercent };
         _version = 1;
         _video = _s.CreateVideoPipeline?.Invoke() ??
             throw new DisplayException("gpu", "No native GPU pipeline is configured.");

@@ -35,8 +35,9 @@ internal static class Program
           --new-pairing      rotate the host public key (all phones must re-enroll)
           --single-session   exit after one phone session
           --ruler-probe      verify rendered density with a pixel ruler at the start of every session
-          --adaptive-dpi     EXPERIMENTAL: calibrate a larger virtual desktop per phone DPR,
-                             verify 1:1 crop, and stream only phone-sized pixels
+          --adaptive-dpi     legacy alias: native-DPI virtual backing monitor (now default)
+          --disable-native-dpi  explicit diagnostic compatibility mode; GPU path
+                                will refuse unverified phone-native DPI
           --no-open-qr       do not open pairing.png automatically
           --log PATH
         density-probe options (defaults describe a 1440x3120, 3.5x, 6.7-inch phone):
@@ -140,7 +141,9 @@ internal static class Program
             SingleSession = args.Contains("--single-session"),
             AllowFullUserFiles = !args.Contains("--auto-approve"),
             CameraFreePairing = !args.Contains("--legacy-qr"),
-            AdaptiveDpiViewport = args.Contains("--adaptive-dpi"),
+            // The POC's verified larger-backing-display method is now
+            // the intended product mode, not an optional experiment.
+            AdaptiveDpiViewport = !args.Contains("--disable-native-dpi"),
         };
         log.Info($"Focus Window host agent {Version}");
         var guards = new List<PhysicalDisplayGuard>();
