@@ -24,6 +24,9 @@ internal static class Program
           FocusWindow.Agent driver-status         talk to the display driver and print its state
           FocusWindow.Agent display-paths         read current Windows CCD display names (NO driver installation)
           FocusWindow.Agent audio-devices          list Windows audio endpoints (READ ONLY)
+          FocusWindow.Agent speakers devices      list active outputs, Bluetooth radios and paired audio sources
+          FocusWindow.Agent speakers receive --source-id ID --output-name MM-1
+                                                  receive native phone Bluetooth audio on the PC
           FocusWindow.Agent hold-gate-self-test    test release-file gate (NO driver installation)
           FocusWindow.Agent --version
         Host options:
@@ -92,6 +95,7 @@ internal static class Program
                 "display-paths" => PrintDisplayPaths(),
                 "trusted-phones" => TrustedPhones(args),
                 "audio-devices" => ListAudioDevices(),
+                "speakers" => await DeskFuse.Audio.SpeakerCommands.RunAsync(args.Skip(1).ToArray(), shutdown.Token),
                 "hold-gate-self-test" => await HoldGateSelfTestAsync(),
                 _ => Fail($"Unknown command '{command}'.\n\n{Usage}"),
             };
@@ -119,8 +123,17 @@ internal static class Program
         {
             using (item)
             {
-                Console.WriteLine($"{item.DataFlow} / {item.State}: {item.FriendlyName}");
-                Console.WriteLine($"  id: {item.ID}");
+                // A stale/unplugged MMDevice can lose its property store while
+                // it is enumerated. One such entry must not hide usable outputs.
+                try
+                {
+                    Console.WriteLine($"{item.DataFlow} / {item.State}: {item.FriendlyName}");
+                    Console.WriteLine($"  id: {item.ID}");
+                }
+                catch (System.Runtime.InteropServices.COMException)
+                {
+                    Console.WriteLine($"Unavailable audio endpoint: {item.ID}");
+                }
             }
         }
         Console.WriteLine("For the development mic bridge use a virtual cable's RENDER endpoint ID.");

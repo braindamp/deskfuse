@@ -7,6 +7,7 @@ on:
       - '.github/workflows/dpr-challenge-ci.yml'
       - 'windows/agent/**'
       - 'windows/native/**'
+      - 'windows/audio/**'
       - 'plans/DeskFuse_One_Codebase_Integration_Implementation_Plan_2026-10-20.md'
       - 'android/**'
       - 'tests/protocol3/**'
@@ -16,6 +17,7 @@ on:
     paths:
       - 'windows/agent/**'
       - 'windows/native/**'
+      - 'windows/audio/**'
       - 'android/**'
       - 'tests/protocol3/**'
       - 'tools/protocol3/**'
