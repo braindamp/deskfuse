@@ -167,10 +167,10 @@ class LanTransport(
 
                     KIND_AUDIO -> {
                         val len = inStream.readInt()
-                        require(len in 32..4096) { "audio frame too large: $len" }
+                        require(len in 30..32796) { "audio frame too large: $len" }
                         val sealed = ByteArray(len).also { inStream.readFully(it) }
                         val plain = secure.open(sealed)
-                        require(plain.size in 8..3844 && (plain.size - 4) % 4 == 0) {
+                        require(plain.size in 8..32772 && (plain.size - 4) % 2 == 0) {
                             "invalid PCM packet"
                         }
                         val streamId = java.nio.ByteBuffer.wrap(plain, 0, 4)
