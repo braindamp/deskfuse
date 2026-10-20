@@ -68,8 +68,9 @@ internal sealed class WindowsLoopbackAudioCapture : IHostAudioCapture
                 ? format.ChannelMask
                 : _sourceFormat.Channels == 2 ? Stereo
                 : _sourceFormat.Channels == 1 ? Center : 0;
-            if (System.Numerics.BitOperations.PopCount((uint)_sourceMask) != _sourceFormat.Channels)
-                throw new NotSupportedException("Windows multichannel speaker positions are not explicit");
+            if (System.Numerics.BitOperations.PopCount((uint)_sourceMask) != _sourceFormat.Channels ||
+                (_sourceMask & ~SevenOne) != 0)
+                throw new NotSupportedException("Windows speaker positions are not supported by the current mapper");
 
             Layout = (_sourceFormat.Channels, _sourceMask) switch
             {
@@ -117,15 +118,15 @@ internal sealed class WindowsLoopbackAudioCapture : IHostAudioCapture
                     }
                     else
                     {
-                        var left = new float[_sourceFormat.Channels];
+                        Span<float> left = stackalloc float[8];
                         for (var frame = 0; frame < frames; frame++)
                         {
-                            for (var ch = 0; ch < left.Length; ch++)
+                            for (var ch = 0; ch < _sourceFormat.Channels; ch++)
                                 left[ch] = ReadSample(input,
-                                    (frame * left.Length + ch) * _bytesPerSourceSample);
+                                    (frame * _sourceFormat.Channels + ch) * _bytesPerSourceSample);
                             var l = 0f;
                             var r = 0f;
-                            for (var ch = 0; ch < left.Length; ch++)
+                            for (var ch = 0; ch < _sourceFormat.Channels; ch++)
                             {
                                 var bit = NthSpeakerBit(_sourceMask, ch);
                                 var v = left[ch];
