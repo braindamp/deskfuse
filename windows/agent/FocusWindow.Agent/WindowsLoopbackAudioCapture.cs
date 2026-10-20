@@ -1,48 +1,188 @@
+using System.Buffers;
+using System.Buffers.Binary;
 using FocusWindow.Core.Session;
+using NAudio.Dmo;
 using NAudio.Wave;
 
 namespace FocusWindow.Agent;
 
 /// <summary>
-/// Captures the current default playback endpoint, not a particular application's
-/// audio. No PC speaker mute or default-device change. User explicitly starts it.
-/// Fails if the endpoint cannot provide the requested 48kHz/stereo/PCM16 format.
+/// Explicit default Windows output LOOPBACK (not a Windows per-phone render
+/// device). Uses its real WASAPI mix format, including native speaker positions
+/// and original sample rate. The phone may request exact 5.1/7.1 layouts.
+/// Unsupported paths use a speaker-aware stereo downmix, never channel truncation.
+///
+/// This is an initial PCM16 transport adapter. Audio is chunked to ~10 ms and
+/// the capture callback does no socket writes: PhoneConnection owns one bounded
+/// audio queue and the encrypted transport writer.
 /// </summary>
 internal sealed class WindowsLoopbackAudioCapture : IHostAudioCapture
 {
     private readonly WasapiLoopbackCapture _capture;
+    private readonly WaveFormat _sourceFormat;
+    private readonly int _sourceMask;
+    private readonly bool _floatSource;
+    private readonly int _bytesPerSourceSample;
+    private readonly int _framesPerPacket;
     private bool _started;
     private bool _disposed;
 
-    public int SampleRate => 48_000;
-    public int Channels => 2;
+    private const int Stereo = 0x3;
+    private const int FiveOneBack = 0x3f;
+    private const int FiveOneSide = 0x60f;
+    private const int SevenOne = 0x63f;
+    private const int Center = 0x4;
+    private const int Lfe = 0x8;
+    private const int BackLeft = 0x10;
+    private const int BackRight = 0x20;
+    private const int SideLeft = 0x200;
+    private const int SideRight = 0x400;
 
-    public WindowsLoopbackAudioCapture()
+    public int SampleRate => _sourceFormat.SampleRate;
+    public int Channels { get; }
+    public string Layout { get; }
+
+    public WindowsLoopbackAudioCapture(IReadOnlyList<string> supportedPhoneLayouts)
     {
-        _capture = new WasapiLoopbackCapture
+        _capture = new WasapiLoopbackCapture();
+        try
         {
-            WaveFormat = new WaveFormat(SampleRate, 16, Channels),
-        };
+            _sourceFormat = _capture.WaveFormat;
+            if (_sourceFormat.SampleRate is < 8000 or > 192000 ||
+                _sourceFormat.Channels is < 1 or > 8 ||
+                _sourceFormat.BitsPerSample % 8 != 0)
+                throw new NotSupportedException("Windows output mix format is outside supported audio limits");
+
+            _bytesPerSourceSample = _sourceFormat.BitsPerSample / 8;
+            _floatSource = _sourceFormat is WaveFormatExtensible ext
+                ? ext.SubFormat == AudioMediaSubtypes.MEDIASUBTYPE_IEEE_FLOAT
+                : _sourceFormat.Encoding == WaveFormatEncoding.IeeeFloat;
+            var pcm = _sourceFormat is WaveFormatExtensible wide
+                ? wide.SubFormat == AudioMediaSubtypes.MEDIASUBTYPE_PCM
+                : _sourceFormat.Encoding == WaveFormatEncoding.Pcm;
+            if (!(_floatSource && _bytesPerSourceSample == 4) &&
+                !(pcm && _bytesPerSourceSample is 2 or 3 or 4))
+                throw new NotSupportedException("Unsupported WASAPI mix sample encoding");
+
+            _sourceMask = _sourceFormat is WaveFormatExtensible format
+                ? format.ChannelMask
+                : _sourceFormat.Channels == 2 ? Stereo
+                : _sourceFormat.Channels == 1 ? Center : 0;
+            if (System.Numerics.BitOperations.PopCount((uint)_sourceMask) != _sourceFormat.Channels)
+                throw new NotSupportedException("Windows multichannel speaker positions are not explicit");
+
+            Layout = (_sourceFormat.Channels, _sourceMask) switch
+            {
+                (8, SevenOne) when supportedPhoneLayouts.Contains("7.1_surround") => "7.1_surround",
+                (6, FiveOneBack) when supportedPhoneLayouts.Contains("5.1_back") => "5.1_back",
+                (6, FiveOneSide) when supportedPhoneLayouts.Contains("5.1_side") => "5.1_side",
+                _ => "stereo",
+            };
+            Channels = Layout == "stereo" ? 2 : _sourceFormat.Channels;
+            _framesPerPacket = Math.Max(1, _sourceFormat.SampleRate / 100); // ~10 ms
+            if (_framesPerPacket * Channels * sizeof(short) > 32768)
+                throw new NotSupportedException("Audio frame exceeds protected packet budget");
+        }
+        catch
+        {
+            _capture.Dispose();
+            throw;
+        }
     }
 
     public void Start(Action<ReadOnlyMemory<byte>> onSamples)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (_started) throw new InvalidOperationException("Audio capture already started");
-        _capture.DataAvailable += (_, e) =>
+        _capture.DataAvailable += (_, args) =>
         {
-            // WASAPI owns e.Buffer only during this callback. The connection
-            // clones each accepted segment before it enters the write queue.
-            var length = e.BytesRecorded - e.BytesRecorded % (Channels * 2);
-            const int maxChunk = 3840; // 20ms at 48kHz stereo PCM16
-            for (var position = 0; position < length; position += maxChunk)
+            var bytesPerFrame = _bytesPerSourceSample * _sourceFormat.Channels;
+            var aligned = args.BytesRecorded / bytesPerFrame * bytesPerFrame;
+            var readPosition = 0;
+            while (readPosition < aligned)
             {
-                var take = Math.Min(maxChunk, length - position);
-                onSamples(e.Buffer.AsMemory(position, take));
+                var frames = Math.Min(_framesPerPacket, (aligned - readPosition) / bytesPerFrame);
+                var size = frames * Channels * sizeof(short);
+                var buffer = ArrayPool<byte>.Shared.Rent(size);
+                try
+                {
+                    var output = buffer.AsSpan(0, size);
+                    var input = args.Buffer.AsSpan(readPosition, frames * bytesPerFrame);
+                    if (Layout != "stereo")
+                    {
+                        for (var frame = 0; frame < frames; frame++)
+                            for (var ch = 0; ch < Channels; ch++)
+                                WritePcm(output, (frame * Channels + ch) * 2,
+                                    ReadSample(input, (frame * Channels + ch) * _bytesPerSourceSample));
+                    }
+                    else
+                    {
+                        var left = new float[_sourceFormat.Channels];
+                        for (var frame = 0; frame < frames; frame++)
+                        {
+                            for (var ch = 0; ch < left.Length; ch++)
+                                left[ch] = ReadSample(input,
+                                    (frame * left.Length + ch) * _bytesPerSourceSample);
+                            var l = 0f;
+                            var r = 0f;
+                            for (var ch = 0; ch < left.Length; ch++)
+                            {
+                                var bit = NthSpeakerBit(_sourceMask, ch);
+                                var v = left[ch];
+                                if (bit == 0x1) l += v;
+                                else if (bit == 0x2) r += v;
+                                else if (bit == Center) { l += 0.707f * v; r += 0.707f * v; }
+                                else if (bit == Lfe) { l += 0.25f * v; r += 0.25f * v; }
+                                else if (bit is BackLeft or SideLeft) l += 0.707f * v;
+                                else if (bit is BackRight or SideRight) r += 0.707f * v;
+                                else throw new NotSupportedException("Unknown Windows speaker position");
+                            }
+                            // Prevent worst-case multi-speaker summation from
+                            // clipping far above original PCM headroom.
+                            var gain = _sourceFormat.Channels > 2 ? 0.55f : 1f;
+                            WritePcm(output, frame * 4, gain * l);
+                            WritePcm(output, frame * 4 + 2, gain * r);
+                        }
+                    }
+                    onSamples(buffer.AsMemory(0, size));
+                }
+                finally { ArrayPool<byte>.Shared.Return(buffer); }
+                readPosition += frames * bytesPerFrame;
             }
         };
         _capture.StartRecording();
         _started = true;
+    }
+
+    private static int NthSpeakerBit(int mask, int index)
+    {
+        for (var bit = 0; bit < 32; bit++)
+            if ((mask & (1 << bit)) != 0 && index-- == 0) return 1 << bit;
+        return 0;
+    }
+
+    private float ReadSample(ReadOnlySpan<byte> input, int offset)
+    {
+        var chunk = input.Slice(offset, _bytesPerSourceSample);
+        if (_floatSource)
+        {
+            var f = BitConverter.Int32BitsToSingle(BinaryPrimitives.ReadInt32LittleEndian(chunk));
+            return float.IsFinite(f) ? Math.Clamp(f, -1f, 1f) : 0f;
+        }
+        return _bytesPerSourceSample switch
+        {
+            2 => BinaryPrimitives.ReadInt16LittleEndian(chunk) / 32768f,
+            3 => ((chunk[0] | chunk[1] << 8 | chunk[2] << 16) << 8 >> 8) / 8388608f,
+            4 => BinaryPrimitives.ReadInt32LittleEndian(chunk) / 2147483648f,
+            _ => throw new NotSupportedException("Unsupported PCM sample width"),
+        };
+    }
+
+    private static void WritePcm(Span<byte> output, int position, float v)
+    {
+        var clipped = Math.Clamp(v, -1f, 1f);
+        var sample = (short)Math.Clamp((int)MathF.Round(clipped * 32767), short.MinValue, short.MaxValue);
+        BinaryPrimitives.WriteInt16LittleEndian(output.Slice(position, 2), sample);
     }
 
     public void Dispose()
