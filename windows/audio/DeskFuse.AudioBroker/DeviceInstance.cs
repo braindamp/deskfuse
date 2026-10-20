@@ -115,15 +115,15 @@ internal static class DeviceInstance
     /// </summary>
     internal static void Matrix()
     {
-        var cases = new (string Label, string? ListClass, string Name, uint Flags)[]
+        var cases = new (string Label, string? ListClass, string Name, uint Flags, bool Params)[]
         {
-            ("class list, hardware id, no flag", "M", "Root\\DeskFuseAudio", 0),
-            ("class list, hardware id, generate", "M", "Root\\DeskFuseAudio", DicdGenerateId),
-            ("class list, star id, generate", "M", "*DeskFuseAudio", DicdGenerateId),
-            ("classless list, star id, generate", null, "*DeskFuseAudio", DicdGenerateId),
-            ("class list, full id, no flag", "M", "Root\\MEDIA\\deskfuse-speakers-z1", 0),
+            ("class list, hw id, no params", "M", "Root\\DeskFuseAudio", 0, false),
+            ("class list, hw id, with params", "M", "Root\\DeskFuseAudio", 0, true),
+            ("classless, full id, no params", null, "Root\\MEDIA\\deskfuse-speakers-y1", 0, false),
+            ("classless, full id, with params", null, "Root\\MEDIA\\deskfuse-speakers-y2", 0, true),
+            ("class list, full id, no params", "M", "Root\\MEDIA\\deskfuse-speakers-y3", 0, false),
         };
-        foreach (var (label, listClass, name, flags) in cases)
+        foreach (var (label, listClass, name, flags, withParams) in cases)
         {
             var set = SetupDiCreateDeviceInfoList(listClass is null ? null : MediaClassGuid.ToString("B"), IntPtr.Zero);
             if (set == IntPtr.Zero || set == new IntPtr(-1))
@@ -142,8 +142,11 @@ internal static class DeviceInstance
             SetMultiStringProperty(set, ref info, SpdrpHardwareId, "Root\\DeskFuseAudio");
             SetStringProperty(set, ref info, SpdrpService, PhoneEndpointContract.ServiceName);
             SetStringProperty(set, ref info, SpdrpFriendlyName, "DeskFuse Matrix");
-            SetClassInstallParams(set, ref info, "Root\\DeskFuseAudio", "DeskFuseAudio_Device",
-                PhoneEndpointContract.ServiceName);
+            if (withParams)
+            {
+                SetClassInstallParams(set, ref info, "Root\\DeskFuseAudio", "DeskFuseAudio_Device",
+                    PhoneEndpointContract.ServiceName);
+            }
             var registered = SetupDiCallClassInstaller(DifRegisterDevice, set, ref info);
             var error = Marshal.GetLastWin32Error();
             Console.WriteLine($"{label}: registered={registered} error {error} " +
@@ -152,6 +155,7 @@ internal static class DeviceInstance
             SetupDiDestroyDeviceInfoList(set);
         }
     }
+
 
 
 
@@ -261,6 +265,45 @@ internal static class DeviceInstance
             Marshal.FreeHGlobal(driverBuffer);
         }
     }
+
+
+    /// <summary>
+    /// Renames an existing DeskFuse device instance, so the endpoint it
+    /// publishes carries the phone's own name. Windows refreshes the
+    /// endpoint name from the device after the change notification.
+    /// </summary>
+    internal static bool RenameDevice(string instancePath, string friendlyName)
+    {
+        var set = SetupDiGetClassDevsEx(IntPtr.Zero, "ROOT", IntPtr.Zero, 0x4 /* DIGCF_ALLCLASSES */);
+        if (set == IntPtr.Zero || set == new IntPtr(-1)) return false;
+        try
+        {
+            var info = new SpDevInfoData { CbSize = Marshal.SizeOf<SpDevInfoData>() };
+            for (var index = 0; SetupDiEnumDeviceInfo(set, index++, ref info); )
+            {
+                var buffer = new StringBuilder(1024);
+                if (!SetupDiGetDeviceInstanceId(set, ref info, buffer, buffer.Capacity, 0)) continue;
+                if (!string.Equals(buffer.ToString(), instancePath, StringComparison.OrdinalIgnoreCase)) continue;
+                var key = DevPropKeyDeviceFriendlyName;
+                var bytes = Encoding.Unicode.GetBytes(friendlyName + " ");
+                var ok = SetupDiSetDeviceProperty(set, ref info, ref key, DevPropTypeString,
+                    bytes, bytes.Length, 0);
+                if (ok) SetupDiBroadcastDeviceChange(IntPtr.Zero, DbtDeviceNodesChanged, IntPtr.Zero, IntPtr.Zero);
+                return ok;
+            }
+            return false;
+        }
+        finally
+        {
+            SetupDiDestroyDeviceInfoList(set);
+        }
+    }
+
+    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool SetupDiBroadcastDeviceChange(IntPtr hwnd, uint notification,
+        IntPtr propertyData, IntPtr deviceData);
+
+    private const uint DbtDeviceNodesChanged = 0x00000007;
 
     /// <summary>
     /// Creates the device node for one phone, names it, and returns its

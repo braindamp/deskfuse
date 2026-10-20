@@ -28,6 +28,7 @@ public static class SpeakerCommands
             if (args[0] == "endpoints") return await ListEndpointsAsync();
             if (args[0] == "endpoint") return await EndpointAsync(args[1..]);
             if (args[0] == "audioroute") return await AudioRouteAsync(args[1..]);
+            if (args[0] == "props") return await PropsAsync(args[1..]);
             if (args[0] != "receive") throw new ArgumentException("Unknown audio command.");
             var source = Value(args, "--source-id") ?? throw new ArgumentException("Choose a paired source ID from 'devices'.");
             using var outputs = new MMDeviceEnumerator();
@@ -182,6 +183,39 @@ public static class SpeakerCommands
             Console.WriteLine("The endpoint accepted real application audio and returned it on the loopback.");
             return 0;
         }
+    }
+
+    /// <summary>
+    /// Prints the property store of one endpoint. The names Windows shows
+    /// come from these properties, so this is how the per-phone name is
+    /// verified.
+    /// </summary>
+    private static Task<int> PropsAsync(string[] args)
+    {
+        var wanted = Value(args, "--endpoint-id");
+        using var enumerator = new MMDeviceEnumerator();
+        foreach (var device in enumerator.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active))
+        {
+            using (device)
+            {
+                if (wanted is not null && device.ID != wanted) continue;
+                Console.WriteLine(device.FriendlyName);
+                Console.WriteLine("  " + device.ID);
+                try
+                {
+                    var store = device.Properties;
+                    for (var i = 0; i < store.Count; i++)
+                    {
+                        Console.WriteLine("  " + store.GetValue(i).Value);
+                    }
+                }
+                catch (Exception ex) when (ex is System.Runtime.InteropServices.COMException or NotSupportedException)
+                {
+                    Console.WriteLine("  (property store unavailable)");
+                }
+            }
+        }
+        return Task.FromResult(0);
     }
 
     /// <summary>
