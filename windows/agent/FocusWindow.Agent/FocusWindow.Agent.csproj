@@ -32,7 +32,20 @@
          failed on the test machine. Keep dependencies beside the EXE. -->
     <PublishSingleFile>false</PublishSingleFile>
     <IncludeNativeLibrariesForSelfExtract>false</IncludeNativeLibrariesForSelfExtract>
+    <!-- GPU capture is ONE product dependency, built during the agent build.
+         The POC executable is never deployed or launched. -->
+    <GpuNativeRoot>$(MSBuildProjectDirectory)\..\..\native\FocusWindow.Gpu</GpuNativeRoot>
+    <GpuNativeBuildDir>$(GpuNativeRoot)\.build</GpuNativeBuildDir>
+    <GpuNativeBinary>$(GpuNativeBuildDir)\bin\$(Configuration)\FocusWindow.Gpu.dll</GpuNativeBinary>
   </PropertyGroup>
+  <Target Name="BuildGpuNative" AfterTargets="Build" Condition="'$(OS)' == 'Windows_NT'">
+    <Exec Command='cmake -S &quot;$(GpuNativeRoot)&quot; -B &quot;$(GpuNativeBuildDir)&quot; -G &quot;Visual Studio 17 2022&quot; -A x64' />
+    <Exec Command='cmake --build &quot;$(GpuNativeBuildDir)&quot; --config $(Configuration) --target FocusWindow.Gpu' />
+    <Copy SourceFiles="$(GpuNativeBinary)" DestinationFiles="$(TargetDir)FocusWindow.Gpu.dll" />
+  </Target>
+  <Target Name="PackageGpuNative" AfterTargets="Publish" Condition="'$(OS)' == 'Windows_NT'">
+    <Copy SourceFiles="$(GpuNativeBinary)" DestinationFiles="$(PublishDir)FocusWindow.Gpu.dll" />
+  </Target>
   <ItemGroup>
     <PackageReference Include="QRCoder" Version="1.6.0" />
     <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="8.0.0" />
