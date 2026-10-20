@@ -27,13 +27,18 @@ concurrency:
 jobs:
   windows:
     name: Windows host compile and driver-free DPI tests
-    runs-on: windows-latest
+    runs-on: windows-2022
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
+      - name: Show available MSVC environment
+        shell: pwsh
+        run: |
+          & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -products * -property installationPath
+          cmake --version
       - name: Compile host and bundled production GPU DLL (never install FocusIdd)
         run: dotnet build windows/agent/FocusWindow.Agent/FocusWindow.Agent.csproj -c Release -p:Platform=x64 -warnaserror
       - name: Run unit and simulated tests (no display changes)
