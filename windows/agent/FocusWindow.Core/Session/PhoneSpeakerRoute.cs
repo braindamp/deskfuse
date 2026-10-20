@@ -21,6 +21,9 @@ internal sealed class PhoneSpeakerRoute(
 {
     private IPhoneSpeakerEndpoint? _endpoint;
     private IHostAudioCapture? _capture;
+    private long _sentPackets;
+    private long _droppedPackets;
+    private long _lastReport;
     private int _streamId;
     private int _disposed;
     private IReadOnlyList<string> _requested = Array.Empty<string>();
@@ -56,6 +59,17 @@ internal sealed class PhoneSpeakerRoute(
         log.Info($"Phone speaker endpoint ready: {endpoint.FriendlyName}");
         conn.SendControl(ServerMessages.AudioVolume(VolumePercent(endpoint.Volume)));
         return new[] { DeviceCapabilities.Speakers };
+    }
+
+    /// <summary>
+    /// The phone's own volume slider moved: the endpoint follows it, so the
+    /// two controls are one control.
+    /// </summary>
+    public void HandleVolume(int level)
+    {
+        if (_endpoint is null) return;
+        try { _endpoint.SetVolume(level / 100f); }
+        catch (Exception ex) { log.Warn("applying the phone volume: " + ex.Message); }
     }
 
     /// <summary>Starts or stops the audio stream for this phone's endpoint.</summary>
@@ -102,7 +116,12 @@ internal sealed class PhoneSpeakerRoute(
             var streamId = ++_streamId;
             conn.SendControl(ServerMessages.AudioState("started", streamId,
                 capture.SampleRate, capture.Channels, layout: capture.Layout));
-            capture.Start(samples => conn.TrySendAudio(samples.Span, streamId));
+            capture.Start(samples =>
+            {
+                if (conn.TrySendAudio(samples.Span, streamId)) _sentPackets++;
+                else _droppedPackets++;
+                ReportAudioHealth();
+            });
         }
         catch (Exception ex)
         {
@@ -111,6 +130,19 @@ internal sealed class PhoneSpeakerRoute(
             conn.SendControl(ServerMessages.AudioState("error", _streamId,
                 detail: "The phone speaker endpoint could not be captured."));
         }
+    }
+
+    /// <summary>
+    /// Reports how much audio reached the phone and how much the transport
+    /// could not take. A dropped packet is an audible click, so this is the
+    /// difference between "the phone is at fault" and "the transport is".
+    /// </summary>
+    private void ReportAudioHealth()
+    {
+        var now = Environment.TickCount64;
+        if (now - _lastReport < 2000) return;
+        _lastReport = now;
+        log.Info($"phone audio: {_sentPackets} packets sent, {_droppedPackets} dropped");
     }
 
     private void OnVolumeChanged(float volume) =>

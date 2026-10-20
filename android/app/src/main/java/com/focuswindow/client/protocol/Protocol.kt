@@ -287,6 +287,14 @@ sealed interface ClientMessage {
     @Serializable @SerialName("microphone")
     data class Microphone(val action: String) : ClientMessage
 
+    /**
+     * The phone's own media volume, 0..100, after the user moved the
+     * phone's slider. The PC applies it to its endpoint, so the two
+     * controls stay the same control.
+     */
+    @Serializable @SerialName("audio_volume")
+    data class AudioVolume(val level: Int) : ClientMessage
+
     /** One explicitly selected Android document, delivered in bounded encrypted chunks. */
     @Serializable @SerialName("files")
     data class Files(val action: String, val path: String? = null, val id: String? = null, val offset: Int = 0) : ClientMessage

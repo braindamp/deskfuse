@@ -120,6 +120,11 @@ internal sealed class DevicePeerSession(
                 microphone.Handle(mic);
                 continue;
             }
+            if (msg is ClientAudioVolume volume)
+            {
+                speakers.HandleVolume(volume.Level);
+                continue;
+            }
             if (msg is ClientAudio audio &&
                 audio.Action is "start_phone_speakers" or "stop_phone_speakers")
             {

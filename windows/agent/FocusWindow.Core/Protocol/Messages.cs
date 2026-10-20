@@ -47,6 +47,9 @@ public sealed record ClientWindows(string Action, string? Id) : ClientMessage;
 public sealed record ClientAudio(string Action, IReadOnlyList<string>? Layouts = null,
     int MaxPcmBytes = 3840) : ClientMessage;
 public sealed record ClientMicrophone(string Action) : ClientMessage;
+/// <summary>The phone's own media volume, 0..100, after the user moved the
+/// phone's slider. The endpoint follows it, so both are one control.</summary>
+public sealed record ClientAudioVolume(int Level) : ClientMessage;
 public sealed record ClientBye(string Reason) : ClientMessage;
 public sealed record ClientUnknown(string Type) : ClientMessage;
 public static class ClientMessageParser
@@ -98,6 +101,8 @@ public static class ClientMessageParser
                         : Array.Empty<string>(),
                     Math.Clamp(root["maxPcmBytes"]?.GetValue<int>() ?? 3840, 384, 32768)),
                 "microphone" => new ClientMicrophone(root["action"]?.GetValue<string>() ?? ""),
+                "audio_volume" => new ClientAudioVolume(
+                    Math.Clamp(root["level"]?.GetValue<int>() ?? 0, 0, 100)),
                 "files" => new ClientFiles(root["action"]?.GetValue<string>() ?? "",
                     root["path"]?.GetValue<string>(), root["id"]?.GetValue<string>(),
                     root["offset"]?.GetValue<int>() ?? 0),

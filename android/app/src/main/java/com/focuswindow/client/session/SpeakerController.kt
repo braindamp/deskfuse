@@ -1,5 +1,6 @@
 package com.focuswindow.client.session
 
+import android.util.Log
 import com.focuswindow.client.media.PcAudioOutput
 import com.focuswindow.client.profile.PhoneProfile
 import com.focuswindow.client.protocol.ClientMessage
@@ -11,6 +12,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 /**
@@ -53,6 +55,7 @@ class SpeakerController(
         pumpJob = scope.launch {
             launch { pumpControl() }
             launch { pumpAudio() }
+            launch { pumpVolume() }
             launch { pumpEvents() }
             transport.connect(payload)
         }
@@ -132,6 +135,7 @@ class SpeakerController(
                     _state.value = State.Failed("This phone has no built-in speaker to play on.")
                     return
                 }
+                Log.i(TAG, "starting the phone audio output")
                 val started = output.start(
                     id = message.streamId,
                     sampleRate = message.sampleRate,
@@ -169,11 +173,39 @@ class SpeakerController(
         }
     }
 
+    /**
+     * The phone's own volume slider is the same control as the PC's. When
+     * the user moves it, the PC is told, so the endpoint follows.
+     */
+    private suspend fun pumpVolume() {
+        while (scope.isActive) {
+            val level = output.systemVolumeChanged()
+            if (level != null) {
+                transport.send(ClientMessage.AudioVolume(level))
+            }
+            kotlinx.coroutines.delay(400)
+        }
+    }
+
     private suspend fun pumpAudio() {
+        var reported = 0L
         transport.audio.collect { chunk ->
             if (!output.write(chunk)) {
                 _state.value = State.Failed("The phone lost the audio route.")
+                return@collect
+            }
+            // A short summary every couple of seconds: how the audio path is
+            // actually behaving, so a click can be explained rather than
+            // guessed at.
+            val now = System.currentTimeMillis()
+            if (now - reported > 2000) {
+                reported = now
+                Log.i(TAG, "audio path: ${output.stats()}")
             }
         }
+    }
+
+    private companion object {
+        const val TAG = "DeskFuseSpeaker"
     }
 }

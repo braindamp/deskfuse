@@ -104,6 +104,16 @@ internal sealed class BrokerPhoneSpeakerEndpoint : IPhoneSpeakerEndpoint
 
     public event Action<float>? VolumeChanged;
 
+    public void SetVolume(float volume)
+    {
+        if (_volume is null) return;
+        try { _volume.MasterVolumeLevelScalar = Math.Clamp(volume, 0f, 1f); }
+        catch (Exception ex) when (ex is System.Runtime.InteropServices.COMException or InvalidOperationException)
+        {
+            // The endpoint stopped accepting volume changes.
+        }
+    }
+
     public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _released, 1) != 0) return;

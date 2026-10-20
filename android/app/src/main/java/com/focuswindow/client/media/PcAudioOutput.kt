@@ -32,6 +32,10 @@ class PcAudioOutput(context: Context) {
     @Volatile private var requestedVolume = 1f
     private var focus: AudioFocusRequest? = null
     private var nativeRoute: AudioDeviceInfo? = null
+    private var carry: ByteArray = ByteArray(0)
+    private var packets: Long = 0
+    private var partialWrites: Long = 0
+    private var lastAppliedSystemIndex: Int = -1
     private var activeLayout = "stereo"
     private var routingRequestedAtMs = 0L
 
@@ -119,6 +123,7 @@ class PcAudioOutput(context: Context) {
                 false
             } else {
                 streamId = id
+                carry = ByteArray(0)
                 track = audio
                 activeLayout = layout
                 nativeRoute = route
@@ -171,23 +176,118 @@ class PcAudioOutput(context: Context) {
     /** The playback level, 0..100, as the user set it on the PC. */
     fun setVolume(level: Int) {
         requestedVolume = level.coerceIn(0, 100) / 100f
+        lastAppliedSystemIndex = -1
+        applyVolumeToSystem()
         val current = track ?: return
         runCatching { current.setVolume(requestedVolume) }
     }
 
     /**
-     * One nonblocking write per audio packet; if Android's hardware output
-     * cannot keep up, drop the packet rather than stalling network/video.
-     * A route loss returns false so the controller can negotiate stereo.
+     * The Windows volume control is the phone's volume control: the level is
+     * applied to the media stream itself, so the phone's own slider moves
+     * with it. The track keeps its own gain at unity and the system stream
+     * does the work, exactly like a wired speaker.
+     */
+    private fun applyVolumeToSystem() {
+        val index = (requestedVolume * maxSystemIndex).toInt()
+        if (index == lastAppliedSystemIndex) return
+        if (!canChangeSystemVolume) return
+        runCatching {
+            manager.setStreamVolume(
+                AudioManager.STREAM_MUSIC, index, AudioManager.FLAG_SHOW_UI,
+            )
+            lastAppliedSystemIndex = index
+        }
+    }
+
+    /**
+     * The phone's current media volume, so the PC can follow the phone's
+     * slider. Returns null when the phone cannot change it.
+     */
+    fun systemVolumeIndex(): Int? = runCatching {
+        manager.getStreamVolume(AudioManager.STREAM_MUSIC)
+    }.getOrNull()
+
+    /**
+     * The level the user just set on the phone's own slider, 0..100, or
+     * null when the phone's volume still matches what the PC asked for.
+     */
+    fun systemVolumeChanged(): Int? {
+        val index = systemVolumeIndex() ?: return null
+        if (index == lastAppliedSystemIndex) return null
+        lastAppliedSystemIndex = index
+        val level = (index * 100f / maxSystemIndex).toInt().coerceIn(0, 100)
+        return level
+    }
+
+    /** True when this app may move the phone's own volume slider. */
+    val canChangeSystemVolume: Boolean =
+        runCatching { manager.getStreamVolume(AudioManager.STREAM_MUSIC) }.isSuccess
+
+    private val maxSystemIndex: Int
+        get() = runCatching {
+            manager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+        }.getOrDefault(15).coerceAtLeast(1)
+
+    /**
+     * One packet in, one packet out.
+     *
+     * A nonblocking write can be *partial*: Android returns how many bytes
+     * it actually took and the rest of the packet would be thrown away,
+     * which is an audible click. The remainder is therefore carried over to
+     * the next packet, and only genuinely stale audio is dropped.
      */
     fun write(chunk: PcmAudioChunk): Boolean {
         if (chunk.streamId != streamId) return true
         val current = track ?: return false
         if (!routeStillSupportsSurround()) return false
-        val count = runCatching {
-            current.write(chunk.pcm, 0, chunk.pcm.size, AudioTrack.WRITE_NON_BLOCKING)
-        }.getOrDefault(-1)
-        return count >= 0
+        val pcm = chunk.pcm
+        var offset = 0
+        // Anything left over from a previous partial write goes first.
+        if (carry.isNotEmpty()) {
+            val need = carry.size + pcm.size
+            val buffer = ByteArray(need)
+            carry.copyInto(buffer, 0)
+            pcm.copyInto(buffer, carry.size)
+            carry = ByteArray(0)
+            val written = writeAll(current, buffer)
+            if (written < 0) return false
+            if (written < buffer.size) {
+                carry = buffer.copyOfRange(written, buffer.size)
+                partialWrites++
+            }
+            packets++
+            return true
+        }
+        val written = writeAll(current, pcm)
+        if (written < 0) return false
+        if (written < pcm.size) {
+            carry = pcm.copyOfRange(written, pcm.size)
+            partialWrites++
+        }
+        packets++
+        return true
+    }
+
+    /** Writes as much as the track takes, without blocking the transport. */
+    private fun writeAll(current: AudioTrack, pcm: ByteArray): Int {
+        var total = 0
+        while (total < pcm.size) {
+            val count = runCatching {
+                current.write(pcm, total, pcm.size - total, AudioTrack.WRITE_NON_BLOCKING)
+            }.getOrDefault(-1)
+            if (count <= 0) break
+            total += count
+        }
+        return total
+    }
+
+    /** How the audio path is behaving, for the diagnostics. */
+    fun stats(): String = "packets=$packets partial=$partialWrites carry=${carry.size}B"
+
+    /** Called when the track is restarted, so the carry does not cross streams. */
+    fun resetCarry() {
+        carry = ByteArray(0)
     }
 
     fun stop() {

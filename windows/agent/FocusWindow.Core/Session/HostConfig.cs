@@ -76,6 +76,10 @@ public interface IPhoneSpeakerEndpoint : IAsyncDisposable
     /// </summary>
     float Volume { get; }
 
+    /// <summary>Sets the endpoint's own volume, 0..1, as the user moved the
+    /// phone's slider. The phone and the PC are then the same control.</summary>
+    void SetVolume(float volume);
+
     event Action<float>? VolumeChanged;
 }
 

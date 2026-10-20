@@ -25,6 +25,10 @@
     <!-- FR-REF-03 — keep the screen alive for the length of a session. -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
+    <!-- The Windows volume control drives the phone's own media volume
+         slider, so the phone behaves like any other speaker. -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+
     <!-- Foreground service so a session survives the app going background. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
