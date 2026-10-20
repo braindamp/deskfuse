@@ -72,11 +72,19 @@ internal sealed class WindowsLoopbackAudioCapture : IHostAudioCapture
                 (_sourceMask & ~SevenOne) != 0)
                 throw new NotSupportedException("Windows speaker positions are not supported by the current mapper");
 
-            Layout = (_sourceFormat.Channels, _sourceMask) switch
+            // Select the best real output layout. A 7.1 Windows mix may be
+            // rendered on genuine Android 5.1 hardware with explicit rear
+            // fold-down, not thrown all the way back to stereo.
+            Layout = _sourceFormat.Channels switch
             {
-                (8, SevenOne) when supportedPhoneLayouts.Contains("7.1_surround") => "7.1_surround",
-                (6, FiveOneBack) when supportedPhoneLayouts.Contains("5.1_back") => "5.1_back",
-                (6, FiveOneSide) when supportedPhoneLayouts.Contains("5.1_side") => "5.1_side",
+                8 when _sourceMask == SevenOne &&
+                    supportedPhoneLayouts.Contains("7.1_surround") => "7.1_surround",
+                6 or 8 when supportedPhoneLayouts.Contains("5.1_back") &&
+                    (_sourceMask == FiveOneBack || _sourceMask == FiveOneSide ||
+                        _sourceMask == SevenOne) => "5.1_back",
+                6 or 8 when supportedPhoneLayouts.Contains("5.1_side") &&
+                    (_sourceMask == FiveOneBack || _sourceMask == FiveOneSide ||
+                        _sourceMask == SevenOne) => "5.1_side",
                 _ => "stereo",
             };
             Channels = Layout == "stereo" ? 2 : _sourceFormat.Channels;
@@ -111,10 +119,28 @@ internal sealed class WindowsLoopbackAudioCapture : IHostAudioCapture
                     var input = args.Buffer.AsSpan(readPosition, frames * bytesPerFrame);
                     if (Layout != "stereo")
                     {
+                        var outputMask = Layout == "7.1_surround" ? SevenOne
+                            : Layout == "5.1_side" ? FiveOneSide : FiveOneBack;
+                        Span<float> source = stackalloc float[8];
                         for (var frame = 0; frame < frames; frame++)
+                        {
+                            for (var ch = 0; ch < _sourceFormat.Channels; ch++)
+                                source[ch] = ReadSample(input,
+                                    (frame * _sourceFormat.Channels + ch) * _bytesPerSourceSample);
                             for (var ch = 0; ch < Channels; ch++)
-                                WritePcm(output, (frame * Channels + ch) * 2,
-                                    ReadSample(input, (frame * Channels + ch) * _bytesPerSourceSample));
+                            {
+                                var speaker = NthSpeakerBit(outputMask, ch);
+                                var value = speaker switch
+                                {
+                                    BackLeft => FoldRear(source, BackLeft, SideLeft),
+                                    BackRight => FoldRear(source, BackRight, SideRight),
+                                    SideLeft => FoldRear(source, SideLeft, BackLeft),
+                                    SideRight => FoldRear(source, SideRight, BackRight),
+                                    _ => SampleForSpeaker(source, speaker),
+                                };
+                                WritePcm(output, (frame * Channels + ch) * 2, value);
+                            }
+                        }
                     }
                     else
                     {
@@ -163,6 +189,22 @@ internal sealed class WindowsLoopbackAudioCapture : IHostAudioCapture
         for (var bit = 0; bit < 32; bit++)
             if ((mask & (1 << bit)) != 0 && index-- == 0) return 1 << bit;
         return 0;
+    }
+
+    private float SampleForSpeaker(ReadOnlySpan<float> source, int speakerBit)
+    {
+        if ((_sourceMask & speakerBit) == 0) return 0f;
+        var index = System.Numerics.BitOperations.PopCount((uint)(_sourceMask & (speakerBit - 1)));
+        return source[index];
+    }
+
+    private float FoldRear(ReadOnlySpan<float> source, int primary, int secondary)
+    {
+        var a = SampleForSpeaker(source, primary);
+        var b = SampleForSpeaker(source, secondary);
+        return (_sourceMask & primary) != 0 && (_sourceMask & secondary) != 0
+            ? (a + b) * 0.70710678f
+            : a + b;
     }
 
     private float ReadSample(ReadOnlySpan<byte> input, int offset)
