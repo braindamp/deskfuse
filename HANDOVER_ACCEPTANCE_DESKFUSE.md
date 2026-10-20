@@ -27,6 +27,8 @@ The owner confirmed both on 2026-10-20. See
   The earlier unsaved test document remains open separately; preserve it.
 - Local checks: 184 .NET passed, 10 optional/historical skipped; 21 Android
   tests; native capture/pacing contracts; Kotlin crypto and actual C#/Kotlin TCP.
+- Source checkpoint `1778285` passed both unified CI jobs:
+  [run 39467372648](https://github.com/braindamp/deskfuse/actions/runs/39467372648).
 - Minimizing the source exposed a fatal-error reconnect loop. Android now
   routes fatal host stages through its lifecycle events and cancels automatic
   retry; late decoder stats cannot revive the failed target. Explicit retry
@@ -40,16 +42,20 @@ The owner confirmed both on 2026-10-20. See
   `out/acceptance/continuation/app-debug-signed.apk`. Preserve enrollment; do not
   uninstall as a signature-mismatch shortcut or commit signing material.
 
-**Next focused work:** the owner identified Android's status bar covering the
-Windows title bar. Measure a usable workspace below system bars/cutout and
-reserve room for controls; size the app and encoded frame to that area, with
-integer offsets and matching touch mapping. The profile already carries safe
-insets, but current adaptive calibration still uses full-panel dimensions.
-Do not merely shrink the existing full-panel stream. Immersive fullscreen can
-be a later option. Smaller frame area does not remove Windows' density-step
-constraint. Also investigate continued capture/encode activity on a static
-document before claiming idle-bandwidth optimization. Preserve the working
-video/input case while making these changes.
+**Owner's latest direction:** minimize is normal Windows behavior. The eventual
+Android workspace should stop showing the minimized window and present the
+appropriate immersive workspace, without treating minimize as an error.
+The current single-window backend's stable stop/manual-retry screen is only an
+interim limitation; the live retest proves containment, not the final UX. Do
+not build more minimize handling now. Keep the fix preventing reconnect loops.
+
+Use **full immersive fullscreen**, hiding Android system bars with swipe-down
+reveal. The owner rejected the suggested safe-area viewport as the current
+direction. **Defer layout work** until reviewing the old Desklink code with the
+owner; do not implement fullscreen/layout options now. Preserve the working
+video/input case. Runtime optimization, especially bandwidth, remains the
+priority: continued capture/encode activity on a static document is still
+unexplained, so do not claim completed idle-bandwidth optimization.
 
 ## Immediate assignment
 

@@ -6,7 +6,9 @@ tests come afterwards. If a step fails, keep its error and fix that step first.
 
 The first Windows 10 / Xiaomi Notepad case now passes video, typing, clean End
 and reconnect reuse. Read [the recorded result](ACCEPTANCE_RESULT_2026-10-20.md)
-before repeating it. Android status-bar overlap is the next identified UI issue.
+before repeating it. Android status-bar overlap and normal minimize UX are
+known limitations; the owner deferred layout/minimize work. Future layout uses
+immersive fullscreen and will be informed by the old Desklink code.
 
 ## 1. Prepare the PC and phone
 

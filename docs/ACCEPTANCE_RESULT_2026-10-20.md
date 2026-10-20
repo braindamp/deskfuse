@@ -23,8 +23,8 @@ Source: an independent `C:\Windows\System32\notepad.exe` instance.
 | Clean End | PASS: host receives goodbye, restores virtual scale, reports physical displays unchanged; one subsequent driver check reports monitor arrived 0 and error 0 |
 | Reconnect reuse | PASS: End, reopen Android, reconnect to the same running host; original owned Notepad process remains and video resumes without another Notepad process |
 | Unsaved document retention | PASS: earlier unsaved test document remains open after its session/host ended |
-| Android system-bar overlap | OPEN: full-panel capture places Notepad's title under the Android status bar; safe-area workspace sizing is next |
-| Minimize / explicit retry | PASS: owner minimized the streamed Notepad and confirmed one stable source-geometry error; monitor departed cleanly; Try again restored the same Notepad process and real video resumed |
+| Android system-bar overlap | OPEN: title is covered. Owner chose future immersive fullscreen with swipe-down system bars; layout work deferred until reviewing old Desklink code |
+| Minimize stability / explicit retry | PASS for containment: one stable screen, no reconnect loop, clean monitor departure; Try again restored the same process and video. Normal minimize UX remains unfinished; owner requested no further minimize work now |
 | Audio, files, clipboard, rotation, congestion, crash cleanup | NOT RUN in this continuation |
 
 The 6.7% is a layout-size difference. Windows rasterizes at 288 DPI; captured
@@ -62,13 +62,13 @@ not measured. A mostly static document continued producing frames and around
 120–150 kbit/s; eliminating unnecessary work while retaining final repaints
 is still a performance task, not a completed idle optimization.
 
-The immediate UI improvement is an unobstructed phone workspace below the
-system bars/cutout, with reserved controls, a matching smaller source/encode
-size and integer-offset input mapping. Existing safe insets should drive it.
-Keep physical panel dimensions distinct from workspace dimensions, round codec
-dimensions safely, and do not scale a full-panel picture down into that area.
-Immersive mode is a separate future choice. A smaller viewport may still need
-a larger Windows backing monitor to obtain the desired density step.
+The owner subsequently chose full immersive fullscreen, with Android system
+bars hidden and revealed by a downward swipe. The alternative smaller safe-area
+workspace is not the current direction. Layout changes are deferred until
+reviewing the old Desklink code. Minimize should eventually remove that window
+from the Android workspace as a normal action, without an error. The current
+stop/manual-retry behavior only contains the previous flicker loop; do not
+expand it into a new minimize framework now.
 
 ## Software validation and tested artifacts
 
@@ -80,6 +80,8 @@ a larger Windows backing monitor to obtain the desired density step.
 - Kotlin protocol checks: crypto vectors and 513 authenticated ordered records
   from eight parallel senders passed.
 - Native ABI, capture-region and latest-frame pacing contract executable passed.
+- Both unified CI jobs passed for the tested source:
+  [run 39467372648](https://github.com/braindamp/deskfuse/actions/runs/39467372648).
 
 SHA-256 of the tested files:
 
