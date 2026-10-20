@@ -7,6 +7,7 @@ import android.media.AudioFocusRequest
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioTrack
+import android.os.SystemClock
 import com.focuswindow.client.transport.PcmAudioChunk
 
 /**
@@ -31,6 +32,7 @@ class PcAudioOutput(context: Context) {
     private var focus: AudioFocusRequest? = null
     private var nativeRoute: AudioDeviceInfo? = null
     private var activeLayout = "stereo"
+    private var routingRequestedAtMs = 0L
 
     private data class Layout(val name: String, val channels: Int, val mask: Int)
     private val stereo = Layout("stereo", 2, AudioFormat.CHANNEL_OUT_STEREO)
@@ -115,11 +117,12 @@ class PcAudioOutput(context: Context) {
                 track = audio
                 activeLayout = layout
                 nativeRoute = route
+                routingRequestedAtMs = SystemClock.elapsedRealtime()
                 audio.play()
-                if (route != null && !routeStillSupportsSurround()) {
-                    stop()
-                    false
-                } else true
+                // Android resolves AudioTrack routing asynchronously. The IO
+                // reader verifies it after the route settles, then triggers an
+                // explicit stereo renegotiation if this peripheral disappears.
+                true
             }
         } catch (e: IllegalArgumentException) {
             stop()
@@ -135,8 +138,9 @@ class PcAudioOutput(context: Context) {
         val selected = surroundLayouts.firstOrNull { it.name == activeLayout } ?: return false
         val route = nativeRoute ?: return false
         val routed = track?.routedDevice
-        return routed != null && routed.id == route.id &&
-            routed.channelMasks.contains(selected.mask)
+        if (routed == null)
+            return SystemClock.elapsedRealtime() - routingRequestedAtMs < 500
+        return routed.id == route.id && routed.channelMasks.contains(selected.mask)
     }
 
     /**
@@ -158,6 +162,7 @@ class PcAudioOutput(context: Context) {
         streamId = -1
         activeLayout = "stereo"
         nativeRoute = null
+        routingRequestedAtMs = 0L
         val old = track
         track = null
         runCatching { old?.pause() }
