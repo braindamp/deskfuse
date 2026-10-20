@@ -1,7 +1,7 @@
 # First unified application hardware result — 2026-10-20
 
-Source: the mainline commit introducing this result. Local artifacts were built
-from its source changes, then exercised on the actual PC and phone. Raw logs,
+Source: mainline `1778285e7b96a3f6eb44c5354d5c65775459d352`. Local artifacts were
+built from its source changes, then exercised on the actual PC and phone. Raw logs,
 screenshots and test reports remain in ignored `out/acceptance/continuation/`.
 
 ## Scenario and results
@@ -24,7 +24,7 @@ Source: an independent `C:\Windows\System32\notepad.exe` instance.
 | Reconnect reuse | PASS: End, reopen Android, reconnect to the same running host; original owned Notepad process remains and video resumes without another Notepad process |
 | Unsaved document retention | PASS: earlier unsaved test document remains open after its session/host ended |
 | Android system-bar overlap | OPEN: full-panel capture places Notepad's title under the Android status bar; safe-area workspace sizing is next |
-| Minimize / explicit retry | Retest pending: owner reproduced connection flicker; fatal-stage handling and owned-window restore are fixed in this build, with two passing transport regression tests |
+| Minimize / explicit retry | PASS: owner minimized the streamed Notepad and confirmed one stable source-geometry error; monitor departed cleanly; Try again restored the same Notepad process and real video resumed |
 | Audio, files, clipboard, rotation, congestion, crash cleanup | NOT RUN in this continuation |
 
 The 6.7% is a layout-size difference. Windows rasterizes at 288 DPI; captured
@@ -48,7 +48,8 @@ compression is still lossy; 1:1 geometry is not a claim of lossless video.
   the fatal host error with automatic socket-loss retries, repeatedly allocating
   and removing the display. Fatal stages now stop on a named error with manual
   Try again. Explicit retry restores the same owned minimized HWND without
-  activating or adopting unrelated windows. Live retest is pending.
+  activating or adopting unrelated windows. The live retest passed, with no
+  automatic reconnect between the error and explicit retry.
 
 ## Performance observations and remaining work
 

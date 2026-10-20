@@ -31,7 +31,9 @@ The owner confirmed both on 2026-10-20. See
   routes fatal host stages through its lifecycle events and cancels automatic
   retry; late decoder stats cannot revive the failed target. Explicit retry
   restores only the catalog-owned minimized window without activation. Two
-  transport regression tests pass; live minimize/retry retest is in progress.
+  transport regression tests pass. Live retest passed: the owner confirmed a
+  stable error screen, cleanup removed the monitor, and Try again restored the
+  same Notepad process and resumed real video. No retry flicker remained.
 - A debug APK built under Arne has a different signer from the installed build.
   The owner explicitly authorized using codexlab's **default Android debug key**
   for this update. The installed signed APK is under ignored
