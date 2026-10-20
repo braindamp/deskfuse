@@ -34,12 +34,13 @@
     <IncludeNativeLibrariesForSelfExtract>false</IncludeNativeLibrariesForSelfExtract>
     <!-- GPU capture is ONE product dependency, built during the agent build.
          The POC executable is never deployed or launched. -->
+    <GpuCmakeGenerator Condition="'$(GpuCmakeGenerator)' == ''">Visual Studio 17 2022</GpuCmakeGenerator>
     <GpuNativeRoot>$(MSBuildProjectDirectory)\..\..\native\FocusWindow.Gpu</GpuNativeRoot>
     <GpuNativeBuildDir>$(GpuNativeRoot)\.build</GpuNativeBuildDir>
     <GpuNativeBinary>$(GpuNativeBuildDir)\bin\$(Configuration)\FocusWindow.Gpu.dll</GpuNativeBinary>
   </PropertyGroup>
   <Target Name="BuildGpuNative" AfterTargets="Build" Condition="'$(OS)' == 'Windows_NT'">
-    <Exec Command='cmake -S &quot;$(GpuNativeRoot)&quot; -B &quot;$(GpuNativeBuildDir)&quot; -G &quot;Visual Studio 17 2022&quot; -A x64' />
+    <Exec Command='cmake -S &quot;$(GpuNativeRoot)&quot; -B &quot;$(GpuNativeBuildDir)&quot; -G &quot;$(GpuCmakeGenerator)&quot; -A x64' />
     <Exec Command='cmake --build &quot;$(GpuNativeBuildDir)&quot; --config $(Configuration) --target FocusWindow.Gpu' />
     <Copy SourceFiles="$(GpuNativeBinary)" DestinationFiles="$(TargetDir)FocusWindow.Gpu.dll" />
   </Target>
