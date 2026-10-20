@@ -42,7 +42,8 @@ internal sealed class WindowsLoopbackAudioCapture : IHostAudioCapture
     public int Channels { get; }
     public string Layout { get; }
 
-    public WindowsLoopbackAudioCapture(IReadOnlyList<string> supportedPhoneLayouts)
+    public WindowsLoopbackAudioCapture(
+        IReadOnlyList<string> supportedPhoneLayouts, int maxPcmBytes = 3840)
     {
         _capture = new WasapiLoopbackCapture();
         try
@@ -88,9 +89,12 @@ internal sealed class WindowsLoopbackAudioCapture : IHostAudioCapture
                 _ => "stereo",
             };
             Channels = Layout == "stereo" ? 2 : _sourceFormat.Channels;
-            _framesPerPacket = Math.Max(1, _sourceFormat.SampleRate / 100); // ~10 ms
-            if (_framesPerPacket * Channels * sizeof(short) > 32768)
-                throw new NotSupportedException("Audio frame exceeds protected packet budget");
+            // Older v3 phones only understand 3840-byte PCM chunks. A new
+            // client explicitly advertises a larger packet budget. Never
+            // issue an oversized packet just because Windows runs at 192kHz.
+            _framesPerPacket = Math.Max(1, Math.Min(
+                _sourceFormat.SampleRate / 100,
+                Math.Clamp(maxPcmBytes, 384, 32768) / (Channels * sizeof(short))));
         }
         catch
         {
