@@ -53,6 +53,8 @@ public interface IHostAudioCapture : IDisposable
 {
     int SampleRate { get; }
     int Channels { get; }
+    // Explicitly identified Windows speaker positions; not just channel count.
+    string Layout => "stereo";
     void Start(Action<ReadOnlyMemory<byte>> onSamples);
 }
 /// <summary>Explicit window picker: list and focus only; never move/resize physical PC windows.</summary>
@@ -81,7 +83,7 @@ public sealed record HostServices(
     IClipboardBridge? Clipboard = null,
     IWindowWorkflow? Windows = null,
     IDeviceCredentialStore? DeviceCredentials = null,
-    Func<IHostAudioCapture>? CreateAudioCapture = null,
+    Func<IReadOnlyList<string>, IHostAudioCapture>? CreateAudioCapture = null,
     IDisplaySessionAdmission? DisplayAdmission = null,
     Func<string, IPhoneMicrophoneSink?>? CreatePhoneMicrophoneSink = null,
     Func<string, bool>? CanUsePhoneMicrophone = null);
