@@ -29,6 +29,7 @@ class PcAudioOutput(context: Context) {
         .build()
     @Volatile private var track: AudioTrack? = null
     @Volatile private var streamId: Int = -1
+    @Volatile private var requestedVolume = 1f
     private var focus: AudioFocusRequest? = null
     private var nativeRoute: AudioDeviceInfo? = null
     private var activeLayout = "stereo"
@@ -122,6 +123,7 @@ class PcAudioOutput(context: Context) {
                 activeLayout = layout
                 nativeRoute = route
                 routingRequestedAtMs = SystemClock.elapsedRealtime()
+                audio.setVolume(requestedVolume)
                 audio.play()
                 // Android resolves AudioTrack routing asynchronously. The IO
                 // reader verifies it after the route settles, then triggers an
@@ -168,8 +170,9 @@ class PcAudioOutput(context: Context) {
 
     /** The playback level, 0..100, as the user set it on the PC. */
     fun setVolume(level: Int) {
+        requestedVolume = level.coerceIn(0, 100) / 100f
         val current = track ?: return
-        runCatching { current.setVolume(level.coerceIn(0, 100) / 100f) }
+        runCatching { current.setVolume(requestedVolume) }
     }
 
     /**

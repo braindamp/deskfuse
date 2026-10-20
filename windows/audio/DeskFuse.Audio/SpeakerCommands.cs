@@ -19,6 +19,8 @@ public static class SpeakerCommands
                 Console.WriteLine("FocusWindow.Agent speakers devices");
                 Console.WriteLine("FocusWindow.Agent speakers receive --source-id BLUETOOTH_ID [--output-name MM-1]");
                 Console.WriteLine("FocusWindow.Agent speakers endpoints");
+                Console.WriteLine("FocusWindow.Agent speakers audioroute --endpoint-id ID --peer-id HASH");
+                Console.WriteLine("FocusWindow.Agent speakers audioroute --endpoint-id ID --peer-id HASH");
                 Console.WriteLine("FocusWindow.Agent speakers endpoint create --peer-id HASH --label NAME");
                 Console.WriteLine("FocusWindow.Agent speakers endpoint release --peer-id HASH");
                 Console.WriteLine("Pair the phone in Windows Bluetooth settings first. The phone selects this PC in its normal audio-output picker.");
@@ -27,8 +29,9 @@ public static class SpeakerCommands
             if (args[0] == "devices") return await ListAsync();
             if (args[0] == "endpoints") return await ListEndpointsAsync();
             if (args[0] == "endpoint") return await EndpointAsync(args[1..]);
-            if (args[0] == "audioroute") return await AudioRouteAsync(args[1..]);
+            if (args[0] == "audioroute") return await AudioRouteAsync(args[1..], stop.Token);
             if (args[0] == "props") return await PropsAsync(args[1..]);
+            if (args[0] == "open") return await OpenAsync(args[1..]);
             if (args[0] != "receive") throw new ArgumentException("Unknown audio command.");
             var source = Value(args, "--source-id") ?? throw new ArgumentException("Choose a paired source ID from 'devices'.");
             using var outputs = new MMDeviceEnumerator();
@@ -66,7 +69,7 @@ public static class SpeakerCommands
             return 0;
         }
         catch (OperationCanceledException) when (stop.IsCancellationRequested) { return 0; }
-        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or System.Runtime.InteropServices.COMException)
+        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or NotSupportedException or System.Runtime.InteropServices.COMException)
         {
             Console.Error.WriteLine(ex.Message);
             return 1;
@@ -87,101 +90,67 @@ public static class SpeakerCommands
     /// application into the endpoint, the endpoint is sampled, and the
     /// samples travel to the phone.
     /// </summary>
-    private static async Task<int> AudioRouteAsync(string[] args)
+    private static async Task<int> AudioRouteAsync(string[] args, CancellationToken cancellationToken)
     {
-        var endpointId = Value(args, "--endpoint-id");
+        var endpointId = Value(args, "--endpoint-id")
+            ?? throw new ArgumentException("audioroute requires --endpoint-id; no default output is selected.");
+        var peerId = Value(args, "--peer-id");
+        if (!PhoneEndpointContract.IsPeerId(peerId))
+            throw new ArgumentException("audioroute requires --peer-id with the phone's 32 hexadecimal identity.");
+        var expectedInstance = PhoneEndpointContract.InstancePath(peerId!);
         using var enumerator = new MMDeviceEnumerator();
-        MMDevice? device = null;
+        using var device = enumerator.GetDevice(endpointId);
+        if (device.DataFlow != DataFlow.Render || device.State != DeviceState.Active)
+            throw new InvalidOperationException("The explicit endpoint is not an active playback endpoint.");
+        var matchesInstance = false;
+        var properties = device.Properties;
+        for (var i = 0; i < properties.Count; i++)
+        {
+            string? value;
+            try { value = properties.GetValue(i).Value as string; }
+            catch (Exception ex) when (ex is NotImplementedException or NotSupportedException) { continue; }
+            if (value is null) continue;
+            // The audio endpoint stores its adapter path as e.g. {1}.ROOT\MEDIA\... .
+            // Compare the full per-phone path, never a display name or a partial identity.
+            if (value.Equals(expectedInstance, StringComparison.OrdinalIgnoreCase) ||
+                value.EndsWith("}." + expectedInstance, StringComparison.OrdinalIgnoreCase))
+            {
+                matchesInstance = true;
+                break;
+            }
+        }
+        if (!matchesInstance)
+            throw new InvalidOperationException("Refusing playback: the endpoint properties do not identify " +
+                "the requested per-phone DeskFuse device: " + expectedInstance);
+        Console.WriteLine($"Endpoint: {device.FriendlyName}\n  {device.ID}\n  {expectedInstance}");
+        return await LoopbackSignalProbe.RunAsync(device, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Opens one endpoint by id and reports what Windows says.</summary>
+    private static Task<int> OpenAsync(string[] args)
+    {
+        var id = Value(args, "--endpoint-id");
+        if (id is null) { Console.Error.WriteLine("--endpoint-id is required."); return Task.FromResult(1); }
         try
         {
-            if (endpointId is not null)
+            using var enumerator = new MMDeviceEnumerator();
+            using var device = enumerator.GetDevice(id);
+            Console.WriteLine("opened: " + device.FriendlyName);
+            try
             {
-                device = enumerator.GetDevice(endpointId);
+                var volume = device.AudioEndpointVolume;
+                Console.WriteLine("volume: " + volume.MasterVolumeLevelScalar);
             }
-            else
+            catch (Exception ex)
             {
-                foreach (var candidate in enumerator.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active))
-                {
-                    using (candidate)
-                    {
-                        if (candidate.FriendlyName.Contains("DeskFuse", StringComparison.OrdinalIgnoreCase))
-                        {
-                            device = candidate;
-                            break;
-                        }
-                    }
-                }
+                Console.WriteLine("volume failed: " + ex.GetType().Name + ": " + ex.Message);
             }
+            return Task.FromResult(0);
         }
-        catch (System.Runtime.InteropServices.COMException ex)
+        catch (Exception ex)
         {
-            Console.Error.WriteLine("That endpoint is not available: " + ex.Message);
-            return 1;
-        }
-        if (device is null)
-        {
-            Console.Error.WriteLine("No phone speaker endpoint was found. Pass --endpoint-id.");
-            return 1;
-        }
-        using (device)
-        {
-            Console.WriteLine($"Endpoint: {device.FriendlyName}\n  {device.ID}");
-
-            var captured = new List<byte>();
-            using var loopback = new WasapiLoopbackCapture(device);
-            loopback.DataAvailable += (_, e) =>
-            {
-                if (e.BytesRecorded <= 0) return;
-                var buffer = new byte[e.BytesRecorded];
-                e.Buffer.AsSpan(0, e.BytesRecorded).CopyTo(buffer);
-                lock (captured) captured.AddRange(buffer);
-            };
-            loopback.StartRecording();
-
-            var mix = device.AudioClient.MixFormat;
-            var rate = mix.SampleRate;
-            var channels = Math.Max(1, mix.Channels);
-            var frames = rate * 2;
-            var pcm = new byte[frames * channels * 2];
-            for (var frame = 0; frame < frames; frame++)
-            {
-                for (var ch = 0; ch < channels; ch++)
-                {
-                    var value = (short)(Math.Sin(2 * Math.PI * 1000 * frame / rate) * 12000);
-                    var index = (frame * channels + ch) * 2;
-                    pcm[index] = (byte)(value & 0xff);
-                    pcm[index + 1] = (byte)((value >> 8) & 0xff);
-                }
-            }
-            using var output = new WasapiOut(device, AudioClientShareMode.Shared, true, 200);
-            output.Init(new RawSourceWaveStream(new MemoryStream(pcm), new WaveFormat(rate, 16, channels)));
-            output.Play();
-            await Task.Delay(1500).ConfigureAwait(false);
-            output.Stop();
-            await Task.Delay(400).ConfigureAwait(false);
-            loopback.StopRecording();
-
-            byte[] samples;
-            lock (captured) samples = captured.ToArray();
-            var peak = 0;
-            var sumSquares = 0.0;
-            var count = samples.Length / 2;
-            for (var i = 0; i < count; i++)
-            {
-                var value = (short)(samples[i * 2] | (samples[i * 2 + 1] << 8));
-                peak = Math.Max(peak, Math.Abs((int)value));
-                sumSquares += value * (double)value;
-            }
-            var rms = count == 0 ? 0 : Math.Sqrt(sumSquares / count);
-            Console.WriteLine($"Played 1 kHz into the endpoint; loopback returned {samples.Length} bytes.");
-            Console.WriteLine($"  peak {peak}, rms {rms:0.0}");
-            if (count == 0 || peak < 100)
-            {
-                Console.Error.WriteLine("The endpoint accepted no real application audio.");
-                return 1;
-            }
-            Console.WriteLine("The endpoint accepted real application audio and returned it on the loopback.");
-            return 0;
+            Console.WriteLine("open failed: " + ex.GetType().Name + ": " + ex.Message);
+            return Task.FromResult(1);
         }
     }
 
@@ -209,7 +178,7 @@ public static class SpeakerCommands
                         Console.WriteLine("  " + store.GetValue(i).Value);
                     }
                 }
-                catch (Exception ex) when (ex is System.Runtime.InteropServices.COMException or NotSupportedException)
+                catch (Exception ex) when (ex is System.Runtime.InteropServices.COMException or NotSupportedException or NotImplementedException)
                 {
                     Console.WriteLine("  (property store unavailable)");
                 }

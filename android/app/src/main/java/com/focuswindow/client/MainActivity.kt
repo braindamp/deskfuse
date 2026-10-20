@@ -676,8 +676,9 @@ class MainActivity : ComponentActivity() {
      */
     private fun togglePhoneSpeaker() {
         val current = profile ?: return
-        val running = SpeakerService.state.value
-        if (running is SpeakerController.State.Playing || running is SpeakerController.State.Waiting) {
+        // The service is the source of truth: the state string can be a
+        // moment behind when the session is starting or failing.
+        if (SpeakerService.running) {
             SpeakerService.stop(this)
         } else {
             SpeakerService.start(this, current)

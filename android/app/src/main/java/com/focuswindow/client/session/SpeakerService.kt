@@ -70,6 +70,7 @@ class SpeakerService : Service() {
             stopSelf()
             return
         }
+        running = true
         val output = PcAudioOutput(applicationContext)
         val speaker = SpeakerController(scope, clientVersion(), output)
         controller = speaker
@@ -142,6 +143,7 @@ class SpeakerService : Service() {
     }
 
     override fun onDestroy() {
+        running = false
         controller?.stop()
         controller = null
         scope.cancel()
@@ -174,6 +176,11 @@ class SpeakerService : Service() {
         /** The state of the speaker session, for the user interface. */
         val state: MutableStateFlow<SpeakerController.State> =
             MutableStateFlow(SpeakerController.State.Idle)
+
+        /** True while the speaker session is actually running. */
+        @Volatile
+        var running: Boolean = false
+            private set
 
         fun start(context: Context, profile: PhoneProfile) {
             val intent = Intent(context, SpeakerService::class.java)

@@ -94,7 +94,7 @@ internal sealed class BrokerPhoneSpeakerEndpoint : IPhoneSpeakerEndpoint
     {
         get
         {
-            try { return _volume?.MasterVolumeLevelScalar ?? 1f; }
+            try { return _volume?.Mute == true ? 0f : _volume?.MasterVolumeLevelScalar ?? 1f; }
             catch (Exception ex) when (ex is System.Runtime.InteropServices.COMException or InvalidOperationException)
             {
                 return 1f;

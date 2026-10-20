@@ -22,11 +22,9 @@ Abstract:
       * no HDMI, no S/PDIF, no headset, no Bluetooth HFP/A2DP/USB sideband
       * no APO demonstration effect module (the module list is empty)
 
-    The single render endpoint uses the upstream speaker topology: a wave
-    RT filter with a software audio engine node and a software loopback
-    pin, bridged to a two pin topology filter. The samples that reach the
-    bridge are the real samples the Windows audio engine rendered for this
-    endpoint; the driver never synthesises audio.
+    The render endpoint has a WaveRT input pin bridged to the speaker
+    topology. Windows supplies shared-mode mixing and WASAPI software
+    loopback. No hardware audio engine, offload or capture pin is exposed.
 
 --*/
 
@@ -104,24 +102,13 @@ const SYSVAD_DEVPROPERTY SysvadWaveFilterInterfacePropertiesRender[] =
 // Render miniports.
 //
 
-/*********************************************************************
-* Topology/Wave bridge connection for the phone speaker endpoint   *
-*                                                                    *
-*              +------+                +------+                      *
-*              | Wave |                | Topo |                      *
-*              |      |                |      |                      *
-* System   --->|0    2|---> Loopback   |      |                      *
-*              |      |                |      |                      *
-* Offload  --->|1    3|--------------->|0    1|---> Line Out         *
-*              |      |                |      |                      *
-*              +------+                +------+                      *
-*********************************************************************/
+// Windows mix -> Wave pin 0 -> Wave bridge 1 -> Topology pin 0 -> Speakers.
 static
 PHYSICALCONNECTIONTABLE SpeakerTopologyPhysicalConnections[] =
 {
     {
         KSPIN_TOPO_WAVEOUT_SOURCE,  // TopologyIn
-        KSPIN_WAVE_RENDER_SOURCE,   // WaveOut
+        KSPIN_WAVE_RENDER3_SOURCE,  // WaveOut: two-pin shared-mode renderer
         CONNECTIONTYPE_WAVE_OUTPUT
     }
 };
@@ -129,17 +116,9 @@ PHYSICALCONNECTIONTABLE SpeakerTopologyPhysicalConnections[] =
 //
 // The phone speaker endpoint.
 //
-// NOTE ON FLAGS: the endpoint keeps ENDPOINT_OFFLOAD_SUPPORTED because the
-// upstream speaker topology is built around the software audio engine node,
-// and the miniport only exposes IMiniportAudioEngineNode when offload is
-// declared (see CMiniportWaveRT::GetMiniportInterface). Removing the flag
-// switches the miniport to the KSPIN_WAVE_RENDER2_* pin numbering, which
-// this wave table does not implement, and the audio engine node would then
-// not be created at all. The offload path itself stays inert: no effect
-// offload APO is installed and the endpoint publishes no audio module.
-//
-// The module list is empty on purpose: the upstream "audio module 0" is the
-// sample's APO demonstration effect, which DeskFuse does not ship.
+// Windows supplies the shared audio mixer and software loopback. Advertising
+// no hardware loopback prevents the sample's synthetic capture pin from being
+// selected by WASAPI. No hardware audio-engine node or offload pin is exposed.
 //
 static
 ENDPOINT_MINIPAIR SpeakerMiniports =
@@ -161,7 +140,7 @@ ENDPOINT_MINIPAIR SpeakerMiniports =
     SIZEOF_ARRAY(SpeakerPinDeviceFormatsAndModes),
     SpeakerTopologyPhysicalConnections,
     SIZEOF_ARRAY(SpeakerTopologyPhysicalConnections),
-    ENDPOINT_OFFLOAD_SUPPORTED,
+    0,                                                      // no offload or hardware loopback
     NULL,                                                   // audio module settings: none
     0,
     NULL,                                                   // module notification device id: none

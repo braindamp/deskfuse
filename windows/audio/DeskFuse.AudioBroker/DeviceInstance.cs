@@ -282,6 +282,13 @@ internal static class DeviceInstance
             }
             if (endpoints[0] == endpoints[1]) throw new InvalidOperationException("Two phones resolved to the same playback endpoint.");
             Console.WriteLine("distinct-per-phone-endpoints=True");
+            // These temporary identities have no connected phone. Verify the
+            // actual render mix without sending diagnostic audio to a user.
+            var audioResult = await SpeakerCommands.RunAsync(
+                ["audioroute", "--endpoint-id", endpoints[0], "--peer-id", ids[0]]).ConfigureAwait(false);
+            if (audioResult != 0)
+                throw new InvalidOperationException("The new endpoint did not return genuine application audio and silence.");
+            Console.WriteLine("genuine-application-loopback=True");
             var original = devices[0];
             Create(original.InstancePath, PhoneEndpointContract.HardwareId, original.FriendlyName, "DeskFuse");
             // Diagnostic only: outlast the measured delayed replacement
