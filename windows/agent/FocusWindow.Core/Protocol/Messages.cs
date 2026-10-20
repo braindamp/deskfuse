@@ -44,7 +44,8 @@ public sealed record ClientFile(string Action, string Id, string? Name = null, l
 public sealed record ClientFiles(string Action, string? Path = null, string? Id = null, int Offset = 0) : ClientMessage;
 public sealed record ClientKeyframeRequest : ClientMessage;
 public sealed record ClientWindows(string Action, string? Id) : ClientMessage;
-public sealed record ClientAudio(string Action, IReadOnlyList<string>? Layouts = null) : ClientMessage;
+public sealed record ClientAudio(string Action, IReadOnlyList<string>? Layouts = null,
+    int MaxPcmBytes = 3840) : ClientMessage;
 public sealed record ClientMicrophone(string Action) : ClientMessage;
 public sealed record ClientBye(string Reason) : ClientMessage;
 public sealed record ClientUnknown(string Type) : ClientMessage;
@@ -94,7 +95,8 @@ public static class ClientMessageParser
                 "audio" => new ClientAudio(root["action"]?.GetValue<string>() ?? "",
                     root["layouts"] is JsonArray layouts && layouts.Count <= 6
                         ? layouts.Select(node => node?.GetValue<string>() ?? "").ToArray()
-                        : Array.Empty<string>()),
+                        : Array.Empty<string>(),
+                    Math.Clamp(root["maxPcmBytes"]?.GetValue<int>() ?? 3840, 384, 32768)),
                 "microphone" => new ClientMicrophone(root["action"]?.GetValue<string>() ?? ""),
                 "files" => new ClientFiles(root["action"]?.GetValue<string>() ?? "",
                     root["path"]?.GetValue<string>(), root["id"]?.GetValue<string>(),
