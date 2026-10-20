@@ -195,6 +195,7 @@ sealed interface ServerMessage {
         val state: String, val streamId: Int,
         val sampleRate: Int = 0, val channels: Int = 0,
         val format: String = "pcm_s16le", val detail: String? = null,
+        val layout: String = "stereo",
     ) : ServerMessage
 
     @Serializable @SerialName("clipboard")
@@ -265,7 +266,10 @@ sealed interface ClientMessage {
     data class Windows(val action: String, val id: String? = null) : ClientMessage
 
     @Serializable @SerialName("audio")
-    data class Audio(val action: String) : ClientMessage
+    data class Audio(
+        val action: String,
+        val layouts: List<String> = emptyList(),
+    ) : ClientMessage
 
     @Serializable @SerialName("microphone")
     data class Microphone(val action: String) : ClientMessage
