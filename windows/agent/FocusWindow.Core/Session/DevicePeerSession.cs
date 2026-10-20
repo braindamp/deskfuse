@@ -8,6 +8,11 @@ namespace FocusWindow.Core.Session;
 /// same device may contribute camera, microphone, speakers, touchpad, keyboard
 /// or sensors concurrently while another device owns a display. No camera/audio
 /// endpoints are claimed present until a real Windows provider is installed.
+///
+/// A phone that asks for the speakers capability gets a real Windows playback
+/// endpoint of its own. The audio the user sends to that endpoint in Windows
+/// is streamed to the phone over the encrypted transport, and the endpoint's
+/// volume is mirrored on the phone.
 /// </summary>
 internal sealed class DevicePeerSession(
     HostOptions options,
@@ -58,13 +63,22 @@ internal sealed class DevicePeerSession(
         using var lease = peers.Attach(
             hello.Profile.DeviceId, hello.Profile.DeviceLabel, shutdown, requested);
         log.Info("Authenticated accessory peer joined: " + lease.Peer.DeviceId);
-        // Distinguish a requested function from an actual, provisioned Windows
-        // endpoint. No accessory provider has been installed in this build.
+
+        // The phone's Windows playback endpoint. It is provisioned only when
+        // the phone asked for the speakers capability, and it stays active
+        // for as long as this peer is connected.
+        var speakers = new PhoneSpeakerRoute(conn, services, lease.Peer.Endpoints.Speakers,
+            lease.Peer.Label, log);
+        var active = await speakers.ProvisionAsync(requested, shutdown).ConfigureAwait(false);
+
+        // A requested function is not the same thing as an active device.
         conn.SendControl(ServerMessages.BridgeState(
-            lease.Peer.RequestedCapabilities, DeviceCapabilities.ActiveForAccessory));
+            lease.Peer.RequestedCapabilities, DeviceCapabilities.ActiveForAccessory(active)));
         conn.SendControl(ServerMessages.Stage("device_bridge",
-            "Accessory connection established. Requested features are not yet " +
-            "active Windows devices or remote input controls in this build."));
+            active.Contains(DeviceCapabilities.Speakers)
+                ? "The phone speaker endpoint is ready. Select it as the Windows output to send sound to this phone."
+                : "Accessory connection established. Requested features are not yet " +
+                  "active Windows devices or remote input controls in this build."));
 
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(
             shutdown, lease.Cancellation);
@@ -72,7 +86,7 @@ internal sealed class DevicePeerSession(
             conn, options, services, lease.Peer.DeviceId, log);
         var microphonePump = mic.PumpAsync(linked.Token);
         var keepAlive = KeepAliveAsync(conn, linked.Token);
-        var control = ReadControlsAsync(conn, mic, requested, linked.Token);
+        var control = ReadControlsAsync(conn, mic, speakers, requested, linked.Token);
         try
         {
             await Task.WhenAny(control, microphonePump, keepAlive, conn.Completion).ConfigureAwait(false);
@@ -83,6 +97,7 @@ internal sealed class DevicePeerSession(
             await conn.DisposeAsync().ConfigureAwait(false);
             try { await Task.WhenAll(control, microphonePump, keepAlive).ConfigureAwait(false); }
             catch (OperationCanceledException) when (linked.IsCancellationRequested) { }
+            await speakers.DisposeAsync().ConfigureAwait(false);
             log.Info("Accessory peer detached: " + lease.Peer.DeviceId);
         }
     }
@@ -94,7 +109,8 @@ internal sealed class DevicePeerSession(
     }
 
     private static async Task ReadControlsAsync(PhoneConnection conn,
-        PhoneMicrophoneRoute microphone, IReadOnlyList<string> requested, CancellationToken ct)
+        PhoneMicrophoneRoute microphone, PhoneSpeakerRoute speakers,
+        IReadOnlyList<string> requested, CancellationToken ct)
     {
         await foreach (var msg in conn.Messages.ReadAllAsync(ct).ConfigureAwait(false))
         {
@@ -103,6 +119,12 @@ internal sealed class DevicePeerSession(
                 requested.Contains(DeviceCapabilities.Microphone))
             {
                 microphone.Handle(mic);
+                continue;
+            }
+            if (msg is ClientAudio audio &&
+                audio.Action is "start_phone_speakers" or "stop_phone_speakers")
+            {
+                await speakers.HandleAsync(audio).ConfigureAwait(false);
                 continue;
             }
             // An accessory peer MUST NOT dispatch input/file/window/monitor

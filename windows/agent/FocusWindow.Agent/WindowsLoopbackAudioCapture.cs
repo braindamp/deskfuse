@@ -3,6 +3,7 @@ using System.Buffers.Binary;
 using System.Runtime.InteropServices;
 using FocusWindow.Core.Session;
 using FocusWindow.Core.Media;
+using NAudio.CoreAudioApi;
 using NAudio.Dmo;
 using NAudio.Wave;
 
@@ -46,8 +47,40 @@ internal sealed class WindowsLoopbackAudioCapture : IHostAudioCapture
 
     public WindowsLoopbackAudioCapture(
         IReadOnlyList<string> supportedPhoneLayouts, int maxPcmBytes = 3840)
+        : this(null, supportedPhoneLayouts, maxPcmBytes)
     {
-        _capture = new WasapiLoopbackCapture();
+    }
+
+    /// <summary>
+    /// Loopback of one explicit render endpoint, for example the phone's own
+    /// DeskFuse endpoint. A missing or unavailable endpoint fails closed:
+    /// this capture never falls back to the PC's default output or to the
+    /// mixed PC sound.
+    /// </summary>
+    public WindowsLoopbackAudioCapture(
+        string? endpointId, IReadOnlyList<string> supportedPhoneLayouts, int maxPcmBytes = 3840)
+    {
+        if (endpointId is not null)
+        {
+            MMDevice device;
+            try
+            {
+                using var enumerator = new MMDeviceEnumerator();
+                device = enumerator.GetDevice(endpointId);
+            }
+            catch (Exception ex) when (ex is System.Runtime.InteropServices.COMException
+                                           or InvalidOperationException or ArgumentException)
+            {
+                throw new InvalidOperationException(
+                    "That phone speaker endpoint is not available on this PC.", ex);
+            }
+            _capture = new WasapiLoopbackCapture(device);
+            device.Dispose();
+        }
+        else
+        {
+            _capture = new WasapiLoopbackCapture();
+        }
         try
         {
             _sourceFormat = _capture.WaveFormat;

@@ -207,6 +207,7 @@ internal static class Program
         var guards = new List<PhysicalDisplayGuard>();
         using var sources = new WorkspaceApplicationCatalog();
         WindowsDisplayBackend? backend = null;
+        var brokerClient = new DeskFuse.Audio.PhoneEndpointBrokerClient();
         var services = new HostServices(
             CreateBackend: () => backend = new WindowsDisplayBackend(log),
             CreateInput: () => new SendInputSink(log),
@@ -223,6 +224,10 @@ internal static class Program
             Windows: new WindowsWindowWorkflow(),
             CreateVideoPipeline: () => new NativeGpuPipeline(Opt(args, "--workspace-app"), Opt(args, "--workspace-args"), sources),
             CreateAudioCapture: (layouts, maxBytes) => new WindowsLoopbackAudioCapture(layouts, maxBytes),
+            // The phone speaker route captures the phone's own endpoint only.
+            CreateEndpointAudioCapture: (endpointId, layouts, maxBytes) =>
+                new WindowsLoopbackAudioCapture(endpointId, layouts, maxBytes),
+            PhoneSpeakers: new BrokerPhoneSpeakerProvider(brokerClient),
             CreatePhoneMicrophoneSink: allowMicrophone
                 ? id => string.Equals(id, microphoneDeviceId, StringComparison.Ordinal)
                     ? new WindowsPhoneMicrophoneCableSink(microphoneOutputId!)

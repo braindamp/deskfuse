@@ -57,6 +57,48 @@ public interface IHostAudioCapture : IDisposable
     string Layout => "stereo";
     void Start(Action<ReadOnlyMemory<byte>> onSamples);
 }
+/// <summary>
+/// One phone's Windows playback endpoint: a real render device that Windows
+/// lists as a selectable output, owned by one enrolled phone for the length
+/// of its connection.
+/// </summary>
+public interface IPhoneSpeakerEndpoint : IAsyncDisposable
+{
+    /// <summary>The WASAPI endpoint id of the render device.</summary>
+    string EndpointId { get; }
+
+    /// <summary>The name Windows shows for this endpoint.</summary>
+    string FriendlyName { get; }
+
+    /// <summary>
+    /// The endpoint's playback volume, 0..1, and a notification when the
+    /// user changes it with the Windows volume control.
+    /// </summary>
+    float Volume { get; }
+
+    event Action<float>? VolumeChanged;
+}
+
+/// <summary>
+/// Provides the Windows playback endpoint of an enrolled phone. The
+/// implementation owns the privileged part: creating a device is a
+/// privileged operation, so it lives in a separate local broker.
+/// </summary>
+public interface IPhoneSpeakerProvider
+{
+    /// <summary>
+    /// Provisions the endpoint of one enrolled phone, or returns null with
+    /// a reason when it cannot be provided. The identity is the enrollment
+    /// hash of the phone, never its network address. The host never
+    /// substitutes another device.
+    /// </summary>
+    Task<(IPhoneSpeakerEndpoint? Endpoint, string? Error)> ProvisionAsync(
+        string peerId, string label, CancellationToken ct);
+
+    /// <summary>Removes the endpoint of one enrolled phone.</summary>
+    Task ReleaseAsync(string peerId, CancellationToken ct);
+}
+
 /// <summary>Explicit window picker: list and focus only; never move/resize physical PC windows.</summary>
 public interface IWindowWorkflow
 {
@@ -87,4 +129,6 @@ public sealed record HostServices(
     Func<IReadOnlyList<string>, int, IHostAudioCapture>? CreateAudioCapture = null,
     IDisplaySessionAdmission? DisplayAdmission = null,
     Func<string, IPhoneMicrophoneSink?>? CreatePhoneMicrophoneSink = null,
-    Func<string, bool>? CanUsePhoneMicrophone = null);
+    Func<string, bool>? CanUsePhoneMicrophone = null,
+    IPhoneSpeakerProvider? PhoneSpeakers = null,
+    Func<string, IReadOnlyList<string>, int, IHostAudioCapture?>? CreateEndpointAudioCapture = null);

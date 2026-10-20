@@ -192,6 +192,17 @@ public static class ServerMessages
         ["layout"] = layout,
         ["detail"] = detail,
     };
+
+    /// <summary>
+    /// The playback volume of the phone's Windows endpoint, 0..100. The
+    /// phone applies it to its own output, so the Windows volume control
+    /// and the phone volume control stay the same control.
+    /// </summary>
+    public static JsonObject AudioVolume(int level) => new()
+    {
+        ["type"] = "audio_volume",
+        ["level"] = Math.Clamp(level, 0, 100),
+    };
     public static JsonObject FileList(FileListing listing)
     {
         var entries = new JsonArray();

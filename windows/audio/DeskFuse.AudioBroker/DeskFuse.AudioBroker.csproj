@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    The DeskFuse audio endpoint broker.
+
+    It creates one Windows software device instance per enrolled phone, using
+    the installed DeskFuse Audio driver, and hands the resulting WASAPI
+    endpoint id back to the unelevated host over a named pipe.
+
+    Creating a software device is a privileged operation, so this process
+    runs elevated and separately from the LAN host.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <SupportedOSPlatformVersion>10.0.19041.0</SupportedOSPlatformVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <AssemblyName>DeskFuse.AudioBroker</AssemblyName>
+    <RootNamespace>DeskFuse.AudioBroker</RootNamespace>
+    <Version>0.3.0</Version>
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <PublishSingleFile>false</PublishSingleFile>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="NAudio" Version="2.2.1" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\DeskFuse.Audio\DeskFuse.Audio.csproj" />
+  </ItemGroup>
+</Project>

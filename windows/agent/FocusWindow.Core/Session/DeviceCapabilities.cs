@@ -37,9 +37,13 @@ public static class DeviceCapabilities
     }
 
     /// <summary>
-    /// A capability only becomes active when a real feature provider confirms
-    /// that it is ready, independently of the peer's declared intentions.
-    /// At present the accessory host implements no active device providers.
+    /// The capabilities that are actually active. A capability is only
+    /// active when a real Windows provider confirmed that it is ready; a
+    /// request alone never makes a device appear.
     /// </summary>
-    public static IReadOnlyList<string> ActiveForAccessory => Array.Empty<string>();
+    public static IReadOnlyList<string> ActiveForAccessory(IEnumerable<string>? active = null) =>
+        (active ?? Array.Empty<string>())
+        .Distinct(StringComparer.Ordinal)
+        .OrderBy(name => name, StringComparer.Ordinal)
+        .ToArray();
 }
