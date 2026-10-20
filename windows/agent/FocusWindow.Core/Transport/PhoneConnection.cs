@@ -60,7 +60,7 @@ public sealed class PhoneConnection : IAsyncDisposable
     private int _frameBacklog;
     private int _audioBacklog;
     private const int MaxAudioBacklog = 8;
-    private const int MaxAudioPayload = 3840;
+    private const int MaxAudioPayload = 32768;
     private long _pingSentTimestamp;
     private double _rttMs = -1;
     private long _framesSent;
@@ -152,7 +152,7 @@ public sealed class PhoneConnection : IAsyncDisposable
     /// </summary>
     public bool TrySendAudio(ReadOnlySpan<byte> pcm16le, int streamId)
     {
-        if (pcm16le.Length is < 4 or > MaxAudioPayload || (pcm16le.Length & 3) != 0 ||
+        if (pcm16le.Length is < 4 or > MaxAudioPayload || (pcm16le.Length & 1) != 0 ||
             Volatile.Read(ref _audioBacklog) >= MaxAudioBacklog)
             return false;
         var plain = new byte[4 + pcm16le.Length];
