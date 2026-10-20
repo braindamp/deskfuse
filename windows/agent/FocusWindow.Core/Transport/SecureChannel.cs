@@ -37,6 +37,10 @@ public sealed class SecureChannel : IDisposable
     private long _sendCounter;
     private long _recvCounter = -1;
     private readonly object _gate = new();
+    private AesGcm? _sendCipher;
+    private byte[]? _sendCipherKey;
+    private AesGcm? _recvCipher;
+    private bool _disposed;
     private SecureChannel(List<KeySet> candidates) => _candidates = candidates;
     /// <summary>The 6-digit short authentication string the user compares on both screens.</summary>
     public string VerificationCode => (_locked ?? _candidates[0]).Code;
@@ -131,19 +135,33 @@ public sealed class SecureChannel : IDisposable
     }
     public byte[] Seal(ReadOnlySpan<byte> plaintext)
     {
+        var output = new byte[checked(plaintext.Length + RecordOverheadBytes)];
+        Seal(plaintext, output);
+        return output;
+    }
+    /// <summary>Encrypt directly into the caller's final record buffer, without a second packet copy.</summary>
+    public void Seal(ReadOnlySpan<byte> plaintext, Span<byte> record)
+    {
+        if (record.Length != checked(plaintext.Length + RecordOverheadBytes))
+            throw new ArgumentException("Destination must fit exactly one sealed record.", nameof(record));
         lock (_gate)
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             // Before lock-in we send with candidate 0. That is safe because the host only
             // sends AFTER it has opened the client's Hello, which is what locks us in.
             var keys = _locked ?? _candidates[0];
-            var counter = _sendCounter++;
+            if (!ReferenceEquals(_sendCipherKey, keys.SendKey))
+            {
+                _sendCipher?.Dispose();
+                _sendCipher = new AesGcm(keys.SendKey, 16);
+                _sendCipherKey = keys.SendKey;
+            }
+            var counter = _sendCounter;
+            _sendCounter = checked(counter + 1); // never reuse a nonce after overflow
             Span<byte> nonce = stackalloc byte[12];
             FillNonce(counter, nonce);
-            var output = new byte[8 + plaintext.Length + 16];
-            BinaryPrimitives.WriteInt64BigEndian(output.AsSpan(0, 8), counter);
-            using var gcm = new AesGcm(keys.SendKey, 16);
-            gcm.Encrypt(nonce, plaintext, output.AsSpan(8, plaintext.Length), output.AsSpan(8 + plaintext.Length, 16));
-            return output;
+            BinaryPrimitives.WriteInt64BigEndian(record[..8], counter);
+            _sendCipher!.Encrypt(nonce, plaintext, record.Slice(8, plaintext.Length), record[^16..]);
         }
     }
     public byte[] Open(ReadOnlySpan<byte> packet)
@@ -153,28 +171,35 @@ public sealed class SecureChannel : IDisposable
         var counter = BinaryPrimitives.ReadInt64BigEndian(packet[..8]);
         lock (_gate)
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             if (_locked is not null)
             {
-                return OpenWith(_locked, packet, counter);
+                return OpenWith(_recvCipher!, packet, counter);
             }
             CryptographicException? last = null;
             foreach (var candidate in _candidates)
             {
+                var cipher = new AesGcm(candidate.RecvKey, 16);
                 try
                 {
-                    var plain = OpenWith(candidate, packet, counter);
+                    var plain = OpenWith(cipher, packet, counter);
                     _locked = candidate;
+                    _recvCipher = cipher;
                     return plain;
                 }
                 catch (CryptographicException ex)
                 {
                     last = ex;
                 }
+                finally
+                {
+                    if (!ReferenceEquals(_recvCipher, cipher)) cipher.Dispose();
+                }
             }
             throw last ?? new CryptographicException("no key candidate authenticated the packet");
         }
     }
-    private byte[] OpenWith(KeySet keys, ReadOnlySpan<byte> packet, long counter)
+    private byte[] OpenWith(AesGcm cipher, ReadOnlySpan<byte> packet, long counter)
     {
         if (counter <= _recvCounter)
             throw new CryptographicException($"replayed or reordered packet: {counter} <= {_recvCounter}");
@@ -182,8 +207,7 @@ public sealed class SecureChannel : IDisposable
         FillNonce(counter, nonce);
         var cipherAndTag = packet[8..];
         var plain = new byte[cipherAndTag.Length - 16];
-        using var gcm = new AesGcm(keys.RecvKey, 16);
-        gcm.Decrypt(nonce, cipherAndTag[..^16], cipherAndTag[^16..], plain);
+        cipher.Decrypt(nonce, cipherAndTag[..^16], cipherAndTag[^16..], plain);
         _recvCounter = counter; // advanced only AFTER authentication succeeds
         return plain;
     }
@@ -208,10 +232,17 @@ public sealed class SecureChannel : IDisposable
     }
     public void Dispose()
     {
-        foreach (var k in _candidates)
+        lock (_gate)
         {
-            CryptographicOperations.ZeroMemory(k.SendKey);
-            CryptographicOperations.ZeroMemory(k.RecvKey);
+            if (_disposed) return;
+            _disposed = true;
+            _sendCipher?.Dispose();
+            _recvCipher?.Dispose();
+            foreach (var k in _candidates)
+            {
+                CryptographicOperations.ZeroMemory(k.SendKey);
+                CryptographicOperations.ZeroMemory(k.RecvKey);
+            }
         }
     }
 }

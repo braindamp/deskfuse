@@ -16,7 +16,8 @@ public static class SessionLifetime
         Func<CancellationToken, Task> video,
         Func<CancellationToken, Task> housekeeping,
         Task transportCompletion,
-        CancellationToken shutdown)
+        CancellationToken shutdown,
+        params Func<CancellationToken, Task>[] additionalWorkers)
     {
         ArgumentNullException.ThrowIfNull(control);
         ArgumentNullException.ThrowIfNull(video);
@@ -24,16 +25,13 @@ public static class SessionLifetime
         ArgumentNullException.ThrowIfNull(transportCompletion);
 
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(shutdown);
-        var workerTasks = new[]
-        {
-            control(linked.Token),
-            video(linked.Token),
-            housekeeping(linked.Token),
-        };
+        static async Task RunWorker(Func<CancellationToken, Task> worker, CancellationToken token) =>
+            await worker(token).ConfigureAwait(false);
+        var workerTasks = new[] { control, video, housekeeping }.Concat(additionalWorkers)
+            .Select(worker => RunWorker(worker, linked.Token)).ToArray();
         try
         {
-            await Task.WhenAny(workerTasks[0], workerTasks[1], workerTasks[2],
-                transportCompletion).ConfigureAwait(false);
+            await Task.WhenAny(workerTasks.Append(transportCompletion)).ConfigureAwait(false);
         }
         finally
         {

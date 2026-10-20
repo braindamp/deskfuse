@@ -27,7 +27,12 @@ namespace FocusWindow.Core.Transport;
 /// </summary>
 public sealed class PhoneConnection : IAsyncDisposable
 {
-    public const int MaxFrameBacklog = 4;
+    public sealed record PhoneMicrophonePacket(int StreamId, byte[] Pcm16Mono);
+    private readonly Channel<PhoneMicrophonePacket> _phoneMicrophone =
+        Channel.CreateBounded<PhoneMicrophonePacket>(new BoundedChannelOptions(8) {
+            SingleReader = true, SingleWriter = true, FullMode = BoundedChannelFullMode.DropOldest
+        });
+    public const int MaxFrameBacklog = 2;
     // Wire.MaxFrameBytes limits the SEALED packet body, not the Annex-B access unit.
     // The 20-byte video header and 24-byte AES-GCM record envelope also count.
     public const int MaxVideoAccessUnitBytes =
@@ -35,7 +40,9 @@ public sealed class PhoneConnection : IAsyncDisposable
 
     public static bool CanSendAccessUnit(int byteCount) =>
         byteCount > 0 && byteCount <= MaxVideoAccessUnitBytes;
-    private sealed record Outbound(byte Kind, byte[]? Plain, bool IsFrame, bool ReleasesSlot = false);
+    // Audio chunks are independent PCM; dropping stale chunks is safe and helps latency.
+    private sealed record Outbound(byte Kind, byte[]? Plain, bool IsFrame,
+        bool ReleasesSlot = false);
     private readonly TcpClient _tcp;
     private readonly Stream _stream;
     private readonly SecureChannel _chan;
@@ -44,6 +51,15 @@ public sealed class PhoneConnection : IAsyncDisposable
         Channel.CreateUnbounded<ClientMessage>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
     private readonly Channel<Outbound> _outgoing =
         Channel.CreateUnbounded<Outbound>(new UnboundedChannelOptions { SingleReader = true });
+    private readonly Channel<Outbound> _videoQueue = Channel.CreateUnbounded<Outbound>(
+        new UnboundedChannelOptions { SingleReader = true });
+    private readonly Channel<Outbound> _fileQueue = Channel.CreateUnbounded<Outbound>(
+        new UnboundedChannelOptions { SingleReader = true });
+    private readonly Channel<Outbound> _audioQueue = Channel.CreateBounded<Outbound>(
+        new BoundedChannelOptions(8) { SingleReader = true, FullMode = BoundedChannelFullMode.DropOldest });
+    private readonly Channel<bool> _queued = Channel.CreateBounded<bool>(
+        new BoundedChannelOptions(1) { SingleReader = true, FullMode = BoundedChannelFullMode.DropWrite });
+    private readonly SemaphoreSlim _videoSlots = new(MaxFrameBacklog, MaxFrameBacklog);
     // Streaming file chunks should not fill an unbounded outgoing channel.
     private readonly SemaphoreSlim _fileSlots = new(16, 16);
     private readonly CancellationTokenSource _cts = new();
@@ -51,10 +67,12 @@ public sealed class PhoneConnection : IAsyncDisposable
     private Task? _reader;
     private Task? _writer;
     private int _frameBacklog;
+    private const int MaxAudioPayload = 32768;
     private long _pingSentTimestamp;
     private double _rttMs = -1;
     private long _framesSent;
     private long _framesRejected;
+    private long _wireBytesSent;
     private int _disposed;
     public PhoneConnection(TcpClient tcp, Stream stream, SecureChannel chan, ILog log)
     {
@@ -65,12 +83,14 @@ public sealed class PhoneConnection : IAsyncDisposable
     }
     public string VerificationCode => _chan.VerificationCode;
     public ChannelReader<ClientMessage> Messages => _incoming.Reader;
+    public ChannelReader<PhoneMicrophonePacket> MicrophonePackets => _phoneMicrophone.Reader;
     public Task Completion => _completion.Task;
     public int FrameBacklog => Volatile.Read(ref _frameBacklog);
     /// <summary>Last measured ping round trip, or null before the first pong.</summary>
     public double? RttMs => _rttMs < 0 ? null : _rttMs;
     public long FramesSent => Interlocked.Read(ref _framesSent);
     public long FramesRejected => Interlocked.Read(ref _framesRejected);
+    public long WireBytesSent => Interlocked.Read(ref _wireBytesSent);
     /// <summary>
     /// Reads and AUTHENTICATES the first packet. A peer that completed the (anonymous) ECDH
     /// but does not hold the pairing secret derives different keys, so decryption fails
@@ -92,17 +112,33 @@ public sealed class PhoneConnection : IAsyncDisposable
     }
     /// <summary>Control messages are never dropped.</summary>
     public void SendControl(System.Text.Json.Nodes.JsonObject message) =>
-        _outgoing.Writer.TryWrite(new Outbound(Wire.KindControl, ServerMessages.Serialize(message), false));
+        Enqueue(_outgoing, new Outbound(Wire.KindControl, ServerMessages.Serialize(message), false));
+    private bool Enqueue(Channel<Outbound> queue, Outbound packet)
+    {
+        if (!queue.Writer.TryWrite(packet)) return false;
+        _queued.Writer.TryWrite(true); // coalesced wakeup, even when stale PCM is replaced
+        return true;
+    }
     public async Task SendFileControlAsync(System.Text.Json.Nodes.JsonObject message, CancellationToken ct)
     {
         await _fileSlots.WaitAsync(ct).ConfigureAwait(false);
-        if (!_outgoing.Writer.TryWrite(new Outbound(Wire.KindControl, ServerMessages.Serialize(message), false, true)))
+        if (!Enqueue(_fileQueue, new Outbound(Wire.KindControl, ServerMessages.Serialize(message), false, true)))
         {
             _fileSlots.Release();
             throw new IOException("File transport closed");
         }
     }
-    public void SendPing() => _outgoing.Writer.TryWrite(new Outbound(Wire.KindPing, null, false));
+    public void SendPing() => Enqueue(_outgoing, new Outbound(Wire.KindPing, null, false));
+    /// <summary>
+    /// Backpressure the encoded consumer while keeping capture latest-wins.
+    /// This avoids dropping reference frames and repeatedly sending large IDRs
+    /// merely because the network is temporarily busy.
+    /// </summary>
+    public async Task WaitForVideoCapacityAsync(CancellationToken ct)
+    {
+        await _videoSlots.WaitAsync(ct).ConfigureAwait(false);
+        _videoSlots.Release();
+    }
     /// <summary>
     /// Queues one access unit. Returns false when the phone is not keeping up (more than
     /// <see cref="MaxFrameBacklog"/> frames queued): the caller must treat the stream as
@@ -120,7 +156,7 @@ public sealed class PhoneConnection : IAsyncDisposable
             _log.Warn($"H.264 access unit length {accessUnit.Length} exceeds wire budget {MaxVideoAccessUnitBytes}; resync required");
             return false;
         }
-        if (Volatile.Read(ref _frameBacklog) >= MaxFrameBacklog) return false;
+        if (!_videoSlots.Wait(0)) return false;
         var plain = new byte[Wire.FrameHeaderBytes + accessUnit.Length];
         var span = plain.AsSpan();
         BinaryPrimitives.WriteUInt16BigEndian(span[0..], (ushort)Wire.FrameMagic);
@@ -130,9 +166,24 @@ public sealed class PhoneConnection : IAsyncDisposable
         BinaryPrimitives.WriteInt32BigEndian(span[16..], accessUnit.Length);
         accessUnit.CopyTo(span[Wire.FrameHeaderBytes..]);
         Interlocked.Increment(ref _frameBacklog);
-        if (_outgoing.Writer.TryWrite(new Outbound(Wire.KindFrame, plain, true))) return true;
+        if (Enqueue(_videoQueue, new Outbound(Wire.KindFrame, plain, true))) return true;
         Interlocked.Decrement(ref _frameBacklog);
+        _videoSlots.Release();
         return false;
+    }
+    /// <summary>
+    /// Queue at most eight audio chunks so a stalled video/file connection cannot
+    /// accumulate seconds of speech. The first 4 plaintext bytes are the stream ID.
+    /// Sealing happens in the same ordered writer as video/control.
+    /// </summary>
+    public bool TrySendAudio(ReadOnlySpan<byte> pcm16le, int streamId)
+    {
+        if (pcm16le.Length is < 4 or > MaxAudioPayload || (pcm16le.Length & 1) != 0 || streamId <= 0)
+            return false;
+        var plain = new byte[4 + pcm16le.Length];
+        BinaryPrimitives.WriteInt32BigEndian(plain.AsSpan(0, 4), streamId);
+        pcm16le.CopyTo(plain.AsSpan(4));
+        return Enqueue(_audioQueue, new Outbound(Wire.KindAudio, plain, false));
     }
     private async Task<byte[]> ReadSealedControlAsync(CancellationToken ct)
     {
@@ -145,6 +196,19 @@ public sealed class PhoneConnection : IAsyncDisposable
         await _stream.ReadExactlyAsync(sealedBytes, ct).ConfigureAwait(false);
         return _chan.Open(sealedBytes);
     }
+    private async Task<byte[]> ReadSealedMicrophoneAsync(CancellationToken ct)
+    {
+        var lengthBytes = new byte[4];
+        await _stream.ReadExactlyAsync(lengthBytes, ct).ConfigureAwait(false);
+        var size = BinaryPrimitives.ReadInt32BigEndian(lengthBytes);
+        if (size < SecureChannel.RecordOverheadBytes + 6 ||
+            size > SecureChannel.RecordOverheadBytes + 644)
+            throw new InvalidDataException("microphone packet exceeds PCM wire budget");
+        var packet = new byte[size];
+        await _stream.ReadExactlyAsync(packet, ct).ConfigureAwait(false);
+        return packet;
+    }
+
     private async Task ReadLoopAsync(CancellationToken ct)
     {
         var kind = new byte[1];
@@ -170,6 +234,23 @@ public sealed class PhoneConnection : IAsyncDisposable
                         }
                         break;
                     }
+                    case Wire.KindPhoneMic:
+                    {
+                        // Strictly bounded 16 kHz mono PCM16, <=20 ms samples.
+                        // Audio is still encrypted/authenticated by SecureChannel.
+                        // Any unconsumed packets are dropped rather than building
+                        // stale audio or backpressuring control/video.
+                        var sealedBytes = await ReadSealedMicrophoneAsync(ct).ConfigureAwait(false);
+                        var plain = _chan.Open(sealedBytes);
+                        if (plain.Length < 6 || plain.Length > 644 ||
+                            (plain.Length & 1) != 0)
+                            throw new InvalidDataException("invalid microphone PCM length");
+                        var streamId = BinaryPrimitives.ReadInt32BigEndian(plain.AsSpan(0, 4));
+                        if (streamId <= 0) throw new InvalidDataException("invalid microphone stream ID");
+                        _phoneMicrophone.Writer.TryWrite(new PhoneMicrophonePacket(
+                            streamId, plain.AsSpan(4).ToArray()));
+                        break;
+                    }
                     case Wire.KindPong:
                     {
                         var sent = Interlocked.Read(ref _pingSentTimestamp);
@@ -190,15 +271,33 @@ public sealed class PhoneConnection : IAsyncDisposable
         finally
         {
             _incoming.Writer.TryComplete();
+            _phoneMicrophone.Writer.TryComplete();
             Finish();
         }
     }
     private async Task WriteLoopAsync(CancellationToken ct)
     {
+        var preferFile = false;
         try
         {
-            await foreach (var o in _outgoing.Reader.ReadAllAsync(ct).ConfigureAwait(false))
+            while (!ct.IsCancellationRequested)
             {
+                // Select BEFORE sealing: AES-GCM counter order remains wire
+                // order across lanes. Target/control precedes dependent media.
+                // Audio bypasses queued video/files; alternate bulk work so
+                // an active screen cannot starve an explicit file download.
+                Outbound? o;
+                if (!_outgoing.Reader.TryRead(out o) && !_audioQueue.Reader.TryRead(out o))
+                {
+                    if (preferFile && _fileQueue.Reader.TryRead(out o)) preferFile = false;
+                    else if (_videoQueue.Reader.TryRead(out o)) preferFile = true;
+                    else if (_fileQueue.Reader.TryRead(out o)) preferFile = false;
+                    else
+                    {
+                        await _queued.Reader.ReadAsync(ct).ConfigureAwait(false);
+                        continue;
+                    }
+                }
                 byte[] packet;
                 if (o.Kind == Wire.KindPing)
                 {
@@ -208,31 +307,32 @@ public sealed class PhoneConnection : IAsyncDisposable
                 else
                 {
                     // Seal HERE, in dequeue order, so counter order == wire order.
-                    var sealedBytes = _chan.Seal(o.Plain!);
-                    if (o.IsFrame)
-                    {
-                        Interlocked.Decrement(ref _frameBacklog);
-                        if (sealedBytes.Length > Wire.MaxFrameBytes)
-                        {
-                            // Defensive invariant: TrySendFrame never queues one of
-                            // these. A future protocol change must fail the entire
-                            // connection rather than silently break inter-frame decode.
-                            throw new InvalidDataException(
-                                $"sealed H.264 frame of {sealedBytes.Length} bytes exceeds wire maximum");
-                        }
-                    }
-                    packet = new byte[5 + sealedBytes.Length];
+                    var sealedLength = checked(o.Plain!.Length + SecureChannel.RecordOverheadBytes);
+                    // TrySendFrame already checks this. Fail the connection if a
+                    // future change violates the contract; never lose a P-frame silently.
+                    if (o.IsFrame && sealedLength > Wire.MaxFrameBytes)
+                        throw new InvalidDataException($"sealed H.264 frame of {sealedLength} bytes exceeds wire maximum");
+                    packet = new byte[5 + sealedLength];
                     packet[0] = o.Kind;
-                    BinaryPrimitives.WriteInt32BigEndian(packet.AsSpan(1, 4), sealedBytes.Length);
-                    sealedBytes.CopyTo(packet.AsSpan(5));
+                    BinaryPrimitives.WriteInt32BigEndian(packet.AsSpan(1, 4), sealedLength);
+                    _chan.Seal(o.Plain, packet.AsSpan(5));
                 }
                 try
                 {
                     await _stream.WriteAsync(packet, ct).ConfigureAwait(false);
                     await _stream.FlushAsync(ct).ConfigureAwait(false);
                 }
-                finally { if (o.ReleasesSlot) _fileSlots.Release(); }
+                finally
+                {
+                    if (o.ReleasesSlot) _fileSlots.Release();
+                    if (o.IsFrame)
+                    {
+                        Interlocked.Decrement(ref _frameBacklog);
+                        _videoSlots.Release();
+                    }
+                }
                 if (o.IsFrame) Interlocked.Increment(ref _framesSent);
+                Interlocked.Add(ref _wireBytesSent, packet.Length);
             }
         }
         catch (Exception ex) when (ex is IOException or InvalidDataException or ObjectDisposedException or OperationCanceledException or SocketException)
@@ -253,6 +353,9 @@ public sealed class PhoneConnection : IAsyncDisposable
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
         _outgoing.Writer.TryComplete();
+        _videoQueue.Writer.TryComplete();
+        _audioQueue.Writer.TryComplete();
+        _fileQueue.Writer.TryComplete();
         try { _cts.Cancel(); } catch (ObjectDisposedException) { }
         try { _tcp.Close(); } catch { /* already closed */ }
         foreach (var t in new[] { _reader, _writer })

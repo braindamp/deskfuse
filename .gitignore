@@ -18,3 +18,7 @@ PROTECTED_FILE_AUDIT.txt
 .vs/
 *.user
 *.log
+
+# Unified production native GPU build outputs (not a POC runtime)
+**/.build/
+gpu-phone-workspace-evidence/

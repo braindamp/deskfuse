@@ -30,6 +30,11 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- Only explicitly enabled while DeskFuse is foreground. Android displays
+         its native microphone privacy indicator. No background microphone FGS. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
+
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
 
     <application

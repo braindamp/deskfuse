@@ -66,6 +66,10 @@ fun SessionChrome(
     onShowKeyboard: () -> Unit,
     onSelectWindow: () -> Unit,
     onSendFile: () -> Unit,
+    pcAudioStatus: String,
+    onTogglePcAudio: () -> Unit,
+    phoneMicStatus: String,
+    onTogglePhoneMic: () -> Unit,
     onAdvisoryAction: (SessionAdvisory) -> Unit,
 ) {
     Box(Modifier.fillMaxSize()) {
@@ -114,6 +118,10 @@ fun SessionChrome(
                 onShowKeyboard = onShowKeyboard,
                 onSelectWindow = onSelectWindow,
                 onSendFile = onSendFile,
+                pcAudioStatus = pcAudioStatus,
+                onTogglePcAudio = onTogglePcAudio,
+                phoneMicStatus = phoneMicStatus,
+                onTogglePhoneMic = onTogglePhoneMic,
                 modifier = Modifier.align(Alignment.BottomCenter),
             )
         }
@@ -253,7 +261,8 @@ private fun DiagnosticsPanel(state: SessionState.Streaming) {
         add("scale" to "${"%.2f".format(state.presentation.scale)}× (${state.presentation.mode})")
         add("token" to "${"%.1f".format(state.tokenDp)} dp")
         add("codec" to "${state.record.codec} / ${state.record.pixelFormat}")
-        add("refresh" to "${state.record.refreshHz} Hz")
+        add("colour" to (state.record.colorRange ?: "unspecified"))
+        add("cadence cap" to "${state.record.refreshHz} fps")
         add("method" to state.record.densityMethod.name)
         add("tier" to state.record.tierLabel(state.profile))
         add("state" to state.record.stateModel.name)
@@ -316,6 +325,10 @@ private fun ModifierBar(
     onShowKeyboard: () -> Unit,
     onSelectWindow: () -> Unit,
     onSendFile: () -> Unit,
+    pcAudioStatus: String,
+    onTogglePcAudio: () -> Unit,
+    phoneMicStatus: String,
+    onTogglePhoneMic: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -328,6 +341,8 @@ private fun ModifierBar(
         ModKey("Keyboard", false) { onShowKeyboard() }
         ModKey("Apps", false) { onSelectWindow() }
         ModKey("PC files", false) { onSendFile() }
+        ModKey("PC sound: $pcAudioStatus", pcAudioStatus.startsWith("On")) { onTogglePcAudio() }
+        ModKey("Phone mic: $phoneMicStatus", phoneMicStatus == "On") { onTogglePhoneMic() }
     }
     Row(
         modifier = Modifier

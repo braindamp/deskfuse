@@ -5,6 +5,12 @@ using FocusWindow.Core.Display;
 using FocusWindow.Core.Protocol;
 using Xunit;
 namespace FocusWindow.Tests;
+/// <summary>Historical CPU session fixture, retained for provenance, never GPU acceptance.</summary>
+public sealed class HistoricalCpuSessionAttribute : FactAttribute
+{
+    public HistoricalCpuSessionAttribute() => Skip =
+        "Historical CPU/FFmpeg PhoneSession fixture; superseded by mandatory UnifiedSessionTests at the encoded GPU seam";
+}
 /// <summary>Tests that need a real ffmpeg are skipped (not faked) when FOCUS_FFMPEG is unset.</summary>
 public sealed class FactIfFfmpegAttribute : FactAttribute
 {
@@ -194,6 +200,7 @@ public sealed class FakeDisplayBackend : IDisplayBackend
     public int? ProbeViewportWindowDpi;
     public bool ProbeViewportAvailable = true;
     public int ViewportProbeCalls;
+    public bool FailOnFrameSource;
 
     public readonly List<MonitorRequest> Created = new();
     private MonitorRequest? _lastRequest;
@@ -267,6 +274,7 @@ public sealed class FakeDisplayBackend : IDisplayBackend
     public DriverHealth ReadDriverHealth() => new(true, DriverContract.ProtocolVersion, true, _bounds.Width, _bounds.Height, 60, 0, 0, 0, 0);
     public void Heartbeat() => Heartbeats++;
     public IFrameSource OpenFrameSource() =>
+        FailOnFrameSource ? throw new InvalidOperationException("Production video must use the encoded GPU seam") :
         new SurfaceFrameSource(Surface.CreateReader(), ms => Surface.FrameReady.WaitOne(ms));
     public ValueTask DisposeAsync()
     {

@@ -1,13 +1,25 @@
-name: DPR challenge software checks
+name: Unified DeskFuse software checks
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'integration/**']
     paths:
       - '.github/workflows/dpr-challenge-ci.yml'
       - 'windows/agent/**'
-      - 'android/app/src/main/java/com/focuswindow/client/profile/**'
+      - 'windows/native/**'
+      - 'plans/DeskFuse_One_Codebase_Integration_Implementation_Plan_2026-10-20.md'
+      - 'android/**'
+      - 'tests/protocol3/**'
+      - 'tools/protocol3/**'
       - 'tools/run-dpr-challenge.ps1'
+  pull_request:
+    paths:
+      - 'windows/agent/**'
+      - 'windows/native/**'
+      - 'android/**'
+      - 'tests/protocol3/**'
+      - 'tools/protocol3/**'
+      - '.github/workflows/dpr-challenge-ci.yml'
   workflow_dispatch:
 
 permissions:
@@ -20,21 +32,46 @@ concurrency:
 jobs:
   windows:
     name: Windows host compile and driver-free DPI tests
-    runs-on: windows-latest
-    timeout-minutes: 15
+    runs-on: windows-2022
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
-      - name: Compile host (never install FocusIdd)
+      - name: Show available MSVC environment
+        shell: pwsh
+        run: |
+          & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -products * -property installationPath
+          cmake --version
+      - name: Compile host and bundled production GPU DLL (never install FocusIdd)
         run: dotnet build windows/agent/FocusWindow.Agent/FocusWindow.Agent.csproj -c Release -p:Platform=x64 -warnaserror
       - name: Run unit and simulated tests (no display changes)
         run: dotnet test windows/agent/FocusWindow.Tests/FocusWindow.Tests.csproj -c Release --verbosity minimal
+      - name: Test native GPU ABI and capture pacing (no hardware access)
+        shell: pwsh
+        run: |
+          cmake --build windows/native/FocusWindow.Gpu/.build --config Release --target FocusWindow.Gpu.ContractTests
+          if ($LASTEXITCODE -ne 0) { throw "Native contract test build failed" }
+          ctest --test-dir windows/native/FocusWindow.Gpu/.build -C Release --output-on-failure
+          if ($LASTEXITCODE -ne 0) { throw "Native contract test failed" }
+      - name: Publish the one Windows host with its native DLL
+        run: dotnet publish windows/agent/FocusWindow.Agent/FocusWindow.Agent.csproj -c Release -r win-x64 --self-contained true -p:Platform=x64 -warnaserror -o out/unified-windows
+      - name: Verify shipping native DLL identity and exclude test runtimes
+        shell: pwsh
+        run: |
+          $built = Get-FileHash windows/native/FocusWindow.Gpu/.build/bin/Release/FocusWindow.Gpu.dll
+          $bundled = Get-FileHash out/unified-windows/FocusWindow.Gpu.dll
+          if ($built.Hash -ne $bundled.Hash) { throw "Published GPU DLL differs from built DLL" }
+          if (Get-ChildItem out/unified-windows -Include '*Poc*.exe','*ContractTests*.exe' -Recurse) { throw "Non-shipping test runtime in package" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deskfuse-windows-x64
+          path: out/unified-windows/
       - name: Windows PowerShell 5.1 wrapper smoke (plan-only; no driver needed)
         shell: pwsh
         run: |
-          $exe = Resolve-Path '.\windows\agent\FocusWindow.Agent\bin\x64\Release\net8.0-windows\FocusWindow.Agent.exe'
+          $exe = Resolve-Path '.\out\unified-windows\FocusWindow.Agent.exe'
           & powershell.exe -NoProfile -ExecutionPolicy Bypass -File '.\tools\run-dpr-challenge.ps1' -AgentExe $exe.Path
           if ($LASTEXITCODE -ne 0) { throw "PowerShell 5.1 runner returned exit $LASTEXITCODE" }
 
@@ -48,6 +85,9 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
       - uses: android-actions/setup-android@v3
         continue-on-error: true
       - name: Install Android SDK
@@ -60,4 +100,12 @@ jobs:
           echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
       - name: Build and test Android without devices
         working-directory: android
-        run: bash ./gradlew :app:testDebugUnitTest :app:assembleDebug --no-daemon
+        run: bash ./gradlew :app:testDebugUnitTest :app:assembleDebug :protocol3:check :protocol3:interopJar --no-daemon
+      - name: Exchange encrypted records between actual Kotlin and C# implementations
+        env:
+          DESKFUSE_KOTLIN_INTEROP_JAR: ${{ github.workspace }}/android/build/protocol3/deskfuse-protocol-v3-kotlin.jar
+        run: dotnet test windows/agent/FocusWindow.Tests/FocusWindow.Tests.csproj -c Release --filter FullyQualifiedName~ProtocolV3InteropTests --verbosity minimal
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deskfuse-android-debug
+          path: android/app/build/outputs/apk/debug/*.apk

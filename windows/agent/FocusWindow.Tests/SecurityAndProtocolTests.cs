@@ -48,6 +48,36 @@ public class SecureChannelTests
         Assert.Equal("pc -> phone", Encoding.UTF8.GetString(client.Open(down)));
     }
     [Fact]
+    public async Task Caller_owned_records_preserve_framing_counters_and_candidate_selection()
+    {
+        var (hostStream, clientStream, cleanup) = await Pair();
+        using var _ = cleanup;
+        using var hostKey = ECDiffieHellman.Create(ECCurve.NamedCurves.nistP256);
+        var secret = RandomNumberGenerator.GetBytes(32);
+        var accepting = SecureChannel.AcceptAnyAsync(hostStream, hostKey,
+            [new DeviceCredential("wrong", RandomNumberGenerator.GetBytes(32)), new DeviceCredential("phone", secret)],
+            CancellationToken.None);
+        using var client = await SecureChannel.ConnectAsync(clientStream, hostKey.ExportSubjectPublicKeyInfo(), secret, CancellationToken.None);
+        using var host = await accepting;
+        Assert.Equal(new byte[] { 42 }, host.Open(client.Seal(new byte[] { 42 })));
+        Assert.Equal("phone", host.CredentialDeviceId);
+        var plain = RandomNumberGenerator.GetBytes(65536);
+        Assert.Throws<ArgumentException>(() => host.Seal(plain, new byte[plain.Length]));
+        for (var counter = 0; counter < 128; counter++)
+        {
+            plain[0] = (byte)counter;
+            var wire = new byte[5 + plain.Length + SecureChannel.RecordOverheadBytes + 3];
+            Array.Fill(wire, (byte)0xA5);
+            host.Seal(plain, wire.AsSpan(5, plain.Length + SecureChannel.RecordOverheadBytes));
+            Assert.Equal(counter, BinaryPrimitives.ReadInt64BigEndian(wire.AsSpan(5)));
+            Assert.All(wire.Take(5).Concat(wire.TakeLast(3)), value => Assert.Equal((byte)0xA5, value));
+            Assert.Equal(plain, client.Open(wire.AsSpan(5, plain.Length + SecureChannel.RecordOverheadBytes)));
+        }
+        host.Dispose();
+        Assert.Throws<ObjectDisposedException>(() => host.Seal(plain));
+        Assert.Throws<ObjectDisposedException>(() => host.Open(client.Seal(plain)));
+    }
+    [Fact]
     public async Task A_peer_without_the_pairing_secret_cannot_authenticate()
     {
         var (hostStream, clientStream, cleanup) = await Pair();

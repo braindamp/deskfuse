@@ -11,15 +11,14 @@ namespace FocusWindow.Core.Session;
 ///
 ///   hello -> approval -> negotiate density -> start encoder -> Target -> frames ... -> restore
 ///
-/// What this session does NOT do, and says so to the phone where it matters: it serves the
-/// DESKTOP CANVAS tier only. The clone tier (a second view of the user's document) is not
-/// implemented, so a request for it is answered with a named, non-fatal Stage message.
+/// Streams one locally selected, independently launched Windows app. Existing
+/// desktop window focus, file and clipboard workflows remain explicit actions.
+/// Capturing a window never grants independent document-clone semantics.
 /// </summary>
 internal sealed class PhoneSession
 {
     private readonly HostOptions _o;
     private readonly HostServices _s;
-    private string _encoderName;
     private readonly ILog _log;
     private PhoneConnection _conn = null!;
     private IDisplayBackend _backend = null!;
@@ -30,37 +29,35 @@ internal sealed class PhoneSession
     private NegotiationOutcome _outcome = null!;
     private PhoneProfile _profile = null!;
     private InputGeometry _geometry = null!;
-    private IVideoEncoder? _encoder;
+    private IVideoPipeline? _video;
+    private IHostAudioCapture? _pcAudio;
+    private PhoneMicrophoneRoute? _phoneMic;
+    private int _pcAudioStreamId;
     private FileUploadReceiver? _uploads;
     private CancellationTokenSource? _downloadStop;
     private Task? _downloadTask;
-    private readonly SemaphoreSlim _gate = new(1, 1);
     private long _version;
     private int _fps;
+    private int _refreshLimit;
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, int> _preferredFrameRates;
     private volatile bool _resync;
-    private volatile bool _keyframeRequested;
-    private long _lastRestartTick;
-    private int _restartCount;
     private long _framesSeen;
     private readonly long _ptsOrigin = Stopwatch.GetTimestamp();
     private long _lastPtsUs;
-    private byte[] _frameBuf = Array.Empty<byte>();
-    // A wider backing monitor is NEVER encoded at backing resolution:
-    // the phone gets only its exact native-pixel top-left viewport.
-    private byte[] _visibleFrameBuf = Array.Empty<byte>();
-    private int _frameBytes;
-    public PhoneSession(HostOptions o, HostServices s, string encoderName, ILog log)
+    public PhoneSession(HostOptions o, HostServices s, string encoderName, ILog log,
+        System.Collections.Concurrent.ConcurrentDictionary<string, int>? preferredFrameRates = null)
     {
         _o = o;
         _s = s;
-        _encoderName = encoderName;
         _log = log;
         _fps = Math.Clamp(o.Fps, 1, 240);
+        _preferredFrameRates = preferredFrameRates ?? new(StringComparer.Ordinal);
     }
     public async Task RunAsync(PhoneConnection conn, ClientHello hello, CancellationToken ct)
     {
         _conn = conn;
         _profile = hello.Profile;
+        _fps = Math.Clamp(_preferredFrameRates.GetValueOrDefault(_profile.DeviceId, _o.Fps), 1, 240);
         await using var _ = conn;
         conn.StartPumps();
         if (hello.ProtocolVersion != Wire.ProtocolVersion)
@@ -70,7 +67,12 @@ internal sealed class PhoneSession
             await Task.Delay(300, CancellationToken.None).ConfigureAwait(false);
             return;
         }
-        conn.SendControl(ServerMessages.Hello(_o.HostVersion, _o.HostName, _o.Channel));
+        conn.SendControl(ServerMessages.Hello(_o.HostVersion, _o.HostName, _o.Channel,
+            pcAudioAvailable: _o.AllowPcAudio && _s.CreateAudioCapture is not null,
+            phoneMicrophoneBridgeAvailable: _o.AllowPhoneMicrophone &&
+                _o.CameraFreePairing && _s.DeviceCredentials is not null &&
+                _s.CreatePhoneMicrophoneSink is not null &&
+                _s.CanUsePhoneMicrophone?.Invoke(_profile.DeviceId) == true));
         conn.SendControl(ServerMessages.Stage("Waiting for approval", $"Confirm code {conn.VerificationCode} on the PC."));
         var approved = await _s.Approval
             .ApproveAsync(_profile.DeviceId, _profile.DeviceLabel, conn.VerificationCode, ct).ConfigureAwait(false);
@@ -80,21 +82,26 @@ internal sealed class PhoneSession
             await Task.Delay(300, CancellationToken.None).ConfigureAwait(false);
             return;
         }
-        _guard = _s.CreateGuard();
-        _before = _guard.Snapshot();
-        _backend = _s.CreateBackend();
-        _input = _s.CreateInput();
-        _uploads = new FileUploadReceiver(Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "FocusWindow", "Incoming"), _o.AllowFullUserFiles);
-        _negotiator = new DensityNegotiator(
-            _backend,
-            new NegotiatorOptions { DrawRuler = true, MaxRefreshHz = _o.MaxRefreshHz,
-                PreserveRequestedResolution = true },
-            _log);
         try
         {
-            await StreamAsync(ct).ConfigureAwait(false);
+            _phoneMic = new PhoneMicrophoneRoute(conn, _o, _s, _profile.DeviceId, _log);
+            _guard = _s.CreateGuard();
+            _before = _guard.Snapshot();
+            _backend = _s.CreateBackend();
+            _input = _s.CreateInput();
+            _uploads = new FileUploadReceiver(Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "FocusWindow", "Incoming"), _o.AllowFullUserFiles);
+            _negotiator = new DensityNegotiator(
+                _backend,
+                new NegotiatorOptions { DrawRuler = true, MaxRefreshHz = _o.MaxRefreshHz,
+                    PreserveRequestedResolution = true },
+                _log);
+            using var sessionStop = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            var stream = StreamAsync(sessionStop.Token);
+            await Task.WhenAny(stream, conn.Completion).ConfigureAwait(false);
+            sessionStop.Cancel();
+            await stream.ConfigureAwait(false);
         }
         catch (DisplayException ex)
         {
@@ -102,10 +109,11 @@ internal sealed class PhoneSession
             Fatal(ex.Stage, ex.Message, ex.Remediation);
             await Task.Delay(300, CancellationToken.None).ConfigureAwait(false);
         }
-        catch (EncoderUnavailableException ex)
+        catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException
+            or BadImageFormatException or IOException or InvalidOperationException or System.ComponentModel.Win32Exception)
         {
-            _log.Error("encoder: " + ex.Message);
-            Fatal("encoder", ex.Message, "Make sure ffmpeg.exe sits next to the agent, or pass --ffmpeg <path>.");
+            _log.Error("native GPU pipeline: " + ex.Message);
+            Fatal("gpu", ex.Message, "Install the matching DeskFuse native GPU library and verify WGC/NVENC support.");
             await Task.Delay(300, CancellationToken.None).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
@@ -120,21 +128,64 @@ internal sealed class PhoneSession
     // ------------------------------------------------------------------------------------
     private async Task StreamAsync(CancellationToken ct)
     {
+        // Validate local source configuration BEFORE allocating any monitor.
+        _video = _s.CreateVideoPipeline?.Invoke() ??
+            throw new DisplayException("gpu", "No native GPU pipeline is configured.");
         _conn.SendControl(ServerMessages.Stage("Preparing the display", "Creating the phone-shaped monitor."));
         _outcome = await NegotiatePhoneDisplayAsync(_profile, ct).ConfigureAwait(false);
         _s.OnNegotiated?.Invoke(_outcome);
-        using var frames = _backend.OpenFrameSource();
-        _geometry = ViewportInputGeometry(_outcome);
+        // WGC/D3D11/NVENC is authoritative. No CPU surface or FFmpeg video loop.
+        if (!_outcome.Native)
+            throw new DisplayException("density", "Verified native DPI is required for the GPU workspace.",
+                "This display profile is not yet supported by the native-density host.");
+        // POC-proven per-client scale enforcement: Windows may reset the
+        // virtual monitor to 100% on reattach. No capture before readback.
+        var beforeScale = _backend.ReadScaleCaps(_outcome.Monitor);
+        var enforced = await ScaleEnforcer.RequireAsync(
+            _backend, _outcome.Monitor, _outcome.Plan.ScalePercent, ct).ConfigureAwait(false);
+        if (enforced.Changed && _outcome.RestoreScalePercent is null)
+            _outcome = _outcome with { RestoreScalePercent = beforeScale?.CurrentPercent };
         _version = 1;
-        await SelectNativeEncoderAsync(ct).ConfigureAwait(false);
-        _encoder = StartEncoder(_version);
+        var driver = _backend.ReadDriverHealth();
+        if (!driver.Reachable || !driver.MonitorArrived || driver.RefreshHz < 1)
+            throw new DisplayException("display", "The negotiated virtual display disappeared before capture.");
+        _refreshLimit = Math.Min(240, Math.Min(driver.RefreshHz, Math.Min(_profile.MaxRefreshHz, _o.MaxRefreshHz)));
+        _fps = Math.Min(_fps, _refreshLimit);
+        var settings = new VideoPipelineSettings(
+            _outcome.Monitor.Bounds, _outcome.Plan.PixelW, _outcome.Plan.PixelH,
+            _fps, _o.BitrateKbps, _outcome.EffectiveDpi, _outcome.Monitor.GdiName, _profile.DeviceId);
+        _conn.SendControl(ServerMessages.Stage("Starting the application", "Launching the PC-selected app on the phone display."));
+        using (var startStop = CancellationTokenSource.CreateLinkedTokenSource(ct))
+        {
+            var pulse = Task.Run(async () =>
+            {
+                while (!startStop.IsCancellationRequested)
+                {
+                    _backend.Heartbeat();
+                    _conn.SendPing();
+                    await Task.Delay(1000, startStop.Token).ConfigureAwait(false);
+                }
+            }, CancellationToken.None);
+            try { await _video.StartAsync(settings, ct).ConfigureAwait(false); }
+            finally
+            {
+                startStop.Cancel();
+                try { await pulse.ConfigureAwait(false); }
+                catch (OperationCanceledException) when (startStop.IsCancellationRequested) { }
+            }
+        }
+        _video.Info.RequireNativeGeometry(settings);
+        _geometry = new InputGeometry(_video.Info.SourceBounds,
+            _video.Info.Width, _video.Info.Height);
+        _resync = true;
         SendTarget();
         await SessionLifetime.RunUntilFirstStopAsync(
             control: ControlLoopAsync,
-            video: token => FrameLoopAsync(frames, token),
+            video: PumpEncodedGpuVideoAsync,
             housekeeping: HousekeepingAsync,
             transportCompletion: _conn.Completion,
-            shutdown: ct).ConfigureAwait(false);
+            shutdown: ct,
+            additionalWorkers: [token => _phoneMic!.PumpAsync(token)]).ConfigureAwait(false);
     }
     private async Task<NegotiationOutcome> NegotiatePhoneDisplayAsync(PhoneProfile phone, CancellationToken ct)
     {
@@ -162,6 +213,7 @@ internal sealed class PhoneSession
                 while (!pulseStop.IsCancellationRequested)
                 {
                     _backend.Heartbeat();
+                    _conn.SendPing();
                     await Task.Delay(1000, pulseStop.Token).ConfigureAwait(false);
                 }
             }
@@ -184,19 +236,6 @@ internal sealed class PhoneSession
             pulseStop.Cancel();
             await pulse.ConfigureAwait(false);
         }
-    }
-
-    private static InputGeometry ViewportInputGeometry(NegotiationOutcome outcome)
-    {
-        var bounds = outcome.Monitor.Bounds;
-        var width = outcome.Plan.PixelW;
-        var height = outcome.Plan.PixelH;
-        // Input coordinates and the streamed pixels share the SAME origin
-        // and 1:1 size. Never stretch touch across the hidden backing region.
-        var viewport = outcome.Plan.Kind == PlanKind.VerifiedViewport
-            ? new RectI(bounds.X, bounds.Y, width, height)
-            : bounds;
-        return new InputGeometry(viewport, width, height);
     }
 
     private void RestoreAdaptiveScale()
@@ -224,39 +263,32 @@ internal sealed class PhoneSession
         _log.Info($"Adaptive virtual-display scale restored to {original}%");
     }
 
-    private async Task SelectNativeEncoderAsync(CancellationToken ct)
+    private async Task PumpEncodedGpuVideoAsync(CancellationToken ct)
     {
-        var plan = _outcome.Plan;
-        _conn.SendControl(ServerMessages.Stage("Preparing GPU video", $"Qualifying H.264 encoder at {plan.PixelW}×{plan.PixelH} native pixels."));
-        var target = new EncoderSettings(plan.PixelW, plan.PixelH, _fps, _o.BitrateKbps, _o.FfmpegPath, "libx264");
-        _encoderName = await EncoderPicker.PickForTargetAsync(target, _log, ct).ConfigureAwait(false);
-        _conn.SendControl(ServerMessages.Stage("Video encoder ready", $"{_encoderName} can produce native {plan.PixelW}×{plan.PixelH} H.264 frames."));
-    }
-    private IVideoEncoder StartEncoder(long version)
-    {
-        var settings = new EncoderSettings(
-            _outcome.Plan.PixelW, _outcome.Plan.PixelH, _fps, _o.BitrateKbps, _o.FfmpegPath, _encoderName);
-        return FfmpegEncoder.Start(settings, au => OnAccessUnit(au, version), _log);
-    }
-    private ValueTask OnAccessUnit(EncodedAccessUnit au, long version)
-    {
-        if (version != Interlocked.Read(ref _version)) return ValueTask.CompletedTask; // output of a retired encoder
-        // After a drop, inter frames are undecodable. Skip them until a keyframe starts the
-        // stream again; the frame loop is already restarting the encoder to produce one.
-        if (_resync)
+        var video = _video ?? throw new InvalidOperationException("Video pipeline not started");
+        await foreach (var packet in video.ReadAccessUnitsAsync(ct).ConfigureAwait(false))
         {
-            if (!au.Keyframe) return ValueTask.CompletedTask;
-            _resync = false;
+            await _conn.WaitForVideoCapacityAsync(ct).ConfigureAwait(false);
+            if (_resync && !packet.Keyframe) { video.RequestKeyframe(); continue; }
+            if (packet.Keyframe) _resync = false;
+            if (!_conn.TrySendFrame(packet.AnnexB, packet.Keyframe, NextPtsUs(packet.CaptureQpc),
+                    Interlocked.Read(ref _version)))
+            {
+                // Never transmit undecodable P/B frames after packet loss.
+                _resync = true;
+                video.RequestKeyframe();
+                continue;
+            }
+            Interlocked.Increment(ref _framesSeen);
         }
-        if (!_conn.TrySendFrame(au.Data, au.Keyframe, NextPtsUs(), version))
-        {
-            _resync = true; // the phone cannot keep up: restart from a keyframe
-        }
-        return ValueTask.CompletedTask;
     }
-    private long NextPtsUs()
+
+    private long NextPtsUs(ulong captureQpc)
     {
-        var now = (long)(Stopwatch.GetElapsedTime(_ptsOrigin).TotalMilliseconds * 1000.0);
+        // Preserve capture timing through encoder/transport queues. The native
+        // QPC uses the same clock as Stopwatch on Windows; no send-time restamp.
+        var stamp = captureQpc == 0 ? Stopwatch.GetTimestamp() : checked((long)captureQpc);
+        var now = Math.Max(0, (long)(Stopwatch.GetElapsedTime(_ptsOrigin, stamp).TotalMilliseconds * 1000.0));
         var next = Math.Max(now, _lastPtsUs + 1); // strictly increasing: the client keys latency by pts
         _lastPtsUs = next;
         return next;
@@ -264,10 +296,10 @@ internal sealed class PhoneSession
     private void SendTarget()
     {
         var plan = _outcome.Plan;
-        var encoder = _encoder!;
+        var video = _video?.Info ?? throw new InvalidOperationException("GPU video not initialized");
         var record = new TargetRecord(
             Version: Interlocked.Read(ref _version),
-            Occupant: OccupantKind.Canvas,
+            Occupant: OccupantKind.Window,
             WidthPx: plan.PixelW,
             HeightPx: plan.PixelH,
             Dpi: _outcome.EffectiveDpi,
@@ -275,165 +307,18 @@ internal sealed class PhoneSession
             CanvasDpH: (int)Math.Round(plan.PixelH * 96.0 / _outcome.EffectiveDpi),
             Native: _outcome.Native,
             Method: _outcome.Method,
-            Codec: encoder.CodecName,
-            PixelFormat: encoder.PixelFormat,
-            RefreshHz: Volatile.Read(ref _fps),
+            Codec: video.Codec,
+            PixelFormat: video.PixelFormat,
+            RefreshHz: video.FramesPerSecond,
             DegradedReason: _outcome.DegradedReason,
             State: StateModel.SharedView,
-            AppLabel: "Phone display (desktop canvas)",
-            DocumentLabel: null);
+            AppLabel: video.AppLabel,
+            DocumentLabel: null,
+            ColorRange: video.ColorRange,
+            SourceId: video.SourceId);
         _conn.SendControl(ServerMessages.Target(record));
     }
     // ------------------------------------------------------------------------------------
-    private async Task FrameLoopAsync(IFrameSource frames, CancellationToken ct)
-    {
-        var dirty = false;
-        long nextDueMs = 0;
-        var mismatches = 0;
-        while (!ct.IsCancellationRequested)
-        {
-            var nowMs = Environment.TickCount64;
-            var wait = dirty ? (int)Math.Clamp(nextDueMs - nowMs, 1, 100) : 100;
-            if (frames.TryRead(wait, ref _frameBuf, out var info))
-            {
-                var plan = _outcome.Plan;
-                var backing = _outcome.Monitor.Bounds;
-                if (info.Width != backing.Width || info.Height != backing.Height)
-                {
-                    // Right after a mode change a stale frame of the old size can still arrive.
-                    // A persistent mismatch is real: the driver is not delivering the target.
-                    if (++mismatches > 60)
-                        throw new DisplayException("mode",
-                            $"The display driver delivers {info.Width}x{info.Height} but the backing monitor is {backing.Width}x{backing.Height}.",
-                            "Windows picked a different mode for the phone monitor. Check Display settings, then reconnect.");
-                    continue;
-                }
-                mismatches = 0;
-                _frameBytes = info.Width * info.Height * 4;
-                if (plan.Kind == PlanKind.VerifiedViewport)
-                {
-                    var visibleBytes = checked(plan.PixelW * plan.PixelH * 4);
-                    if (_visibleFrameBuf.Length != visibleBytes)
-                        _visibleFrameBuf = new byte[visibleBytes];
-                    DprChallengeTheory.CopyViewportBgra(
-                        _frameBuf.AsSpan(0, _frameBytes), info.Width, info.Height,
-                        new RectI(0, 0, plan.PixelW, plan.PixelH),
-                        _visibleFrameBuf);
-                }
-                Interlocked.Increment(ref _framesSeen);
-                dirty = true;
-            }
-            nowMs = Environment.TickCount64;
-            // The fps cap must never swallow the LAST frame of a burst: a frame skipped
-            // because it arrived early stays "dirty" and is submitted at the next interval,
-            // so the picture on the phone always converges to the PC's.
-            if (dirty && nowMs >= nextDueMs)
-            {
-                await SubmitFrameAsync(ct).ConfigureAwait(false);
-                dirty = false;
-                nextDueMs = nowMs + 1000 / Math.Max(1, Volatile.Read(ref _fps));
-            }
-            if (_keyframeRequested || _resync || (_encoder?.HasExited ?? false))
-            {
-                _keyframeRequested = false;
-                await RestartEncoderAsync(ct).ConfigureAwait(false);
-            }
-        }
-    }
-    private async Task SubmitFrameAsync(CancellationToken ct)
-    {
-        await _gate.WaitAsync(ct).ConfigureAwait(false);
-        try
-        {
-            if (_encoder is null || _frameBytes == 0) return;
-            using var write = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            write.CancelAfter(TimeSpan.FromSeconds(5)); // a wedged ffmpeg must not wedge the session
-            try
-            {
-                await _encoder.WriteFrameAsync(
-                    _outcome.Plan.Kind == PlanKind.VerifiedViewport
-                        ? _visibleFrameBuf.AsMemory(0, checked(_outcome.Plan.PixelW *
-                            _outcome.Plan.PixelH * 4))
-                        : _frameBuf.AsMemory(0, _frameBytes),
-                    write.Token).ConfigureAwait(false);
-            }
-            catch (Exception ex) when (ex is EncoderUnavailableException ||
-                                       (ex is OperationCanceledException && !ct.IsCancellationRequested))
-            {
-                _log.Warn("encoder stalled or died; restarting: " + ex.Message);
-                _resync = true;
-            }
-        }
-        finally
-        {
-            _gate.Release();
-        }
-    }
-    /// <summary>
-    /// ffmpeg cannot be told to emit an IDR on demand, so a keyframe request (or a resync after a
-    /// slow phone) restarts the process and immediately re-feeds the newest frame. Rate-limited
-    /// so a misbehaving client cannot make the host thrash.
-    /// </summary>
-    private async Task RestartEncoderAsync(CancellationToken ct)
-    {
-        await _gate.WaitAsync(ct).ConfigureAwait(false);
-        try
-        {
-            var now = Environment.TickCount64;
-            if (now - _lastRestartTick < 1500) return;
-            if (++_restartCount > 12)
-                throw new EncoderUnavailableException(
-                    "The video encoder keeps failing. " + ((_encoder as FfmpegEncoder)?.StderrTail ?? ""));
-            _lastRestartTick = now;
-            var old = _encoder;
-            _encoder = null;
-            if (old is not null) await old.DisposeAsync().ConfigureAwait(false);
-            _resync = true; // output of the new process is accepted from its first keyframe on
-            _encoder = StartEncoder(Interlocked.Read(ref _version));
-            if (_frameBytes > 0)
-            {
-                var view = _outcome.Plan.Kind == PlanKind.VerifiedViewport
-                    ? _visibleFrameBuf.AsMemory(0, checked(_outcome.Plan.PixelW *
-                        _outcome.Plan.PixelH * 4))
-                    : _frameBuf.AsMemory(0, _frameBytes);
-                await _encoder.WriteFrameAsync(view, ct).ConfigureAwait(false);
-            }
-        }
-        finally
-        {
-            _gate.Release();
-        }
-    }
-    private async Task RenegotiateAsync(PhoneProfile next, CancellationToken ct)
-    {
-        var invalidProfile = next.Validate();
-        if (invalidProfile.Length != 0)
-            throw new DisplayException("profile",
-                "Phone sent an invalid updated display profile: " + invalidProfile);
-        await _gate.WaitAsync(ct).ConfigureAwait(false);
-        try
-        {
-            _log.Info($"profile changed: {_profile.PhysicalW}x{_profile.PhysicalH}@{_profile.Dpr} -> {next.PhysicalW}x{next.PhysicalH}@{next.Dpr}");
-            _profile = next;
-            var old = _encoder;
-            _encoder = null;
-            if (old is not null) await old.DisposeAsync().ConfigureAwait(false);
-            RestoreAdaptiveScale();
-            _outcome = await NegotiatePhoneDisplayAsync(next, ct).ConfigureAwait(false);
-            _s.OnNegotiated?.Invoke(_outcome);
-            _geometry = ViewportInputGeometry(_outcome);
-            _frameBytes = 0; // the old frame is the wrong size now
-            var version = Interlocked.Increment(ref _version);
-            _resync = true;
-            await SelectNativeEncoderAsync(ct).ConfigureAwait(false);
-            _encoder = StartEncoder(version);
-            SendTarget();
-        }
-        finally
-        {
-            _gate.Release();
-        }
-    }
     // ------------------------------------------------------------------------------------
     private async Task ControlLoopAsync(CancellationToken ct)
     {
@@ -442,24 +327,38 @@ internal sealed class PhoneSession
             switch (message)
             {
                 case ClientProfile p when GeometryChanged(p.Profile):
-                    await RenegotiateAsync(p.Profile, ct).ConfigureAwait(false);
-                    break;
+                    _conn.SendControl(ServerMessages.Stage("geometry",
+                        "Phone geometry changed. Reconnect to provision a new native GPU window."));
+                    return;
                 case ClientRefresh r:
-                    Volatile.Write(ref _fps, Math.Clamp(Math.Min(r.Hz, _o.Fps), 1, 240));
+                    var requestedFps = Math.Clamp(r.Hz, 1, _refreshLimit);
+                    if (requestedFps != _fps)
+                    {
+                        // Reopen the same enrolled app through the source
+                        // catalog. Never just relabel an unchanged encoder.
+                        _preferredFrameRates[_profile.DeviceId] = requestedFps;
+                        _conn.SendControl(ServerMessages.Stage("refresh",
+                            $"Reconnecting the GPU stream at up to {requestedFps} fps."));
+                        return;
+                    }
                     break;
                 case ClientKeyframeRequest:
-                    _keyframeRequested = true;
+                    _video?.RequestKeyframe();
                     break;
                 case ClientInput i:
-                    try { _input.Handle(i.Event, _geometry); }
+                    try
+                    {
+                        if (_video?.TryPrepareInput(i.Event) == true) _input.Handle(i.Event, _geometry);
+                        else _input.ReleaseAll();
+                    }
                     catch (Exception ex) { _log.Warn("input injection failed: " + ex.Message); }
                     break;
                 case ClientOccupant o:
-                    _log.Info($"phone asked for the '{o.Want}' tier; only the desktop canvas is implemented");
+                    _log.Info($"phone asked for the '{o.Want}' tier; the selected app source remains authoritative");
                     _conn.SendControl(ServerMessages.Stage(
                         "Tier unavailable",
-                        $"This host build only serves the desktop-canvas tier; '{o.Want}' (a second view of one app) is not implemented.",
-                        "Open the app on the phone display instead."));
+                        $"This session streams the PC-selected application. '{o.Want}' independent document semantics are unavailable.",
+                        "Choose a new application instance with --workspace-app on the PC."));
                     break;
                 case ClientDensity d:
                     _log.Info($"density preset '{d.Preset}' noted; this host always uses the phone's exact density");
@@ -469,6 +368,12 @@ internal sealed class PhoneSession
                     break;
                 case ClientWindows windows:
                     HandleWindows(windows);
+                    break;
+                case ClientAudio audio:
+                    HandlePcAudio(audio);
+                    break;
+                case ClientMicrophone mic:
+                    _phoneMic?.Handle(mic);
                     break;
                 case ClientFiles files:
                     HandleFiles(files, ct);
@@ -600,6 +505,50 @@ internal sealed class PhoneSession
         }
     }
 
+    private void HandlePcAudio(ClientAudio request)
+    {
+        if (request.Action == "stop_pc")
+        {
+            StopPcAudio();
+            _conn.SendControl(ServerMessages.AudioState("stopped", _pcAudioStreamId));
+            return;
+        }
+        if (request.Action != "start_pc" || !_o.AllowPcAudio || _s.CreateAudioCapture is null)
+        {
+            _conn.SendControl(ServerMessages.AudioState("error", _pcAudioStreamId,
+                detail: "Windows playback capture unavailable."));
+            return;
+        }
+        StopPcAudio();
+        _log.Info("Approved phone requested mixed PC playback audio (host opted in).");
+        try
+        {
+            var capture = _s.CreateAudioCapture(
+                request.Layouts ?? Array.Empty<string>(), request.MaxPcmBytes);
+            _pcAudio = capture;
+            var streamId = ++_pcAudioStreamId;
+            _conn.SendControl(ServerMessages.AudioState("started", streamId,
+                capture.SampleRate, capture.Channels, layout: capture.Layout));
+            capture.Start(samples => _conn.TrySendAudio(samples.Span, streamId));
+        }
+        catch (Exception ex)
+        {
+            _log.Warn("PC audio capture unavailable: " + ex.GetType().Name);
+            StopPcAudio();
+            _conn.SendControl(ServerMessages.AudioState("error", _pcAudioStreamId,
+                detail: "Could not capture the selected Windows playback endpoint."));
+        }
+    }
+
+    private void StopPcAudio()
+    {
+        var capture = _pcAudio;
+        _pcAudio = null;
+        if (capture is null) return;
+        try { capture.Dispose(); }
+        catch (Exception ex) { _log.Warn("stopping PC audio: " + ex.GetType().Name); }
+    }
+
     private void HandleWindows(ClientWindows request)
     {
         if (_s.Windows is null) return;
@@ -667,11 +616,17 @@ internal sealed class PhoneSession
         !float.IsFinite(next.Dpr) ||
         next.PhysicalW != _profile.PhysicalW ||
         next.PhysicalH != _profile.PhysicalH ||
+        next.SafeTop != _profile.SafeTop || next.SafeBottom != _profile.SafeBottom ||
+        next.SafeLeft != _profile.SafeLeft || next.SafeRight != _profile.SafeRight ||
+        next.Orientation != _profile.Orientation ||
         Math.Abs(next.Dpr - _profile.Dpr) > 0.001f ||
         next.DiagonalMm != _profile.DiagonalMm;
     private async Task HousekeepingAsync(CancellationToken ct)
     {
         var tick = 0;
+        var measuredAt = Stopwatch.GetTimestamp();
+        var previousBytes = _conn.WireBytesSent;
+        var previousFrames = _conn.FramesSent;
         while (!ct.IsCancellationRequested)
         {
             await Task.Delay(1000, ct).ConfigureAwait(false);
@@ -682,16 +637,26 @@ internal sealed class PhoneSession
             if (tick % 2 == 0) _conn.SendPing();
             if (tick % 5 == 0)
             {
+                var seconds = Stopwatch.GetElapsedTime(measuredAt).TotalSeconds;
+                var bytes = _conn.WireBytesSent;
+                var frames = _conn.FramesSent;
+                _log.Info($"Media measured: {(frames - previousFrames) / seconds:0.0} video fps; " +
+                    $"{(bytes - previousBytes) * 8 / seconds / 1000:0.0} kbit/s total encrypted outbound; " +
+                    $"{_conn.FrameBacklog} video records queued/in flight.");
+                previousBytes = bytes; previousFrames = frames; measuredAt = Stopwatch.GetTimestamp();
                 var report = _guard.Verify(_before);
                 _conn.SendControl(ServerMessages.Invariant(report.Clean, report.Drift));
-                if (!report.Clean) _log.Warn("physical display drift: " + string.Join("; ", report.Drift));
+                if (!report.Clean)
+                    throw new DisplayException("physical-display-guard", "Physical display state changed during the session.",
+                        "The session stopped. Review the Windows display state before reconnecting.");
             }
             if (Interlocked.Read(ref _framesSeen) == 0)
             {
                 if (tick == 4)
                     _conn.SendControl(ServerMessages.Stage("Waiting for the first frame", "The phone display is up but Windows has not drawn to it yet."));
                 if (tick >= 15)
-                    throw new DisplayException("capture", "The display driver never delivered a frame.", DescribeNoFrames());
+                    throw new DisplayException("capture", "The native WGC/NVENC pipeline has not delivered a frame.",
+                        "Verify the source HWND is visible, at the target DPI, and NVENC is available.");
             }
         }
     }
@@ -709,6 +674,9 @@ internal sealed class PhoneSession
         _conn.SendControl(ServerMessages.Stage(stage, detail, remediation, fatal: true));
     private async Task TeardownAsync()
     {
+        StopPcAudio();
+        _phoneMic?.Dispose();
+        _phoneMic = null;
         _downloadStop?.Cancel();
         if (_downloadTask is not null)
         {
@@ -724,11 +692,12 @@ internal sealed class PhoneSession
         catch (Exception ex) { _log.Warn("closing phone transport: " + ex.Message); }
         _uploads?.Dispose(); // removes incomplete encrypted-upload parts on disconnect
         try { _input?.ReleaseAll(); } catch (Exception ex) { _log.Warn("releasing input: " + ex.Message); }
-        var encoder = _encoder;
-        _encoder = null;
-        if (encoder is not null)
+        var video = _video;
+        _video = null;
+        if (video is not null)
         {
-            try { await encoder.DisposeAsync().ConfigureAwait(false); } catch { /* process already gone */ }
+            try { await video.DisposeAsync().ConfigureAwait(false); }
+            catch (Exception ex) { _log.Warn("GPU pipeline cleanup: " + ex.Message); }
         }
         if (_backend is not null)
         {

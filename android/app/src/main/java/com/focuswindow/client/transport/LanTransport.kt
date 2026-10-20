@@ -28,6 +28,9 @@ class WireFrame(
     val arrivedAtNanos: Long = System.nanoTime(),
 )
 
+/** Audio PCM payloads are independent and may be dropped to avoid old sound. */
+data class PcmAudioChunk(val streamId: Int, val pcm: ByteArray)
+
 /**
  * FR-TRUST-03 — direct LAN transport is the default and the only path required
  * for the free tier. One TCP connection carries two logical channels:
@@ -58,13 +61,18 @@ class LanTransport(
         onBufferOverflow = BufferOverflow.SUSPEND, // never discard approval/target/control state
     )
     val control: SharedFlow<ServerMessage> = _control.asSharedFlow()
+    private val _audio = MutableSharedFlow<PcmAudioChunk>(
+        extraBufferCapacity = 8,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST,
+    )
+    val audio: SharedFlow<PcmAudioChunk> = _audio.asSharedFlow()
 
     private val _frames = MutableSharedFlow<WireFrame>(
         replay = 0,
         extraBufferCapacity = 8,
         // H.264 inter frames depend on preceding frames. Silent DROP_OLDEST causes
         // decode corruption: MediaCodec cannot detect which reference was lost.
-        // Backpressure the reader instead; the host's four-frame send gate then
+        // Backpressure the reader instead; the host's bounded send gate then
         // forces an IDR resync rather than hiding a loss.
         onBufferOverflow = BufferOverflow.SUSPEND,
     )
@@ -157,6 +165,19 @@ class LanTransport(
                         _frames.emit(parseFrame(plain))
                     }
 
+                    KIND_AUDIO -> {
+                        val len = inStream.readInt()
+                        require(len in 30..32796) { "audio frame too large: $len" }
+                        val sealed = ByteArray(len).also { inStream.readFully(it) }
+                        val plain = secure.open(sealed)
+                        require(plain.size in 8..32772 && (plain.size - 4) % 2 == 0) {
+                            "invalid PCM packet"
+                        }
+                        val streamId = java.nio.ByteBuffer.wrap(plain, 0, 4)
+                            .order(java.nio.ByteOrder.BIG_ENDIAN).int
+                        _audio.emit(PcmAudioChunk(streamId, plain.copyOfRange(4, plain.size)))
+                    }
+
                     KIND_PING -> {
                         // Keeps NAT/firewall state alive on long idle sessions
                         // where the pacer is sending 0 fps (FR-REF-02).
@@ -225,6 +246,25 @@ class LanTransport(
         }
     }
 
+    /** Forward only host-authorized microphone stream packets.
+     *  Returns false if the authenticated transport disappeared.
+     */
+    suspend fun sendPhoneMicrophone(streamId: Int, pcm16le: ByteArray): Boolean =
+        withContext(Dispatchers.IO) {
+            val sender = writer ?: return@withContext false
+            if (!running.get()) return@withContext false
+            try {
+                sender.microphone(streamId, pcm16le)
+                true
+            } catch (ex: java.io.IOException) {
+                val lost = running.getAndSet(false)
+                closeQuietly()
+                if (lost) _events.emit(TransportEvent.Closed(
+                    ex.message ?: "microphone send failed", recoverable = true))
+                false
+            }
+        }
+
     suspend fun close(reason: String) {
         if (!running.get()) return
         runCatching { send(ClientMessage.Bye(reason)) }
@@ -285,6 +325,7 @@ class LanTransport(
         const val KIND_CONTROL = 1
         const val KIND_FRAME = 2
         const val KIND_PING = 3
+        const val KIND_AUDIO = 5
 
         const val CONNECT_TIMEOUT_MS = 4_000
         const val READ_TIMEOUT_MS = 20_000

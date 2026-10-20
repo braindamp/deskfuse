@@ -22,6 +22,11 @@ public sealed record HostOptions
     /// <summary>Opt-in per-phone exact-DPR virtual backing display calibration.
     /// Remains experimental until real-device viewport/window UX is qualified.</summary>
     public bool AdaptiveDpiViewport { get; init; }
+    // Separate PC-side authorization: a paired device cannot capture mixed PC
+    // output without an explicit host launch flag. Default deny.
+    public bool AllowPcAudio { get; init; }
+    // Separate consent gate for forwarding Android microphone input.
+    public bool AllowPhoneMicrophone { get; init; }
 }
 /// <summary>Decides whether a phone that just authenticated may use this PC (default: ask the user).</summary>
 public interface IApprovalPolicy
@@ -40,12 +45,34 @@ public interface IClipboardBridge
     Task WriteTextAsync(string text, CancellationToken ct);
 }
 public sealed record WindowItem(string Id, string Title, string AppLabel);
+/// <summary>
+/// One explicitly requested loopback of the user's default Windows output.
+/// Callbacks are synchronous; the sender must copy the transient audio memory.
+/// </summary>
+public interface IHostAudioCapture : IDisposable
+{
+    int SampleRate { get; }
+    int Channels { get; }
+    // Explicitly identified Windows speaker positions; not just channel count.
+    string Layout => "stereo";
+    void Start(Action<ReadOnlyMemory<byte>> onSamples);
+}
 /// <summary>Explicit window picker: list and focus only; never move/resize physical PC windows.</summary>
 public interface IWindowWorkflow
 {
     IReadOnlyList<WindowItem> ListVisible();
     bool Activate(string id);
 }
+/// <summary>
+/// Destination for PCM16 mono, 16 kHz phone microphone data. An implementation
+/// must route to a *real* Windows capture endpoint (or an explicitly selected
+/// external virtual-cable adapter). This interface itself creates NO microphone.
+/// </summary>
+public interface IPhoneMicrophoneSink : IDisposable
+{
+    void Write(ReadOnlySpan<byte> pcm16Mono);
+}
+
 public sealed record HostServices(
     Func<IDisplayBackend> CreateBackend,
     Func<IInputSink> CreateInput,
@@ -55,4 +82,9 @@ public sealed record HostServices(
     Action<NegotiationOutcome>? OnNegotiated = null,
     IClipboardBridge? Clipboard = null,
     IWindowWorkflow? Windows = null,
-    IDeviceCredentialStore? DeviceCredentials = null);
+    IDeviceCredentialStore? DeviceCredentials = null,
+    Func<IVideoPipeline>? CreateVideoPipeline = null,
+    Func<IReadOnlyList<string>, int, IHostAudioCapture>? CreateAudioCapture = null,
+    IDisplaySessionAdmission? DisplayAdmission = null,
+    Func<string, IPhoneMicrophoneSink?>? CreatePhoneMicrophoneSink = null,
+    Func<string, bool>? CanUsePhoneMicrophone = null);

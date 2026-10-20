@@ -59,7 +59,10 @@ class VideoDecoder(
     /** Arrival timestamps keyed by presentation time, for the latency estimate. */
     private val pending = java.util.concurrent.ConcurrentHashMap<Long, Long>()
 
-    fun start(surface: Surface, mimeType: String, widthPx: Int, heightPx: Int, targetVersion: Long) {
+    fun start(
+        surface: Surface, mimeType: String, widthPx: Int, heightPx: Int, targetVersion: Long,
+        colorRange: String? = null, framesPerSecond: Int = 60,
+    ) {
         stop()
         this.surface = surface
         this.mime = mimeType
@@ -92,10 +95,15 @@ class VideoDecoder(
                 var candidate: MediaCodec? = null
                 try {
                     val format = MediaFormat.createVideoFormat(mimeType, widthPx, heightPx).apply {
+                        if (colorRange == "BT.709 full range") {
+                            setInteger(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT709)
+                            setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_FULL)
+                            setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
+                        }
                         if (lowLatency) {
                             setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
                             setInteger(MediaFormat.KEY_PRIORITY, 0)
-                            setInteger(MediaFormat.KEY_OPERATING_RATE, 60)
+                            setInteger(MediaFormat.KEY_OPERATING_RATE, framesPerSecond.coerceIn(1, 240))
                         }
                     }
                     candidate = MediaCodec.createByCodecName(name)

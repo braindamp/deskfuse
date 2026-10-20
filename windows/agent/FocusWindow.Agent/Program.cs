@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Globalization;
 using FocusWindow.Agent.Display;
 using FocusWindow.Agent.Input;
+using FocusWindow.Agent.Media;
 using FocusWindow.Agent.Interop;
 using FocusWindow.Core;
 using FocusWindow.Core.Display;
@@ -22,20 +23,32 @@ internal static class Program
           FocusWindow.Agent dpi-challenge         FA/BB DPI lab: PLAN ONLY unless explicitly armed
           FocusWindow.Agent driver-status         talk to the display driver and print its state
           FocusWindow.Agent display-paths         read current Windows CCD display names (NO driver installation)
+          FocusWindow.Agent audio-devices          list Windows audio endpoints (READ ONLY)
           FocusWindow.Agent hold-gate-self-test    test release-file gate (NO driver installation)
           FocusWindow.Agent --version
         Host options:
           --port N (47810)   --bind IP (0.0.0.0)   --fps N (60)   --bitrate KBPS (20000)
-          --ffmpeg PATH      (default: ffmpeg.exe next to the agent, else PATH)
+          --workspace-app EXE  absolute path to a NEW application instance for GPU sessions
+          --workspace-args TEXT  local launch arguments (for example, an app's new-instance flag)
+                             Existing physical windows are never moved; app documents survive disconnect.
           --auto-approve     legacy QR test-mode only; does NOT bypass first-time LAN enrollment
           --legacy-qr       explicitly enable historical QR pairing instead of phone discovery
           trusted-phones    list enrolled device IDs (for review and revocation)
           trusted-phones --forget-phone ID   revoke a phone and its approvals
           --new-pairing      rotate the host public key (all phones must re-enroll)
           --single-session   exit after one phone session
+          --experimental-mic-cable --phone-mic-output-id ID --phone-mic-device-id DEVICE_ID
+                             DEV BRIDGE: opt in to route authorized Android microphone
+                             into explicitly selected Windows render endpoint ID.
+                             Select a virtual cable's corresponding RECORDING device
+                             in Windows apps. This does NOT install a DeskFuse mic.
+                             Never select physical speakers for this adapter.
+          --enable-pc-audio  allow approved phones to request mixed PC playback sound
+                             (OFF by default; may include audio from other PC apps)
           --ruler-probe      verify rendered density with a pixel ruler at the start of every session
-          --adaptive-dpi     EXPERIMENTAL: calibrate a larger virtual desktop per phone DPR,
-                             verify 1:1 crop, and stream only phone-sized pixels
+          --adaptive-dpi     legacy alias: native-DPI virtual backing monitor (now default)
+          --disable-native-dpi  explicit diagnostic compatibility mode; GPU path
+                                will refuse unverified phone-native DPI
           --no-open-qr       do not open pairing.png automatically
           --log PATH
         density-probe options (defaults describe a 1440x3120, 3.5x, 6.7-inch phone):
@@ -76,6 +89,7 @@ internal static class Program
                 "driver-status" => DriverStatus(),
                 "display-paths" => PrintDisplayPaths(),
                 "trusted-phones" => TrustedPhones(args),
+                "audio-devices" => ListAudioDevices(),
                 "hold-gate-self-test" => await HoldGateSelfTestAsync(),
                 _ => Fail($"Unknown command '{command}'.\n\n{Usage}"),
             };
@@ -91,6 +105,27 @@ internal static class Program
             return 1;
         }
     }
+    /// <summary>Read-only audio endpoint discovery for explicit cable routing.
+    /// Does not change Windows default inputs/outputs or device state.
+    /// </summary>
+    private static int ListAudioDevices()
+    {
+        using var enumerator = new NAudio.CoreAudioApi.MMDeviceEnumerator();
+        var devices = enumerator.EnumerateAudioEndPoints(
+            NAudio.CoreAudioApi.DataFlow.All, NAudio.CoreAudioApi.DeviceState.All);
+        foreach (var item in devices)
+        {
+            using (item)
+            {
+                Console.WriteLine($"{item.DataFlow} / {item.State}: {item.FriendlyName}");
+                Console.WriteLine($"  id: {item.ID}");
+            }
+        }
+        Console.WriteLine("For the development mic bridge use a virtual cable's RENDER endpoint ID.");
+        Console.WriteLine("Select its corresponding CAPTURE endpoint in Windows applications.");
+        return 0;
+    }
+
     private static int Fail(string message)
     {
         Console.Error.WriteLine(message);
@@ -124,25 +159,42 @@ internal static class Program
     // ---- run ----------------------------------------------------------------------------------------
     private static async Task<int> RunHostAsync(string[] args, CancellationToken ct)
     {
+        using var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
+        if (new System.Security.Principal.WindowsPrincipal(identity).IsInRole(
+            System.Security.Principal.WindowsBuiltInRole.Administrator))
+            return Fail("Run the network host as a normal Windows user. Installed driver access must be resolved through an approved local boundary, not an elevated LAN host.");
         using var log = new ConsoleLog(Opt(args, "--log"));
-        var bundled = Path.Combine(AppContext.BaseDirectory, "ffmpeg.exe");
+        // The cable adapter is deliberately unavailable without both flags.
+        // A Windows render-endpoint ID is not a DeskFuse PnP mic identity.
+        var microphoneOutputId = Opt(args, "--phone-mic-output-id");
+        var microphoneDeviceId = Opt(args, "--phone-mic-device-id");
+        var allowMicrophone = args.Contains("--experimental-mic-cable") &&
+            !string.IsNullOrWhiteSpace(microphoneOutputId) &&
+            !string.IsNullOrWhiteSpace(microphoneDeviceId);
         var options = new HostOptions
         {
             Port = Int(args, "--port", 47810),
             Bind = Opt(args, "--bind") ?? "0.0.0.0",
             Fps = Int(args, "--fps", 60),
             BitrateKbps = Int(args, "--bitrate", 20_000),
-            FfmpegPath = Opt(args, "--ffmpeg") ?? (File.Exists(bundled) ? bundled : "ffmpeg"),
             HostVersion = Version,
             DrawRulerProbe = args.Contains("--ruler-probe"),
             NewPairing = args.Contains("--new-pairing"),
             SingleSession = args.Contains("--single-session"),
             AllowFullUserFiles = !args.Contains("--auto-approve"),
             CameraFreePairing = !args.Contains("--legacy-qr"),
-            AdaptiveDpiViewport = args.Contains("--adaptive-dpi"),
+            // The POC's verified larger-backing-display method is now
+            // the intended product mode, not an optional experiment.
+            AdaptiveDpiViewport = !args.Contains("--disable-native-dpi"),
+            AllowPcAudio = args.Contains("--enable-pc-audio"),
+            AllowPhoneMicrophone = allowMicrophone,
         };
         log.Info($"Focus Window host agent {Version}");
+        if (allowMicrophone)
+            log.Warn("Development microphone bridge ENABLED for one explicitly selected Windows playback endpoint. " +
+                "Use a virtual audio cable only; a physical endpoint would play the phone microphone aloud.");
         var guards = new List<PhysicalDisplayGuard>();
+        using var sources = new WorkspaceApplicationCatalog();
         WindowsDisplayBackend? backend = null;
         var services = new HostServices(
             CreateBackend: () => backend = new WindowsDisplayBackend(log),
@@ -158,6 +210,16 @@ internal static class Program
             DeviceCredentials: new DpapiDeviceCredentialStore(),
             Clipboard: new WindowsClipboardBridge(),
             Windows: new WindowsWindowWorkflow(),
+            CreateVideoPipeline: () => new NativeGpuPipeline(Opt(args, "--workspace-app"), Opt(args, "--workspace-args"), sources),
+            CreateAudioCapture: (layouts, maxBytes) => new WindowsLoopbackAudioCapture(layouts, maxBytes),
+            CreatePhoneMicrophoneSink: allowMicrophone
+                ? id => string.Equals(id, microphoneDeviceId, StringComparison.Ordinal)
+                    ? new WindowsPhoneMicrophoneCableSink(microphoneOutputId!)
+                    : null
+                : null,
+            CanUsePhoneMicrophone: allowMicrophone
+                ? id => string.Equals(id, microphoneDeviceId, StringComparison.Ordinal)
+                : null,
             OnNegotiated: outcome =>
             {
                 var path = Path.Combine(AppData.Directory, "last-session-evidence.md");
