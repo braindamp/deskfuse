@@ -130,14 +130,19 @@ internal sealed class WindowsLoopbackAudioCapture : IHostAudioCapture
                             for (var ch = 0; ch < Channels; ch++)
                             {
                                 var speaker = NthSpeakerBit(outputMask, ch);
-                                var value = speaker switch
-                                {
-                                    BackLeft => FoldRear(source, BackLeft, SideLeft),
-                                    BackRight => FoldRear(source, BackRight, SideRight),
-                                    SideLeft => FoldRear(source, SideLeft, BackLeft),
-                                    SideRight => FoldRear(source, SideRight, BackRight),
-                                    _ => SampleForSpeaker(source, speaker),
-                                };
+                                // A native 7.1 route must NEVER fold separate
+                                // side channels into back channels. Remap only
+                                // when reducing to 5.1.
+                                var value = Layout == "7.1_surround"
+                                    ? SampleForSpeaker(source, speaker)
+                                    : speaker switch
+                                    {
+                                        BackLeft => FoldRear(source, BackLeft, SideLeft),
+                                        BackRight => FoldRear(source, BackRight, SideRight),
+                                        SideLeft => FoldRear(source, SideLeft, BackLeft),
+                                        SideRight => FoldRear(source, SideRight, BackRight),
+                                        _ => SampleForSpeaker(source, speaker),
+                                    };
                                 WritePcm(output, (frame * Channels + ch) * 2, value);
                             }
                         }
