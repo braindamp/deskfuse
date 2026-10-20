@@ -269,6 +269,7 @@ sealed interface ClientMessage {
     data class Audio(
         val action: String,
         val layouts: List<String> = emptyList(),
+        val maxPcmBytes: Int = 32768,
     ) : ClientMessage
 
     @Serializable @SerialName("microphone")
