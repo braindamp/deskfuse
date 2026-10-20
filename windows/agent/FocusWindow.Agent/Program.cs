@@ -23,6 +23,7 @@ internal static class Program
           FocusWindow.Agent dpi-challenge         FA/BB DPI lab: PLAN ONLY unless explicitly armed
           FocusWindow.Agent driver-status         talk to the display driver and print its state
           FocusWindow.Agent display-paths         read current Windows CCD display names (NO driver installation)
+          FocusWindow.Agent audio-devices          list Windows audio endpoints (READ ONLY)
           FocusWindow.Agent hold-gate-self-test    test release-file gate (NO driver installation)
           FocusWindow.Agent --version
         Host options:
@@ -34,6 +35,14 @@ internal static class Program
           trusted-phones --forget-phone ID   revoke a phone and its approvals
           --new-pairing      rotate the host public key (all phones must re-enroll)
           --single-session   exit after one phone session
+          --experimental-mic-cable --phone-mic-output-id ID --phone-mic-device-id DEVICE_ID
+                             DEV BRIDGE: opt in to route authorized Android microphone
+                             into explicitly selected Windows render endpoint ID.
+                             Select a virtual cable's corresponding RECORDING device
+                             in Windows apps. This does NOT install a DeskFuse mic.
+                             Never select physical speakers for this adapter.
+          --enable-pc-audio  allow approved phones to request mixed PC playback sound
+                             (OFF by default; may include audio from other PC apps)
           --ruler-probe      verify rendered density with a pixel ruler at the start of every session
           --adaptive-dpi     legacy alias: native-DPI virtual backing monitor (now default)
           --disable-native-dpi  explicit diagnostic compatibility mode; GPU path
@@ -78,6 +87,7 @@ internal static class Program
                 "driver-status" => DriverStatus(),
                 "display-paths" => PrintDisplayPaths(),
                 "trusted-phones" => TrustedPhones(args),
+                "audio-devices" => ListAudioDevices(),
                 "hold-gate-self-test" => await HoldGateSelfTestAsync(),
                 _ => Fail($"Unknown command '{command}'.\n\n{Usage}"),
             };
@@ -93,6 +103,27 @@ internal static class Program
             return 1;
         }
     }
+    /// <summary>Read-only audio endpoint discovery for explicit cable routing.
+    /// Does not change Windows default inputs/outputs or device state.
+    /// </summary>
+    private static int ListAudioDevices()
+    {
+        using var enumerator = new NAudio.CoreAudioApi.MMDeviceEnumerator();
+        var devices = enumerator.EnumerateAudioEndPoints(
+            NAudio.CoreAudioApi.DataFlow.All, NAudio.CoreAudioApi.DeviceState.All);
+        foreach (var item in devices)
+        {
+            using (item)
+            {
+                Console.WriteLine($"{item.DataFlow} / {item.State}: {item.FriendlyName}");
+                Console.WriteLine($"  id: {item.ID}");
+            }
+        }
+        Console.WriteLine("For the development mic bridge use a virtual cable's RENDER endpoint ID.");
+        Console.WriteLine("Select its corresponding CAPTURE endpoint in Windows applications.");
+        return 0;
+    }
+
     private static int Fail(string message)
     {
         Console.Error.WriteLine(message);
@@ -128,6 +159,13 @@ internal static class Program
     {
         using var log = new ConsoleLog(Opt(args, "--log"));
         var bundled = Path.Combine(AppContext.BaseDirectory, "ffmpeg.exe");
+        // The cable adapter is deliberately unavailable without both flags.
+        // A Windows render-endpoint ID is not a DeskFuse PnP mic identity.
+        var microphoneOutputId = Opt(args, "--phone-mic-output-id");
+        var microphoneDeviceId = Opt(args, "--phone-mic-device-id");
+        var allowMicrophone = args.Contains("--experimental-mic-cable") &&
+            !string.IsNullOrWhiteSpace(microphoneOutputId) &&
+            !string.IsNullOrWhiteSpace(microphoneDeviceId);
         var options = new HostOptions
         {
             Port = Int(args, "--port", 47810),
@@ -144,8 +182,13 @@ internal static class Program
             // The POC's verified larger-backing-display method is now
             // the intended product mode, not an optional experiment.
             AdaptiveDpiViewport = !args.Contains("--disable-native-dpi"),
+            AllowPcAudio = args.Contains("--enable-pc-audio"),
+            AllowPhoneMicrophone = allowMicrophone,
         };
         log.Info($"Focus Window host agent {Version}");
+        if (allowMicrophone)
+            log.Warn("Development microphone bridge ENABLED for one explicitly selected Windows playback endpoint. " +
+                "Use a virtual audio cable only; a physical endpoint would play the phone microphone aloud.");
         var guards = new List<PhysicalDisplayGuard>();
         WindowsDisplayBackend? backend = null;
         var services = new HostServices(
@@ -163,6 +206,15 @@ internal static class Program
             Clipboard: new WindowsClipboardBridge(),
             Windows: new WindowsWindowWorkflow(),
             CreateVideoPipeline: () => new NativeGpuPipeline(),
+            CreateAudioCapture: (layouts, maxBytes) => new WindowsLoopbackAudioCapture(layouts, maxBytes),
+            CreatePhoneMicrophoneSink: allowMicrophone
+                ? id => string.Equals(id, microphoneDeviceId, StringComparison.Ordinal)
+                    ? new WindowsPhoneMicrophoneCableSink(microphoneOutputId!)
+                    : null
+                : null,
+            CanUsePhoneMicrophone: allowMicrophone
+                ? id => string.Equals(id, microphoneDeviceId, StringComparison.Ordinal)
+                : null,
             OnNegotiated: outcome =>
             {
                 var path = Path.Combine(AppData.Directory, "last-session-evidence.md");

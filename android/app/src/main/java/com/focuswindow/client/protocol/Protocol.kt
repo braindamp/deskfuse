@@ -122,6 +122,8 @@ sealed interface ServerMessage {
         val hostName: String,
         /** FR-OPS-01 — the build the user can pin / roll back to. */
         val channel: String,
+        val pcAudioAvailable: Boolean = false,
+        val phoneMicrophoneBridgeAvailable: Boolean = false,
     ) : ServerMessage
 
     @Serializable @SerialName("target")
@@ -172,6 +174,30 @@ sealed interface ServerMessage {
     @Serializable @SerialName("window_list")
     data class WindowList(val windows: List<WindowEntry>) : ServerMessage
 
+    @Serializable @SerialName("microphone_state")
+    data class MicrophoneState(
+        val state: String,
+        val streamId: Int = 0,
+        val sampleRate: Int = 16000,
+        val channels: Int = 1,
+        val format: String = "pcm_s16le",
+        val detail: String? = null,
+    ) : ServerMessage
+
+    @Serializable @SerialName("bridge_state")
+    data class BridgeState(
+        val requestedCapabilities: List<String> = emptyList(),
+        val activeCapabilities: List<String> = emptyList(),
+    ) : ServerMessage
+
+    @Serializable @SerialName("audio_state")
+    data class AudioState(
+        val state: String, val streamId: Int,
+        val sampleRate: Int = 0, val channels: Int = 0,
+        val format: String = "pcm_s16le", val detail: String? = null,
+        val layout: String = "stereo",
+    ) : ServerMessage
+
     @Serializable @SerialName("clipboard")
     data class Clipboard(val mime: String, val text: String? = null, val base64: String? = null) :
         ServerMessage
@@ -195,6 +221,18 @@ sealed interface ClientMessage {
         val protocolVersion: Int = PROTOCOL_VERSION,
         val clientVersion: String,
         val profile: PhoneProfile,
+        val capabilities: List<String> = emptyList(),
+    ) : ClientMessage
+
+    // Never send a role flag in ordinary "hello": pre-bridge Windows hosts
+    // would ignore it and start a virtual monitor. Older hosts reject this
+    // distinct first-message type without acquiring the display.
+    @Serializable @SerialName("bridge_hello")
+    data class BridgeHello(
+        val protocolVersion: Int = PROTOCOL_VERSION,
+        val clientVersion: String,
+        val profile: PhoneProfile,
+        val capabilities: List<String> = emptyList(),
     ) : ClientMessage
 
     /** FR-DPI-09 — rotation/fold/font-scale re-derive the TARGET, nothing else. */
@@ -226,6 +264,16 @@ sealed interface ClientMessage {
 
     @Serializable @SerialName("windows")
     data class Windows(val action: String, val id: String? = null) : ClientMessage
+
+    @Serializable @SerialName("audio")
+    data class Audio(
+        val action: String,
+        val layouts: List<String> = emptyList(),
+        val maxPcmBytes: Int = 32768,
+    ) : ClientMessage
+
+    @Serializable @SerialName("microphone")
+    data class Microphone(val action: String) : ClientMessage
 
     /** One explicitly selected Android document, delivered in bounded encrypted chunks. */
     @Serializable @SerialName("files")

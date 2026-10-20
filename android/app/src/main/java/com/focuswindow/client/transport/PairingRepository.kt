@@ -3,6 +3,7 @@ package com.focuswindow.client.transport
 import android.content.Context
 import android.content.SharedPreferences
 import android.util.Base64
+import java.security.MessageDigest
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 
@@ -78,8 +79,35 @@ class PairingRepository internal constructor(
         }.getOrNull()
     }
 
+    // These preferences belong to the authenticated host *identity*, not IP or
+    // phone-wide settings. No background capture is authorized by a stored flag.
+    // Encrypted preferences are reused; no plaintext copy of a secret is made.
+    private val temporaryAudioPreferences = mutableMapOf<String, Boolean>()
+
+    private fun audioKey(payload: PairingPayload, direction: String): String {
+        val hash = MessageDigest.getInstance("SHA-256")
+            .digest(payload.hostPublicKeyB64.toByteArray(Charsets.UTF_8))
+            .take(16).joinToString("") { "%02x".format(it.toInt() and 255) }
+        return "bridge.$hash.$direction"
+    }
+
+    fun audioWanted(payload: PairingPayload, direction: String): Boolean {
+        require(direction == "pc_sound" || direction == "phone_mic")
+        val key = audioKey(payload, direction)
+        return runCatching { prefs?.getBoolean(key, false) }
+            .getOrNull() ?: temporaryAudioPreferences[key] ?: false
+    }
+
+    fun setAudioWanted(payload: PairingPayload, direction: String, enabled: Boolean) {
+        require(direction == "pc_sound" || direction == "phone_mic")
+        val key = audioKey(payload, direction)
+        temporaryAudioPreferences[key] = enabled
+        runCatching { prefs?.edit()?.putBoolean(key, enabled)?.apply() }
+    }
+
     fun forget() {
         ephemeralPairing = null
+        temporaryAudioPreferences.clear()
         runCatching { prefs?.edit()?.clear()?.apply() }
     }
 

@@ -30,6 +30,9 @@ internal sealed class PhoneSession
     private PhoneProfile _profile = null!;
     private InputGeometry _geometry = null!;
     private IVideoPipeline? _video;
+    private IHostAudioCapture? _pcAudio;
+    private PhoneMicrophoneRoute? _phoneMic;
+    private int _pcAudioStreamId;
     private FileUploadReceiver? _uploads;
     private CancellationTokenSource? _downloadStop;
     private Task? _downloadTask;
@@ -59,7 +62,12 @@ internal sealed class PhoneSession
             await Task.Delay(300, CancellationToken.None).ConfigureAwait(false);
             return;
         }
-        conn.SendControl(ServerMessages.Hello(_o.HostVersion, _o.HostName, _o.Channel));
+        conn.SendControl(ServerMessages.Hello(_o.HostVersion, _o.HostName, _o.Channel,
+            pcAudioAvailable: _o.AllowPcAudio && _s.CreateAudioCapture is not null,
+            phoneMicrophoneBridgeAvailable: _o.AllowPhoneMicrophone &&
+                _o.CameraFreePairing && _s.DeviceCredentials is not null &&
+                _s.CreatePhoneMicrophoneSink is not null &&
+                _s.CanUsePhoneMicrophone?.Invoke(_profile.DeviceId) == true));
         conn.SendControl(ServerMessages.Stage("Waiting for approval", $"Confirm code {conn.VerificationCode} on the PC."));
         var approved = await _s.Approval
             .ApproveAsync(_profile.DeviceId, _profile.DeviceLabel, conn.VerificationCode, ct).ConfigureAwait(false);
@@ -69,6 +77,7 @@ internal sealed class PhoneSession
             await Task.Delay(300, CancellationToken.None).ConfigureAwait(false);
             return;
         }
+        _phoneMic = new PhoneMicrophoneRoute(conn, _o, _s, _profile.DeviceId, _log);
         _guard = _s.CreateGuard();
         _before = _guard.Snapshot();
         _backend = _s.CreateBackend();
@@ -137,12 +146,23 @@ internal sealed class PhoneSession
             _video.Info.Width, _video.Info.Height);
         _resync = true;
         SendTarget();
-        await SessionLifetime.RunUntilFirstStopAsync(
-            control: ControlLoopAsync,
-            video: PumpEncodedGpuVideoAsync,
-            housekeeping: HousekeepingAsync,
-            transportCompletion: _conn.Completion,
-            shutdown: ct).ConfigureAwait(false);
+        using var microphoneStop = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var microphonePump = _phoneMic?.PumpAsync(microphoneStop.Token) ?? Task.CompletedTask;
+        try
+        {
+            await SessionLifetime.RunUntilFirstStopAsync(
+                control: ControlLoopAsync,
+                video: PumpEncodedGpuVideoAsync,
+                housekeeping: HousekeepingAsync,
+                transportCompletion: _conn.Completion,
+                shutdown: ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            microphoneStop.Cancel();
+            try { await microphonePump.ConfigureAwait(false); }
+            catch (OperationCanceledException) when (microphoneStop.IsCancellationRequested) { }
+        }
     }
     private async Task<NegotiationOutcome> NegotiatePhoneDisplayAsync(PhoneProfile phone, CancellationToken ct)
     {
@@ -309,6 +329,12 @@ internal sealed class PhoneSession
                 case ClientWindows windows:
                     HandleWindows(windows);
                     break;
+                case ClientAudio audio:
+                    HandlePcAudio(audio);
+                    break;
+                case ClientMicrophone mic:
+                    _phoneMic?.Handle(mic);
+                    break;
                 case ClientFiles files:
                     HandleFiles(files, ct);
                     break;
@@ -439,6 +465,50 @@ internal sealed class PhoneSession
         }
     }
 
+    private void HandlePcAudio(ClientAudio request)
+    {
+        if (request.Action == "stop_pc")
+        {
+            StopPcAudio();
+            _conn.SendControl(ServerMessages.AudioState("stopped", _pcAudioStreamId));
+            return;
+        }
+        if (request.Action != "start_pc" || !_o.AllowPcAudio || _s.CreateAudioCapture is null)
+        {
+            _conn.SendControl(ServerMessages.AudioState("error", _pcAudioStreamId,
+                detail: "Windows playback capture unavailable."));
+            return;
+        }
+        StopPcAudio();
+        _log.Info("Approved phone requested mixed PC playback audio (host opted in).");
+        try
+        {
+            var capture = _s.CreateAudioCapture(
+                request.Layouts ?? Array.Empty<string>(), request.MaxPcmBytes);
+            _pcAudio = capture;
+            var streamId = ++_pcAudioStreamId;
+            _conn.SendControl(ServerMessages.AudioState("started", streamId,
+                capture.SampleRate, capture.Channels, layout: capture.Layout));
+            capture.Start(samples => _conn.TrySendAudio(samples.Span, streamId));
+        }
+        catch (Exception ex)
+        {
+            _log.Warn("PC audio capture unavailable: " + ex.GetType().Name);
+            StopPcAudio();
+            _conn.SendControl(ServerMessages.AudioState("error", _pcAudioStreamId,
+                detail: "Could not capture the selected Windows playback endpoint."));
+        }
+    }
+
+    private void StopPcAudio()
+    {
+        var capture = _pcAudio;
+        _pcAudio = null;
+        if (capture is null) return;
+        try { capture.Dispose(); }
+        catch (Exception ex) { _log.Warn("stopping PC audio: " + ex.GetType().Name); }
+    }
+
     private void HandleWindows(ClientWindows request)
     {
         if (_s.Windows is null) return;
@@ -549,6 +619,9 @@ internal sealed class PhoneSession
         _conn.SendControl(ServerMessages.Stage(stage, detail, remediation, fatal: true));
     private async Task TeardownAsync()
     {
+        StopPcAudio();
+        _phoneMic?.Dispose();
+        _phoneMic = null;
         _downloadStop?.Cancel();
         if (_downloadTask is not null)
         {

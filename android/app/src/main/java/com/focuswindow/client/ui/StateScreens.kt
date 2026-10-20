@@ -53,6 +53,9 @@ fun StateScreen(
     onScan: () -> Unit,
     onDismiss: () -> Unit,
 ) {
+    // Streaming/reconnecting content is owned by the underlying decoder surface.
+    // Drawing an opaque empty screen here obscures real video and last-frame hold.
+    if (state is SessionState.Streaming || state is SessionState.Reconnecting) return
     Box(
         Modifier
             .fillMaxSize()
