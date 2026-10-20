@@ -83,7 +83,7 @@ public sealed record HostServices(
     IClipboardBridge? Clipboard = null,
     IWindowWorkflow? Windows = null,
     IDeviceCredentialStore? DeviceCredentials = null,
-    Func<IReadOnlyList<string>, IHostAudioCapture>? CreateAudioCapture = null,
+    Func<IReadOnlyList<string>, int, IHostAudioCapture>? CreateAudioCapture = null,
     IDisplaySessionAdmission? DisplayAdmission = null,
     Func<string, IPhoneMicrophoneSink?>? CreatePhoneMicrophoneSink = null,
     Func<string, bool>? CanUsePhoneMicrophone = null);
