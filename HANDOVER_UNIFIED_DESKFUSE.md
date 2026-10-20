@@ -1,5 +1,10 @@
 # START HERE — DeskFuse unified integration and development handover
 
+**Next task:** use [HANDOVER_ACCEPTANCE_DESKFUSE.md](HANDOVER_ACCEPTANCE_DESKFUSE.md)
+for the short flash-model continuation handover and
+[docs/ACCEPTANCE_TESTING.md](docs/ACCEPTANCE_TESTING.md) for owner-run acceptance.
+The integration history below is retained as reference.
+
 **Date:** 2026-10-20  
 **Mainline result:** PR #11 merged into `main` as `1b9165c` after both exact-head
 unified CI runs passed on `c26732c`. All further development starts from `main`.
