@@ -201,7 +201,7 @@ internal static class Program
             DeviceCredentials: new DpapiDeviceCredentialStore(),
             Clipboard: new WindowsClipboardBridge(),
             Windows: new WindowsWindowWorkflow(),
-            CreateAudioCapture: () => new WindowsLoopbackAudioCapture(),
+            CreateAudioCapture: layouts => new WindowsLoopbackAudioCapture(layouts),
             CreatePhoneMicrophoneSink: allowMicrophone
                 ? id => string.Equals(id, microphoneDeviceId, StringComparison.Ordinal)
                     ? new WindowsPhoneMicrophoneCableSink(microphoneOutputId!)
