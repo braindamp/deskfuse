@@ -16,6 +16,9 @@
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\FocusWindow.Core\FocusWindow.Core.csproj" />
+    <!-- Exercise the production pipe/identity code without Windows audio APIs. -->
+    <Compile Include="..\..\audio\DeskFuse.Audio\PhoneEndpointBrokerClient.cs" Link="Audio\PhoneEndpointBrokerClient.cs" />
+    <Compile Include="..\..\audio\DeskFuse.Audio\PhoneEndpointContract.cs" Link="Audio\PhoneEndpointContract.cs" />
   </ItemGroup>
   <ItemGroup>
     <!-- The independent phone-side client (follows SecureChannel.kt/LanTransport.kt, not our C#). -->

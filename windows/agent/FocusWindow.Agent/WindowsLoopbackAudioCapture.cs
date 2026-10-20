@@ -22,6 +22,7 @@ namespace FocusWindow.Agent;
 internal sealed class WindowsLoopbackAudioCapture : IHostAudioCapture
 {
     private readonly WasapiLoopbackCapture _capture;
+    private readonly MMDevice? _device;
     private readonly WaveFormat _sourceFormat;
     private readonly int _sourceMask;
     private readonly bool _floatSource;
@@ -74,8 +75,9 @@ internal sealed class WindowsLoopbackAudioCapture : IHostAudioCapture
                 throw new InvalidOperationException(
                     "That phone speaker endpoint is not available on this PC.", ex);
             }
+            // The capture uses the device, so it has to outlive it.
+            _device = device;
             _capture = new WasapiLoopbackCapture(device);
-            device.Dispose();
         }
         else
         {
@@ -279,6 +281,6 @@ internal sealed class WindowsLoopbackAudioCapture : IHostAudioCapture
         if (_disposed) return;
         _disposed = true;
         try { if (_started) _capture.StopRecording(); }
-        finally { _capture.Dispose(); }
+        finally { _capture.Dispose(); _device?.Dispose(); }
     }
 }

@@ -67,7 +67,7 @@ internal sealed class DevicePeerSession(
         // The phone's Windows playback endpoint. It is provisioned only when
         // the phone asked for the speakers capability, and it stays active
         // for as long as this peer is connected.
-        var speakers = new PhoneSpeakerRoute(conn, services, lease.Peer.Endpoints.Speakers,
+        await using var speakers = new PhoneSpeakerRoute(conn, services, lease.Peer.Endpoints.Speakers,
             lease.Peer.Label, log);
         var active = await speakers.ProvisionAsync(requested, shutdown).ConfigureAwait(false);
 
@@ -97,7 +97,6 @@ internal sealed class DevicePeerSession(
             await conn.DisposeAsync().ConfigureAwait(false);
             try { await Task.WhenAll(control, microphonePump, keepAlive).ConfigureAwait(false); }
             catch (OperationCanceledException) when (linked.IsCancellationRequested) { }
-            await speakers.DisposeAsync().ConfigureAwait(false);
             log.Info("Accessory peer detached: " + lease.Peer.DeviceId);
         }
     }

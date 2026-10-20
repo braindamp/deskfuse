@@ -71,7 +71,7 @@ internal sealed class PhoneSpeakerRoute(
         {
             // The phone may ask again after the provider became available.
             var active = await ProvisionAsync(_requested, _ct).ConfigureAwait(false);
-            if (active.Contains(DeviceCapabilities.Speakers))
+            if (active.Contains(DeviceCapabilities.Speakers) && _endpoint is not null)
             {
                 conn.SendControl(ServerMessages.BridgeState(
                     _requested, DeviceCapabilities.ActiveForAccessory(active)));
@@ -80,8 +80,8 @@ internal sealed class PhoneSpeakerRoute(
             {
                 conn.SendControl(ServerMessages.AudioState("error", _streamId,
                     detail: "This phone has no Windows playback endpoint."));
+                return;
             }
-            return;
         }
         if (services.CreateEndpointAudioCapture is null)
         {
@@ -138,11 +138,6 @@ internal sealed class PhoneSpeakerRoute(
             try { await _endpoint.DisposeAsync().ConfigureAwait(false); }
             catch (Exception ex) { log.Warn("releasing the phone speaker endpoint: " + ex.Message); }
             _endpoint = null;
-        }
-        if (services.PhoneSpeakers is not null)
-        {
-            try { await services.PhoneSpeakers.ReleaseAsync(peerId, CancellationToken.None).ConfigureAwait(false); }
-            catch (Exception ex) { log.Warn("releasing the phone speaker endpoint: " + ex.Message); }
         }
     }
 }

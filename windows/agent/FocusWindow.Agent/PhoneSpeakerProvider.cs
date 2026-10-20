@@ -23,17 +23,29 @@ internal sealed class BrokerPhoneSpeakerProvider : IPhoneSpeakerProvider
     public async Task<(IPhoneSpeakerEndpoint? Endpoint, string? Error)> ProvisionAsync(
         string peerId, string label, CancellationToken ct)
     {
-        var (endpointId, error) = await _client.ProvisionAsync(peerId, label, ct).ConfigureAwait(false);
-        if (endpointId is null) return (null, error);
+        // A separate retained pipe is the lease of this session, including
+        // when another session reconnects with the same enrollment identity.
+        var client = _client.CreateLeaseClient();
         try
         {
-            return (new BrokerPhoneSpeakerEndpoint(_client, endpointId, peerId), null);
+            var (endpointId, error) = await client.ProvisionAsync(peerId, label, ct).ConfigureAwait(false);
+            if (endpointId is null)
+            {
+                await client.DisposeAsync().ConfigureAwait(false);
+                return (null, error);
+            }
+            return (new BrokerPhoneSpeakerEndpoint(client, endpointId, peerId), null);
         }
         catch (Exception ex) when (ex is System.Runtime.InteropServices.COMException
                                        or InvalidOperationException or ArgumentException)
         {
-            await _client.ReleaseAsync(peerId, ct).ConfigureAwait(false);
+            await client.DisposeAsync().ConfigureAwait(false);
             return (null, "The phone speaker endpoint appeared but Windows would not open it.");
+        }
+        catch
+        {
+            await client.DisposeAsync().ConfigureAwait(false);
+            throw;
         }
     }
 
@@ -47,6 +59,7 @@ internal sealed class BrokerPhoneSpeakerEndpoint : IPhoneSpeakerEndpoint
 {
     private readonly DeskFuse.Audio.PhoneEndpointBrokerClient _client;
     private readonly string _peerId;
+    private readonly MMDevice _device;
     private readonly AudioEndpointVolume? _volume;
     private readonly AudioEndpointVolumeNotificationDelegate? _volumeHandler;
     private int _released;
@@ -58,17 +71,18 @@ internal sealed class BrokerPhoneSpeakerEndpoint : IPhoneSpeakerEndpoint
         _peerId = peerId;
         EndpointId = endpointId;
         using var enumerator = new MMDeviceEnumerator();
-        var device = enumerator.GetDevice(endpointId);
+        _device = enumerator.GetDevice(endpointId);
         try
         {
-            FriendlyName = device.FriendlyName;
-            _volume = device.AudioEndpointVolume;
+            FriendlyName = _device.FriendlyName;
+            _volume = _device.AudioEndpointVolume;
             _volumeHandler = notification => VolumeChanged?.Invoke(Volume);
             _volume.OnVolumeNotification += _volumeHandler;
         }
-        finally
+        catch
         {
-            device.Dispose();
+            _device.Dispose();
+            throw;
         }
     }
 
@@ -93,11 +107,23 @@ internal sealed class BrokerPhoneSpeakerEndpoint : IPhoneSpeakerEndpoint
     public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _released, 1) != 0) return;
-        if (_volume is not null)
+        try
         {
-            if (_volumeHandler is not null) _volume.OnVolumeNotification -= _volumeHandler;
-            _volume.Dispose();
+            if (_volume is not null)
+            {
+                if (_volumeHandler is not null) _volume.OnVolumeNotification -= _volumeHandler;
+            }
         }
-        await _client.ReleaseAsync(_peerId, CancellationToken.None).ConfigureAwait(false);
+        finally
+        {
+            // MMDevice owns its cached AudioEndpointVolume COM wrapper.
+            // Keep both alive together and let the device dispose it once.
+            try { _device.Dispose(); }
+            finally
+            {
+                try { await _client.ReleaseAsync(_peerId, CancellationToken.None).ConfigureAwait(false); }
+                finally { await _client.DisposeAsync().ConfigureAwait(false); }
+            }
+        }
     }
 }

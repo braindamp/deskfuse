@@ -24,11 +24,19 @@ public sealed class PhoneEndpointBrokerClient : IAsyncDisposable
 
     private readonly string _pipeName;
     private readonly SemaphoreSlim _gate = new(1, 1);
+    private NamedPipeClientStream? _pipe;
+    private int _disposed;
 
     public PhoneEndpointBrokerClient(string pipeName = PhoneEndpointContract.PipeName)
     {
         _pipeName = pipeName;
     }
+
+    /// <summary>
+    /// Creates an independent connection whose lifetime can belong to one
+    /// phone session. Closing it releases only that connection's endpoint lease.
+    /// </summary>
+    public PhoneEndpointBrokerClient CreateLeaseClient() => new(_pipeName);
 
     /// <summary>True when a broker is listening. Never throws.</summary>
     public async Task<bool> IsAvailableAsync(CancellationToken cancellationToken = default)
@@ -85,26 +93,38 @@ public sealed class PhoneEndpointBrokerClient : IAsyncDisposable
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            using var pipe = new NamedPipeClientStream(".", _pipeName, PipeDirection.InOut,
-                PipeOptions.Asynchronous);
-            try
+            if (Volatile.Read(ref _disposed) != 0) return null;
+            if (_pipe is null)
             {
-                await pipe.ConnectAsync(ConnectTimeoutMs, cancellationToken).ConfigureAwait(false);
-            }
-            catch (Exception ex) when (ex is TimeoutException or IOException or UnauthorizedAccessException)
-            {
-                return null;
+                var pipe = new NamedPipeClientStream(".", _pipeName, PipeDirection.InOut,
+                    PipeOptions.Asynchronous);
+                try
+                {
+                    await pipe.ConnectAsync(ConnectTimeoutMs, cancellationToken).ConfigureAwait(false);
+                    _pipe = pipe;
+                }
+                catch
+                {
+                    pipe.Dispose();
+                    throw;
+                }
             }
             var json = JsonSerializer.Serialize(request);
             var payload = Encoding.UTF8.GetBytes(json + "\n");
-            await pipe.WriteAsync(payload, cancellationToken).ConfigureAwait(false);
-            await pipe.FlushAsync(cancellationToken).ConfigureAwait(false);
-            var line = await ReadLineAsync(pipe, cancellationToken).ConfigureAwait(false);
-            if (line is null) return null;
+            await _pipe.WriteAsync(payload, cancellationToken).ConfigureAwait(false);
+            await _pipe.FlushAsync(cancellationToken).ConfigureAwait(false);
+            var line = await ReadLineAsync(_pipe, cancellationToken).ConfigureAwait(false);
+            if (line is null)
+            {
+                ClosePipe();
+                return null;
+            }
             return JsonSerializer.Deserialize<BrokerResponse>(line);
         }
-        catch (Exception ex) when (ex is IOException or JsonException or OperationCanceledException)
+        catch (Exception ex) when (ex is IOException or JsonException or OperationCanceledException
+                                       or TimeoutException or UnauthorizedAccessException)
         {
+            ClosePipe();
             return null;
         }
         finally
@@ -128,9 +148,17 @@ public sealed class PhoneEndpointBrokerClient : IAsyncDisposable
         }
     }
 
-    public ValueTask DisposeAsync()
+    private void ClosePipe()
     {
-        _gate.Dispose();
-        return ValueTask.CompletedTask;
+        _pipe?.Dispose();
+        _pipe = null;
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try { ClosePipe(); }
+        finally { _gate.Release(); }
     }
 }
