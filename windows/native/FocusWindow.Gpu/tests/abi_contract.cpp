@@ -1,6 +1,8 @@
 #include "focus_window_gpu.h"
 #include <iostream>
 
+int TestLatestFrameQueue();
+
 // No monitor, HWND, adapter or driver is opened by this contract test.
 int main() {
     if(fwgpu_abi_version() != 1) return 1;
@@ -21,5 +23,5 @@ int main() {
     fwgpu_force_idr(nullptr);
     fwgpu_close(nullptr);
     std::cout << "GPU ABI contract passed without hardware\n";
-    return 0;
+    return TestLatestFrameQueue();
 }

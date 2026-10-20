@@ -10,6 +10,7 @@ on:
       - 'plans/DeskFuse_One_Codebase_Integration_Implementation_Plan_2026-10-20.md'
       - 'android/**'
       - 'tests/protocol3/**'
+      - 'tools/protocol3/**'
       - 'tools/run-dpr-challenge.ps1'
   pull_request:
     paths:
@@ -17,6 +18,7 @@ on:
       - 'windows/native/**'
       - 'android/**'
       - 'tests/protocol3/**'
+      - 'tools/protocol3/**'
       - '.github/workflows/dpr-challenge-ci.yml'
   workflow_dispatch:
 
@@ -46,7 +48,7 @@ jobs:
         run: dotnet build windows/agent/FocusWindow.Agent/FocusWindow.Agent.csproj -c Release -p:Platform=x64 -warnaserror
       - name: Run unit and simulated tests (no display changes)
         run: dotnet test windows/agent/FocusWindow.Tests/FocusWindow.Tests.csproj -c Release --verbosity minimal
-      - name: Test native GPU ABI (no HWND, adapter, monitor or installed driver access)
+      - name: Test native GPU ABI and capture pacing (no hardware access)
         shell: pwsh
         run: |
           cmake --build windows/native/FocusWindow.Gpu/.build --config Release --target FocusWindow.Gpu.ContractTests
@@ -83,6 +85,9 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
       - uses: android-actions/setup-android@v3
         continue-on-error: true
       - name: Install Android SDK
@@ -95,7 +100,11 @@ jobs:
           echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
       - name: Build and test Android without devices
         working-directory: android
-        run: bash ./gradlew :app:testDebugUnitTest :app:assembleDebug --no-daemon
+        run: bash ./gradlew :app:testDebugUnitTest :app:assembleDebug :protocol3:check :protocol3:interopJar --no-daemon
+      - name: Exchange encrypted records between actual Kotlin and C# implementations
+        env:
+          DESKFUSE_KOTLIN_INTEROP_JAR: ${{ github.workspace }}/android/build/protocol3/deskfuse-protocol-v3-kotlin.jar
+        run: dotnet test windows/agent/FocusWindow.Tests/FocusWindow.Tests.csproj -c Release --filter FullyQualifiedName~ProtocolV3InteropTests --verbosity minimal
       - uses: actions/upload-artifact@v4
         with:
           name: deskfuse-android-debug

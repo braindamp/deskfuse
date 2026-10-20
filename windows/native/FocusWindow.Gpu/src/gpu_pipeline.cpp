@@ -20,7 +20,7 @@ struct fwgpu_session {
     std::mutex gate;
     std::wstring error;
     uint64_t packetQpc = 0;
-    uint64_t lastQpc = 0;
+    std::chrono::steady_clock::time_point nextEncodeAt = std::chrono::steady_clock::time_point::min();
     int64_t lastSourceTime = 0;
     CapturedFrame cached;
     bool haveCached = false;
@@ -128,10 +128,9 @@ FWGPU_EXPORT int32_t __cdecl fwgpu_read(fwgpu_session* s,uint32_t timeoutMs,
     if(s->packet.empty()){
         CapturedFrame frame;
         const bool forceIdr = s->wantIdr.exchange(false);
-        const auto step = static_cast<uint64_t>(QpcFrequency()) / s->fps;
-        const auto earliest = forceIdr || !s->lastQpc ? 0 : s->lastQpc + step;
+        const auto earliest = forceIdr ? std::chrono::steady_clock::time_point::min() : s->nextEncodeAt;
         const bool fresh = s->capture->WaitFrame(frame,(int)std::min(timeoutMs,1000u),
-            static_cast<int64_t>(earliest), s->lastSourceTime);
+            earliest, s->lastSourceTime);
         if(!fresh){
             if(!s->capture->Error().empty()){s->error=s->capture->Error();return -1;}
             if (!forceIdr || !s->haveCached) {
@@ -149,6 +148,7 @@ FWGPU_EXPORT int32_t __cdecl fwgpu_read(fwgpu_session* s,uint32_t timeoutMs,
             ~FrameScope(){if(release)capture->ReleaseFrame(frame);}
         } scope{s->capture.get(),frame,fresh};
         uint32_t bytes=0;double submit=0,lock=0;
+        const auto encodeStarted = std::chrono::steady_clock::now();
         const bool ok=s->encoder->Encode(frame.slot,(uint64_t)frame.systemRelativeTime,
            s->frameNo++,bytes,submit,lock,s->error,s->packet,forceIdr);
         if(!ok)return -1;
@@ -162,10 +162,10 @@ FWGPU_EXPORT int32_t __cdecl fwgpu_read(fwgpu_session* s,uint32_t timeoutMs,
             s->packet.clear();s->error=L"NVENC did not provide SPS/PPS/IDR for recovery";return -1;
         }
         s->packetQpc=SourceQpc(frame);
+        s->nextEncodeAt = encodeStarted + std::chrono::nanoseconds((1000000000ull + s->fps - 1) / s->fps);
         if(fresh){
             if(s->haveCached)s->capture->ReleaseFrame(s->cached);
             s->cached=frame;s->haveCached=true;scope.release=false;
-            s->lastQpc=static_cast<uint64_t>(frame.qpcArrival);
             s->lastSourceTime=frame.systemRelativeTime;
         }
     }

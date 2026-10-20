@@ -15,9 +15,11 @@ set_target_properties(FocusWindow.Gpu PROPERTIES OUTPUT_NAME "FocusWindow.Gpu"
 
 include(CTest)
 if(BUILD_TESTING)
-    add_executable(FocusWindow.Gpu.ContractTests tests/abi_contract.cpp)
+    add_executable(FocusWindow.Gpu.ContractTests tests/abi_contract.cpp tests/frame_queue.cpp)
+    target_include_directories(FocusWindow.Gpu.ContractTests PRIVATE src)
+    target_compile_options(FocusWindow.Gpu.ContractTests PRIVATE /W4 /permissive- /EHsc /utf-8)
     target_link_libraries(FocusWindow.Gpu.ContractTests PRIVATE FocusWindow.Gpu)
     set_target_properties(FocusWindow.Gpu.ContractTests PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-    add_test(NAME gpu_abi_without_hardware COMMAND FocusWindow.Gpu.ContractTests)
+    add_test(NAME gpu_contracts_without_hardware COMMAND FocusWindow.Gpu.ContractTests)
 endif()

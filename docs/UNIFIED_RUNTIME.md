@@ -16,13 +16,21 @@ dotnet test windows/agent/FocusWindow.Tests/FocusWindow.Tests.csproj -c Release
 cmake --build windows/native/FocusWindow.Gpu/.build --config Release --target FocusWindow.Gpu.ContractTests
 ctest --test-dir windows/native/FocusWindow.Gpu/.build -C Release --output-on-failure
 # From android/, with Android SDK 35 and Java 17 or 21 configured:
-./gradlew :app:testDebugUnitTest :app:assembleDebug --no-daemon
+./gradlew :app:testDebugUnitTest :app:assembleDebug :protocol3:check :protocol3:interopJar --no-daemon
+# From the repository root, with Java on PATH, run the actual Kotlin/C# TCP bridge:
+# DESKFUSE_KOTLIN_INTEROP_JAR must be the absolute path to
+# android/build/protocol3/deskfuse-protocol-v3-kotlin.jar.
+dotnet test windows/agent/FocusWindow.Tests/FocusWindow.Tests.csproj -c Release --filter FullyQualifiedName~ProtocolV3InteropTests
 ```
 
 The normal CI workflow runs these software gates and provides a Windows x64
 host directory and Android debug APK as artifacts. Debug APKs are development
 artifacts, not signed production releases. Native ABI tests reject invalid
 arguments without opening a real HWND, adapter, virtual display or driver.
+The same native test target exercises the production latest-frame queue, including
+the final update after a burst, 144 Hz to 60 fps pacing, bounded surface ownership,
+duplicate timestamps and shutdown. CI also compiles Android's actual crypto sources
+into a test-only JVM harness and exchanges authenticated records with C# over TCP.
 
 ## Actual application source
 
@@ -70,8 +78,10 @@ CPU/GPU/memory load and especially bandwidth, not source-code size.
 - One MTA thread owns native open/read/close and COM lifetime. No per-frame tasks
   or steady full-frame CPU readback.
 - Two registered GPU texture slots, one latest pending WGC capture and one
-  queued encoded packet. Capture pacing and repeated compositor timestamps are
-  filtered before GPU copy. Different pictures are not guessed from arrival rate.
+  queued encoded packet. Pacing retains the newest pending update until the next
+  encode deadline, including a final repaint followed by idle. Repeated compositor
+  timestamps are rejected before GPU copy. Different pictures are not guessed
+  from arrival rate; idle periods do not generate padding video.
 - Original compositor QPC reaches transport PTS. The advertised cadence is the
   configured cap, not a measurement of delivered frames.
 - NVENC keeps the POC SDR BT.709 full-range and H.264 4:2:0 contract, with VBR
@@ -83,6 +93,10 @@ CPU/GPU/memory load and especially bandwidth, not source-code size.
 - A single ordered AES-GCM writer prioritizes control and recent PCM audio,
   then alternates video/file work. This cannot interrupt a record already being
   transmitted; TCP head-of-line blocking and PCM bandwidth remain limitations.
+- Encryption writes directly into the final framed network buffer and reuses
+  authenticated per-direction cipher instances. This removes a full-packet
+  allocation/copy and repeated key setup while preserving the existing wire bytes,
+  nonce ordering and replay protection.
 - Five-second host diagnostics report measured delivered video fps and total
   encrypted outbound kbit/s, including control/audio/files. No bandwidth,
   fidelity or latency improvement is claimed as measured on physical hardware.
@@ -130,5 +144,7 @@ with GPU/bridge/session coverage in `UnifiedSessionTests`; independent protocol
 denial/version tests no longer require FFmpeg. Standalone old encoder tests
 remain optional when their external tools are provided.
 
-PR #11 stays draft and `main` remains unmodified until those completion gates
-are met. The original POC branch remains read-only and retains its history.
+The owner deferred physical-device acceptance until after the code is built.
+The unified tree is consolidated into `main` after software validation; this is
+not a physical acceptance or production-release claim. The original POC branch
+remains read-only and retains its history.

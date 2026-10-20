@@ -6,20 +6,23 @@ merge `c12367c` (parents include the complete `e62f371` feature stack). Further
 implemented source/lifecycle/bandwidth work and current limitations are recorded
 in [`docs/UNIFIED_RUNTIME.md`](docs/UNIFIED_RUNTIME.md). Sections 3–7 below describe
 the original handoff state and work order; they are retained as historical context.
-The integrated candidate is not physically accepted and must not merge solely
-because software checks pass.
+**Owner follow-up:** continue building and consolidating the code; physical-device
+acceptance will follow later. The older hardware-before-merge instructions below
+are historical and superseded by that direction. Software checks do not establish
+physical acceptance.
 
 **Local software verification for the executed increment:** Windows x64
-self-contained publish with bundled native DLL; hardware-free native ABI test;
-.NET **171 passed / 10 legacy or optional skipped**; Android **19 unit tests**
-and debug APK; plan-only PowerShell 5.1 smoke. Real WGC/NVENC/Android decode,
+self-contained publish with bundled native DLL; hardware-free native ABI and
+capture-pacing contracts; .NET **172 passed / 10 legacy or optional skipped**; Android **19 unit tests**
+and debug APK; actual Kotlin/C# encrypted TCP interoperability; plan-only
+PowerShell 5.1 smoke. Real WGC/NVENC/Android decode,
 bandwidth/latency/color and installed-driver permissions were not exercised.
 
 **Repository:** https://github.com/braindamp/deskfuse (private; use the connected GitHub app/authorized checkout)  
 **Repository directory:** repository root `.`  
 **Primary work branch:** `integration/unified-gpu-workspace-20261020`  
 **Integration PR:** https://github.com/braindamp/deskfuse/pull/11  
-**Destination:** `main`, after one unified build and functional integration have been achieved.  
+**Destination:** `main`, after the unified code and software checks pass; physical acceptance follows later per the owner.
 **Other agent's proven POC branch:** `poc/gpu-phone-workspace-wgc`, **READ ONLY**.  
 **Functional branches:** draft PRs #5–#10, source for reconciliation, not independently maintained end products.
 

@@ -307,22 +307,15 @@ public sealed class PhoneConnection : IAsyncDisposable
                 else
                 {
                     // Seal HERE, in dequeue order, so counter order == wire order.
-                    var sealedBytes = _chan.Seal(o.Plain!);
-                    if (o.IsFrame)
-                    {
-                        if (sealedBytes.Length > Wire.MaxFrameBytes)
-                        {
-                            // Defensive invariant: TrySendFrame never queues one of
-                            // these. A future protocol change must fail the entire
-                            // connection rather than silently break inter-frame decode.
-                            throw new InvalidDataException(
-                                $"sealed H.264 frame of {sealedBytes.Length} bytes exceeds wire maximum");
-                        }
-                    }
-                    packet = new byte[5 + sealedBytes.Length];
+                    var sealedLength = checked(o.Plain!.Length + SecureChannel.RecordOverheadBytes);
+                    // TrySendFrame already checks this. Fail the connection if a
+                    // future change violates the contract; never lose a P-frame silently.
+                    if (o.IsFrame && sealedLength > Wire.MaxFrameBytes)
+                        throw new InvalidDataException($"sealed H.264 frame of {sealedLength} bytes exceeds wire maximum");
+                    packet = new byte[5 + sealedLength];
                     packet[0] = o.Kind;
-                    BinaryPrimitives.WriteInt32BigEndian(packet.AsSpan(1, 4), sealedBytes.Length);
-                    sealedBytes.CopyTo(packet.AsSpan(5));
+                    BinaryPrimitives.WriteInt32BigEndian(packet.AsSpan(1, 4), sealedLength);
+                    _chan.Seal(o.Plain, packet.AsSpan(5));
                 }
                 try
                 {

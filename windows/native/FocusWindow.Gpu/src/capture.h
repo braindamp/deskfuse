@@ -1,14 +1,15 @@
 #pragma once
 
 #include "common.h"
+#include "latest_frame_queue.h"
 
 #include <winrt/base.h>
+#include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Graphics.Capture.h>
 #include <winrt/Windows.Graphics.DirectX.Direct3D11.h>
 
 #include <atomic>
 #include <condition_variable>
-#include <deque>
 #include <mutex>
 #include <memory>
 #include <string>
@@ -28,20 +29,38 @@ struct CapturedFrame
     winrt::Windows::Graphics::Capture::Direct3D11CaptureFrame frame{ nullptr };
 };
 
+struct ReleaseCapturedFrame
+{
+    void operator()(CapturedFrame& frame) const noexcept
+    {
+        if (frame.frame)
+        {
+            try { frame.frame.Close(); } catch (...) {}
+            frame.frame = nullptr;
+        }
+    }
+};
+struct CapturedSourceTime
+{
+    int64_t operator()(const CapturedFrame& frame) const noexcept { return frame.systemRelativeTime; }
+};
+
 /// Windows.Graphics.Capture of one HWND into persistent D3D11 BGRA textures.
 /// The capture path never maps the frame on the CPU; Readback() exists only for
 /// the one-off ruler verification frame.
 class WgcCapture
 {
 public:
-    WgcCapture(ID3D11Device* device, ID3D11DeviceContext* context, int width, int height, int slotCount = 6);
+    WgcCapture(ID3D11Device* device, ID3D11DeviceContext* context, int width, int height, int slotCount = 2);
     ~WgcCapture();
 
     bool CreateResources(std::wstring& error);
     bool Start(HWND hwnd, std::wstring& error);
     void Stop();
 
-    bool WaitFrame(CapturedFrame& frame, int timeoutMs, int64_t minimumQpc = 0, int64_t afterSourceTime = 0);
+    bool WaitFrame(CapturedFrame& frame, int timeoutMs,
+        std::chrono::steady_clock::time_point notBefore = std::chrono::steady_clock::time_point::min(),
+        int64_t afterSourceTime = 0);
     void ReleaseFrame(const CapturedFrame& frame);
     bool Readback(int slot, std::vector<uint8_t>& bgra, int& width, int& height, std::wstring& error);
 
@@ -91,9 +110,7 @@ private:
     std::vector<Slot> slots_;
     mutable std::mutex stateMutex_;
     std::mutex copyMutex_;
-    std::condition_variable frameReady_;
-    std::deque<CapturedFrame> queue_;
-    bool closed_ = false;
+    LatestFrameQueue<CapturedFrame, ReleaseCapturedFrame, CapturedSourceTime> frames_;
     std::wstring error_;
 
     ComPtr<ID3D11Texture2D> staging_;

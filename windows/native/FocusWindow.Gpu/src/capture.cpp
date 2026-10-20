@@ -46,10 +46,11 @@ std::wstring WgcCapture::Error() const
 
 void WgcCapture::SetError(const std::wstring& error)
 {
-    std::lock_guard<std::mutex> lock(stateMutex_);
-    if (error_.empty()) error_ = error;
-    closed_ = true;
-    frameReady_.notify_all();
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        if (error_.empty()) error_ = error;
+    }
+    frames_.Close();
 }
 
 bool WgcCapture::CreateResources(std::wstring& error)
@@ -163,6 +164,7 @@ bool WgcCapture::Start(HWND hwnd, std::wstring& error)
 
 void WgcCapture::Stop()
 {
+    frames_.Close();
     // Queued WinRT callbacks may run after handler revocation. They hold only
     // this shared state, never an unguarded `this` after destruction begins.
     {
@@ -199,29 +201,11 @@ void WgcCapture::Stop()
     }
     catch (...) {}
 
-    std::deque<CapturedFrame> pending;
-    {
-        std::lock_guard<std::mutex> lock(stateMutex_);
-        pending.swap(queue_);
-        closed_ = true;
-    }
-    for (auto& frame : pending)
-    {
-        if (frame.slot >= 0 && frame.slot < static_cast<int>(slots_.size()))
-            slots_[static_cast<size_t>(frame.slot)].state = SlotState::Free;
-        if (frame.frame)
-        {
-            try { frame.frame.Close(); } catch (...) {}
-            frame.frame = nullptr;
-        }
-    }
-
     session_ = nullptr;
     pool_ = nullptr;
     item_ = nullptr;
     graphicsDevice_ = nullptr;
     started_ = false;
-    frameReady_.notify_all();
 }
 
 void WgcCapture::OnClosed(const wchar_t* why)
@@ -280,27 +264,16 @@ void WgcCapture::OnFrameArrived()
         // frame pool owns this thread; blocking it can stall the capture
         // producer and deadlock the copy. Keep the frame alive and materialize
         // it on the caller's thread.
-        std::lock_guard<std::mutex> lock(stateMutex_);
-        if (closed_) return;
-        // Keep ONE latest capture, not a FIFO of stale frames. Dropping before
-        // encode does not damage an H.264 GOP. Explicit Close returns the WGC
-        // pool surface immediately instead of retaining all three pool frames.
-        if (!queue_.empty())
-        {
-            ++droppedNoSlot_;
-            try { if (queue_.front().frame) queue_.front().frame.Close(); } catch (...) {}
-            queue_.pop_front();
-        }
-
         CapturedFrame captured{};
         captured.width = static_cast<uint32_t>(content.Width);
         captured.height = static_cast<uint32_t>(content.Height);
         captured.qpcArrival = QpcNow();
         captured.systemRelativeTime = frame.SystemRelativeTime().count();
         captured.frame = frame;
-        queue_.push_back(std::move(captured));
-        ++arrived_;
-        frameReady_.notify_one();
+        const auto queued = frames_.Push(std::move(captured));
+        using PendingFrames = decltype(frames_);
+        if (queued == PendingFrames::PushResult::Replaced) ++droppedNoSlot_;
+        if (queued != PendingFrames::PushResult::Closed) ++arrived_;
     }
     catch (...)
     {
@@ -430,27 +403,11 @@ bool WgcCapture::MaterializeFrame(CapturedFrame& frame, std::wstring& error)
     }
 }
 
-bool WgcCapture::WaitFrame(CapturedFrame& frame, int timeoutMs, int64_t minimumQpc, int64_t afterSourceTime)
+bool WgcCapture::WaitFrame(CapturedFrame& frame, int timeoutMs,
+    std::chrono::steady_clock::time_point notBefore, int64_t afterSourceTime)
 {
     CapturedFrame pending;
-    {
-        std::unique_lock<std::mutex> lock(stateMutex_);
-        if (!frameReady_.wait_for(lock, std::chrono::milliseconds(timeoutMs),
-                [this] { return !queue_.empty() || closed_; }))
-            return false;
-        if (queue_.empty()) return false;
-        pending = std::move(queue_.front());
-        queue_.pop_front();
-    }
-
-    // Pace and reject repeated compositor timestamps BEFORE any GPU copy.
-    // A different picture is never guessed from frame arrival cadence alone.
-    if (pending.qpcArrival < minimumQpc ||
-        (afterSourceTime != 0 && pending.systemRelativeTime <= afterSourceTime))
-    {
-        try { if (pending.frame) pending.frame.Close(); } catch (...) {}
-        return false;
-    }
+    if (!frames_.Wait(pending, std::chrono::milliseconds(timeoutMs), notBefore, afterSourceTime)) return false;
 
     std::wstring materializeError;
     if (!MaterializeFrame(pending, materializeError))
@@ -473,7 +430,6 @@ void WgcCapture::ReleaseFrame(const CapturedFrame& frame)
     {
         try { frame.frame.Close(); } catch (...) {}
     }
-    frameReady_.notify_all();
 }
 
 ID3D11Texture2D* WgcCapture::SlotTexture(int slot) const
