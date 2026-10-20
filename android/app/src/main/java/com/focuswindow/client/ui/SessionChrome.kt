@@ -340,7 +340,7 @@ private fun ModifierBar(
         ModKey("Keyboard", false) { onShowKeyboard() }
         ModKey("Apps", false) { onSelectWindow() }
         ModKey("PC files", false) { onSendFile() }
-        ModKey("PC sound: $pcAudioStatus", pcAudioStatus == "On") { onTogglePcAudio() }
+        ModKey("PC sound: $pcAudioStatus", pcAudioStatus.startsWith("On")) { onTogglePcAudio() }
         ModKey("Phone mic: $phoneMicStatus", phoneMicStatus == "On") { onTogglePhoneMic() }
     }
     Row(
