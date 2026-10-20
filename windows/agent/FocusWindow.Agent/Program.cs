@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Globalization;
 using FocusWindow.Agent.Display;
 using FocusWindow.Agent.Input;
+using FocusWindow.Agent.Media;
 using FocusWindow.Agent.Interop;
 using FocusWindow.Core;
 using FocusWindow.Core.Display;
@@ -158,6 +159,7 @@ internal static class Program
             DeviceCredentials: new DpapiDeviceCredentialStore(),
             Clipboard: new WindowsClipboardBridge(),
             Windows: new WindowsWindowWorkflow(),
+            CreateVideoPipeline: () => new NativeGpuPipeline(),
             OnNegotiated: outcome =>
             {
                 var path = Path.Combine(AppData.Directory, "last-session-evidence.md");

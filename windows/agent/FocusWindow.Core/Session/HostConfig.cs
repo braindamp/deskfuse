@@ -55,4 +55,5 @@ public sealed record HostServices(
     Action<NegotiationOutcome>? OnNegotiated = null,
     IClipboardBridge? Clipboard = null,
     IWindowWorkflow? Windows = null,
-    IDeviceCredentialStore? DeviceCredentials = null);
+    IDeviceCredentialStore? DeviceCredentials = null,
+    Func<IVideoPipeline>? CreateVideoPipeline = null);
