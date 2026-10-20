@@ -1,6 +1,6 @@
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
-using FocusWindow.Core.Display;
+using FocusWindow.Core.Protocol;
 
 namespace FocusWindow.Agent.Media;
 
