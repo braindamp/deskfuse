@@ -28,6 +28,40 @@ Baseline checked against remote on 2026-10-20 (re-read before any commit):
 - The installed FocusIdd device ACL currently forces elevation for POC monitor control; shipping a network-facing DeskFuse host as administrator is **not** an acceptable production permission solution.
 - POC observed ~144 Hz WGC arrivals with a requested 60 fps encoder configuration. **Production pacing and latency accounting are not proven.**
 
+## 1A. Exact POC code disposition — replace, consolidate, or retire
+
+**The POC is not a shipping backend or a separately maintained implementation. All proven GPU/native-DPI/color technology migrates into DeskFuse.** The code inventory below resolves what "use the POC" means at the file level.
+
+| Source from accepted POC | Exact product disposition | Legacy implementation it supersedes or complements |
+| --- | --- | --- |
+| \`windows/poc/gpu-phone-workspace/src/capture.h/.cpp\` (\`WgcCapture\`) | **PROMOTE** to the shipping native GPU engine; retain GPU texture slots, WGC session, exact-size validation, frame timestamps, lightweight capture callbacks, proper release. Replace the POC's HWND test source with a managed real-app source. | **REPLACES as primary** old \`IFrameSource\` / \`SurfaceFrameSource\` / \`PhoneSession.FrameLoopAsync\` CPU desktop-frame capture; old source can serve explicit unsupported-GPU compatibility only. |
+| \`windows/poc/gpu-phone-workspace/src/nvenc_encoder.h/.cpp\` (\`NvEncoder\`) | **PROMOTE** NVENC's D3D11 interop, resource registration, low-latency encode and SDR BT.709 signaling. Refactor \`Encode\` to emit in-memory Annex-B access units with SPS/PPS, keyframe and timing metadata; **remove file output**. | **REPLACES as primary on NVIDIA** old \`FfmpegEncoder\`/FFmpeg child-process and stdin BGRA pipeline. Other GPU/codec backends must be selected by capabilities, not forced through a CPU readback contract. |
+| \`windows/poc/gpu-phone-workspace/src/common.*\`, GPU/D3D helpers | **REUSE/EXTRACT** only native shared functionality required for WGC/NVENC, adapter matching, timing and error handling, under production namespace/module. | Existing C# session infrastructure remains; avoid duplicate monitor/session owners. |
+| DPI/layout and stable monitor identity in \`windows/agent/FocusWindow.Agent/Display/PocMonitorHost.cs\` | **MIGRATE** verified profile identity, EDID match, requested-vs-actual DPI/scale checks and guarded teardown into the one production \`DisplayResourceManager\`, using current \`WindowsDisplayBackend\`/FocusIdd. Retire \`PocMonitorHost\` as an independent runtime. | **REPLACES** redundant/ineffective exact-1440 scale-calibration choices and competing monitor lifecycle paths. Retain useful physical-display guard, driver interop and heartbeat code rather than replacing the FocusIdd driver. |
+| \`windows/poc/gpu-phone-workspace/src/test_window.*\` | **TEST-ONLY then retire from shipped runtime.** Keep ruler, colors and dimensions as automated diagnostic fixtures if useful. | Real DeskFuse source/window management supplies capture HWND and input mapping. |
+| \`windows/poc/gpu-phone-workspace/src/main.cpp\` | **EXTRACT** useful capture orchestration and diagnostics into production GPU engine and nonshipping tests; **DELETE standalone POC program entry point** from product builds. | Existing \`Program.cs\` remains the one host entry point; it creates unified authenticated sessions rather than launching a parallel demo. |
+| \`windows/poc/gpu-phone-workspace/CMakeLists.txt\` and native app manifest | **REWRITE** into one integrated native DLL build, versioned ABI, packaging, CI and matching x64 runtime. | Replace separately launched native EXE, manual POC build and independent deployment. |
+| \`third_party/nvenc/nvEncodeAPI.h\` | **RETAIN where required** in native shipping component subject to license review; no duplicated copies. | Supports the new native encoder. |
+| \`third_party/nlohmann/json.hpp\`, BMP/CSV/JSON evidence exporters | **RETAIN only if product needs them**; otherwise remove from runtime and reserve for nonshipping diagnostic tools. | Product runtime should use a typed/versioned ABI, not pass POC JSON evidence between native GPU engine and .NET. |
+| \`tools/build-gpu-workspace-poc.ps1\`, \`tools/run-gpu-workspace-poc.ps1\`, \`poc-monitor\` CLI | **RETIRE from shipping** after incorporating useful safeguards into host startup and unified build/CI. Retain test-only scripts under diagnostic/test names where they still verify native hardware. | Single DeskFuse build/start flow; no second manual POC runner or release-flag handshake. |
+| POC spec, architecture and historical evidence | **CONSOLIDATE** proven facts, limitations and reproducible acceptance references into the canonical project architecture; preserve old commit provenance in Git history. Evidence folder stays ignored. | No competing architecture specifications or current product status split between old POC and main. |
+
+### Explicit legacy-deletion rule
+
+Once the integrated GPU path has passed the **real app's** encoder/decoder, native DPI, color, touch and teardown gates:
+1. The GPU path is the standard capture/encoding route for supported hardware and sources. **Do not keep the old CPU/FFmpeg pipeline as the hidden default.**
+2. Remove the old verified-viewport **CPU cropping** from the main streaming path; its replacement is WGC's exact captured HWND pixel geometry.
+3. Keep a **clearly named, isolated compatibility backend** for hardware that cannot use native WGC/NVENC *only while it is genuinely required*. Compatibility implementations must not duplicate PhoneSession, monitor ownership, device catalogs or transport semantics. Remove obsolete calibration algorithms when the replacement covers their supported use cases.
+4. Remove the POC executable, native standalone main, POC-only \`Program.cs\` command, separate test-window launch and file-output path from shipping code and release artifacts.
+5. No critical implementation may remain **only** in \`poc/gpu-phone-workspace-wgc\` after main integration. Historical commit pointers are retained for audit, **not an ongoing code dependency**.
+6. The final source/build must use one GPU engine, one stream transport, one monitor/session owner, one Android receiver and the same peer/device bridge.
+
+### Things the POC did NOT replace
+
+Do not delete or rewrite the existing authenticated enrollment, AES-GCM framing, input authorization, Android \`MediaCodec\`, file/clipboard operations, Device Bridge, microphone/camera capability design, physical-display guard or FocusIdd driver **just because they are old main code**. Connect the new POC rendering engine to those services. FocusIdd was a dependency of the POC, **not a component superseded by it**.
+
+**Known adaptation, not a rejection of POC technology:** NVENC's current \`std::ofstream\` output, the synthetic HWND, CLI release flag, POC client ID and diagnostic JSON cannot be shipped unchanged; replace each with production session access-unit callbacks, actual source ownership, authenticated enrollment ID and structured in-process runtime state. Keep the working WGC/D3D/NVENC/color/scale mechanisms.
+
 ## 2. Target production architecture
 
 ### Windows runtime in one application
