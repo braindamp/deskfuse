@@ -75,8 +75,8 @@ class PcAudioOutput(context: Context) {
         if (sampleRate !in 8_000..192_000 || channels != selected.channels ||
             format != "pcm_s16le" || id <= 0) return false
 
-        val route = if (layout == "stereo") null else supportingDevice(selected, sampleRate)
-            ?: return false
+        val route = if (layout == "stereo") null
+            else (supportingDevice(selected, sampleRate) ?: return false)
         val encoding = AudioFormat.ENCODING_PCM_16BIT
         val min = AudioTrack.getMinBufferSize(sampleRate, selected.mask, encoding)
         if (min <= 0) return false
