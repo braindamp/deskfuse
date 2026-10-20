@@ -82,6 +82,7 @@ class SessionController(
     private var activePcAudioStreamId = -1
     private var pcAudioDesired = false
     private var pcAudioFailedOnConnection = false
+    private var pcAudioForceStereo = false
     private var hostPcAudioAvailable = false
     private var pcAudioOutput: PcAudioOutput? = null
 
@@ -266,6 +267,7 @@ class SessionController(
         } else {
             // An explicit user tap can retry after a previous audio error.
             pcAudioFailedOnConnection = false
+            pcAudioForceStereo = false
             requestPreferredPcAudio()
         }
     }
@@ -278,7 +280,33 @@ class SessionController(
             pcAudioFailedOnConnection || _state.value !is SessionState.Streaming) return
         pcAudioRequested = true
         _pcAudioStatus.value = "Starting"
-        scope.launch { transport.send(ClientMessage.Audio("start_pc")) }
+        val offers = if (pcAudioForceStereo) listOf("stereo")
+            else pcAudioOutput?.offeredLayouts() ?: listOf("stereo")
+        scope.launch { transport.send(ClientMessage.Audio("start_pc", offers)) }
+    }
+
+    /** If the multichannel peripheral vanishes, start a newly negotiated
+     * stereo route. Never rely on Android silently downmixing 5.1.
+     */
+    private fun fallbackPcAudioToStereo() {
+        if (pcAudioForceStereo || !pcAudioDesired) {
+            pcAudioFailedOnConnection = true
+            stopPcAudioLocal()
+            _pcAudioStatus.value = "Unavailable"
+            scope.launch { transport.send(ClientMessage.Audio("stop_pc")) }
+            return
+        }
+        pcAudioForceStereo = true
+        stopPcAudioLocal()
+        _pcAudioStatus.value = "Starting"
+        scope.launch {
+            transport.send(ClientMessage.Audio("stop_pc"))
+            if (pcAudioDesired && hostPcAudioAvailable &&
+                _state.value is SessionState.Streaming) {
+                pcAudioRequested = true
+                transport.send(ClientMessage.Audio("start_pc", listOf("stereo")))
+            }
+        }
     }
 
     private fun stopPcAudioLocal() {
@@ -309,6 +337,7 @@ class SessionController(
         _bridgeState.value = null
         stopPcAudioLocal()
         pcAudioDesired = audioPreferences?.audioWanted(payload, "pc_sound") ?: false
+        pcAudioForceStereo = false
         hostMicAvailable = false
         phoneMicFailed = false
         stopPhoneMicrophoneLocal()
@@ -420,6 +449,7 @@ class SessionController(
                     phoneMicFailed = false
                     if (!hostMicAvailable) _phoneMicStatus.value = "Unavailable"
                     pcAudioFailedOnConnection = false
+                    pcAudioForceStereo = false
                     _pcAudioStatus.value = if (msg.pcAudioAvailable) "Off" else "Unavailable"
                     requestPreferredPcAudio()
                     requestPreferredPhoneMicrophone()
@@ -483,14 +513,16 @@ class SessionController(
                                 transport.send(ClientMessage.Audio("stop_pc"))
                             } else if (pcAudioOutput?.start(
                                     msg.streamId, msg.sampleRate, msg.channels, msg.format,
+                                    msg.layout,
                                 ) == true) {
                                 activePcAudioStreamId = msg.streamId
-                                _pcAudioStatus.value = "On"
+                                _pcAudioStatus.value = when (msg.layout) {
+                                    "5.1_back", "5.1_side" -> "On · 5.1"
+                                    "7.1_surround" -> "On · 7.1"
+                                    else -> "On"
+                                }
                             } else {
-                                pcAudioFailedOnConnection = true
-                                stopPcAudioLocal()
-                                _pcAudioStatus.value = "Unavailable"
-                                transport.send(ClientMessage.Audio("stop_pc"))
+                                fallbackPcAudioToStereo()
                             }
                         }
                         "stopped" -> {
@@ -665,8 +697,12 @@ class SessionController(
 
     private suspend fun pumpAudio() {
         transport.audio.collect { chunk ->
-            if (_pcAudioStatus.value == "On") withContext(Dispatchers.IO) {
-                pcAudioOutput?.write(chunk)
+            if (_pcAudioStatus.value.startsWith("On") &&
+                chunk.streamId == activePcAudioStreamId) {
+                val received = withContext(Dispatchers.IO) {
+                    pcAudioOutput?.write(chunk) ?: false
+                }
+                if (!received) fallbackPcAudioToStereo()
             }
         }
     }
