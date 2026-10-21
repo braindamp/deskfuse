@@ -49,9 +49,8 @@ internal sealed class PhoneSpeakerRoute(
         if (endpoint is null)
         {
             log.Warn("Phone speaker endpoint unavailable: " + (error ?? "unknown reason"));
-            conn.SendControl(ServerMessages.Stage("speakers",
-                "The phone speaker endpoint is not available on this PC.",
-                error ?? "Install the DeskFuse Audio driver and start the DeskFuse audio endpoint broker."));
+            conn.SendControl(ServerMessages.Stage("speakers", UserFacing.For("speakers"),
+                "Try again in a moment.", technical: error));
             return Array.Empty<string>();
         }
         _endpoint = endpoint;
@@ -100,7 +99,7 @@ internal sealed class PhoneSpeakerRoute(
         if (services.CreateEndpointAudioCapture is null)
         {
             conn.SendControl(ServerMessages.AudioState("error", _streamId,
-                detail: "This host cannot capture a Windows playback endpoint."));
+                detail: UserFacing.For("speakers")));
             return;
         }
         StopCapture();
@@ -128,7 +127,7 @@ internal sealed class PhoneSpeakerRoute(
             log.Warn("phone speaker capture unavailable: " + ex.Message);
             StopCapture();
             conn.SendControl(ServerMessages.AudioState("error", _streamId,
-                detail: "The phone speaker endpoint could not be captured."));
+                detail: UserFacing.For("speakers"), technical: ex.Message));
         }
     }
 

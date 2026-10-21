@@ -193,9 +193,8 @@ class PcAudioOutput(context: Context) {
         if (index == lastAppliedSystemIndex) return
         if (!canChangeSystemVolume) return
         runCatching {
-            manager.setStreamVolume(
-                AudioManager.STREAM_MUSIC, index, AudioManager.FLAG_SHOW_UI,
-            )
+            // No system panel: the phone's own slider moves, quietly.
+            manager.setStreamVolume(AudioManager.STREAM_MUSIC, index, 0)
             lastAppliedSystemIndex = index
         }
     }

@@ -140,6 +140,11 @@ sealed interface ServerMessage {
         val detail: String,
         val remediation: String? = null,
         val fatal: Boolean = false,
+        /**
+         * How it actually went wrong, for the diagnostics. Never shown as
+         * the headline: the person using the phone has no use for it.
+         */
+        val technical: String? = null,
     ) : ServerMessage
 
     /** FR-ENC-04 — quality changed, and why. Shown, not swallowed. */
@@ -200,6 +205,8 @@ sealed interface ServerMessage {
         val sampleRate: Int = 0, val channels: Int = 0,
         val format: String = "pcm_s16le", val detail: String? = null,
         val layout: String = "stereo",
+        /** For the diagnostics only. */
+        val technical: String? = null,
     ) : ServerMessage
 
     /**

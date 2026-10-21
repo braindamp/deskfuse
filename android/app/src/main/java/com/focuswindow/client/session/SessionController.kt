@@ -467,6 +467,7 @@ class SessionController(
                     if (msg.fatal) {
                         _state.value = SessionState.Failed(
                             msg.stage, msg.detail, msg.remediation, recoverable = true,
+                            technical = msg.technical,
                         )
                     } else if (_state.value !is SessionState.Streaming) {
                         _state.value = SessionState.PreparingTarget(

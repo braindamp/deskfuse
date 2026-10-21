@@ -186,7 +186,7 @@ public static class ServerMessages
     }
 
     public static JsonObject AudioState(string state, int streamId, int sampleRate = 0, int channels = 0,
-        string? detail = null, string layout = "stereo") => new()
+        string? detail = null, string layout = "stereo", string? technical = null) => new()
     {
         ["type"] = "audio_state",
         ["state"] = state,
@@ -196,6 +196,8 @@ public static class ServerMessages
         ["format"] = "pcm_s16le",
         ["layout"] = layout,
         ["detail"] = detail,
+        // The implementation detail. The phone shows it in diagnostics only.
+        ["technical"] = technical,
     };
 
     /// <summary>
@@ -243,13 +245,16 @@ public static class ServerMessages
         ["record"] = record.ToJson(),
     };
     /// <summary>FR-OPS-03: every non-streaming state is named. Never a blank surface.</summary>
-    public static JsonObject Stage(string stage, string detail, string? remediation = null, bool fatal = false) => new()
+    public static JsonObject Stage(string stage, string detail, string? remediation = null, bool fatal = false,
+        string? technical = null) => new()
     {
         ["type"] = "stage",
         ["stage"] = stage,
         ["detail"] = detail,
         ["remediation"] = remediation,
         ["fatal"] = fatal,
+        // The implementation detail. The phone shows it in diagnostics only.
+        ["technical"] = technical,
     };
     public static JsonObject Quality(string codec, string pixelFormat, int bitrateKbps, int refreshHz, string reason) => new()
     {

@@ -45,7 +45,9 @@ sealed interface SessionState {
         val detail: String,
         val progress: Float,
     ) : SessionState {
-        override val stageLabel = stage
+        // What the PC is doing, in the person's terms. The stage code stays
+        // in the diagnostics.
+        override val stageLabel = stage.toPlainLabel()
     }
 
     data class Streaming(
@@ -111,8 +113,10 @@ sealed interface SessionState {
         val detail: String,
         val remediation: String?,
         val recoverable: Boolean,
+        /** How it actually went wrong. Shown in the diagnostics only. */
+        val technical: String? = null,
     ) : SessionState {
-        override val stageLabel = "Couldn't start — $stage"
+        override val stageLabel = "Couldn't connect"
     }
 
     data class Ended(val reason: String) : SessionState {
@@ -187,4 +191,14 @@ data class SessionAdvisory(
                 "encrypted, but it is not a direct LAN connection.",
         )
     }
+}
+
+/**
+ * What the PC is doing, in the person's terms. The stage code is an
+ * implementation detail and stays in the diagnostics.
+ */
+private fun String.toPlainLabel(): String = when {
+    contains("gpu", true) || contains("capture", true) -> "Preparing the picture"
+    contains("speaker", true) || contains("audio", true) -> "Preparing the sound"
+    else -> "Preparing the connection"
 }

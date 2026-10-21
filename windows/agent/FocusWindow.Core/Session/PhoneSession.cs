@@ -131,7 +131,7 @@ internal sealed class PhoneSession
         // Validate local source configuration BEFORE allocating any monitor.
         _video = _s.CreateVideoPipeline?.Invoke() ??
             throw new DisplayException("gpu", "No native GPU pipeline is configured.");
-        _conn.SendControl(ServerMessages.Stage("Preparing the display", "Creating the phone-shaped monitor."));
+        _conn.SendControl(ServerMessages.Stage("Preparing the display", UserFacing.Preparing));
         _outcome = await NegotiatePhoneDisplayAsync(_profile, ct).ConfigureAwait(false);
         _s.OnNegotiated?.Invoke(_outcome);
         // WGC/D3D11/NVENC is authoritative. No CPU surface or FFmpeg video loop.
@@ -159,7 +159,7 @@ internal sealed class PhoneSession
         var settings = new VideoPipelineSettings(
             _outcome.Monitor.Bounds, _outcome.Plan.PixelW, _outcome.Plan.PixelH,
             _fps, _o.BitrateKbps, _outcome.EffectiveDpi, _outcome.Monitor.GdiName, _profile.DeviceId);
-        _conn.SendControl(ServerMessages.Stage("Starting the application", "Launching the PC-selected app on the phone display."));
+        _conn.SendControl(ServerMessages.Stage("Starting the application", UserFacing.Starting));
         using (var startStop = CancellationTokenSource.CreateLinkedTokenSource(ct))
         {
             var pulse = Task.Run(async () =>
@@ -661,7 +661,8 @@ internal sealed class PhoneSession
             if (Interlocked.Read(ref _framesSeen) == 0)
             {
                 if (tick == 4)
-                    _conn.SendControl(ServerMessages.Stage("Waiting for the first frame", "The phone display is up but Windows has not drawn to it yet."));
+                    _conn.SendControl(ServerMessages.Stage("Waiting for the first frame",
+                        "Your PC is still drawing the picture for this phone."));
                 if (tick >= 15)
                     throw new DisplayException("capture", "The native WGC/NVENC pipeline has not delivered a frame.",
                         "Verify the source HWND is visible, at the target DPI, and NVENC is available.");
@@ -678,8 +679,13 @@ internal sealed class PhoneSession
         if (h.LastError == DriverContract.ErrFrameTooLarge) return "The monitor mode is larger than the driver's frame limit.";
         return $"Driver status: dropped {h.FramesDropped}, published {h.FramesPublished}, last error 0x{h.LastError:X8}.";
     }
+    /// <summary>
+    /// A failure the user has to see. The phone is told what it means for
+    /// them; how it happened stays in the log and in the phone's diagnostics.
+    /// </summary>
     private void Fatal(string stage, string detail, string? remediation) =>
-        _conn.SendControl(ServerMessages.Stage(stage, detail, remediation, fatal: true));
+        _conn.SendControl(ServerMessages.Stage(stage, UserFacing.For(stage), remediation, fatal: true,
+            technical: detail));
     private async Task TeardownAsync()
     {
         StopPcAudio();

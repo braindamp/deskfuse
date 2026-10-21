@@ -156,7 +156,7 @@ private fun Failure(state: SessionState.Failed, onRetry: () -> Unit) {
             Box(Modifier.size(8.dp).background(Coral, CircleShape))
             Spacer(Modifier.width(8.dp))
             Text(
-                "FAILED AT: ${state.stage.uppercase()}",
+                state.stageLabel.uppercase(),
                 color = Coral,
                 fontSize = 9.sp,
                 letterSpacing = 1.6.sp,
