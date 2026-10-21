@@ -3,6 +3,12 @@
 **Invariant:** an enrolled but disconnected phone is not an available Windows
 render output. Enrollment identity survives, the per-phone PnP device does not.
 
+**Related architecture:** [Speakers-only connection](speakers-only-architecture.md)
+requires an independent authenticated audio/accessory role, with no
+\`--workspace-app\`, virtual monitor, Windows Graphics Capture or NVENC
+requirement. This document covers PnP endpoint lifetime, not the complete
+Android-to-accessory session UX.
+
 The old elevated audio broker intentionally kept the root-enumerated device
 after a phone session ended. This left a clickable Windows speaker that could
 not deliver audio. This behavior is independent of the Windows audio
