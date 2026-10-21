@@ -46,6 +46,7 @@ class PcAudioOutput(context: Context) {
     private var lastAppliedSystemIndex: Int = -1
     private var activeLayout = "stereo"
     private var routingRequestedAtMs = 0L
+    private var seamGuard: PcmSeamGuard? = null
 
     private data class Layout(val name: String, val channels: Int, val mask: Int)
     private val stereo = Layout("stereo", 2, AudioFormat.CHANNEL_OUT_STEREO)
@@ -140,6 +141,7 @@ class PcAudioOutput(context: Context) {
                 writeOver10Ms = 0
                 writeOver30Ms = 0
                 bytesPerFrame = channels * 2
+                seamGuard = PcmSeamGuard(channels, sampleRate)
                 activeLayout = layout
                 nativeRoute = route
                 routingRequestedAtMs = SystemClock.elapsedRealtime()
@@ -260,6 +262,9 @@ class PcAudioOutput(context: Context) {
         if (chunk.streamId != streamId) return@withContext true
         val current = track ?: return@withContext false
         if (!routeStillSupportsSurround()) return@withContext false
+        // Protect only severe packet-boundary waveform splices, without
+        // delaying or modifying continuous PCM.
+        seamGuard?.apply(chunk.pcm)
         val completed = writePcmPacket(chunk.pcm.size) { offset, count ->
             ensureActive()
             if (track !== current || streamId != chunk.streamId) return@writePcmPacket -1
@@ -292,7 +297,7 @@ class PcAudioOutput(context: Context) {
             .getOrDefault(0)
         val underruns = runCatching { current?.underrunCount ?: 0 }.getOrDefault(0)
         val timing = "writeMaxMs=$writeMaxMs write>10ms=$writeOver10Ms " +
-            "write>30ms=$writeOver30Ms"
+            "write>30ms=$writeOver30Ms seams=${seamGuard?.repaired ?: 0}"
         writeMaxMs = 0
         writeOver10Ms = 0
         writeOver30Ms = 0
@@ -302,6 +307,7 @@ class PcAudioOutput(context: Context) {
 
     fun stop() {
         streamId = -1
+        seamGuard = null
         activeLayout = "stereo"
         nativeRoute = null
         routingRequestedAtMs = 0L
