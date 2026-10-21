@@ -22,6 +22,7 @@ namespace FocusWindow.Agent;
 internal sealed class WindowsLoopbackAudioCapture : IHostAudioCapture
 {
     private readonly WasapiCapture _capture;
+    private readonly bool _eventSync;
     private readonly MMDevice? _device;
     private readonly WaveFormat _sourceFormat;
     private readonly int _sourceMask;
@@ -73,6 +74,12 @@ internal sealed class WindowsLoopbackAudioCapture : IHostAudioCapture
     public WindowsLoopbackAudioCapture(
         string? endpointId, IReadOnlyList<string> supportedPhoneLayouts, int maxPcmBytes = 3840)
     {
+        // Explicit A/B experiment only. Preserve the empirically reliable
+        // polling mode unless the launcher opts into the Windows 10 1703+
+        // EVENTCALLBACK + LOOPBACK capture path.
+        _eventSync = string.Equals(
+            Environment.GetEnvironmentVariable("DESKFUSE_WASAPI_EVENT_SYNC"),
+            "1", StringComparison.Ordinal);
         if (endpointId is not null)
         {
             MMDevice device;
@@ -89,13 +96,13 @@ internal sealed class WindowsLoopbackAudioCapture : IHostAudioCapture
             }
             // The capture uses the device, so it has to outlive it.
             _device = device;
-            _capture = new LowLatencyLoopbackCapture(device);
+            _capture = new LowLatencyLoopbackCapture(device, _eventSync);
         }
         else
         {
             using var enumerator = new MMDeviceEnumerator();
             _device = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
-            _capture = new LowLatencyLoopbackCapture(_device);
+            _capture = new LowLatencyLoopbackCapture(_device, _eventSync);
         }
         try
         {
@@ -144,11 +151,12 @@ internal sealed class WindowsLoopbackAudioCapture : IHostAudioCapture
         }
     }
 
-    // NAudio's loopback helper uses a 100 ms capture buffer and polls every
-    // half-buffer, batching roughly 50 ms before any audio reaches the phone.
-    // Keep its loopback flags and shared mix, but poll a 20 ms buffer instead.
-    private sealed class LowLatencyLoopbackCapture(MMDevice device)
-        : WasapiCapture(device, false, 20)
+    // Retain the proven 20 ms NAudio loopback buffer for both A/B modes.
+    // Windows 10 1703+ supports event-driven loopback with EVENTCALLBACK;
+    // changing from polling is OPT-IN and does not alter endpoint flags,
+    // sample conversion, packet duration, encryption or Android playback.
+    private sealed class LowLatencyLoopbackCapture(MMDevice device, bool eventSync)
+        : WasapiCapture(device, eventSync, 20)
     {
         protected override AudioClientStreamFlags GetAudioClientStreamFlags() =>
             AudioClientStreamFlags.Loopback | base.GetAudioClientStreamFlags();
@@ -321,6 +329,7 @@ internal sealed class WindowsLoopbackAudioCapture : IHostAudioCapture
     /// time the 2-second reporter reads this snapshot.
     /// </summary>
     public string? Health =>
+        $"capMode={(_eventSync ? "event" : "poll")} " +
         $"{Interlocked.Read(ref _packets)} capture callbacks, longest hole {Volatile.Read(ref _maxGapMs)} ms" +
         $" | cap2s callbacks={Interlocked.Exchange(ref _windowCallbacks, 0)}" +
         $" maxGapMs={Interlocked.Exchange(ref _windowMaxGapMs, 0)}" +
