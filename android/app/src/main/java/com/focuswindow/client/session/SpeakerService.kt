@@ -43,7 +43,18 @@ class SpeakerService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_START -> start(intent)
-            ACTION_STOP -> stopSelf()
+            ACTION_STOP -> {
+                // Stop the socket immediately, not whenever Android later
+                // dispatches onDestroy(). stopSelf(startId) cannot tear down
+                // a newer ACTION_START that arrived after this STOP.
+                controller?.stop()
+                controller = null
+                stateJob?.cancel()
+                stateJob = null
+                running = false
+                state.value = SpeakerController.State.Idle
+                stopSelf(startId)
+            }
         }
         // The user ends the session explicitly. A killed service does not
         // silently reconnect to someone's PC.
