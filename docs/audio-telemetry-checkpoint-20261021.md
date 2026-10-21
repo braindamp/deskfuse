@@ -133,3 +133,85 @@ The goal is **not** to eliminate all jitter by enlarging a playback
 buffer. It is to identify the first stage that stalls during mouse
 movement, then change only that stage and verify that perceived
 near-instant playback is preserved.
+
+## First actual user run: unexpectedly excellent sound (October 21, 20:04–20:06)
+
+**User's direct assessment:** "MUCH MUCH BETTER! This was practically
+PERFECT." Occasional small pops/crackles remain, but this exact
+diagnostic-agent bundle is now a **valuable subjectively acceptable
+baseline** and must be preserved. Previous agent/run was reported
+massively broken, especially on mouse movement and repeated seeks.
+
+**Interpretation caution:** Changes in this branch were intended to be
+diagnostic-only: same sample conversion, pacing, channel capacity and
+Android application. A different compiled agent from an earlier local
+acceptance bundle was deployed. Improved sound is **empirical**, not
+yet causally attributable to any instrumentation code. Different
+binary vintage, timing perturbation, changed process launch or other
+environmental factors cannot be ruled out. Do **not** call the mouse
+or A/V sync defects completely fixed, and do not remove the pacer yet.
+Do not overwrite or replace the known-good diagnostic executable
+while testing the remaining crackles.
+
+**Windows agent log, 31 provided health lines:**
+
+- Cumulative `routeEvict=0`, `txEvict=0`,
+  `routeReject=0`, and `0 rejected` throughout. No loss was
+  reported in either measured Windows channel during this good run.
+  This does **not** establish zero Android `SharedFlow` loss, and
+  does not prove a channel could never evict during a worse run.
+- By 20:06:36, `packets queued=6297`, `txAccept=6297`,
+  `txWritten=6296`: roughly one audio packet in flight at
+  the host's two distinct accounting points; **not** an Android ACK.
+  Across the steady intervals roughly 200 packets/2 s are accepted.
+- `txWriteMaxMs` within supplied windows was at most 18 ms;
+  `txAgeMaxMs` at most 18 ms; no `txWrite>20ms` or
+  `txAge>50ms` was reported.
+- The 2-second capture arrival-window largest gap peaked at
+  **68 ms** and the cumulative `longest hole` reached 68 ms.
+  Several otherwise stable intervals had roughly 129–131 callback
+  arrivals every ~2 s while ~200 PCM chunks were sent. A
+  **callback is not equivalent to a 10 ms audio chunk**; capture
+  can deliver multiple chunks per callback.
+- `Task.Delay` oversleep is demonstrably nonzero:
+  `oversleepMaxMs` reached **69 ms**, and recurring intervals
+  saw >5 ms and >10 ms late delays. Nevertheless overall sound
+  was judged acceptable; oversleep alone does not establish
+  that a particular audible pop was caused by the pacer.
+- At **20:06:06**, `ageMaxMs=126`, `age>50ms=18`,
+  `age>100ms=2`, `paceReset=6`, `oversleepMaxMs=69`;
+  the same reporting window has `cap2s maxGapMs=68`,
+  `gap>20ms=21`, `gap>50ms=2`.
+  At **20:06:10**, `ageMaxMs=102`, `age>50ms=159`
+  and `cap2s maxGapMs=41`. Correlation between these
+  timestamps and audible clicks is **not available**.
+- A large `cap2s callbacks=2938` row at 20:05:38
+  follows a long interval between supplied log lines; it should
+  not be interpreted as 2938 callbacks in two seconds.
+  Health reporting happens when the sender can call
+  `ReportAudioHealth`, not on its own strict scheduler.
+- The follow-up `adb logcat -d -v time -s DeskFuseSpeaker:I`
+  was reported to produce an empty saved file. Therefore
+  **no current Android underrun delta can be asserted**.
+  The earlier 451–595 rising underrun sequence was from
+  the previous severely broken run, **not this improved run**.
+
+**CI validation caveat:** GitHub Actions run
+[39644243550](https://github.com/braindamp/deskfuse/actions/runs/39644243550)
+built the Windows agent, completed unit/native tests and published
+`deskfuse-windows-x64`; the Windows job was ultimately marked
+**cancelled during the final PowerShell wrapper smoke step**.
+The Android job finished successfully. Do not mark the whole
+workflow green; the new artifact exists and was exercised on
+the user's Windows/Android device.
+
+**Next step:** Preserve this compiled bundle, the current
+`16.1.56.615` driver, elevated broker and existing Android APK.
+Obtain a fresh **live** Android `DeskFuseSpeaker` trace while
+this good host agent is playing, so we can quantify whether
+underruns persist during the occasional residual clicks.
+If available, note the approximate local time of a click
+against a Windows `phone audio:` log interval. Only then run a
+separately versioned A/B experiment (same workload, explicit
+user rollback) to see whether reducing `Task.Delay` oversleep
+can improve quality without degrading perceived speed.
