@@ -383,11 +383,18 @@ internal sealed class EndpointBroker
                         removed = current;
                     }
                 }
-                // The endpoint stays. It belongs to the enrollment, not to
-                // one session: removing it here destroys the device Windows
-                // may be playing through, which empties the sound list and
-                // upsets the shell's sound interface. The device is removed
-                // when the phone is unenrolled.
+                // The pipe was closed (e.g., Phone speaker Off or a crashed
+                // client). Only the current generation owns the device.
+                // Do not remove an endpoint taken over by a newer connection.
+                if (removed is not null)
+                {
+                    try { await RemoveReleasedDeviceAsync(removed).ConfigureAwait(false); }
+                    catch (Exception ex)
+                    {
+                        Console.Error.WriteLine(
+                            $"speaker endpoint removal failed on disconnect: {ex.Message}");
+                    }
+                }
             }
         }
         finally { _deviceGate.Release(); }
@@ -414,12 +421,35 @@ internal sealed class EndpointBroker
                     removed = current;
                 }
             }
-            // The endpoint stays until the phone is unenrolled (see
-            // ReleaseOwnedAsync). Removing it here would destroy the device
-            // Windows may be playing through.
+            // A normal explicit lease release follows capture shutdown.
+            // Wait until Windows confirms endpoint departure before another
+            // Create can acquire _deviceGate, preventing stale endpoint IDs.
+            if (removed is not null)
+            {
+                try { await RemoveReleasedDeviceAsync(removed).ConfigureAwait(false); }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine(
+                        $"speaker endpoint removal failed on release: {ex.Message}");
+                    return new BrokerResponse(false,
+                        "Windows could not remove the released phone speaker: " + ex.Message,
+                        PeerId: peerId);
+                }
+            }
             return new BrokerResponse(true, PeerId: peerId);
         }
         finally { _deviceGate.Release(); }
+    }
+
+    /// <summary>
+    /// Remove only the enrollment-derived DeskFuse device that the lease owned.
+    /// Caller MUST hold _deviceGate. Never delete a shared/root driver device.
+    /// DeviceInstance.RemoveAsync validates the path and confirms departure.
+    /// </summary>
+    private static async Task RemoveReleasedDeviceAsync(Instance removed)
+    {
+        await DeviceInstance.RemoveAsync(removed.Device.InstancePath).ConfigureAwait(false);
+        Console.WriteLine($"speaker-endpoint-removed=True instance={removed.Device.InstancePath}");
     }
 
     private IReadOnlyList<BrokerResponse> Snapshot()
