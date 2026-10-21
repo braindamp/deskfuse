@@ -260,3 +260,44 @@ fallback. But any experimental driver candidate must be separately
 built/signed, reviewed, reversible and checked for RAW/application
 compatibility. Do not casually replace a driver on the working machine
 or inject custom sounds.
+
+## Critical cross-endpoint control: MM-1 succeeds 7/7
+
+The owner immediately ran the **same standalone category probe** against
+MM-1, using explicit endpoint selection, with the following results:
+
+| Category | DeskFuse phone: signal/nonzero/total, raw peak | MM-1: signal/nonzero/total, raw peak |
+| --- | --- | --- |
+| Other | 13/13/19, 0.03770750 | 13/13/18, 0.08000000 |
+| SoundEffects | 0/0/20, 0.00000000 | 13/13/19, 0.08000000 |
+| Alerts | 0/0/20, 0.00000000 | 13/13/20, 0.08000000 |
+| Media | 0/0/19, 0.00000000 | 12/12/19, 0.08000000 |
+| Movie | 0/0/18, 0.00000000 | 12/12/19, 0.08000000 |
+| GameEffects | 13/13/19, 0.03770750 | 13/13/19, 0.08000000 |
+| RawOther | 0/0/19, 0.00000000 | 13/13/19, 0.08000000 |
+
+The owner confirmed **all seven MM-1 tones were audible**; on DeskFuse
+only Other and GameEffects were audible. Every IAudioClient2 call returned
+success in both trials. This controls for the probe implementation and
+demonstrates an endpoint-specific category/processing-mode defect,
+**not** a simple taskbar UI-only problem or signal threshold. The
+DeskFuse successful category gain of 0.03770750 / 0.08000000 ≈ 0.4713
+is consistent with endpoint-level attenuation, but the actual current
+gain-setting mechanism was not simultaneously verified; don't treat this
+ratio as a driver fault.
+
+Working hypothesis: Windows creates separate, non-DEFAULT hardware-like
+WaveRT pin streams for the explicitly advertised modes, while DeskFuse
+depends on software-engine loopback and does not implement the multi-
+mode hardware mixing/loopback described by Microsoft's Device.Audio
+requirements. **A category matrix proves category-specific loss but
+not the exact kernel pin allocation or routing.** Do not claim it
+proves that the driver received the PCM for the missing categories.
+
+Next engineering step: prepare a **separately isolated and uninstalled**
+experimental driver variant that advertises a single DEFAULT mode,
+preserving the original package. Change one variable at a time:
+advertised modes first, then consider pin capacity only if warranted.
+Before any installation, verify WDK build, signature, rollback,
+endpoint reconnection behavior and unchanged other apps. Continue to
+keep any lab-generated test sound out of production.
