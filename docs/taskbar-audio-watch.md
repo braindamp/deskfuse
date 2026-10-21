@@ -152,3 +152,64 @@ Next investigate the endpoint's actual property store/capabilities and
 Windows audio event trace while operating each flyout, without generating
 a duplicate/custom phone sound or modifying the installed driver. Only
 then consider an isolated signed driver candidate with a rollback plan.
+
+## Controlled active-endpoint test (completed)
+
+The owner confirmed that **the Windows taskbar flyout still produces no ding
+while a video is actively and successfully streaming audio through DeskFuse
+to the phone**. This is a negative result for the simplest idle-activation
+hypothesis; it does not alone establish which processing mode the flyout
+requests. Do not ask to repeat this test.
+
+## Explicit opt-in Windows audio-category matrix (next experiment)
+
+An independent lab-only executable, `DeskFuse.AudioCategoryProbe`, creates
+ordinary Windows WASAPI playback streams explicitly against the selected
+endpoint, using **IAudioClient2::SetClientProperties** with these categories:
+
+`Other`, `SoundEffects`, `Alerts`, `Media`, `Movie`,
+`GameEffects`, and `RawOther` (`AUDCLNT_STREAMOPTIONS_RAW`).
+
+It writes a **quiet, short 900 Hz diagnostic signal**, captures its own
+endpoint through a concurrent WASAPI loopback client, and prints above-
+threshold callback counts, any-nonzero counts, total counts and raw peak.
+It *does not* simulate the Windows ding in the product. This is deliberately
+**separate from the strictly read-only** `DeskFuse.TaskbarWatch`. It
+requires the interactive user's exact keyboard confirmation (`YES`) before
+emitting any diagnostic audio. It never alters volume, Windows output
+selection, sound schemes, installation, host processes, or driver settings.
+
+From the checkout root in PowerShell:
+
+```powershell
+git fetch origin diagnostics/taskbar-audio-routing-20261021
+git switch --detach origin/diagnostics/taskbar-audio-routing-20261021
+dotnet run --project windows/audio/DeskFuse.AudioCategoryProbe/DeskFuse.AudioCategoryProbe.csproj -c Release -- "DeskFuse Xiaomi"
+```
+
+Type `YES` to begin. At a comfortable, audible Windows output level,
+the tone should be heard (if delivered) as a sequence of seven brief
+diagnostic tones. Then compare to the physical speaker endpoint:
+
+```powershell
+dotnet run --project windows/audio/DeskFuse.AudioCategoryProbe/DeskFuse.AudioCategoryProbe.csproj -c Release -- "MM-1"
+```
+
+The probe uses each **explicit endpoint ID**; there is no need to change
+Windows default playback between trials. Close or pause other programs'
+playback while running the probe so concurrent audio is not attributed to
+the lab waveform. The category matrix is **not a replay of the taskbar
+flyout**. A missing category points toward Windows category/mode routing
+and driver mixing; all categories present weakens the specific claim that
+simple category selection explains the flyout silence. Neither result
+by itself establishes what the taskbar's undisclosed shell playback client
+requests. If one category fails, record the full HRESULT and category.
+
+The C# source uses explicit COM interfaces for IAudioClient2 instead of
+relying on higher-version NAudio APIs; the existing NAudio 2.2.1 dependency
+is used only for endpoint selection and loopback monitoring. The project
+needs .NET 8 SDK and runs without Visual Studio, CMake, GPU host or driver
+reinstallation. GitHub CI compiles it **but never runs it**.
+
+Only use these test signals in the diagnostic; do not merge them into
+production speakers code. No driver change has yet been made.
