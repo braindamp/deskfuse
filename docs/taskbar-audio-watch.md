@@ -82,3 +82,40 @@ mirrored PC↔phone and adding sound in that handler would generate loops or
 extra notifications. Do not confuse this taskbar issue with Auto/Buffered
 PC-screen video synchronization: that needs a supported player presentation
 integration, not bigger Android audio buffers.
+
+## October 21 field observations (Windows 10, physical phone)
+
+Owner-supplied 30-second standalone watch recordings:
+
+- At 11:29:48–11:30:17 UTC, when changing from the DeskFuse phone output
+  to MM-1 toward the end, the watcher recorded 25 signal packets from the phone,
+  24 from MM-1, and none from the monitor output. This was a **mixed UI and
+  output-selection run**; it does not isolate the taskbar sound generation.
+- In the subsequent **taskbar-flyout-only** run at 11:32:20–11:32:50 UTC,
+  the phone was still Console and Multimedia default, MM-1 Communications
+  default. The user opened the small flyout, clicked its slider, waited, moved
+  it left, and clicked again. Phone volume changed from 0.72 to 0.42 to 0.23.
+  The phone System Sounds session meter briefly read 0.0926 and 0.0205,
+  yet the phone, MM-1 and monitor loopback each reported **0 above-threshold
+  packets**, with 485/485/484 total callbacks respectively. This reproduces
+  the missing flyout ding without any synthetic stimulus.
+- The owner confirmed that **the broader Volume Mixer still produces audible
+  sound on the phone**. When opening it, they hear faint background hiss
+  beginning about half a second later with their ear near the phone speaker.
+  One hypothesis is Android's output/amp activating in response to mixer
+  playback; hiss alone **cannot prove** a particular stream was opened.
+- A historic Microsoft Q&A report describes essentially the same Windows 10
+  distinction without DeskFuse: modern taskbar slider silent while classic
+  Volume Mixer plays the default beep. It is an **anecdote, not a root-cause
+  diagnosis or confirmation of a general Windows 10 issue**:
+  https://learn.microsoft.com/en-us/answers/questions/3802693/default-beep-not-working-in-windows-10-volume-slid
+
+Next discriminating comparison: **select MM-1 as the default Console/
+Multimedia output before starting a separate watch, then operate only the
+small taskbar flyout**. Determine whether that slider produces an audible ding
+on physical speakers, with no output switching during the recording. If this
+also fails, the symptom is not isolated to DeskFuse's virtual endpoint; if it
+works, investigate capability/pin format and sound-session routing differences.
+The earlier observed System Sounds peaks must not be equated with audible
+rendered PCM. New diagnostic summaries provide raw nonzero-sample counts and
+captured frame counts to distinguish silent captures from subthreshold samples.
