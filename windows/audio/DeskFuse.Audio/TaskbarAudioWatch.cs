@@ -1,5 +1,4 @@
 using System.Buffers.Binary;
-using System.Diagnostics;
 using System.Runtime.InteropServices;
 using NAudio.CoreAudioApi;
 using NAudio.Wave;
@@ -95,7 +94,6 @@ internal static class TaskbarAudioWatch
         private long _capturedPackets;
         private long _signalPackets;
         private long _lastReportedPackets;
-        private float _peak;
         private float _lastVolume = -1f;
         private bool _lastMute;
         private DateTimeOffset _lastSessions;
