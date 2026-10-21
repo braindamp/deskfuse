@@ -38,6 +38,23 @@ it lists default roles, logs volume/mute changes and loopback samples above
 No PCM is saved to disk. There is no synthetic sound, no network transmission,
 and no privileged broker call.
 
+The final summary now prints `signal / nonzero / total loopback packets`,
+captured frame count, and maximum raw PCM peak. If a taskbar-only run shows
+`0 signal / 0 nonzero` **with a positive frame count**, every captured float
+sample was exactly zero; Windows' nonzero System Sounds *session meter* did
+not become audible endpoint-loopback PCM. If `nonzero` is positive but
+`signal` is zero, captured samples existed but never crossed the
+80/32768 threshold. These observations do not identify which Windows audio
+component suppressed the sound.
+
+To compare the taskbar flyout independently, collect separate **taskbar-only**
+runs with (1) DeskFuse phone selected as default output and (2) physical MM-1
+selected as default output. Keep the watch active after changing the default
+output, and record whether the ding was audible on MM-1. Do not confuse a
+burst caused by **switching** endpoints with a burst caused by the subsequent
+slider click. The watcher is enumerating all endpoints at launch; no output
+selection is changed by the watcher.
+
 The output can distinguish:
 
 - **Phone loopback signal coincides with taskbar action:** follow that packet
