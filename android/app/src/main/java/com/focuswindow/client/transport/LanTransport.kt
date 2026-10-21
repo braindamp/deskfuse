@@ -29,7 +29,12 @@ class WireFrame(
 )
 
 /** Audio PCM payloads are independent and may be dropped to avoid old sound. */
-data class PcmAudioChunk(val streamId: Int, val pcm: ByteArray)
+data class PcmAudioChunk(
+    val streamId: Int,
+    val pcm: ByteArray,
+    val receiveSequence: Long = 0L,
+    val receivedAtNanos: Long = 0L,
+)
 
 /**
  * FR-TRUST-03 — direct LAN transport is the default and the only path required
@@ -66,6 +71,10 @@ class LanTransport(
         onBufferOverflow = BufferOverflow.DROP_OLDEST,
     )
     val audio: SharedFlow<PcmAudioChunk> = _audio.asSharedFlow()
+    private val audioArrival = AudioArrivalMeter()
+
+    /** Local receive stats. Queue gaps are measured at its consumer. */
+    fun audioArrivalHealth(): String = audioArrival.report()
 
     private val _frames = MutableSharedFlow<WireFrame>(
         replay = 0,
@@ -194,7 +203,12 @@ class LanTransport(
                         }
                         val streamId = java.nio.ByteBuffer.wrap(plain, 0, 4)
                             .order(java.nio.ByteOrder.BIG_ENDIAN).int
-                        _audio.emit(PcmAudioChunk(streamId, plain.copyOfRange(4, plain.size)))
+                        val nowNs = System.nanoTime()
+                        val receiveSequence = audioArrival.arrived(nowNs)
+                        _audio.emit(PcmAudioChunk(
+                            streamId, plain.copyOfRange(4, plain.size),
+                            receiveSequence, nowNs,
+                        ))
                     }
 
                     KIND_PING -> {
