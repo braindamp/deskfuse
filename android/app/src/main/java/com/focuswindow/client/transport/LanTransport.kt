@@ -107,7 +107,8 @@ class LanTransport(
         data object Ready : TransportEvent
         data class Closed(val reason: String, val recoverable: Boolean) : TransportEvent
         data class Failed(val stage: String, val detail: String, val remediation: String?,
-                          val terminal: Boolean = false) :
+                          val terminal: Boolean = false,
+                          val retryable: Boolean = false) :
             TransportEvent
     }
 
@@ -153,6 +154,10 @@ class LanTransport(
             running.set(false)
             // FR-OPS-03 — a failure is a NAMED stage with a remediation, never
             // a black screen.
+            // Keep the raw socket diagnosis in developer logs, not on the
+            // phone's connection status screen.
+            android.util.Log.i("DeskFuseTransport",
+                "connection attempt failed: ${t.javaClass.simpleName}: ${t.message}")
             _events.emit(diagnose(t, payload))
             closeQuietly()
         }
@@ -349,23 +354,21 @@ class LanTransport(
      * highest-leverage piece of UX in a driver+codec product: "black screen on
      * connect" is the category's signature failure.
      */
-    private fun diagnose(t: Throwable, payload: PairingPayload): TransportEvent.Failed = when (t) {
-        is java.net.SocketTimeoutException -> TransportEvent.Failed(
-            stage = "connect",
-            detail = "${payload.host} did not answer on port ${payload.port}.",
-            remediation = "Check the host agent is running and that both devices are on the same network.",
-        )
-
-        is java.net.ConnectException -> TransportEvent.Failed(
-            stage = "connect",
-            detail = "Connection refused by ${payload.host}:${payload.port}.",
-            remediation = "The agent may have stopped, or a firewall is blocking the port.",
-        )
+    internal fun diagnose(t: Throwable, payload: PairingPayload): TransportEvent.Failed = when (t) {
+        is java.net.SocketTimeoutException, is java.net.ConnectException,
+        is java.net.NoRouteToHostException, is java.net.SocketException ->
+            TransportEvent.Failed(
+                stage = "connect",
+                detail = "The PC isn't reachable right now.",
+                remediation = "Check your network connection and that DeskFuse is running on the PC.",
+                retryable = true,
+            )
 
         is java.net.UnknownHostException -> TransportEvent.Failed(
             stage = "resolve",
-            detail = "Cannot resolve ${payload.host}.",
-            remediation = "Choose the PC again; its network address may have changed.",
+            detail = "The PC isn't reachable right now.",
+            remediation = "Check your network connection and the PC's address.",
+            retryable = true,
         )
 
         is IllegalArgumentException -> TransportEvent.Failed(
