@@ -6,10 +6,35 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
+import java.net.ServerSocket
+import java.net.Socket
+import java.util.concurrent.atomic.AtomicBoolean
+import org.robolectric.util.ReflectionHelpers
 import org.junit.Assert.*
 import org.junit.Test
 
 class LanTransportFailureTest {
+    @Test
+    fun explicit_speaker_shutdown_closes_socket_immediately_even_without_coroutine_scope() = runBlocking {
+        ServerSocket(0).use { listener ->
+            val client = Socket("127.0.0.1", listener.localPort)
+            val accepted = listener.accept()
+            try {
+                val transport = LanTransport(this)
+                ReflectionHelpers.setField(transport, "socket", client)
+                ReflectionHelpers.getField<AtomicBoolean>(transport, "running").set(true)
+                transport.disconnectNow()
+                assertTrue(client.isClosed)
+                assertFalse(transport.isRunning)
+                // Idempotent: Service can receive repeated STOP and onDestroy.
+                transport.disconnectNow()
+            } finally {
+                client.close()
+                accepted.close()
+            }
+        }
+    }
+
     @Test
     fun fatal_source_error_stops_the_reader_and_requests_manual_retry() = runBlocking {
         val transport = LanTransport(this)
