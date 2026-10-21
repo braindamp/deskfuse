@@ -7,8 +7,10 @@ import com.focuswindow.client.protocol.ClientMessage
 import com.focuswindow.client.protocol.ServerMessage
 import com.focuswindow.client.transport.LanTransport
 import com.focuswindow.client.transport.PairingPayload
+import kotlin.math.min
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -46,9 +48,14 @@ class SpeakerController(
 
     private var pumpJob: Job? = null
     private var audioJob: Job? = null
+    private var reconnectJob: Job? = null
+    private var payload: PairingPayload? = null
+    private var attempt: Int = 0
     private var profile: PhoneProfile? = null
 
     fun start(payload: PairingPayload, phoneProfile: PhoneProfile) {
+        this.payload = payload
+        attempt = 0
         profile = phoneProfile
         pumpJob?.cancel()
         audioJob?.cancel()
@@ -90,14 +97,40 @@ class SpeakerController(
                     _state.value = State.Waiting("Waiting for the PC to create the phone speaker endpoint.")
                 }
 
-                is LanTransport.TransportEvent.Closed ->
-                    _state.value = State.Failed(event.reason)
+                is LanTransport.TransportEvent.Closed -> {
+                    // The PC can go away and come back. Keep trying, the
+                    // same way the workspace session does.
+                    if (event.recoverable) scheduleReconnect(event.reason)
+                    else _state.value = State.Failed(event.reason)
+                }
 
                 is LanTransport.TransportEvent.Failed ->
                     _state.value = State.Failed(event.detail)
 
                 else -> Unit
             }
+        }
+    }
+
+    /** Reconnect to the PC after it goes away, with a bounded backoff. */
+    private fun scheduleReconnect(reason: String) {
+        if (reconnectJob?.isActive == true) return
+        val pl = payload ?: return
+        val pf = profile ?: return
+        reconnectJob = scope.launch {
+            while (attempt < MAX_RECONNECT) {
+                attempt++
+                val wait = min(MAX_BACKOFF_MS, BASE_BACKOFF_MS * (1L shl (attempt - 1)))
+                _state.value = State.Waiting("Reconnecting to the PC.")
+                delay(wait)
+                transport.connect(pl)
+                delay(HANDSHAKE_WINDOW_MS)
+                if (_state.value is State.Playing) {
+                    transport.send(ClientMessage.Audio("start_phone_speakers"))
+                    return@launch
+                }
+            }
+            _state.value = State.Failed("The PC stopped sending sound. $reason")
         }
     }
 
@@ -209,5 +242,9 @@ class SpeakerController(
 
     private companion object {
         const val TAG = "DeskFuseSpeaker"
+        const val MAX_RECONNECT = 6
+        const val BASE_BACKOFF_MS = 400L
+        const val MAX_BACKOFF_MS = 8_000L
+        const val HANDSHAKE_WINDOW_MS = 2_500L
     }
 }
