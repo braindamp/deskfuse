@@ -19,6 +19,7 @@ public static class SpeakerCommands
                 Console.WriteLine("FocusWindow.Agent speakers devices");
                 Console.WriteLine("FocusWindow.Agent speakers receive --source-id BLUETOOTH_ID [--output-name MM-1]");
                 Console.WriteLine("FocusWindow.Agent speakers endpoints");
+                Console.WriteLine("FocusWindow.Agent speakers taskbar-watch [--seconds 25]  (read-only; no sound injection)");
                 Console.WriteLine("FocusWindow.Agent speakers audioroute --endpoint-id ID --peer-id HASH");
                 Console.WriteLine("FocusWindow.Agent speakers audioroute --endpoint-id ID --peer-id HASH");
                 Console.WriteLine("FocusWindow.Agent speakers endpoint create --peer-id HASH --label NAME");
@@ -28,6 +29,13 @@ public static class SpeakerCommands
             }
             if (args[0] == "devices") return await ListAsync();
             if (args[0] == "endpoints") return await ListEndpointsAsync();
+            if (args[0] == "taskbar-watch")
+            {
+                var value = Value(args, "--seconds") ?? "25";
+                if (!int.TryParse(value, out var seconds))
+                    throw new ArgumentException("--seconds must be an integer between 5 and 120.");
+                return await TaskbarAudioWatch.RunAsync(seconds, stop.Token).ConfigureAwait(false);
+            }
             if (args[0] == "endpoint") return await EndpointAsync(args[1..]);
             if (args[0] == "audioroute") return await AudioRouteAsync(args[1..], stop.Token);
             if (args[0] == "props") return await PropsAsync(args[1..]);
