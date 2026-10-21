@@ -6,9 +6,11 @@ branch contains only source and documentation, not an automatically deployed
 driver. The experiment is separate from the read-only diagnostic PR #12.
 The signed WDK build generated packaged INF version
 `10/21/2026,16.1.56.615`; prior active driver was
-`10/21/2026,0.57.52.884`. The owner reported the successful category test
-after installation and re-establishing the phone connection. A follow-up
-device-instance version check on the newly connected endpoint is still useful.
+`10/21/2026,0.57.52.884`. The owner reported the successful category test after installation and
+re-establishing the phone connection. The live per-phone endpoint is now
+**verified** with `Win32_PnPSignedDriver`:
+`DeskFuse Phone Speakers`, `DriverVersion=16.1.56.615`,
+`InfName=oem128.inf`.
 
 ## Reproducible failure and physical endpoint control
 
@@ -64,17 +66,32 @@ mode and stream instrumentation.
   RAW behavior remains unverified and must not be reported as a 7/7 pass.
   A DEFAULT-only endpoint may reasonably reject a truly RAW-only request,
   but must not accept it and silently discard PCM.
-- The owner explicitly reported **intermittently broken-sounding audio**
-  even with the successful ding and normal categories. The short probe
-  does not establish glitch-free sustained PCM, end-to-end latency or
-  media quality. This is a **high-priority independent performance defect**.
+- **Subjective responsiveness is excellent:** the owner specifically
+  describes the working phone playback as **"EXCELLENT near zero latency"**
+  and **"PERFECT in terms of speed"**. Preserve this responsiveness; it
+  is a perceptual report, not a measured end-to-end latency in ms.
+- **Audio continuity and synchronization are severely broken:** irregular
+  pops and brief crackles recur every few seconds with any source, even
+  **midway through the genuine Windows volume ding**. Repeated seeking
+  in a video can yield major, sometimes persistent A/V desynchronization;
+  further seeks can temporarily recover sync.
+- **Critical deterministic reproduction:** moving the **mouse** during
+  playback causes audible silence; after motion ends the phone appears
+  to play backed-up audio quickly, with pops/crackles, until it catches
+  up with the picture. This is the primary investigation trigger.
+  The repeated correlation is user-observed, not yet a proven point of
+  starvation or a proof that GPU processing itself is at fault.
+  See [mouse-activity audio backlog investigation](audio-mouse-motion-backlog.md).
 - The reported `0.0 ms` is the `GetStreamLatency` value shown by the
   probe, **not** measured end-to-end phone playback delay.
-- Validate the **active newly connected** PnP device driver version,
-  because the earlier `Win32_PnPSignedDriver` query was empty when
-  the stale speaker had been removed and no phone device existed.
+- The active device version is now **verified**; the earlier empty
+  `Win32_PnPSignedDriver` query was simply after the stale device was
+  removed and before the phone reconnected.
 
-**Next experiment:** Keep the new driver and phone configuration fixed.
+**Next experiment:** First reproduce mouse-related silence in controlled
+intervals and compare logs, as specified in
+[audio-mouse-motion-backlog.md](audio-mouse-motion-backlog.md).
+Keep the new driver and phone configuration fixed.
 Run sustained normal video/music audio, inspect Windows capture
 signal/discontinuities, host paced packet/drop counters, transport jitter,
 Android AudioTrack underrun counts, effective queue depth, partial writes
