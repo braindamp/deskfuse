@@ -11,6 +11,11 @@ namespace DeskFuse.AudioBroker;
 internal static class SetupApi
 {
     internal const uint DifRegisterDevice = 0x19;
+    // Application-initiated removal must go through class/co-installers, not
+    // call the DIF_REMOVE default handler (SetupDiRemoveDevice) directly.
+    internal const uint DifRemoveDevice = 0x05;
+    internal const uint CrSuccess = 0x00000000;
+    internal const uint CrNoSuchDevnode = 0x0000000D;
     internal const uint SpdrpHardwareId = 1;
     internal const uint SpdrpFriendlyName = 12;
     internal const uint SpdrpService = 3;
@@ -72,5 +77,10 @@ internal static class SetupApi
 
     [DllImport("cfgmgr32.dll", ExactSpelling = true)]
     internal static extern uint CM_Get_DevNode_Status(out uint status, out uint problem, uint devInst, uint flags);
+
+    // NORMAL (0) does not count removed/phantom devices as present.
+    [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    internal static extern uint CM_Locate_DevNodeW(out uint devInst, string deviceId, uint flags);
+
 
 }
