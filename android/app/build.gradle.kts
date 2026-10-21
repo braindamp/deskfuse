@@ -27,7 +27,11 @@ android {
 
     buildTypes {
         debug {
-            applicationIdSuffix = ".debug"
+            // This branch is a side-by-side diagnostic APK. GitHub-hosted CI
+            // has an ephemeral debug signing key, so it cannot update the
+            // user's previously installed .debug app without erasing data.
+            // A distinct package keeps that known-good installation intact.
+            applicationIdSuffix = ".debug.telemetry"
             isMinifyEnabled = false
         }
         release {
