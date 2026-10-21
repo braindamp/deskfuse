@@ -47,6 +47,8 @@ class PcAudioOutput(context: Context) {
     private var activeLayout = "stereo"
     private var routingRequestedAtMs = 0L
     private var seamGuard: PcmSeamGuard? = null
+    private var silenceEdges: PcmSilenceEdges? = null
+    @Volatile private var lastFocusChange = 0
 
     private data class Layout(val name: String, val channels: Int, val mask: Int)
     private val stereo = Layout("stereo", 2, AudioFormat.CHANNEL_OUT_STEREO)
@@ -103,6 +105,8 @@ class PcAudioOutput(context: Context) {
         val focusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
             .setAudioAttributes(attributes)
             .setOnAudioFocusChangeListener { change ->
+                lastFocusChange = change
+                android.util.Log.i("DeskFuseSpeaker", "audio focus change=$change")
                 val current = track ?: return@setOnAudioFocusChangeListener
                 runCatching {
                     if (change == AudioManager.AUDIOFOCUS_GAIN) current.play()
@@ -142,6 +146,8 @@ class PcAudioOutput(context: Context) {
                 writeOver30Ms = 0
                 bytesPerFrame = channels * 2
                 seamGuard = PcmSeamGuard(channels, sampleRate)
+                silenceEdges = PcmSilenceEdges(channels, sampleRate)
+                lastFocusChange = 0
                 activeLayout = layout
                 nativeRoute = route
                 routingRequestedAtMs = SystemClock.elapsedRealtime()
@@ -265,6 +271,7 @@ class PcAudioOutput(context: Context) {
         // Protect only severe packet-boundary waveform splices, without
         // delaying or modifying continuous PCM.
         seamGuard?.apply(chunk.pcm)
+        silenceEdges?.apply(chunk.pcm, chunk.receivedAtNanos)
         val completed = writePcmPacket(chunk.pcm.size) { offset, count ->
             ensureActive()
             if (track !== current || streamId != chunk.streamId) return@writePcmPacket -1
@@ -297,7 +304,10 @@ class PcAudioOutput(context: Context) {
             .getOrDefault(0)
         val underruns = runCatching { current?.underrunCount ?: 0 }.getOrDefault(0)
         val timing = "writeMaxMs=$writeMaxMs write>10ms=$writeOver10Ms " +
-            "write>30ms=$writeOver30Ms seams=${seamGuard?.repaired ?: 0}"
+            "write>30ms=$writeOver30Ms seams=${seamGuard?.repaired ?: 0} " +
+            "onsets=${silenceEdges?.onsets ?: 0} releases=${silenceEdges?.releases ?: 0} " +
+            "resumeGaps=${silenceEdges?.resumed ?: 0} boundaryCuts=${silenceEdges?.boundaryCuts ?: 0} " +
+            "playState=${current?.playState ?: -1} focus=$lastFocusChange"
         writeMaxMs = 0
         writeOver10Ms = 0
         writeOver30Ms = 0
@@ -308,6 +318,7 @@ class PcAudioOutput(context: Context) {
     fun stop() {
         streamId = -1
         seamGuard = null
+        silenceEdges = null
         activeLayout = "stereo"
         nativeRoute = null
         routingRequestedAtMs = 0L
