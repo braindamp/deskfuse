@@ -215,3 +215,91 @@ against a Windows `phone audio:` log interval. Only then run a
 separately versioned A/B experiment (same workload, explicit
 user rollback) to see whether reducing `Task.Delay` oversleep
 can improve quality without degrading perceived speed.
+
+## Second on-device session: live Android underruns persist despite nearly clean sound (20:26–20:27)
+
+The owner re-launched the **same improved Windows diagnostic agent**,
+elevated broker and installed speaker driver. The Android phone had an
+authenticated **separate accessory speaker** connection. Display video
+was also running in this particular session. Subjective report:
+**"there IS some breaking but no extreme desync."** This supersedes
+any temptation to mark the stream glitch-free.
+
+### Evidence: live Android `DeskFuseSpeaker` (20:26:02–20:26:59)
+
+- `packets=146 → 5170`; during continuous media,
+  typically ~199–202 ten-ms PCM packets per two-second log interval:
+  the **average long-run rate is nearly the nominal 100 packets/s**.
+  This alone is *not* proof that every packet was delivered or
+  that playout intervals were sufficiently regular.
+- Android `AudioTrack.underrunCount` **1 → 123** in
+  approximately **56.8 seconds**: **+122 underrun events**,
+  roughly 2.15/s averaged over this interval. This is
+  **not** an acceptable zero-glitch performance result,
+  even though the owner reports vastly better subjective
+  quality and no major video sync drift.
+- `queued` repeatedly **10–56 ms** in reported snapshots,
+  `buffer=85ms` hardware/AudioTrack capacity, `partial=0`
+  throughout. `partial=0` does not show that incoming
+  PCM was on time.
+- At `20:26:18 → 20:26:20`, the completed-write packet count
+  advances `1748 → 1946` (~99/s) **while underruns advance
+  `18 → 32` (+14)**. Thus average packet throughput is
+  compatible with *serious subsecond delivery/consumption jitter*.
+  Other sharp rises include `79 → 96` at
+  `20:26:46 → 20:26:48` (+17).
+- `20:26:28 → 20:26:34` has a conspicuous reduction in
+  packet count; the host log also shows a period with very
+  few PCM packets. This may be the Windows render endpoint
+  temporarily becoming silent/idle, **not** necessarily
+  a transport fault. Correlate media activity, not only
+  log rate.
+
+### Host diagnostic Windows agent (user attached 92 lines)
+
+- **No observed Windows queue loss:** `routeEvict=0`,
+  `txEvict=0`, `routeReject=0`, `0 rejected`
+  across the supplied audio health lines.
+- Host transport: `txWritten` tracks `txAccept` closely
+  (typically one packet behind). `txWriteMaxMs=0` in the
+  measured windows; no `txWrite>20ms` reported.
+  These are only **local WriteAsync completions**, not remote
+  delivery or AudioTrack deadline guarantees.
+- During steady media the sender accepts roughly 200 ten-ms
+  PCM packets every two seconds, while NAudio loopback produces
+  about 130 callbacks (roughly **15–16 ms callback interval**).
+  Callback and packet count are different units: the capture
+  callback frequently contributes more than one PCM chunk.
+  That cadence is compatible with a timer-quantized polling
+  capture path, but no direct proof of Windows timer resolution
+  or its role in every pop.
+- Isolated Windows capture callback arrival gaps
+  reach **66 ms** cumulative max; `paceReset` reaches
+  **16**, and `oversleepMaxMs` reached **43 ms**
+  in this trace. Most periods are much healthier, but
+  significant jitter exists.
+- Windows host agent timestamps and Android Logcat
+  timestamps **must not be subtracted** or aligned packet
+  for packet without establishing clock offset. No packet
+  sequence/timestamp header currently crosses the wire.
+
+### Next diagnostic gate (no speculative buffering)
+
+1. Preserve this improved binary and the signed `16.1.56.615`
+   driver as the known-good baseline. Do not treat the
+   telemetry build as a deliberate algorithmic improvement.
+2. Add **Android-side local instrumentation**, preferably
+   without changing PCM delivery policy: inbound chunk count
+   and arrival-gap histogram **before** `SharedFlow.emit`,
+   `SharedFlow` consumer gap/eviction accounting, receiver
+   queue age, `AudioTrack.write(WRITE_BLOCKING)` duration,
+   and playback-head/underrun snapshots.
+3. Only if host-plus-Android local counters cannot localize the
+   interruption, add a **versioned host/Android audio packet
+   sequence/timestamp extension**, not a unilateral wire
+   format change.
+4. Compare instrumented app and original app in a reversible
+   A/B test while listening for real taskbar dings, continuous
+   music, mouse movement and seek behavior. Do **not** assume
+   that increasing Android occupancy or stripping the
+   Windows pacer will improve this now-acceptable configuration.
