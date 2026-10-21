@@ -173,40 +173,75 @@ internal static class DeviceInstance
                 throw Error("SetupApi.SetupDiOpenDeviceInfoW(remove)");
             }
             RequireAudioDevice(set, ref info);
-            if (!SetupApi.SetupDiRemoveDevice(set, ref info)) throw Error("SetupApi.SetupDiRemoveDevice");
+            // DIF_REMOVE lets class/device co-installers clean up before
+            // Windows stops the devnode. Calling SetupDiRemoveDevice here is
+            // only valid from a class installer (not this application).
+            if (!SetupApi.SetupDiCallClassInstaller(SetupApi.DifRemoveDevice, set, ref info))
+                throw Error("SetupApi.SetupDiCallClassInstaller(DIF_REMOVE=0x05)");
         }
         finally { SetupApi.SetupDiDestroyDeviceInfoList(set); }
     }
 
+    /// <summary>
+    /// A departed PnP node and an MMDevice audio-list refresh are distinct
+    /// events. The PnP node is authoritative for safe re-creation; CoreAudio
+    /// may briefly report a cached endpoint after that node has gone.
+    /// Never block the broker's device gate for 20 seconds on a shell refresh.
+    /// </summary>
     internal static async Task RemoveAsync(string path)
     {
+        RequirePhonePath(path);
         RemoveNode(path);
-        // PnP removal precedes AudioEndpointBuilder's departure notification.
-        // Hold the broker's device gate until the old endpoint is truly gone,
-        // so immediate recreation cannot accidentally capture the old GUID.
-        var deadline = Environment.TickCount64 + 20_000;
-        Exception? lastError = null;
+
+        // Confirm actual PnP absence, NOT just a successful remove request.
+        // An unexpected Config Manager result is an error, not "removed".
+        var pnpDeadline = Environment.TickCount64 + 2_000;
+        while (true)
+        {
+            var code = SetupApi.CM_Locate_DevNodeW(out _, path, 0);
+            if (code == SetupApi.CrNoSuchDevnode)
+            {
+                Console.WriteLine($"speaker-pnp-departed=True instance={path}");
+                break;
+            }
+            if (code != SetupApi.CrSuccess)
+                throw new InvalidOperationException(
+                    $"CM_Locate_DevNodeW({path}) failed: CR=0x{code:X8}");
+            if (Environment.TickCount64 >= pnpDeadline)
+                throw new TimeoutException(
+                    $"DeskFuse speaker remains in the PnP device tree 2s after DIF_REMOVE: {path}");
+            await Task.Delay(100).ConfigureAwait(false);
+        }
+
+        // Keep the known prior endpoint GUID out of a new session wherever
+        // possible, but do not mistake CoreAudio shell-cache lag for failed
+        // PnP removal. The device is already gone from the live PnP tree.
+        var audioDeadline = Environment.TickCount64 + 1_500;
         while (true)
         {
             try
             {
-                if (EndpointResolver.FindActiveEndpoint(path) is null)
+                var endpointId = EndpointResolver.FindActiveEndpoint(path);
+                if (endpointId is null)
                 {
-                    Console.WriteLine($"audio-endpoint-departed=True instance={path}");
+                    Console.WriteLine($"speaker-audio-departed=True instance={path}");
                     return;
                 }
-                lastError = null;
+                if (Environment.TickCount64 >= audioDeadline)
+                {
+                    Console.Error.WriteLine(
+                        $"speaker-audio-refresh-pending=True instance={path} endpoint={endpointId}");
+                    return;
+                }
             }
             catch (COMException ex)
             {
-                // An unsuccessful enumeration is not proof of departure.
-                lastError = ex;
-            }
-            if (Environment.TickCount64 >= deadline)
-            {
-                var message = $"Windows did not confirm playback endpoint departure for '{path}' within 20 seconds.";
-                Console.Error.WriteLine(message);
-                throw new TimeoutException(message, lastError);
+                if (Environment.TickCount64 >= audioDeadline)
+                {
+                    Console.Error.WriteLine(
+                        $"speaker-audio-refresh-unverified=True instance={path} error={ex.Message}");
+                    return;
+                }
             }
             await Task.Delay(100).ConfigureAwait(false);
         }
