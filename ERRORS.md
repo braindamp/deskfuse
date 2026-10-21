@@ -72,6 +72,27 @@ These five cost the most time, because every one of them looked like a
 `, so the replacement never matched and the old code stayed. | guard: edits to the Android sources are written with `
 ` (or read/write with `newline=''` and patterns that match). Always confirm the file changed. |
 
+## THE ONE THAT COULD KILL THE PRODUCT
+
+> **Severity: shipping blocker.** A regression here ends the app in the
+> store. It is recorded here in full, with the facts, the unknowns and the
+> guards, so that nobody repeats it and nobody inherits it unknowingly.
+
+| # | Symptom | What is known | What is not yet known | Guard |
+| --- | --- | --- | --- | --- |
+| 26 | **Clicking the loudspeaker icon in the Windows taskbar stopped bringing up the sound devices.** The Windows shell's sound flyout no longer opens. | * The DeskFuse Audio driver is installed and publishes a render endpoint, and that endpoint had been chosen as the current output.<br>* The Windows audio services (Audiosrv, AudioEndpointBuilder) are RUNNING and healthy.<br>* No shell crash, no hang and no audio error appears in the Application or System event log.<br>* The agent can still enumerate every endpoint (including ours) without trouble.<br>* The failure appeared while the DeskFuse endpoint was the current output. | * Which component the flyout is waiting on. It may be our endpoint's device properties, the driver's own device interface, or something the flyout queries only for the current output.<br>* Whether the vendored SysVad adapter misbehaves when it is the default output.<br>* Whether the endpoint is left in a bad state by a *killed* host (the driver instance survives, the monitor does not). | **Three guards, all required:**<br>1. The DeskFuse endpoint must never outlive a live phone session. The broker reaps any DeskFuse device that no live lease claims, on startup and periodically.<br>2. The host must never leave the DeskFuse endpoint as the Windows default output when a session ends; the owner chooses it, and the product says so plainly.<br>3. Before any release, the DeskFuse driver must be exercised as the *current* output, with the shell's sound flyout opened and closed repeatedly, and with the endpoint removed and re-added. A driver that wedges the Windows audio UI is a blocker, not a bug. |
+
+**Why it is recorded so prominently:** a virtual audio driver that disturbs
+the operating system's own audio interface is not a defect in our feature,
+it is a defect in the product. The sound flyout is the most-used piece of
+Windows audio UI there is; if our endpoint can break it, the product cannot
+ship. Treat every "the shell misbehaves" observation as a release blocker
+until proven otherwise.
+
+**Immediate mitigation (in use):** the DeskFuse endpoint is removed by
+stopping the phone speaker session. The Windows sound list returns to its
+normal state as soon as the device is gone.
+
 ## User-facing language
 
 | # | Symptom | Root cause | Guard |
