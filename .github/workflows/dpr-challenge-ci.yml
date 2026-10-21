@@ -50,6 +50,8 @@ jobs:
         run: dotnet build windows/agent/FocusWindow.Agent/FocusWindow.Agent.csproj -c Release -p:Platform=x64 -warnaserror
       - name: Compile standalone read-only taskbar audio watcher (no CMake dependency)
         run: dotnet build windows/audio/DeskFuse.TaskbarWatch/DeskFuse.TaskbarWatch.csproj -c Release -warnaserror
+      - name: Compile elevated DeskFuse audio endpoint broker without running PnP changes
+        run: dotnet build windows/audio/DeskFuse.AudioBroker/DeskFuse.AudioBroker.csproj -c Release -warnaserror
       - name: Compile explicit-opt-in WASAPI category probe (never run audio on CI)
         run: dotnet build windows/audio/DeskFuse.AudioCategoryProbe/DeskFuse.AudioCategoryProbe.csproj -c Release -warnaserror
       - name: Run unit and simulated tests (no display changes)
