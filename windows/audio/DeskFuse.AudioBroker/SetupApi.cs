@@ -34,6 +34,15 @@ internal static class SetupApi
         public nuint Reserved;
         public static SpDevInfoData Empty => new() { CbSize = (uint)Marshal.SizeOf<SpDevInfoData>() };
     }
+    // Enumerate installed media-class devnodes (present or absent) so
+    // root-enumerated per-phone devices left by a crashed broker can be pruned.
+    [DllImport("setupapi.dll", ExactSpelling = true, CharSet = CharSet.Unicode, SetLastError = true)]
+    internal static extern nint SetupDiGetClassDevsW(ref Guid classGuid,
+        nint enumerator, nint hwndParent, uint flags);
+
+    [DllImport("setupapi.dll", ExactSpelling = true, SetLastError = true)]
+    internal static extern bool SetupDiEnumDeviceInfo(nint set, uint index, ref SpDevInfoData info);
+
     [DllImport("setupapi.dll", ExactSpelling = true, SetLastError = true)]
     internal static extern nint SetupDiCreateDeviceInfoList(ref Guid classGuid, nint hwndParent);
 

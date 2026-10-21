@@ -160,6 +160,51 @@ internal static class DeviceInstance
         finally { SetupApi.SetupDiDestroyDeviceInfoList(set); }
     }
 
+    /// <summary>
+    /// Enumerate only the enrollment-derived DeskFuse root audio devices.
+    /// These can persist across a crashed broker or a PC reboot because they
+    /// were created with SetupAPI rather than SwDevice handles. The broker
+    /// calls this before accepting any host connection, while holding its
+    /// single-instance ownership. No unrelated media-class PnP node qualifies.
+    /// </summary>
+    internal static IReadOnlyList<string> FindOrphanedPhoneNodes()
+    {
+        var guid = MediaClassGuid;
+        var set = SetupApi.SetupDiGetClassDevsW(ref guid, nint.Zero, nint.Zero, 0);
+        if (set == new nint(-1)) throw Error("SetupApi.SetupDiGetClassDevsW");
+        var found = new List<string>();
+        var prefix = PhoneEndpointContract.InstanceRoot + "\\" + PhoneEndpointContract.InstancePrefix;
+        try
+        {
+            for (uint index = 0; ; index++)
+            {
+                var info = SetupApi.SpDevInfoData.Empty;
+                if (!SetupApi.SetupDiEnumDeviceInfo(set, index, ref info))
+                {
+                    const int ErrorNoMoreItems = 259;
+                    if (Marshal.GetLastWin32Error() == ErrorNoMoreItems) break;
+                    throw Error("SetupApi.SetupDiEnumDeviceInfo");
+                }
+
+                var instancePath = ReadInstanceId(set, ref info);
+                if (!instancePath.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) ||
+                    !PhoneEndpointContract.IsPeerId(instancePath[prefix.Length..]))
+                    continue;
+                if (info.ClassGuid != MediaClassGuid ||
+                    !HardwareIds(set, ref info).Contains(PhoneEndpointContract.HardwareId,
+                        StringComparer.OrdinalIgnoreCase))
+                    continue;
+
+                found.Add(instancePath);
+            }
+        }
+        finally
+        {
+            SetupApi.SetupDiDestroyDeviceInfoList(set);
+        }
+        return found;
+    }
+
     private static void RemoveNode(string path)
     {
         RequirePhonePath(path); // Never remove the existing generic ROOT\MEDIA\0000 baseline.

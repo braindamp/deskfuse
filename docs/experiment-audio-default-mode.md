@@ -1,8 +1,16 @@
-# Experimental single-mode WaveRT renderer (not installed)
+# Experimental single-mode WaveRT renderer — first on-device result
 
-Status: **source-only candidate**. This branch does not modify a running
-Windows machine, sign or install the driver, change Android, or emit any sound.
-It deliberately remains separate from the read-only diagnostic PR #12.
+Status: **WDK-built and locally installed by the owner; initial correctness
+result positive**, latency/glitch stability not yet accepted. This GitHub
+branch contains only source and documentation, not an automatically deployed
+driver. The experiment is separate from the read-only diagnostic PR #12.
+The signed WDK build generated packaged INF version
+`10/21/2026,16.1.56.615`; prior active driver was
+`10/21/2026,0.57.52.884`. The owner reported the successful category test after installation and
+re-establishing the phone connection. The live per-phone endpoint is now
+**verified** with `Win32_PnPSignedDriver`:
+`DeskFuse Phone Speakers`, `DriverVersion=16.1.56.615`,
+`InfName=oem128.inf`.
 
 ## Reproducible failure and physical endpoint control
 
@@ -29,6 +37,70 @@ streaming through DeskFuse.
 This establishes a **category-dependent endpoint defect**. It does not
 by itself prove that audio is reaching an uncaptured driver pin, nor
 that the Windows taskbar uses a particular processing mode.
+
+## October 21 on-device result after DEFAULT-only driver experiment
+
+**Breakthrough:** The owner confirmed the genuine Windows taskbar ding
+**now plays**. The owner supplied this WASAPI category probe output from
+the reconnected phone endpoint, with `32 bit IEEFloat, 48000 Hz, stereo`:
+
+| Category | Init/start | Signal/nonzero/total callbacks | Max raw PCM peak |
+| --- | --- | --- | --- |
+| Other | OK, 0.0 ms | 13/13/20 | 0.08000000 |
+| SoundEffects | OK, 0.0 ms | 13/13/19 | 0.08000000 |
+| Alerts | OK, 0.0 ms | 13/13/19 | 0.08000000 |
+| Media | OK, 0.0 ms | 13/13/19 | 0.08000000 |
+| Movie | OK, 0.0 ms | 14/14/20 | 0.08000000 |
+| GameEffects | OK, 0.0 ms | 13/13/19 | 0.08000000 |
+
+The formerly silent **SoundEffects, Alerts, Media and Movie** now produce
+nonzero PCM. All six normal categories succeeded, versus only two on the
+original DeskFuse driver. The user also heard the real volume ding; no
+synthetic or replacement sound was added. This strongly supports a
+category-to-processing-mode routing fault in the original endpoint.
+It does **not** prove the exact kernel buffer/loopback mechanism without
+mode and stream instrumentation.
+
+**Unresolved / regression gates:**
+- `RawOther` was **not included** in the posted follow-up output; explicit
+  RAW behavior remains unverified and must not be reported as a 7/7 pass.
+  A DEFAULT-only endpoint may reasonably reject a truly RAW-only request,
+  but must not accept it and silently discard PCM.
+- **Subjective responsiveness is excellent:** the owner specifically
+  describes the working phone playback as **"EXCELLENT near zero latency"**
+  and **"PERFECT in terms of speed"**. Preserve this responsiveness; it
+  is a perceptual report, not a measured end-to-end latency in ms.
+- **Audio continuity and synchronization are severely broken:** irregular
+  pops and brief crackles recur every few seconds with any source, even
+  **midway through the genuine Windows volume ding**. Repeated seeking
+  in a video can yield major, sometimes persistent A/V desynchronization;
+  further seeks can temporarily recover sync.
+- **Critical deterministic reproduction:** moving the **mouse** during
+  playback causes audible silence; after motion ends the phone appears
+  to play backed-up audio quickly, with pops/crackles, until it catches
+  up with the picture. This is the primary investigation trigger.
+  The repeated correlation is user-observed, not yet a proven point of
+  starvation or a proof that GPU processing itself is at fault.
+  See [mouse-activity audio backlog investigation](audio-mouse-motion-backlog.md).
+- The reported `0.0 ms` is the `GetStreamLatency` value shown by the
+  probe, **not** measured end-to-end phone playback delay.
+- The active device version is now **verified**; the earlier empty
+  `Win32_PnPSignedDriver` query was simply after the stale device was
+  removed and before the phone reconnected.
+
+**Next experiment:** First reproduce mouse-related silence in controlled
+intervals and compare logs, as specified in
+[audio-mouse-motion-backlog.md](audio-mouse-motion-backlog.md).
+Keep the new driver and phone configuration fixed.
+Run sustained normal video/music audio, inspect Windows capture
+signal/discontinuities, host paced packet/drop counters, transport jitter,
+Android AudioTrack underrun counts, effective queue depth, partial writes
+and event-time correlation. Distinguish glitches in the probe's short
+category tones from continuous audio, and determine whether they are
+heard on the actual Android phone output. Do not substitute 20 ms fixed
+Android buffering: that earlier experiment caused severe sustained
+underruns. Compare against the old signed driver **only** in a controlled
+A/B test after measuring baseline. No fake tones or replacement dings.
 
 Microsoft source documentation:
 - https://learn.microsoft.com/en-us/windows-hardware/drivers/audio/audio-signal-processing-modes
@@ -66,10 +138,11 @@ Everything else, including wave buffer code, host loopback, encrypted
 transport, Android playback, Windows/phone volume mirroring and
 the driver's no-synthetic-tone policy, is unchanged.
 
-**It has not been built with the WDK, signed, installed or empirically
-validated yet. Do not treat it as a fix until those steps and the tests
-below succeed.** The normal GitHub .NET checks do not compile this kernel
-driver, so their success cannot validate its correctness.
+**Build and initial real-device audio-category tests have now succeeded.**
+The WDK's generated INF version is not the literal version in the source
+INF. Full real-device acceptance, including RAW compatibility, glitch
+resilience, latency, bidirectional volume and reconnect, remains pending.
+The GitHub .NET CI checks do not validate kernel-driver runtime behavior.
 
 ## Next validation gates, in order
 

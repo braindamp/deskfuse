@@ -104,6 +104,32 @@ internal static class Program
             return 1;
         }
 
+        // Prevent startup orphan cleanup from touching endpoints owned by
+        // another live broker in this interactive Windows session.
+        using var singleton = new Mutex(initiallyOwned: true,
+            name: @"Local\DeskFuse.AudioBroker.v1.singleton", createdNew: out var createdNew);
+        if (!createdNew)
+        {
+            Console.Error.WriteLine("Another DeskFuse audio broker is already running.");
+            return 1;
+        }
+
+        // Previous broker versions left root-enumerated phone speakers
+        // installed even after disconnect. Reconcile only our own
+        // enrollment-derived devices before accepting any host connections.
+        foreach (var orphan in DeviceInstance.FindOrphanedPhoneNodes())
+        {
+            try
+            {
+                await DeviceInstance.RemoveAsync(orphan).ConfigureAwait(false);
+                Console.WriteLine($"Removed disconnected DeskFuse speaker: {orphan}");
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"Could not remove stale DeskFuse speaker {orphan}: {ex.Message}");
+            }
+        }
+
         using var stop = new CancellationTokenSource();
         Console.CancelKeyPress += (_, e) => { e.Cancel = true; stop.Cancel(); };
         var broker = new EndpointBroker();
@@ -383,11 +409,25 @@ internal sealed class EndpointBroker
                         removed = current;
                     }
                 }
-                // The endpoint stays. It belongs to the enrollment, not to
-                // one session: removing it here destroys the device Windows
-                // may be playing through, which empties the sound list and
-                // upsets the shell's sound interface. The device is removed
-                // when the phone is unenrolled.
+                // An offline phone must not remain selectable in the Windows
+                // speaker list. The generation check above protects any newer
+                // connection that already took over this endpoint.
+                if (removed is not null)
+                {
+                    try
+                    {
+                        await DeviceInstance.RemoveAsync(removed.Device.InstancePath)
+                            .ConfigureAwait(false);
+                        Console.WriteLine($"Removed disconnected DeskFuse speaker: {removed.Device.InstancePath}");
+                    }
+                    catch (Exception ex)
+                    {
+                        // Startup reconciliation repairs a device left behind
+                        // after failed removal or abrupt broker termination.
+                        Console.Error.WriteLine(
+                            $"Failed to remove speaker {removed.Device.InstancePath}: {ex.Message}");
+                    }
+                }
             }
         }
         finally { _deviceGate.Release(); }
@@ -414,9 +454,20 @@ internal sealed class EndpointBroker
                     removed = current;
                 }
             }
-            // The endpoint stays until the phone is unenrolled (see
-            // ReleaseOwnedAsync). Removing it here would destroy the device
-            // Windows may be playing through.
+            if (removed is not null)
+            {
+                try
+                {
+                    await DeviceInstance.RemoveAsync(removed.Device.InstancePath)
+                        .ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    return new BrokerResponse(false,
+                        "Windows could not remove the disconnected phone speaker: " + ex.Message,
+                        PeerId: peerId);
+                }
+            }
             return new BrokerResponse(true, PeerId: peerId);
         }
         finally { _deviceGate.Release(); }
