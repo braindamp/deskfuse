@@ -93,6 +93,31 @@ until proven otherwise.
 stopping the phone speaker session. The Windows sound list returns to its
 normal state as soon as the device is gone.
 
+**Later refinement (the owner identified the likely trigger):** the USB DAC
+"MM-1" was unplugged while it was the current output. It is now reported
+by the device tree as `Status: Disconnected`, and the flyout recovered when
+another device was selected. Removing the device that Windows is currently
+playing through is a known way to leave the shell's sound UI with a current
+device that no longer exists, and the flyout then does nothing when it is
+clicked. The regression is therefore most likely **not** caused by the
+DeskFuse driver.
+
+**Why the note stays, and why the guard is still the same:** the DeskFuse
+endpoint *is* the current output whenever a phone session is running, so
+the product deliberately puts itself in that position. Any device being
+unplugged, disabled or removed while our endpoint is current can leave the
+Windows audio UI in that state. So the guards stand:
+
+1. The broker reaps any DeskFuse device that no live phone lease claims,
+   so an endpoint never outlives its session.
+2. The host restores the Windows default output when the phone session ends,
+   so the machine is never left pointing at an endpoint that is about to
+   disappear.
+3. Before any release: exercise the driver as the current output with
+   devices being unplugged, removed and re-added, and with the sound flyout
+   opened and closed repeatedly. A driver that can leave the Windows audio
+   UI unusable is a blocker, not a bug.
+
 ## User-facing language
 
 | # | Symptom | Root cause | Guard |
