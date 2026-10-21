@@ -107,3 +107,22 @@ Both are in `ERRORS.md`; they are the first two things to read.
 4. If there is no sound, read the host log for `phone audio: N packets sent`
    (the transport), the phone's log for `audio path: packets=… partial=…`
    (the write path), and the broker's log for the endpoint's life.
+
+## TODO (not now, but must not be lost)
+
+* **A regression test for the control-message contract.** A control message
+  added on the PC must not be able to end the phone's session: the phone has
+  to skip what it does not understand (it does now), and there should be a
+  test that sends an unknown message and asserts the session survives, plus
+  one per message type. This cost an hour of a broken session today.
+* **A test for the sound itself**: a signal of a known frequency played
+  into the phone's endpoint must come back on the phone with that
+  frequency, and be silent before and after. Never accept "there are bytes".
+* **The audio/video alignment**, per `docs/av-sync-design.md`.
+* **The Windows volume slider should give the Windows ding** on the phone.
+  The PC already plays it through the endpoint, so this is a matter of the
+  phone not fighting it with its own tone (the phone-side tone was removed).
+* **The workspace app outlives the host.** Every host restart leaves
+  another Notepad behind, because the host never kills apps with unsaved
+  documents. The next host should adopt the instance it launched before
+  rather than starting a new one.

@@ -518,6 +518,8 @@ class SessionController(
 
                 is ServerMessage.AudioVolume -> Unit
 
+                is ServerMessage.AudioClock -> Unit
+
                 is ServerMessage.AudioState -> {
                     when (msg.state) {
                         "started" -> {

@@ -118,6 +118,8 @@ Windows audio UI in that state. So the guards stand:
    opened and closed repeatedly. A driver that can leave the Windows audio
    UI unusable is a blocker, not a bug.
 
+| 27 | The phone's session died the moment the PC sent a control message the phone did not know. | The host sent a new `audio_clock` message (for the audio/video alignment work) and the phone's kotlinx.serialization threw on the unknown type. The transport's read loop died, the connection dropped, and the phone went silent - with no error anywhere on the phone. | guard: the phone now **skips** a control message it does not understand instead of failing the session, exactly as the PC side already does. wanted: a regression test that sends an unknown control message and asserts the session survives, plus one per new message type, so a message is never added on one side only. |
+
 ## User-facing language
 
 | # | Symptom | Root cause | Guard |

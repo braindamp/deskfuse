@@ -158,10 +158,21 @@ class LanTransport(
                         require(len in 1..MAX_CONTROL_BYTES) { "control frame too large: $len" }
                         val sealed = ByteArray(len).also { inStream.readFully(it) }
                         val plain = secure.open(sealed)
-                        val msg = json.decodeFromString(
-                            ServerMessage.serializer(),
-                            plain.decodeToString(),
-                        )
+                        val msg = try {
+                            json.decodeFromString(
+                                ServerMessage.serializer(),
+                                plain.decodeToString(),
+                            )
+                        } catch (e: Exception) {
+                            // A message this build does not know about must not
+                            // end the session: the host may send things this
+                            // phone's version does not have yet.
+                            android.util.Log.i(
+                                "DeskFuseTransport",
+                                "ignoring a control message this build does not understand",
+                            )
+                            continue
+                        }
                         if (!dispatchControl(msg)) return
                     }
 

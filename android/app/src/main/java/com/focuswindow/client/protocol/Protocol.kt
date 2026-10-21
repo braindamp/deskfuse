@@ -217,6 +217,18 @@ sealed interface ServerMessage {
     @Serializable @SerialName("audio_volume")
     data class AudioVolume(val level: Int) : ServerMessage
 
+    /**
+     * Where an audio stream sits on the host's clock. The phone uses it
+     * to measure how long the sound took to arrive and to align it with
+     * the picture.
+     */
+    @Serializable @SerialName("audio_clock")
+    data class AudioClock(
+        val streamId: Int = 0,
+        val hostUs: Long = 0,
+        val sampleRate: Int = 0,
+    ) : ServerMessage
+
     @Serializable @SerialName("clipboard")
     data class Clipboard(val mime: String, val text: String? = null, val base64: String? = null) :
         ServerMessage
