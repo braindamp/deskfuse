@@ -53,6 +53,8 @@ public interface IHostAudioCapture : IDisposable
 {
     int SampleRate { get; }
     int Channels { get; }
+    /// <summary>How the capture is arriving, for diagnostics.</summary>
+    string? Health => null;
     // Explicitly identified Windows speaker positions; not just channel count.
     string Layout => "stereo";
     void Start(Action<ReadOnlyMemory<byte>> onSamples);

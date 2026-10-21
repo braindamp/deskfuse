@@ -21,6 +21,15 @@ internal sealed class PhoneSpeakerRoute(
 {
     private IPhoneSpeakerEndpoint? _endpoint;
     private IHostAudioCapture? _capture;
+    private readonly System.Threading.Channels.Channel<byte[]> _paced =
+        System.Threading.Channels.Channel.CreateBounded<byte[]>(
+            new System.Threading.Channels.BoundedChannelOptions(64)
+            {
+                SingleReader = true,
+                SingleWriter = true,
+                FullMode = System.Threading.Channels.BoundedChannelFullMode.DropOldest,
+            });
+    private Task? _paceTask;
     private long _sentPackets;
     private long _droppedPackets;
     private long _lastReport;
@@ -117,10 +126,14 @@ internal sealed class PhoneSpeakerRoute(
                 capture.SampleRate, capture.Channels, layout: capture.Layout));
             capture.Start(samples =>
             {
-                if (conn.TrySendAudio(samples.Span, streamId)) _sentPackets++;
-                else _droppedPackets++;
-                ReportAudioHealth();
+                // The capture delivers in bursts; the phone plays steadily.
+                // Releasing the packets evenly keeps the phone's output
+                // buffer from emptying between bursts, which is an audible
+                // pop. The bytes are the same either way.
+                var packet = samples.ToArray();
+                _paced.Writer.TryWrite(packet);
             });
+            _paceTask = Task.Run(() => PaceAsync(streamId, capture.SampleRate, capture.Channels), CancellationToken.None);
         }
         catch (Exception ex)
         {
@@ -129,6 +142,30 @@ internal sealed class PhoneSpeakerRoute(
             conn.SendControl(ServerMessages.AudioState("error", _streamId,
                 detail: UserFacing.For("speakers"), technical: ex.Message));
         }
+    }
+
+    /// <summary>
+    /// Sends the captured audio to the phone at the rate it was captured,
+    /// so the phone's output buffer stays at a steady level.
+    /// </summary>
+    private async Task PaceAsync(int streamId, int sampleRate, int channels)
+    {
+        var bytesPerMs = Math.Max(1, sampleRate * channels * 2 / 1000);
+        try
+        {
+            while (await _paced.Reader.WaitToReadAsync().ConfigureAwait(false))
+            {
+                while (_paced.Reader.TryRead(out var packet))
+                {
+                    if (conn.TrySendAudio(packet, streamId)) _sentPackets++;
+                    else _droppedPackets++;
+                    ReportAudioHealth();
+                    var wait = packet.Length / bytesPerMs;
+                    if (wait > 0) await Task.Delay(wait).ConfigureAwait(false);
+                }
+            }
+        }
+        catch (OperationCanceledException) { }
     }
 
     /// <summary>
@@ -141,7 +178,8 @@ internal sealed class PhoneSpeakerRoute(
         var now = Environment.TickCount64;
         if (now - _lastReport < 2000) return;
         _lastReport = now;
-        log.Info($"phone audio: {_sentPackets} packets sent, {_droppedPackets} dropped");
+        log.Info($"phone audio: {_sentPackets} packets sent, {_droppedPackets} dropped" +
+            (_capture is null ? "" : " | " + _capture.Health));
     }
 
     private void OnVolumeChanged(float volume) =>
@@ -152,6 +190,9 @@ internal sealed class PhoneSpeakerRoute(
 
     private void StopCapture()
     {
+        _paced.Writer.TryComplete();
+        var pace = _paceTask;
+        _paceTask = null;
         var capture = _capture;
         _capture = null;
         if (capture is null) return;

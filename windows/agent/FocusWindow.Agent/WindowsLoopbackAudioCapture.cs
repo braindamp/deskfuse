@@ -290,7 +290,7 @@ internal sealed class WindowsLoopbackAudioCapture : IHostAudioCapture
     }
 
     /// <summary>How the capture arrived: packets, and the longest hole.</summary>
-    public string Health => $"{_packets} capture packets, longest hole {_maxGapMs} ms";
+    public string? Health => $"{_packets} capture packets, longest hole {_maxGapMs} ms";
 
     public void Dispose()
     {
