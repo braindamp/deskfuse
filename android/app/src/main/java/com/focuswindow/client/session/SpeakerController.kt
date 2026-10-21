@@ -50,11 +50,20 @@ class SpeakerController(
     private var pumpJob: Job? = null
     private var audioJob: Job? = null
     private var reconnectJob: Job? = null
+    private var reconnectGraceJob: Job? = null
+    // Keep the last "Playing" status briefly during a network handoff, but
+    // never mistake that old status for successful recovery.
+    private var recovering = false
     private var payload: PairingPayload? = null
     private var attempt: Int = 0
     private var profile: PhoneProfile? = null
 
     fun start(payload: PairingPayload, phoneProfile: PhoneProfile) {
+        reconnectJob?.cancel()
+        reconnectJob = null
+        reconnectGraceJob?.cancel()
+        reconnectGraceJob = null
+        recovering = false
         this.payload = payload
         attempt = 0
         profile = phoneProfile
@@ -75,6 +84,9 @@ class SpeakerController(
         // Service immediately cancels its scope.
         reconnectJob?.cancel()
         reconnectJob = null
+        reconnectGraceJob?.cancel()
+        reconnectGraceJob = null
+        recovering = false
         pumpJob?.cancel()
         audioJob?.cancel()
         pumpJob = null
@@ -87,8 +99,11 @@ class SpeakerController(
     private suspend fun pumpEvents() {
         transport.events.collect { event ->
             when (event) {
-                is LanTransport.TransportEvent.Connecting ->
-                    _state.value = State.Connecting(event.host)
+                is LanTransport.TransportEvent.Connecting -> {
+                    // The reconnect loop must not expose every short-lived TCP
+                    // attempt to the user before the 2s grace has expired.
+                    if (!recovering) _state.value = State.Connecting(event.host)
+                }
 
                 is LanTransport.TransportEvent.Ready -> {
                     // The accessory hello: no display is acquired, and the
@@ -101,14 +116,22 @@ class SpeakerController(
                             capabilities = listOf("speakers"),
                         )
                     )
-                    _state.value = State.Waiting("Waiting for the PC to create the phone speaker endpoint.")
+                    if (!recovering) {
+                        _state.value = State.Waiting("Waiting for the PC to create the phone speaker endpoint.")
+                    }
                 }
 
                 is LanTransport.TransportEvent.Closed -> {
                     // The PC can go away and come back. Keep trying, the
                     // same way the workspace session does.
-                    if (event.recoverable) scheduleReconnect(event.reason)
-                    else _state.value = State.Failed(event.reason)
+                    if (event.recoverable) {
+                        // Old AudioTrack samples are no longer valid across an
+                        // authenticated TCP session. The new stream restarts it.
+                        output.stop()
+                        scheduleReconnect(event.reason)
+                    } else {
+                        _state.value = State.Failed(event.reason)
+                    }
                 }
 
                 is LanTransport.TransportEvent.Failed -> {
@@ -125,23 +148,31 @@ class SpeakerController(
     private fun scheduleReconnect(reason: String) {
         if (reconnectJob?.isActive == true) return
         val pl = payload ?: return
-        val pf = profile ?: return
+        recovering = true
+        reconnectGraceJob?.cancel()
+        reconnectGraceJob = scope.launch {
+            delay(RECONNECT_GRACE_MS)
+            if (recovering) _state.value = State.Waiting("Reconnecting to the PC…")
+        }
         reconnectJob = scope.launch {
-            while (attempt < MAX_RECONNECT) {
+            while (attempt < MAX_RECONNECT && recovering) {
                 attempt++
                 val wait = min(MAX_BACKOFF_MS, BASE_BACKOFF_MS * (1L shl (attempt - 1)))
-                _state.value = State.Waiting("Reconnecting to the PC.")
                 delay(wait)
+                if (!recovering) return@launch
                 transport.connect(pl)
+                // Wait for the new stream's AudioState(started), rather than
+                // confusing a stale pre-disconnect Playing label for success.
                 delay(HANDSHAKE_WINDOW_MS)
-                if (_state.value is State.Playing) {
-                    transport.send(ClientMessage.Audio("start_phone_speakers"))
-                    return@launch
-                }
+                if (!recovering) return@launch
             }
-            _state.value = State.Failed(
-                "Couldn't reach the PC. Check the network connection and that DeskFuse is running on Windows."
-            )
+            if (recovering) {
+                recovering = false
+                reconnectGraceJob?.cancel()
+                _state.value = State.Failed(
+                    "Couldn't reach the PC. Check the network connection and that DeskFuse is running on Windows."
+                )
+            }
         }
     }
 
@@ -153,9 +184,9 @@ class SpeakerController(
                         + " active=" + message.activeCapabilities)
                     if (message.activeCapabilities.contains("speakers")) {
                         transport.send(ClientMessage.Audio("start_phone_speakers"))
-                        _state.value = State.Waiting("The PC is sending sound to this phone.")
+                        if (!recovering) _state.value = State.Waiting("The PC is sending sound to this phone.")
                     } else {
-                        _state.value = State.Waiting(
+                        if (!recovering) _state.value = State.Waiting(
                             "The PC has not created a phone speaker endpoint yet.",
                         )
                     }
@@ -194,6 +225,10 @@ class SpeakerController(
                     _state.value = State.Failed("The phone could not start the audio output.")
                     return
                 }
+                recovering = false
+                reconnectGraceJob?.cancel()
+                reconnectGraceJob = null
+                attempt = 0
                 _state.value = State.Playing("Playing the PC's sound on this phone.")
                 // Android resolves the route asynchronously: confirm after a
                 // moment that the sound really leaves through the speaker.
@@ -254,6 +289,7 @@ class SpeakerController(
 
     private companion object {
         const val TAG = "DeskFuseSpeaker"
+        const val RECONNECT_GRACE_MS = 2_000L
         const val MAX_RECONNECT = 6
         const val BASE_BACKOFF_MS = 400L
         const val MAX_BACKOFF_MS = 8_000L
