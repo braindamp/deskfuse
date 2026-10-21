@@ -48,6 +48,8 @@ jobs:
           cmake --version
       - name: Compile host and bundled production GPU DLL (never install FocusIdd)
         run: dotnet build windows/agent/FocusWindow.Agent/FocusWindow.Agent.csproj -c Release -p:Platform=x64 -warnaserror
+      - name: Compile standalone read-only taskbar audio watcher (no CMake dependency)
+        run: dotnet build windows/audio/DeskFuse.TaskbarWatch/DeskFuse.TaskbarWatch.csproj -c Release -warnaserror
       - name: Run unit and simulated tests (no display changes)
         run: dotnet test windows/agent/FocusWindow.Tests/FocusWindow.Tests.csproj -c Release --verbosity minimal
       - name: Test native GPU ABI and capture pacing (no hardware access)
