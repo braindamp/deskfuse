@@ -62,29 +62,19 @@ CreateMiniportTopologySYSVAD
 //
 // Describe buffer size constraints for WaveRT buffers
 //
-static struct
+// Match packet-size metadata to the single advertised DEFAULT mode.
+// The second, MOVIE-only constraint would describe a mode this experimental
+// endpoint no longer exposes. Keep the DEFAULT latency/packet values intact.
+static KSAUDIO_PACKETSIZE_CONSTRAINTS2 SysvadWaveRtPacketSizeConstraintsRender =
 {
-    KSAUDIO_PACKETSIZE_CONSTRAINTS2 TransportPacketConstraints;
-    KSAUDIO_PACKETSIZE_PROCESSINGMODE_CONSTRAINT AdditionalProcessingConstraints[1];
-} SysvadWaveRtPacketSizeConstraintsRender =
-{
+    2 * HNSTIME_PER_MILLISECOND,              // unchanged 2 ms minimum processing interval
+    FILE_BYTE_ALIGNMENT,                      // unchanged 1-byte alignment
+    0,                                        // unchanged: no maximum packet-size constraint
+    1,                                        // one supported processing mode (DEFAULT)
     {
-        2 * HNSTIME_PER_MILLISECOND,                // 2 ms minimum processing interval
-        FILE_BYTE_ALIGNMENT,                        // 1 byte packet size alignment
-        0,                                          // no maximum packet size constraint
-        2,                                          // 2 processing constraints follow
-        {
-            STATIC_AUDIO_SIGNALPROCESSINGMODE_DEFAULT,          // constraint for default processing mode
-            128,                                                // 128 samples per processing frame
-            0,                                                  // NA hns per processing frame
-        },
-    },
-    {
-        {
-            STATIC_AUDIO_SIGNALPROCESSINGMODE_MOVIE,            // constraint for movie processing mode
-            1024,                                               // 1024 samples per processing frame
-            0,                                                  // NA hns per processing frame
-        },
+        STATIC_AUDIO_SIGNALPROCESSINGMODE_DEFAULT,
+        128,                                  // unchanged DEFAULT processing frame size
+        0
     }
 };
 
