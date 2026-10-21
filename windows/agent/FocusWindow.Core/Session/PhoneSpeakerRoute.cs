@@ -21,11 +21,26 @@ internal sealed class PhoneSpeakerRoute(
 {
     private IPhoneSpeakerEndpoint? _endpoint;
     private IHostAudioCapture? _capture;
-    private System.Threading.Channels.Channel<byte[]>? _paced;
+    // Timestamp is attached at the existing enqueue point; the buffer is
+    // still owned by the queue and sent unchanged. The struct adds no heap
+    // allocation and does not change pacing or packet size.
+    private readonly record struct TimedPcm(byte[] Data, long EnqueuedQpc);
+    private System.Threading.Channels.Channel<TimedPcm>? _paced;
     private CancellationTokenSource? _paceCancellation;
     private Task? _paceTask;
     private long _sentPackets;
     private long _droppedPackets;
+    private long _routeEvicted;
+    private long _routeRejected;
+    private long _routeDequeued;
+    private long _paceResets;
+    private long _paceDelayCalls;
+    private long _paceOversleep5;
+    private long _paceOversleep10;
+    private long _paceOversleepMaxMs;
+    private long _routeAgeMaxMs;
+    private long _routeAgeOver50;
+    private long _routeAgeOver100;
     private long _lastReport;
     private int _streamId;
     private int _disposed;
@@ -116,13 +131,16 @@ internal sealed class PhoneSpeakerRoute(
                 throw new InvalidOperationException("The phone speaker endpoint is not available.");
             _capture = capture;
             var streamId = ++_streamId;
-            var queue = System.Threading.Channels.Channel.CreateBounded<byte[]>(
+            var queue = System.Threading.Channels.Channel.CreateBounded<TimedPcm>(
                 new System.Threading.Channels.BoundedChannelOptions(16)
                 {
                     SingleReader = true,
                     SingleWriter = true,
                     FullMode = System.Threading.Channels.BoundedChannelFullMode.DropOldest,
-                });
+                },
+                // DropOldest's TryWrite returns true EVEN WHEN old PCM was lost.
+                // The .NET 8 callback reports actual evictions without a new queue policy.
+                itemDropped: _ => Interlocked.Increment(ref _routeEvicted));
             _paced = queue;
             _paceCancellation = new CancellationTokenSource();
             _paceTask = PaceAsync(queue.Reader, streamId, capture.SampleRate,
@@ -135,8 +153,10 @@ internal sealed class PhoneSpeakerRoute(
                 // Releasing the packets evenly keeps the phone's output
                 // buffer from emptying between bursts, which is an audible
                 // pop. The bytes are the same either way.
-                var packet = samples.ToArray();
-                queue.Writer.TryWrite(packet);
+                var packet = new TimedPcm(samples.ToArray(),
+                    System.Diagnostics.Stopwatch.GetTimestamp());
+                if (!queue.Writer.TryWrite(packet))
+                    Interlocked.Increment(ref _routeRejected);
             });
             // Tell the phone where this stream sits on the host's clock, so it
             // can measure the sound's journey against the picture's.
@@ -156,7 +176,7 @@ internal sealed class PhoneSpeakerRoute(
     /// Sends the captured audio to the phone at the rate it was captured,
     /// so the phone's output buffer stays at a steady level.
     /// </summary>
-    private async Task PaceAsync(System.Threading.Channels.ChannelReader<byte[]> reader,
+    private async Task PaceAsync(System.Threading.Channels.ChannelReader<TimedPcm> reader,
         int streamId, int sampleRate, int channels, CancellationToken ct)
     {
         var frequency = System.Diagnostics.Stopwatch.Frequency;
@@ -167,19 +187,41 @@ internal sealed class PhoneSpeakerRoute(
             while (await reader.WaitToReadAsync(ct).ConfigureAwait(false))
             {
                 var now = System.Diagnostics.Stopwatch.GetTimestamp();
-                if (now - nextPacket > frequency / 10) nextPacket = now;
+                if (now - nextPacket > frequency / 10)
+                {
+                    Interlocked.Increment(ref _paceResets);
+                    nextPacket = now;
+                }
                 while (reader.TryRead(out var packet))
                 {
+                    Interlocked.Increment(ref _routeDequeued);
                     var remaining = nextPacket - System.Diagnostics.Stopwatch.GetTimestamp();
                     if (remaining > 0)
+                    {
+                        var beforeDelay = System.Diagnostics.Stopwatch.GetTimestamp();
                         await Task.Delay(TimeSpan.FromSeconds(remaining / (double)frequency), ct).ConfigureAwait(false);
+                        var elapsed = System.Diagnostics.Stopwatch.GetTimestamp() - beforeDelay;
+                        var overshootTicks = Math.Max(0L, elapsed - remaining);
+                        var overshootMs = (long)(overshootTicks * 1000.0 / frequency);
+                        Interlocked.Increment(ref _paceDelayCalls);
+                        if (overshootTicks > frequency / 200) Interlocked.Increment(ref _paceOversleep5);
+                        if (overshootTicks > frequency / 100) Interlocked.Increment(ref _paceOversleep10);
+                        if (overshootMs > _paceOversleepMaxMs) _paceOversleepMaxMs = overshootMs;
+                    }
                     ct.ThrowIfCancellationRequested();
-                    if (conn.TrySendAudio(packet, streamId)) _sentPackets++;
+                    // Time spent behind both the route channel and existing pacer.
+                    // This is not end-to-end latency or capture-to-phone time.
+                    var ageMs = (long)((System.Diagnostics.Stopwatch.GetTimestamp() -
+                        packet.EnqueuedQpc) * 1000.0 / frequency);
+                    if (ageMs > _routeAgeMaxMs) _routeAgeMaxMs = ageMs;
+                    if (ageMs > 50) Interlocked.Increment(ref _routeAgeOver50);
+                    if (ageMs > 100) Interlocked.Increment(ref _routeAgeOver100);
+                    if (conn.TrySendAudio(packet.Data, streamId)) _sentPackets++;
                     else _droppedPackets++;
                     ReportAudioHealth();
                     // Accumulate sample time rather than timer overshoot: a
                     // coarse Windows timer must not make every packet late.
-                    nextPacket += (long)(packet.Length * (double)frequency / bytesPerSecond);
+                    nextPacket += (long)(packet.Data.Length * (double)frequency / bytesPerSecond);
                 }
             }
         }
@@ -196,7 +238,18 @@ internal sealed class PhoneSpeakerRoute(
         var now = Environment.TickCount64;
         if (now - _lastReport < 2000) return;
         _lastReport = now;
-        log.Info($"phone audio: {_sentPackets} packets sent, {_droppedPackets} dropped" +
+        log.Info($"phone audio: {_sentPackets} packets queued, {_droppedPackets} rejected" +
+            $" | routeEvict={Interlocked.Read(ref _routeEvicted)} routeReject={Interlocked.Read(ref _routeRejected)}" +
+            $" routeDeq={Interlocked.Read(ref _routeDequeued)}" +
+            $" ageMaxMs={Interlocked.Exchange(ref _routeAgeMaxMs, 0)}" +
+            $" age>50ms={Interlocked.Exchange(ref _routeAgeOver50, 0)}" +
+            $" age>100ms={Interlocked.Exchange(ref _routeAgeOver100, 0)}" +
+            $" paceReset={Interlocked.Read(ref _paceResets)}" +
+            $" delayCalls={Interlocked.Exchange(ref _paceDelayCalls, 0)}" +
+            $" oversleep>5ms={Interlocked.Exchange(ref _paceOversleep5, 0)}" +
+            $" oversleep>10ms={Interlocked.Exchange(ref _paceOversleep10, 0)}" +
+            $" oversleepMaxMs={Interlocked.Exchange(ref _paceOversleepMaxMs, 0)}" +
+            " | " + conn.AudioHealth +
             (_capture is null ? "" : " | " + _capture.Health));
     }
 

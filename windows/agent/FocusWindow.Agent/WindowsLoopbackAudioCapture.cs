@@ -34,7 +34,14 @@ internal sealed class WindowsLoopbackAudioCapture : IHostAudioCapture
     // an audible dropout, and it is not a dropped packet.
     private long _packets;
     private long _maxGapMs;
-    private long _lastArrival;
+    private long _lastArrivalQpc;
+    // Reset by the existing 2-second health reporter; callback only increments
+    // fixed-size counters. No per-packet logging, socket I/O or allocations.
+    private long _windowCallbacks;
+    private long _windowGapOver20;
+    private long _windowGapOver50;
+    private long _windowGapOver100;
+    private long _windowMaxGapMs;
 
     private const int Stereo = 0x3;
     private const int FiveOneBack = 0x3f;
@@ -153,14 +160,21 @@ internal sealed class WindowsLoopbackAudioCapture : IHostAudioCapture
         if (_started) throw new InvalidOperationException("Audio capture already started");
         _capture.DataAvailable += (_, args) =>
         {
-            var now = Environment.TickCount64;
-            if (_lastArrival != 0)
+            var nowQpc = System.Diagnostics.Stopwatch.GetTimestamp();
+            var previousQpc = _lastArrivalQpc;
+            if (previousQpc != 0)
             {
-                var gap = now - _lastArrival;
-                if (gap > _maxGapMs) _maxGapMs = gap;
+                var gapMs = (long)((nowQpc - previousQpc) * 1000.0 /
+                    System.Diagnostics.Stopwatch.Frequency);
+                if (gapMs > _maxGapMs) _maxGapMs = gapMs;
+                if (gapMs > _windowMaxGapMs) _windowMaxGapMs = gapMs;
+                if (gapMs > 20) Interlocked.Increment(ref _windowGapOver20);
+                if (gapMs > 50) Interlocked.Increment(ref _windowGapOver50);
+                if (gapMs > 100) Interlocked.Increment(ref _windowGapOver100);
             }
-            _lastArrival = now;
-            _packets++;
+            _lastArrivalQpc = nowQpc;
+            Interlocked.Increment(ref _windowCallbacks);
+            Interlocked.Increment(ref _packets);
             var bytesPerFrame = _bytesPerSourceSample * _sourceFormat.Channels;
             var aligned = args.BytesRecorded / bytesPerFrame * bytesPerFrame;
             var readPosition = 0;
@@ -301,8 +315,18 @@ internal sealed class WindowsLoopbackAudioCapture : IHostAudioCapture
         BinaryPrimitives.WriteInt16LittleEndian(output.Slice(position, 2), sample);
     }
 
-    /// <summary>How the capture arrived: packets, and the longest hole.</summary>
-    public string? Health => $"{_packets} capture packets, longest hole {_maxGapMs} ms";
+    /// <summary>
+    /// WASAPI callback arrival timing, not a measure of missing audio samples.
+    /// The largest-gap counter is cumulative; window counters are reset every
+    /// time the 2-second reporter reads this snapshot.
+    /// </summary>
+    public string? Health =>
+        $"{Interlocked.Read(ref _packets)} capture callbacks, longest hole {Volatile.Read(ref _maxGapMs)} ms" +
+        $" | cap2s callbacks={Interlocked.Exchange(ref _windowCallbacks, 0)}" +
+        $" maxGapMs={Interlocked.Exchange(ref _windowMaxGapMs, 0)}" +
+        $" gap>20ms={Interlocked.Exchange(ref _windowGapOver20, 0)}" +
+        $" gap>50ms={Interlocked.Exchange(ref _windowGapOver50, 0)}" +
+        $" gap>100ms={Interlocked.Exchange(ref _windowGapOver100, 0)}";
 
     public void Dispose()
     {
