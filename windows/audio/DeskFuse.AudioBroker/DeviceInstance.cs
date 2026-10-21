@@ -8,58 +8,17 @@ namespace DeskFuse.AudioBroker;
 /// <summary>Creates caller-named root devices using the already installed audio driver.</summary>
 internal static class DeviceInstance
 {
-    private const uint SpdrpHardwareId = 1;
-    private const uint SpdrpFriendlyName = 12;
-    private const uint DifRegisterDevice = 0x19;
     private const int ErrorDevinstAlreadyExists = unchecked((int)0xE0000207);
     private static readonly Guid MediaClassGuid = new("4d36e96c-e325-11ce-bfc1-08002be10318");
 
-    [StructLayout(LayoutKind.Sequential)]
-    private struct SpDevInfoData
-    {
-        public uint CbSize;
-        public Guid ClassGuid;
-        public uint DevInst;
-        public nuint Reserved;
-        public static SpDevInfoData Empty => new() { CbSize = (uint)Marshal.SizeOf<SpDevInfoData>() };
-    }
 
     // SDK GUIDs are binary. Registry property types are implicit in the property;
-    // SetupDiSetDeviceRegistryPropertyW takes five arguments, not six.
-    [DllImport("setupapi.dll", ExactSpelling = true, SetLastError = true)]
-    private static extern nint SetupDiCreateDeviceInfoList(ref Guid classGuid, nint hwndParent);
-    [DllImport("setupapi.dll", ExactSpelling = true, CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern bool SetupDiCreateDeviceInfoW(nint set, string name, ref Guid classGuid,
-        string? description, nint hwndParent, uint creationFlags, ref SpDevInfoData info);
-    [DllImport("setupapi.dll", ExactSpelling = true, CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern bool SetupDiOpenDeviceInfoW(nint set, string instanceId,
-        nint hwndParent, uint flags, ref SpDevInfoData info);
-    [DllImport("setupapi.dll", ExactSpelling = true, CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern bool SetupDiSetDeviceRegistryPropertyW(nint set, ref SpDevInfoData info,
-        uint property, byte[] buffer, uint bytes);
-    [DllImport("setupapi.dll", ExactSpelling = true, CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern bool SetupDiGetDeviceRegistryPropertyW(nint set, ref SpDevInfoData info,
-        uint property, out uint type, byte[]? buffer, uint bytes, out uint required);
-    [DllImport("setupapi.dll", ExactSpelling = true, CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern bool SetupDiGetDeviceInstanceIdW(nint set, ref SpDevInfoData info,
-        StringBuilder instanceId, uint chars, out uint required);
-    [DllImport("setupapi.dll", ExactSpelling = true, SetLastError = true)]
-    private static extern bool SetupDiCallClassInstaller(uint function, nint set, ref SpDevInfoData info);
-    [DllImport("setupapi.dll", ExactSpelling = true, SetLastError = true)]
-    private static extern bool SetupDiRemoveDevice(nint set, ref SpDevInfoData info);
-    [DllImport("setupapi.dll", ExactSpelling = true, SetLastError = true)]
-    private static extern bool SetupDiDestroyDeviceInfoList(nint set);
-    [DllImport("newdev.dll", ExactSpelling = true, SetLastError = true)]
-    private static extern bool DiInstallDevice(nint hwndParent, nint set, ref SpDevInfoData info,
-        nint driverInfo, uint flags, [MarshalAs(UnmanagedType.Bool)] out bool rebootRequired);
-    [DllImport("cfgmgr32.dll", ExactSpelling = true)]
-    private static extern uint CM_Get_DevNode_Status(out uint status, out uint problem, uint devInst, uint flags);
-
+    // SetupApi.SetupDiSetDeviceRegistryPropertyW takes five arguments, not six.
     private static nint OpenSet()
     {
         var guid = MediaClassGuid;
-        var set = SetupDiCreateDeviceInfoList(ref guid, nint.Zero);
-        if (set == new nint(-1)) throw Error("SetupDiCreateDeviceInfoList");
+        var set = SetupApi.SetupDiCreateDeviceInfoList(ref guid, nint.Zero);
+        if (set == new nint(-1)) throw Error("SetupApi.SetupDiCreateDeviceInfoList");
         return set;
     }
 
@@ -69,50 +28,50 @@ internal static class DeviceInstance
         return new InvalidOperationException($"{operation}: 0x{unchecked((uint)code):X8} ({new Win32Exception(code).Message}).");
     }
 
-    private static void SetProperty(nint set, ref SpDevInfoData info, uint property, string value, bool multi = false)
+    private static void SetProperty(nint set, ref SetupApi.SpDevInfoData info, uint property, string value, bool multi = false)
     {
         var bytes = Encoding.Unicode.GetBytes(value + (multi ? "\0\0" : "\0"));
-        if (!SetupDiSetDeviceRegistryPropertyW(set, ref info, property, bytes, (uint)bytes.Length))
-            throw Error($"SetupDiSetDeviceRegistryPropertyW({property})");
+        if (!SetupApi.SetupDiSetDeviceRegistryPropertyW(set, ref info, property, bytes, (uint)bytes.Length))
+            throw Error($"SetupApi.SetupDiSetDeviceRegistryPropertyW({property})");
     }
 
-    private static void SetFriendlyNameIfChanged(nint set, ref SpDevInfoData info, string value)
+    private static void SetFriendlyNameIfChanged(nint set, ref SetupApi.SpDevInfoData info, string value)
     {
-        SetupDiGetDeviceRegistryPropertyW(set, ref info, SpdrpFriendlyName, out _, null, 0, out var size);
+        SetupApi.SetupDiGetDeviceRegistryPropertyW(set, ref info, SetupApi.SpdrpFriendlyName, out _, null, 0, out var size);
         if (size != 0)
         {
             var buffer = new byte[size];
-            if (!SetupDiGetDeviceRegistryPropertyW(set, ref info, SpdrpFriendlyName,
+            if (!SetupApi.SetupDiGetDeviceRegistryPropertyW(set, ref info, SetupApi.SpdrpFriendlyName,
                     out _, buffer, size, out _))
-                throw Error("SetupDiGetDeviceRegistryPropertyW(friendly name)");
+                throw Error("SetupApi.SetupDiGetDeviceRegistryPropertyW(friendly name)");
             if (Encoding.Unicode.GetString(buffer).TrimEnd('\0').Equals(value, StringComparison.Ordinal))
                 return;
         }
-        SetProperty(set, ref info, SpdrpFriendlyName, value);
+        SetProperty(set, ref info, SetupApi.SpdrpFriendlyName, value);
     }
 
-    private static string[] HardwareIds(nint set, ref SpDevInfoData info)
+    private static string[] HardwareIds(nint set, ref SetupApi.SpDevInfoData info)
     {
-        SetupDiGetDeviceRegistryPropertyW(set, ref info, SpdrpHardwareId, out _, null, 0, out var size);
+        SetupApi.SetupDiGetDeviceRegistryPropertyW(set, ref info, SetupApi.SpdrpHardwareId, out _, null, 0, out var size);
         if (size == 0) return [];
         var buffer = new byte[size];
-        if (!SetupDiGetDeviceRegistryPropertyW(set, ref info, SpdrpHardwareId, out _, buffer, size, out _))
-            throw Error("SetupDiGetDeviceRegistryPropertyW");
+        if (!SetupApi.SetupDiGetDeviceRegistryPropertyW(set, ref info, SetupApi.SpdrpHardwareId, out _, buffer, size, out _))
+            throw Error("SetupApi.SetupDiGetDeviceRegistryPropertyW");
         return Encoding.Unicode.GetString(buffer).Split('\0', StringSplitOptions.RemoveEmptyEntries);
     }
 
-    private static void RequireAudioDevice(nint set, ref SpDevInfoData info)
+    private static void RequireAudioDevice(nint set, ref SetupApi.SpDevInfoData info)
     {
         if (info.ClassGuid != MediaClassGuid ||
             !HardwareIds(set, ref info).Contains(PhoneEndpointContract.HardwareId, StringComparer.OrdinalIgnoreCase))
             throw new InvalidOperationException("The instance does not belong to the DeskFuse Audio driver.");
     }
 
-    private static string ReadInstanceId(nint set, ref SpDevInfoData info)
+    private static string ReadInstanceId(nint set, ref SetupApi.SpDevInfoData info)
     {
         var text = new StringBuilder(1024);
-        if (!SetupDiGetDeviceInstanceIdW(set, ref info, text, (uint)text.Capacity, out _))
-            throw Error("SetupDiGetDeviceInstanceIdW");
+        if (!SetupApi.SetupDiGetDeviceInstanceIdW(set, ref info, text, (uint)text.Capacity, out _))
+            throw Error("SetupApi.SetupDiGetDeviceInstanceIdW");
         return text.ToString();
     }
 
@@ -133,29 +92,29 @@ internal static class DeviceInstance
             throw new ArgumentException("Only the DeskFuse Audio hardware ID is supported.");
         var inf = FindDriverStoreInf() ?? throw new InvalidOperationException("The DeskFuse Audio driver is not installed.");
         var set = OpenSet();
-        var info = SpDevInfoData.Empty;
+        var info = SetupApi.SpDevInfoData.Empty;
         var created = false;
         try
         {
             var guid = MediaClassGuid;
-            if (!SetupDiCreateDeviceInfoW(set, instanceId, ref guid, friendlyName, nint.Zero, 0, ref info))
+            if (!SetupApi.SetupDiCreateDeviceInfoW(set, instanceId, ref guid, friendlyName, nint.Zero, 0, ref info))
             {
                 if (Marshal.GetLastWin32Error() != ErrorDevinstAlreadyExists)
-                    throw Error("SetupDiCreateDeviceInfoW");
-                info = SpDevInfoData.Empty;
-                if (!SetupDiOpenDeviceInfoW(set, instanceId, nint.Zero, 0, ref info))
-                    throw Error("SetupDiOpenDeviceInfoW");
+                    throw Error("SetupApi.SetupDiCreateDeviceInfoW");
+                info = SetupApi.SpDevInfoData.Empty;
+                if (!SetupApi.SetupDiOpenDeviceInfoW(set, instanceId, nint.Zero, 0, ref info))
+                    throw Error("SetupApi.SetupDiOpenDeviceInfoW");
                 RequireAudioDevice(set, ref info);
             }
             else
             {
                 created = true;
-                SetProperty(set, ref info, SpdrpHardwareId, hardwareId, multi: true);
-                SetProperty(set, ref info, SpdrpFriendlyName, friendlyName);
+                SetProperty(set, ref info, SetupApi.SpdrpHardwareId, hardwareId, multi: true);
+                SetProperty(set, ref info, SetupApi.SpdrpFriendlyName, friendlyName);
                 // 0x18 is DIF_ALLOW_INSTALL. Registration is 0x19 and has NO
                 // fabricated class-install parameter payload.
-                if (!SetupDiCallClassInstaller(DifRegisterDevice, set, ref info))
-                    throw Error("SetupDiCallClassInstaller(DIF_REGISTERDEVICE=0x19)");
+                if (!SetupApi.SetupDiCallClassInstaller(SetupApi.DifRegisterDevice, set, ref info))
+                    throw Error("SetupApi.SetupDiCallClassInstaller(DIF_REGISTERDEVICE=0x19)");
             }
             var actual = ReadInstanceId(set, ref info);
             if (!actual.Equals(instanceId, StringComparison.OrdinalIgnoreCase))
@@ -163,16 +122,16 @@ internal static class DeviceInstance
             var started = false;
             if (!created)
             {
-                var result = CM_Get_DevNode_Status(out var status, out var problem, info.DevInst, 0);
-                if (result != 0) throw new InvalidOperationException($"CM_Get_DevNode_Status: 0x{result:X8}");
+                var result = SetupApi.CM_Get_DevNode_Status(out var status, out var problem, info.DevInst, 0);
+                if (result != 0) throw new InvalidOperationException($"SetupApi.CM_Get_DevNode_Status: 0x{result:X8}");
                 started = (status & 0x8) != 0 && problem == 0; // DN_STARTED
             }
             // Reinstalling a healthy node restarts its subtree. Windows can
             // still report its old audio endpoint active for several seconds.
             if (!started)
             {
-                if (!DiInstallDevice(nint.Zero, set, ref info, nint.Zero, 0, out var reboot))
-                    throw Error("DiInstallDevice");
+                if (!SetupApi.DiInstallDevice(nint.Zero, set, ref info, nint.Zero, 0, out var reboot))
+                    throw Error("SetupApi.DiInstallDevice");
                 if (reboot) throw new InvalidOperationException("This audio node requires a Windows restart; none was performed.");
             }
             SetFriendlyNameIfChanged(set, ref info, friendlyName);
@@ -180,11 +139,11 @@ internal static class DeviceInstance
         }
         catch
         {
-            if (created && !SetupDiRemoveDevice(set, ref info))
+            if (created && !SetupApi.SetupDiRemoveDevice(set, ref info))
                 Console.Error.WriteLine($"Device rollback: 0x{unchecked((uint)Marshal.GetLastWin32Error()):X8}");
             throw;
         }
-        finally { SetupDiDestroyDeviceInfoList(set); }
+        finally { SetupApi.SetupDiDestroyDeviceInfoList(set); }
     }
 
     internal static bool RenameDevice(string path, string friendlyName)
@@ -192,13 +151,13 @@ internal static class DeviceInstance
         var set = OpenSet();
         try
         {
-            var info = SpDevInfoData.Empty;
-            if (!SetupDiOpenDeviceInfoW(set, path, nint.Zero, 0, ref info)) return false;
+            var info = SetupApi.SpDevInfoData.Empty;
+            if (!SetupApi.SetupDiOpenDeviceInfoW(set, path, nint.Zero, 0, ref info)) return false;
             RequireAudioDevice(set, ref info);
             SetFriendlyNameIfChanged(set, ref info, friendlyName);
             return true;
         }
-        finally { SetupDiDestroyDeviceInfoList(set); }
+        finally { SetupApi.SetupDiDestroyDeviceInfoList(set); }
     }
 
     private static void RemoveNode(string path)
@@ -207,16 +166,16 @@ internal static class DeviceInstance
         var set = OpenSet();
         try
         {
-            var info = SpDevInfoData.Empty;
-            if (!SetupDiOpenDeviceInfoW(set, path, nint.Zero, 0, ref info))
+            var info = SetupApi.SpDevInfoData.Empty;
+            if (!SetupApi.SetupDiOpenDeviceInfoW(set, path, nint.Zero, 0, ref info))
             {
                 if (Marshal.GetLastWin32Error() == unchecked((int)0xE000020B)) return;
-                throw Error("SetupDiOpenDeviceInfoW(remove)");
+                throw Error("SetupApi.SetupDiOpenDeviceInfoW(remove)");
             }
             RequireAudioDevice(set, ref info);
-            if (!SetupDiRemoveDevice(set, ref info)) throw Error("SetupDiRemoveDevice");
+            if (!SetupApi.SetupDiRemoveDevice(set, ref info)) throw Error("SetupApi.SetupDiRemoveDevice");
         }
-        finally { SetupDiDestroyDeviceInfoList(set); }
+        finally { SetupApi.SetupDiDestroyDeviceInfoList(set); }
     }
 
     internal static async Task RemoveAsync(string path)
@@ -254,7 +213,7 @@ internal static class DeviceInstance
     }
 
     internal static void Probe() => Console.WriteLine(
-        $"SDK contracts: x64={Environment.Is64BitProcess}; SP_DEVINFO_DATA={Marshal.SizeOf<SpDevInfoData>()}; DIF_REGISTERDEVICE=0x{DifRegisterDevice:X2}; property setter args=5; class GUID=binary");
+        $"SDK contracts: x64={Environment.Is64BitProcess}; SP_DEVINFO_DATA={Marshal.SizeOf<SetupApi.SpDevInfoData>()}; DIF_REGISTERDEVICE=0x{SetupApi.DifRegisterDevice:X2}; property setter args=5; class GUID=binary");
 
     internal static void Matrix() => MatrixAsync().GetAwaiter().GetResult();
 
@@ -323,13 +282,13 @@ internal static class DeviceInstance
         var set = OpenSet();
         try
         {
-            var info = SpDevInfoData.Empty;
-            if (!SetupDiOpenDeviceInfoW(set, path, nint.Zero, 0, ref info)) throw Error("SetupDiOpenDeviceInfoW(status)");
-            var result = CM_Get_DevNode_Status(out var status, out var problem, info.DevInst, 0);
-            if (result != 0) throw new InvalidOperationException($"CM_Get_DevNode_Status: 0x{result:X8}");
+            var info = SetupApi.SpDevInfoData.Empty;
+            if (!SetupApi.SetupDiOpenDeviceInfoW(set, path, nint.Zero, 0, ref info)) throw Error("SetupApi.SetupDiOpenDeviceInfoW(status)");
+            var result = SetupApi.CM_Get_DevNode_Status(out var status, out var problem, info.DevInst, 0);
+            if (result != 0) throw new InvalidOperationException($"SetupApi.CM_Get_DevNode_Status: 0x{result:X8}");
             return (status, problem);
         }
-        finally { SetupDiDestroyDeviceInfoList(set); }
+        finally { SetupApi.SetupDiDestroyDeviceInfoList(set); }
     }
 
     internal static string? FindDriverStoreInf()

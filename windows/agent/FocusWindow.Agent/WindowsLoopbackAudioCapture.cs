@@ -30,6 +30,11 @@ internal sealed class WindowsLoopbackAudioCapture : IHostAudioCapture
     private readonly int _framesPerPacket;
     private bool _started;
     private bool _disposed;
+    // How the capture is actually arriving. A hole in the captured stream is
+    // an audible dropout, and it is not a dropped packet.
+    private long _packets;
+    private long _maxGapMs;
+    private long _lastArrival;
 
     private const int Stereo = 0x3;
     private const int FiveOneBack = 0x3f;
@@ -136,6 +141,14 @@ internal sealed class WindowsLoopbackAudioCapture : IHostAudioCapture
         if (_started) throw new InvalidOperationException("Audio capture already started");
         _capture.DataAvailable += (_, args) =>
         {
+            var now = Environment.TickCount64;
+            if (_lastArrival != 0)
+            {
+                var gap = now - _lastArrival;
+                if (gap > _maxGapMs) _maxGapMs = gap;
+            }
+            _lastArrival = now;
+            _packets++;
             var bytesPerFrame = _bytesPerSourceSample * _sourceFormat.Channels;
             var aligned = args.BytesRecorded / bytesPerFrame * bytesPerFrame;
             var readPosition = 0;
@@ -275,6 +288,9 @@ internal sealed class WindowsLoopbackAudioCapture : IHostAudioCapture
         var sample = (short)Math.Clamp((int)MathF.Round(clipped * 32767), short.MinValue, short.MaxValue);
         BinaryPrimitives.WriteInt16LittleEndian(output.Slice(position, 2), sample);
     }
+
+    /// <summary>How the capture arrived: packets, and the longest hole.</summary>
+    public string Health => $"{_packets} capture packets, longest hole {_maxGapMs} ms";
 
     public void Dispose()
     {

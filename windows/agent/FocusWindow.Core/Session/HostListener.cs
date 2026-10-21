@@ -23,7 +23,10 @@ public sealed class HostListener : IDisposable
     {
         _log = log;
         _listener = new TcpListener(bind, port);
-        _listener.Start(4);
+        // A generous accept backlog. A phone that reconnects in a burst
+        // must never be refused because the queue is one deep, and a slow
+        // peer must not be able to starve the next one.
+        _listener.Start(64);
         Port = ((IPEndPoint)_listener.LocalEndpoint).Port;
     }
     public async Task<(PhoneConnection Connection, ClientHello Hello)> AcceptAuthenticatedAsync(

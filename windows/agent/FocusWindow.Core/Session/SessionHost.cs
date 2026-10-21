@@ -76,10 +76,11 @@ public sealed class SessionHost : IDisposable
         {
             while (!ct.IsCancellationRequested)
             {
-                (PhoneConnection connection, Protocol.ClientHello hello) accepted;
+                PhoneConnection? acceptedConnection = null;
+                Protocol.ClientHello? acceptedHello = null;
                 try
                 {
-                    accepted = await _listener.AcceptAuthenticatedAsync(_offer,
+                    (acceptedConnection, acceptedHello) = await _listener.AcceptAuthenticatedAsync(_offer,
                         _options.CameraFreePairing ? _services.DeviceCredentials : null, ct)
                         .ConfigureAwait(false);
                 }
@@ -87,26 +88,36 @@ public sealed class SessionHost : IDisposable
                 {
                     break;
                 }
+                catch (Exception ex)
+                {
+                    // One peer must never be able to stop the host from
+                    // serving the next one. Say so plainly: a silent wedge
+                    // here looks like "the PC is not answering".
+                    _log.Error("accept loop: " + ex.GetType().Name + ": " + ex.Message);
+                    await Task.Delay(200, CancellationToken.None).ConfigureAwait(false);
+                    continue;
+                }
+                if (acceptedConnection is null || acceptedHello is null) continue;
+                var connection = acceptedConnection;
+                var hello = acceptedHello;
 
-                if (accepted.hello.Role is "media" or "accessory")
+                if (acceptedHello.Role is "media" or "accessory")
                 {
                     // Accessory identities MUST be backed by per-device
                     // credentials. Legacy QR credentials don't bind DeviceId.
                     if (!_options.CameraFreePairing || _services.DeviceCredentials is null ||
                         _options.SingleSession)
                     {
-                        await accepted.connection.DisposeAsync().ConfigureAwait(false);
+                        await connection.DisposeAsync().ConfigureAwait(false);
                         continue;
                     }
                     accessoryTasks.RemoveAll(task => task.IsCompleted);
                     if (accessoryTasks.Count >= 8)
                     {
-                        await accepted.connection.DisposeAsync().ConfigureAwait(false);
+                        await connection.DisposeAsync().ConfigureAwait(false);
                         _log.Warn("accessory connection capacity reached");
                         continue;
                     }
-                    var connection = accepted.connection;
-                    var hello = accepted.hello;
                     accessoryTasks.Add(Task.Run(async () =>
                     {
                         try
@@ -124,9 +135,9 @@ public sealed class SessionHost : IDisposable
                     continue;
                 }
 
-                if (accepted.hello.Role != "display")
+                if (acceptedHello.Role != "display")
                 {
-                    await accepted.connection.DisposeAsync().ConfigureAwait(false);
+                    await connection.DisposeAsync().ConfigureAwait(false);
                     continue;
                 }
 
@@ -134,16 +145,16 @@ public sealed class SessionHost : IDisposable
                 // Resource admission is a backend safety contract, not a user
                 // or device role limit. It prevents current FocusIdd sessions
                 // from racing over global display creation/removal.
-                var displayLease = displayAdmission.TryAcquire(accepted.hello.Profile.DeviceId);
+                var displayLease = displayAdmission.TryAcquire(hello.Profile.DeviceId);
                 if (displayLease is null)
                 {
                     _log.Warn("virtual display backend is currently occupied");
-                    await accepted.connection.DisposeAsync().ConfigureAwait(false);
+                    await connection.DisposeAsync().ConfigureAwait(false);
                     continue;
                 }
 
-                var displayConnection = accepted.connection;
-                var displayHello = accepted.hello;
+                var displayConnection = connection;
+                var displayHello = hello;
                 var displayTask = Task.Run(async () =>
                 {
                     using (displayLease)
