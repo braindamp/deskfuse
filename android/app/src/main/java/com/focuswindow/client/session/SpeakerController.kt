@@ -5,6 +5,7 @@ import com.focuswindow.client.media.PcAudioOutput
 import com.focuswindow.client.profile.PhoneProfile
 import com.focuswindow.client.protocol.ClientMessage
 import com.focuswindow.client.protocol.ServerMessage
+import com.focuswindow.client.transport.AudioConsumptionMeter
 import com.focuswindow.client.transport.LanTransport
 import com.focuswindow.client.transport.PairingPayload
 import kotlin.math.min
@@ -224,18 +225,19 @@ class SpeakerController(
 
     private suspend fun pumpAudio() {
         var reported = 0L
+        val consumed = AudioConsumptionMeter()
         transport.audio.collect { chunk ->
+            consumed.consumed(chunk.receiveSequence, chunk.receivedAtNanos, System.nanoTime())
             if (!output.write(chunk)) {
                 _state.value = State.Failed("The phone lost the audio route.")
                 return@collect
             }
-            // A short summary every couple of seconds: how the audio path is
-            // actually behaving, so a click can be explained rather than
-            // guessed at.
+            // Aggregate after each completed write. Never log per PCM packet.
             val now = System.currentTimeMillis()
             if (now - reported > 2000) {
                 reported = now
-                Log.i(TAG, "audio path: ${output.stats()}")
+                Log.i(TAG, "audio path: ${output.stats()} | " +
+                    transport.audioArrivalHealth() + " | " + consumed.report())
             }
         }
     }
