@@ -5,7 +5,7 @@ render output. Enrollment identity survives, the per-phone PnP device does not.
 
 **Related architecture:** [Speakers-only connection](speakers-only-architecture.md)
 requires an independent authenticated audio/accessory role, with no
-\`--workspace-app\`, virtual monitor, Windows Graphics Capture or NVENC
+`--workspace-app`, virtual monitor, Windows Graphics Capture or NVENC
 requirement. This document covers PnP endpoint lifetime, not the complete
 Android-to-accessory session UX.
 
