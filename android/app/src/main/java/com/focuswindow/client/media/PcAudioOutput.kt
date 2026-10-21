@@ -175,11 +175,51 @@ class PcAudioOutput(context: Context) {
 
     /** The playback level, 0..100, as the user set it on the PC. */
     fun setVolume(level: Int) {
-        requestedVolume = level.coerceIn(0, 100) / 100f
+        val clamped = level.coerceIn(0, 100)
+        val changed = clamped != (requestedVolume * 100f).toInt()
+        requestedVolume = clamped / 100f
         lastAppliedSystemIndex = -1
         applyVolumeToSystem()
         val current = track ?: return
         runCatching { current.setVolume(requestedVolume) }
+        // A speaker tells you it heard you: the same short tone a real device
+        // makes when its volume is changed.
+        if (changed) ding()
+    }
+
+    /**
+     * The short tone a speaker makes when the volume is changed. It is
+     * written into the same track, so it arrives with the music and at the
+     * new level, exactly like a real device.
+     */
+    private fun ding() {
+        val current = track ?: return
+        val sampleRate = current.sampleRate
+        if (sampleRate <= 0) return
+        val channels = current.channelCount.coerceAtLeast(1)
+        val frameCount = (sampleRate * 0.12).toInt()
+        val pcm = ByteArray(frameCount * channels * 2)
+        repeat(frameCount) { index ->
+            val t = index.toDouble() / sampleRate
+            // Two quick partials, like a bell, fading out.
+            val envelope = Math.exp(-t * 14.0)
+            val value = (Math.sin(2 * Math.PI * 1180 * t) * 0.5 +
+                Math.sin(2 * Math.PI * 1760 * t) * 0.25) * envelope * 9000
+            val sample = value.toInt().coerceIn(-32768, 32767).toShort()
+            repeat(channels) { ch ->
+                val at = (index * channels + ch) * 2
+                pcm[at] = (sample.toInt() and 0xFF).toByte()
+                pcm[at + 1] = ((sample.toInt() shr 8) and 0xFF).toByte()
+            }
+        }
+        var offset = 0
+        while (offset < pcm.size) {
+            val written = runCatching {
+                current.write(pcm, offset, pcm.size - offset, AudioTrack.WRITE_NON_BLOCKING)
+            }.getOrDefault(-1)
+            if (written <= 0) break
+            offset += written
+        }
     }
 
     /**

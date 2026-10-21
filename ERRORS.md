@@ -67,6 +67,11 @@ These five cost the most time, because every one of them looked like a
 | 21 | Removing the stale display device took the virtual display *driver* with it | `ROOT\DISPLAY\0000` was the driver's own device, not a leftover monitor. | guard: the driver device is restored with `devcon install FocusIdd.inf Root\FocusIdd`. Rule: never remove a display *device* to clear a stale *monitor*. |
 | 22 | The phone sat on "Preparing the display" after the host had already given up | The phone showed a stage it was waiting for, and nothing reconciled it with the host's state. | guard: the phone's preparing state now has a timeout and a plain message, and the stage code is never shown as a label. |
 
+| 24 | The Kotlin compiler rejected a plain `for (var i = 0; i < n; i++)` with "Method 'iterator()' is ambiguous" | Kotlin 2.0.21's K2 parser mis-parses the C-style `for` loop in this project. | guard: use `repeat(n) { i -> ... }` in the Android sources. |
+| 25 | A text replacement that "should" have matched silently did nothing | The Android sources are CRLF and the edit patterns were written with `
+`, so the replacement never matched and the old code stayed. | guard: edits to the Android sources are written with `
+` (or read/write with `newline=''` and patterns that match). Always confirm the file changed. |
+
 ## User-facing language
 
 | # | Symptom | Root cause | Guard |

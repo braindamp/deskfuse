@@ -104,7 +104,7 @@ fun StateScreen(
 
             is SessionState.PreparingTarget -> Progress(
                 kicker = "PREPARING",
-                title = state.stage,
+                title = state.stageLabel,
                 body = state.detail,
                 progress = state.progress,
             )

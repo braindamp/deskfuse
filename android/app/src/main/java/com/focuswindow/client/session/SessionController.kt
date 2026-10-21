@@ -111,6 +111,7 @@ class SessionController(
 
     private var pumpJob: Job? = null
     private var reconnectJob: Job? = null
+    private var preparingWatchdog: Job? = null
     private var staleJob: Job? = null
     private var attempt = 0
     private var lastFrameAtMs = 0L
@@ -332,6 +333,11 @@ class SessionController(
     }
 
     fun start(payload: PairingPayload, profile: PhoneProfile) {
+        android.util.Log.i(
+            "DeskFuseSession",
+            "start: host=${payload.host}:${payload.port} profile=${profile.deviceLabel} " +
+                "dpr=${profile.dpr} transportRunning=${transport.isRunning}",
+        )
         hostPcAudioAvailable = false
         pcAudioFailedOnConnection = false
         _bridgeState.value = null
@@ -348,6 +354,7 @@ class SessionController(
 
         val problems = profile.validate()
         if (problems.isNotEmpty()) {
+            android.util.Log.i("DeskFuseSession", "profile problems: " + problems.joinToString("; "))
             _state.value = SessionState.Failed(
                 stage = "profile",
                 detail = problems.joinToString("; "),
@@ -673,6 +680,27 @@ class SessionController(
         requestPreferredPhoneMicrophone()
     }
 
+    /**
+     * The host confirms the picture or it does not. A screen that waits
+     * forever for a confirmation that will never come is a desync between
+     * the phone and the PC, and the person sees a stuck screen.
+     */
+    private fun armPreparingWatchdog() {
+        preparingWatchdog?.cancel()
+        preparingWatchdog = scope.launch {
+            delay(PREPARING_TIMEOUT_MS)
+            if (_state.value is SessionState.PreparingTarget) {
+                _state.value = SessionState.Failed(
+                    stage = "preparing",
+                    detail = "Your PC could not open a window for this phone.",
+                    remediation = "Try again. If it keeps happening, ask the person at the PC to check DeskFuse.",
+                    recoverable = true,
+                    technical = "The host did not confirm a target within ${PREPARING_TIMEOUT_MS}ms.",
+                )
+            }
+        }
+    }
+
     private fun scheduleReconnect(reason: String) {
         if (reconnectJob?.isActive == true) return
         val pl = payload ?: return
@@ -900,6 +928,8 @@ class SessionController(
     }
 
     private companion object {
+        /** How long the phone waits for the host to confirm a picture. */
+        const val PREPARING_TIMEOUT_MS = 30_000L
         const val MAX_FILE_BYTES = 32L * 1024 * 1024
         const val FILE_CHUNK_BYTES = 24 * 1024
         const val MAX_RECONNECT = 6

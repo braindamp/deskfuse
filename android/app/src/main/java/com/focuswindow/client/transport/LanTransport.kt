@@ -104,8 +104,15 @@ class LanTransport(
 
     val verificationCode: String? get() = channel?.verificationCode
 
+    /** True while a connection attempt or session is live. */
+    val isRunning: Boolean get() = running.get()
+
     suspend fun connect(payload: PairingPayload) = withContext(Dispatchers.IO) {
-        if (!running.compareAndSet(false, true)) return@withContext
+        if (!running.compareAndSet(false, true)) {
+            android.util.Log.i("DeskFuseSession", "connect skipped: a connection is already live")
+            return@withContext
+        }
+        android.util.Log.i("DeskFuseSession", "connecting to ${payload.host}:${payload.port}")
         _events.emit(TransportEvent.Connecting(payload.host, payload.port))
 
         try {

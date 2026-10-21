@@ -132,7 +132,7 @@ internal sealed class PhoneSession
         _video = _s.CreateVideoPipeline?.Invoke() ??
             throw new DisplayException("gpu", "No native GPU pipeline is configured.");
         _conn.SendControl(ServerMessages.Stage("Preparing the display", UserFacing.Preparing));
-        _outcome = await NegotiatePhoneDisplayAsync(_profile, ct).ConfigureAwait(false);
+        _outcome = await NegotiateWithOwnedDisplayAsync(ct).ConfigureAwait(false);
         _s.OnNegotiated?.Invoke(_outcome);
         // WGC/D3D11/NVENC is authoritative. No CPU surface or FFmpeg video loop.
         // Exact density is preferred; a verified 1:1 viewport at the nearest
@@ -192,6 +192,29 @@ internal sealed class PhoneSession
             shutdown: ct,
             additionalWorkers: [token => _phoneMic!.PumpAsync(token)]).ConfigureAwait(false);
     }
+    /// <summary>
+    /// Sets up the phone's display, waiting for a display that is still held
+    /// by a host that has just gone away. The driver keeps a display for a
+    /// few seconds after its owner disappears, and failing the session in
+    /// that window throws the phone back to "preparing" for no reason.
+    /// </summary>
+    private async Task<NegotiationOutcome> NegotiateWithOwnedDisplayAsync(CancellationToken ct)
+    {
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(30);
+        while (true)
+        {
+            try
+            {
+                return await NegotiatePhoneDisplayAsync(_profile, ct).ConfigureAwait(false);
+            }
+            catch (DisplayException ex) when (ex.Stage == "display-owned" && DateTime.UtcNow < deadline)
+            {
+                _log.Info("a display is still held by a host that has gone; waiting for it to be released");
+                await Task.Delay(TimeSpan.FromSeconds(2), ct).ConfigureAwait(false);
+            }
+        }
+    }
+
     private async Task<NegotiationOutcome> NegotiatePhoneDisplayAsync(PhoneProfile phone, CancellationToken ct)
     {
         void Progress(string stage, string detail)
