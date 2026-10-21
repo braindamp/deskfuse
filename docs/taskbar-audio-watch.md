@@ -119,3 +119,36 @@ works, investigate capability/pin format and sound-session routing differences.
 The earlier observed System Sounds peaks must not be equated with audible
 rendered PCM. New diagnostic summaries provide raw nonzero-sample counts and
 captured frame counts to distinguish silent captures from subthreshold samples.
+
+## Follow-up: physical MM-1 taskbar feedback is working
+
+The owner has now explicitly confirmed that **MM-1 operates normally with
+the Windows taskbar flyout**. By contrast, the same flyout fails to produce
+an audible ding on the DeskFuse phone endpoint, despite normal media and
+classic Volume Mixer playback. This strongly localizes the difference to
+endpoint-specific Windows handling, but does not yet prove which driver or
+endpoint property is responsible.
+
+Static review of DeskFuse's current WaveRT miniport:
+
+- `speakerwavtable.h` **does advertise**
+  `STATIC_AUDIO_SIGNALPROCESSINGMODE_NOTIFICATION` with a 48 kHz stereo
+  default. Do **not** claim notification mode is absent.
+- The speaker filter is a two-pin shared-mode render endpoint, without a
+  hardware loopback or offload engine, in `minipairs.h`. Its other
+  applications' audio and the classic mixer can reach software loopback.
+- `DeskFuseAudio.inf` does **not** register
+  `PKEY_AudioEndpoint_Supports_EventDriven_Mode` on the wave filter
+  interface. Microsoft's SysVad sample does register that endpoint
+  property, but its documentation primarily describes HDAudio endpoints;
+  the omission is a **candidate difference only**, not demonstrated to
+  suppress taskbar feedback. Do not apply or reinstall an INF based on
+  this inference alone.
+- The driver's speaker topology advertises `KSNODETYPE_SPEAKER`, a
+  connected integrated jack, and `eConnTypeUnknown`; other endpoint
+  metadata may differ from MM-1.
+
+Next investigate the endpoint's actual property store/capabilities and
+Windows audio event trace while operating each flyout, without generating
+a duplicate/custom phone sound or modifying the installed driver. Only
+then consider an isolated signed driver candidate with a rollback plan.
