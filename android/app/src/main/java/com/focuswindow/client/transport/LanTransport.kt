@@ -315,9 +315,22 @@ class LanTransport(
     suspend fun close(reason: String) {
         if (!running.get()) return
         runCatching { send(ClientMessage.Bye(reason)) }
-        running.set(false)
-        closeQuietly()
+        disconnectNow()
         _events.emit(TransportEvent.Closed(reason, recoverable = false))
+    }
+
+    /**
+     * A foreground Service can be destroyed immediately after the user taps
+     * speaker Off. Its CoroutineScope is canceled before a suspending Bye
+     * could run, so close the actual socket SYNCHRONOUSLY instead. This also
+     * wakes the blocking receive thread rather than leaving an orphan host
+     * connection for the full socket-read timeout.
+     */
+    fun disconnectNow() {
+        running.set(false)
+        // Closing the socket first unblocks any concurrent readFully().
+        runCatching { socket?.close() }
+        closeQuietly()
     }
 
     private fun closeQuietly() {
