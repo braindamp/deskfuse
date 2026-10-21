@@ -246,7 +246,7 @@ function onControl(plain) {
   if (m.type === 'hello') report.hello = m;
   else if (m.type === 'stage') {
     report.stages.push({ stage: m.stage, detail: m.detail, fatal: !!m.fatal });
-    if (m.fatal) report.fatalStage = { stage: m.stage, detail: m.detail, remediation: m.remediation ?? null };
+    if (m.fatal) report.fatalStage = { stage: m.stage, detail: m.detail, remediation: m.remediation ?? null, technical: m.technical ?? null };
   } else if (m.type === 'target') {
     report.targets.push(m.record);
     knownVersions.add(m.record.version);

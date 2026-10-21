@@ -18,6 +18,105 @@ namespace FocusWindow.Tests;
 /// <summary>Real session/crypto/TCP; simulated GPU, audio and display only. No decode/hardware claim.</summary>
 public sealed class UnifiedSessionTests
 {
+    private sealed class SpeakerEndpoint : IPhoneSpeakerEndpoint
+    {
+        public string EndpointId => "phone-only-render-endpoint";
+        public string FriendlyName => "Test phone speaker";
+        public float Volume => 0.2f;
+        public void SetVolume(float volume) { }
+        public event Action<float>? VolumeChanged { add { } remove { } }
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+    private sealed class Speakers : IPhoneSpeakerProvider
+    {
+        public Task<(IPhoneSpeakerEndpoint? Endpoint, string? Error)> ProvisionAsync(
+            string peerId, string label, CancellationToken ct) =>
+            Task.FromResult<(IPhoneSpeakerEndpoint?, string?)>((new SpeakerEndpoint(), null));
+        public Task ReleaseAsync(string peerId, CancellationToken ct) => Task.CompletedTask;
+    }
+    private sealed class SpeakerCapture(byte marker) : IHostAudioCapture
+    {
+        public int SampleRate => 48000;
+        public int Channels => 2;
+        public bool Disposed;
+        public void Start(Action<ReadOnlyMemory<byte>> onSamples) =>
+            onSamples(Enumerable.Repeat(marker, 1920).ToArray());
+        public void Dispose() => Disposed = true;
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Speaker_audio_reaches_the_wire_on_first_start_and_restart(bool stopBetween)
+    {
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        var credentials = new MemoryDeviceCredentialStore();
+        var secret = RandomNumberGenerator.GetBytes(32);
+        credentials.Save(new DeviceCredential("speaker-enrolled", secret));
+        var captures = new List<SpeakerCapture>();
+        var services = new HostServices(
+            () => throw new InvalidOperationException("An accessory must not acquire a display"),
+            () => new RecordingInputSink(), () => new StaticGuard(),
+            new AutoApprove(), new MemoryPairingStore(), DeviceCredentials: credentials,
+            PhoneSpeakers: new Speakers(), CreateEndpointAudioCapture: (endpointId, _, _) =>
+            {
+                Assert.Equal("phone-only-render-endpoint", endpointId);
+                var capture = new SpeakerCapture((byte)(captures.Count + 1));
+                captures.Add(capture);
+                return capture;
+            });
+        SessionHost? host = null;
+        for (var retry = 0; retry < 40; retry++)
+        {
+            host = new SessionHost(new HostOptions { Bind = "127.0.0.1",
+                Port = RandomNumberGenerator.GetInt32(12000, 45000), CameraFreePairing = true },
+                services, NullLog.Instance);
+            try { await host.StartAsync(deadline.Token); break; }
+            catch (System.Net.Sockets.SocketException) { host.Dispose(); host = null; }
+        }
+        using var hostScope = host ?? throw new InvalidOperationException("No test port trio");
+        var running = host.RunSessionsAsync(deadline.Token);
+        try
+        {
+            await using var phone = await ConnectedPeer.ConnectAsync(host.Offer!, secret, deadline.Token);
+            var hello = Hello("speaker-enrolled", accessory: true);
+            hello["capabilities"] = new JsonArray("speakers");
+            await phone.ControlAsync(hello, deadline.Token);
+            Assert.Contains("speakers", (await phone.UntilAsync("bridge_state", deadline.Token))
+                ["activeCapabilities"]!.AsArray().Select(value => value!.GetValue<string>()));
+            for (var start = 1; start <= 3; start++)
+            {
+                await phone.ControlAsync(new JsonObject { ["type"] = "audio",
+                    ["action"] = "start_phone_speakers" }, deadline.Token);
+                var state = await phone.UntilAsync("audio_state", deadline.Token);
+                Assert.Equal("started", state["state"]!.GetValue<string>());
+                var streamId = state["streamId"]!.GetValue<int>();
+                Assert.Equal(start, streamId);
+                while (true)
+                {
+                    var record = await phone.ReadAsync(deadline.Token);
+                    if (record.Kind != Wire.KindAudio) continue;
+                    Assert.Equal(streamId, BinaryPrimitives.ReadInt32BigEndian(record.Plain));
+                    Assert.Equal(1924, record.Plain.Length);
+                    Assert.All(record.Plain.Skip(4), value => Assert.Equal((byte)start, value));
+                    break;
+                }
+                if (stopBetween)
+                {
+                    await phone.ControlAsync(new JsonObject { ["type"] = "audio",
+                        ["action"] = "stop_phone_speakers" }, deadline.Token);
+                    Assert.Equal("stopped", (await phone.UntilAsync("audio_state", deadline.Token))
+                        ["state"]!.GetValue<string>());
+                    Assert.True(captures[^1].Disposed);
+                }
+                if (start > 1) Assert.True(captures[start - 2].Disposed);
+            }
+            await phone.ControlAsync(new JsonObject { ["type"] = "bye" }, deadline.Token);
+        }
+        finally { deadline.Cancel(); await running; }
+        Assert.All(captures, capture => Assert.True(capture.Disposed));
+    }
+
     private sealed class Video : IVideoPipeline
     {
         public VideoPipelineInfo Info { get; private set; } = null!;

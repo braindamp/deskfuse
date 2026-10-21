@@ -21,14 +21,8 @@ internal sealed class PhoneSpeakerRoute(
 {
     private IPhoneSpeakerEndpoint? _endpoint;
     private IHostAudioCapture? _capture;
-    private readonly System.Threading.Channels.Channel<byte[]> _paced =
-        System.Threading.Channels.Channel.CreateBounded<byte[]>(
-            new System.Threading.Channels.BoundedChannelOptions(64)
-            {
-                SingleReader = true,
-                SingleWriter = true,
-                FullMode = System.Threading.Channels.BoundedChannelFullMode.DropOldest,
-            });
+    private System.Threading.Channels.Channel<byte[]>? _paced;
+    private CancellationTokenSource? _paceCancellation;
     private Task? _paceTask;
     private long _sentPackets;
     private long _droppedPackets;
@@ -85,7 +79,7 @@ internal sealed class PhoneSpeakerRoute(
     {
         if (request.Action == "stop_phone_speakers")
         {
-            StopCapture();
+            await StopCaptureAsync().ConfigureAwait(false);
             conn.SendControl(ServerMessages.AudioState("stopped", _streamId));
             return;
         }
@@ -111,7 +105,7 @@ internal sealed class PhoneSpeakerRoute(
                 detail: UserFacing.For("speakers")));
             return;
         }
-        StopCapture();
+        await StopCaptureAsync().ConfigureAwait(false);
         try
         {
             // Only this phone's own endpoint is captured. A missing endpoint
@@ -122,6 +116,17 @@ internal sealed class PhoneSpeakerRoute(
                 throw new InvalidOperationException("The phone speaker endpoint is not available.");
             _capture = capture;
             var streamId = ++_streamId;
+            var queue = System.Threading.Channels.Channel.CreateBounded<byte[]>(
+                new System.Threading.Channels.BoundedChannelOptions(16)
+                {
+                    SingleReader = true,
+                    SingleWriter = true,
+                    FullMode = System.Threading.Channels.BoundedChannelFullMode.DropOldest,
+                });
+            _paced = queue;
+            _paceCancellation = new CancellationTokenSource();
+            _paceTask = PaceAsync(queue.Reader, streamId, capture.SampleRate,
+                capture.Channels, _paceCancellation.Token);
             conn.SendControl(ServerMessages.AudioState("started", streamId,
                 capture.SampleRate, capture.Channels, layout: capture.Layout));
             capture.Start(samples =>
@@ -131,9 +136,8 @@ internal sealed class PhoneSpeakerRoute(
                 // buffer from emptying between bursts, which is an audible
                 // pop. The bytes are the same either way.
                 var packet = samples.ToArray();
-                _paced.Writer.TryWrite(packet);
+                queue.Writer.TryWrite(packet);
             });
-            _paceTask = Task.Run(() => PaceAsync(streamId, capture.SampleRate, capture.Channels), CancellationToken.None);
             // Tell the phone where this stream sits on the host's clock, so it
             // can measure the sound's journey against the picture's.
             conn.SendControl(ServerMessages.AudioClock(streamId,
@@ -142,7 +146,7 @@ internal sealed class PhoneSpeakerRoute(
         catch (Exception ex)
         {
             log.Warn("phone speaker capture unavailable: " + ex.Message);
-            StopCapture();
+            await StopCaptureAsync().ConfigureAwait(false);
             conn.SendControl(ServerMessages.AudioState("error", _streamId,
                 detail: UserFacing.For("speakers"), technical: ex.Message));
         }
@@ -152,24 +156,34 @@ internal sealed class PhoneSpeakerRoute(
     /// Sends the captured audio to the phone at the rate it was captured,
     /// so the phone's output buffer stays at a steady level.
     /// </summary>
-    private async Task PaceAsync(int streamId, int sampleRate, int channels)
+    private async Task PaceAsync(System.Threading.Channels.ChannelReader<byte[]> reader,
+        int streamId, int sampleRate, int channels, CancellationToken ct)
     {
-        var bytesPerMs = Math.Max(1, sampleRate * channels * 2 / 1000);
+        var frequency = System.Diagnostics.Stopwatch.Frequency;
+        var bytesPerSecond = checked(sampleRate * channels * 2);
+        var nextPacket = System.Diagnostics.Stopwatch.GetTimestamp();
         try
         {
-            while (await _paced.Reader.WaitToReadAsync().ConfigureAwait(false))
+            while (await reader.WaitToReadAsync(ct).ConfigureAwait(false))
             {
-                while (_paced.Reader.TryRead(out var packet))
+                var now = System.Diagnostics.Stopwatch.GetTimestamp();
+                if (now - nextPacket > frequency / 10) nextPacket = now;
+                while (reader.TryRead(out var packet))
                 {
+                    var remaining = nextPacket - System.Diagnostics.Stopwatch.GetTimestamp();
+                    if (remaining > 0)
+                        await Task.Delay(TimeSpan.FromSeconds(remaining / (double)frequency), ct).ConfigureAwait(false);
+                    ct.ThrowIfCancellationRequested();
                     if (conn.TrySendAudio(packet, streamId)) _sentPackets++;
                     else _droppedPackets++;
                     ReportAudioHealth();
-                    var wait = packet.Length / bytesPerMs;
-                    if (wait > 0) await Task.Delay(wait).ConfigureAwait(false);
+                    // Accumulate sample time rather than timer overshoot: a
+                    // coarse Windows timer must not make every packet late.
+                    nextPacket += (long)(packet.Length * (double)frequency / bytesPerSecond);
                 }
             }
         }
-        catch (OperationCanceledException) { }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
     }
 
     /// <summary>
@@ -192,22 +206,27 @@ internal sealed class PhoneSpeakerRoute(
     private static int VolumePercent(float volume) =>
         (int)Math.Round(Math.Clamp(volume, 0f, 1f) * 100f);
 
-    private void StopCapture()
+    private async Task StopCaptureAsync()
     {
-        _paced.Writer.TryComplete();
+        var cancellation = _paceCancellation;
+        _paceCancellation = null;
+        cancellation?.Cancel();
+        _paced?.Writer.TryComplete();
+        _paced = null;
         var pace = _paceTask;
         _paceTask = null;
         var capture = _capture;
         _capture = null;
-        if (capture is null) return;
-        try { capture.Dispose(); }
+        try { capture?.Dispose(); }
         catch (Exception ex) { log.Warn("stopping the phone speaker capture: " + ex.Message); }
+        try { if (pace is not null) await pace.ConfigureAwait(false); }
+        finally { cancellation?.Dispose(); }
     }
 
     public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
-        StopCapture();
+        await StopCaptureAsync().ConfigureAwait(false);
         if (_endpoint is not null)
         {
             _endpoint.VolumeChanged -= OnVolumeChanged;

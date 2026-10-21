@@ -266,7 +266,8 @@ public class InteropEndToEndTests
         var (r, _, _) = await RunPhone(rig, "--protocol 2 --frames 1");
         await rig.Sessions.WaitAsync(TimeSpan.FromSeconds(20));
         Assert.Equal("version", (string)r["fatalStage"]!["stage"]!);
-        Assert.Contains("protocol 2", (string)r["fatalStage"]!["detail"]!);
+        Assert.Equal(UserFacing.For("version"), (string)r["fatalStage"]!["detail"]!);
+        Assert.Contains("protocol 2", (string)r["fatalStage"]!["technical"]!);
         Assert.Empty(rig.Backend.Created);
     }
     [HistoricalCpuSession]
