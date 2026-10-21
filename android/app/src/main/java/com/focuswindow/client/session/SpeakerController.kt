@@ -111,8 +111,10 @@ class SpeakerController(
                     else _state.value = State.Failed(event.reason)
                 }
 
-                is LanTransport.TransportEvent.Failed ->
-                    _state.value = State.Failed(event.detail)
+                is LanTransport.TransportEvent.Failed -> {
+                    if (event.retryable) scheduleReconnect(event.detail)
+                    else _state.value = State.Failed(event.detail)
+                }
 
                 else -> Unit
             }
@@ -137,7 +139,9 @@ class SpeakerController(
                     return@launch
                 }
             }
-            _state.value = State.Failed("The PC stopped sending sound. $reason")
+            _state.value = State.Failed(
+                "Couldn't reach the PC. Check the network connection and that DeskFuse is running on Windows."
+            )
         }
     }
 
