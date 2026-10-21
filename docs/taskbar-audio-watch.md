@@ -12,16 +12,22 @@ The Android 20 ms buffer experiment distorted audio and must **not** be repeated
 
 ## Run (interactive Windows user, no elevation)
 
-From the repository root, after building the latest agent:
+From the repository root, use the independent read-only runner:
 
 ```powershell
-dotnet run --project windows/agent/FocusWindow.Agent/FocusWindow.Agent.csproj -- speakers taskbar-watch --seconds 30
+dotnet run --project windows/audio/DeskFuse.TaskbarWatch/DeskFuse.TaskbarWatch.csproj -c Release -- 30
 ```
 
-Or run the corresponding **newly built** `FocusWindow.Agent.exe` with
-`speakers taskbar-watch --seconds 30`. An older deployed binary will not have
-this command. Running the command does **not** restart the current host, change
-volume/default devices or invoke a Windows ding.
+This lightweight project references the existing DeskFuse audio library but does
+**not** build the GPU host, require CMake, install a driver, or touch the running
+host process. Run it *after* selecting the phone output in the Windows speaker picker,
+so the phone endpoint exists when enumeration begins. It accepts an optional
+duration in seconds (5–120, default 30).
+
+The full host also offers `FocusWindow.Agent.exe speakers taskbar-watch --seconds
+30`, but building that host requires native CMake/Visual Studio. An older deployed
+binary will not have the command. Running either watch does **not** restart the
+host, change volume/default devices, or invoke a Windows ding.
 
 Keep music and videos paused. During the watch, first move and **release** the
 volume knob in the small taskbar speaker popup, then independently open the broad
