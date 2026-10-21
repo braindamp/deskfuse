@@ -16,6 +16,7 @@ import com.focuswindow.client.transport.PairingPayload
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -35,6 +36,7 @@ class SpeakerService : Service() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var controller: SpeakerController? = null
+    private var stateJob: Job? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -70,11 +72,17 @@ class SpeakerService : Service() {
             stopSelf()
             return
         }
+        // Repeated ACTION_START must never orphan the previous authenticated
+        // socket, capture route or StateFlow collector.
+        controller?.stop()
+        stateJob?.cancel()
+        stateJob = null
+        controller = null
         running = true
         val output = PcAudioOutput(applicationContext)
         val speaker = SpeakerController(scope, clientVersion(), output)
         controller = speaker
-        scope.launch {
+        stateJob = scope.launch {
             speaker.state.collect { current ->
                 state.value = current
                 notificationManager()?.notify(
@@ -146,6 +154,8 @@ class SpeakerService : Service() {
         running = false
         controller?.stop()
         controller = null
+        stateJob?.cancel()
+        stateJob = null
         scope.cancel()
         // The session is over: the interface must show the speaker as off,
         // otherwise the next tap would only ever try to stop it again.
