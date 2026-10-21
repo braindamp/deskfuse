@@ -213,3 +213,50 @@ reinstallation. GitHub CI compiles it **but never runs it**.
 
 Only use these test signals in the diagnostic; do not merge them into
 production speakers code. No driver change has yet been made.
+
+## User-proven audio category split: 2/7 audible
+
+The owner ran the opt-in `DeskFuse.AudioCategoryProbe` against the **phone
+endpoint** and directly heard only two of the seven tones. The tool reported:
+
+| Category | Result | Signal/nonzero/total callbacks | Max raw PCM peak |
+| --- | --- | --- | --- |
+| Other | audible | 13/13/19 | 0.03770750 |
+| SoundEffects | inaudible | 0/0/20 | 0.00000000 |
+| Alerts | inaudible | 0/0/20 | 0.00000000 |
+| Media | inaudible | 0/0/19 | 0.00000000 |
+| Movie | inaudible | 0/0/18 | 0.00000000 |
+| GameEffects | audible | 13/13/19 | 0.03770750 |
+| RawOther | inaudible | 0/0/19 | 0.00000000 |
+
+**Every IAudioClient2 SetClientProperties / Initialize / Start sequence
+reported success**, and the same probe captured a real, positive peak for
+Other/GameEffects. Windows reported 0.0 ms stream latency for all cases;
+this returned latency is not an end-to-end latency measurement.
+
+This is much stronger than the taskbar-only observation: on the **same**
+endpoint and the **same** test program, simply selecting different render
+categories or RAW changes real audibility and software loopback content.
+No above-threshold **or nonzero** samples were captured in failed trials.
+It supports the multiple-mode/driver-mixing hypothesis, but **does not yet
+prove that each silent category created a second WaveRT pin instance**.
+Microsoft maps categories to modes internally and does not expose the
+per-stream mode decision to a WASAPI application. In addition, all-zero
+software loopback is not necessarily proof that the driver receives
+nonzero packets on those instances.
+
+**Next control:** Run the identical explicit-endpoint probe against MM-1:
+`dotnet run --project windows/audio/DeskFuse.AudioCategoryProbe/DeskFuse.AudioCategoryProbe.csproj -c Release -- "MM-1"`.
+This checks for category-dependent behavior in the probe/Windows itself.
+If all seven produce sounds and PCM on MM-1, inspect the DeskFuse WaveRT
+stream instances and processing mode GUIDs using an actual kernel trace or
+carefully validated read-only KS query before installing a driver update.
+
+**Candidate fix, NOT installed:** Restrict unsupported driver processing
+modes (potentially to DEFAULT) and ensure that all application categories
+mix in the Windows audio engine. Microsoft documents that at least RAW
+**or** DEFAULT is required and that unsupported modes are mapped to a
+fallback. But any experimental driver candidate must be separately
+built/signed, reviewed, reversible and checked for RAW/application
+compatibility. Do not casually replace a driver on the working machine
+or inject custom sounds.
