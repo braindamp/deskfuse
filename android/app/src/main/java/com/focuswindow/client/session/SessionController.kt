@@ -428,12 +428,19 @@ class SessionController(
                     stopPcAudioLocal()
                     uploadJob?.cancel()
                     abortDownload("Connection lost; incomplete download discarded")
-                    _state.value = SessionState.Failed(
-                        stage = event.stage,
-                        detail = event.detail,
-                        remediation = event.remediation,
-                        recoverable = true,
-                    )
+                    if (event.retryable) {
+                        // A temporarily unreachable PC is not a terminal
+                        // failure. Leave the reconnect UI neutral while the
+                        // bounded backoff attempts continue.
+                        scheduleReconnect(event.detail)
+                    } else {
+                        _state.value = SessionState.Failed(
+                            stage = event.stage,
+                            detail = event.detail,
+                            remediation = event.remediation,
+                            recoverable = true,
+                        )
+                    }
                 }
 
                 is LanTransport.TransportEvent.Closed -> {
