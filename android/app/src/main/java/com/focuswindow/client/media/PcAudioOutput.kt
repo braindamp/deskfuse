@@ -38,6 +38,9 @@ class PcAudioOutput(context: Context) {
     private var nativeRoute: AudioDeviceInfo? = null
     private var packets: Long = 0
     private var partialWrites: Long = 0
+    private var writeMaxMs: Long = 0
+    private var writeOver10Ms: Long = 0
+    private var writeOver30Ms: Long = 0
     private var writtenFrames: Long = 0
     private var bytesPerFrame = 4
     private var lastAppliedSystemIndex: Int = -1
@@ -133,6 +136,9 @@ class PcAudioOutput(context: Context) {
                 writtenFrames = 0
                 packets = 0
                 partialWrites = 0
+                writeMaxMs = 0
+                writeOver10Ms = 0
+                writeOver30Ms = 0
                 bytesPerFrame = channels * 2
                 activeLayout = layout
                 nativeRoute = route
@@ -257,9 +263,14 @@ class PcAudioOutput(context: Context) {
         val completed = writePcmPacket(chunk.pcm.size) { offset, count ->
             ensureActive()
             if (track !== current || streamId != chunk.streamId) return@writePcmPacket -1
+            val writeStartedNs = System.nanoTime()
             val written = runCatching {
                 current.write(chunk.pcm, offset, count, AudioTrack.WRITE_BLOCKING)
             }.getOrDefault(-1)
+            val writeMs = (System.nanoTime() - writeStartedNs).coerceAtLeast(0) / 1_000_000
+            if (writeMs > writeMaxMs) writeMaxMs = writeMs
+            if (writeMs > 10) writeOver10Ms++
+            if (writeMs > 30) writeOver30Ms++
             if (written > 0) {
                 writtenFrames += written / bytesPerFrame
                 if (offset + written < chunk.pcm.size) partialWrites++
@@ -280,8 +291,13 @@ class PcAudioOutput(context: Context) {
         val bufferMs = runCatching { (current?.bufferSizeInFrames ?: 0) * 1000 / rate }
             .getOrDefault(0)
         val underruns = runCatching { current?.underrunCount ?: 0 }.getOrDefault(0)
+        val timing = "writeMaxMs=$writeMaxMs write>10ms=$writeOver10Ms " +
+            "write>30ms=$writeOver30Ms"
+        writeMaxMs = 0
+        writeOver10Ms = 0
+        writeOver30Ms = 0
         return "packets=$packets partial=$partialWrites queued=${queued * 1000 / rate}ms " +
-            "buffer=${bufferMs}ms underruns=$underruns"
+            "buffer=${bufferMs}ms underruns=$underruns $timing"
     }
 
     fun stop() {
