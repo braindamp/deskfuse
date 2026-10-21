@@ -39,19 +39,20 @@ internal static class TaskbarAudioWatch
         {
             foreach (var device in enumerator.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active))
             {
+                EndpointWatch? watch = null;
                 try
                 {
-                    var watch = new EndpointWatch(device);
-                    watches.Add(watch); // watch owns the MMDevice
+                    watch = new EndpointWatch(device);
                     watch.Start();
+                    watches.Add(watch); // watch owns the MMDevice
                 }
                 catch (Exception ex) when (ex is COMException or InvalidOperationException or
                                            NotSupportedException or ArgumentException)
                 {
                     // A stale endpoint must not prevent observing the others.
                     Console.WriteLine($"Cannot watch {device.ID}: {ex.Message}");
-                    if (!watches.Any(w => ReferenceEquals(w.Device, device)))
-                        device.Dispose();
+                    if (watch is null) device.Dispose();
+                    else watch.Dispose();
                 }
             }
             if (watches.Count == 0)
