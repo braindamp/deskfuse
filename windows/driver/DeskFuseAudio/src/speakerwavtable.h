@@ -24,7 +24,9 @@ Abstract:
 #define SPEAKER_HOST_MIN_SAMPLE_RATE                24000
 #define SPEAKER_HOST_MAX_SAMPLE_RATE                96000
 
-// Keep the existing capacity for concurrent Windows processing modes.
+// Experiment 1: preserve the old pin-instance limit to isolate the effect
+// of *advertised processing modes*. A later, separate experiment may reduce
+// capacity if tests demonstrate it is necessary.
 #define SPEAKER_MAX_INPUT_SYSTEM_STREAMS            6
 
 static 
@@ -182,32 +184,19 @@ KSDATAFORMAT_WAVEFORMATEXTENSIBLE SpeakerHostPinSupportedDeviceFormats[] =
     }
 };
 
+// EXPERIMENTAL: a virtual endpoint with no hardware SUM node and no
+// functional hardware loopback cannot promise independently routed RAW,
+// MEDIA, MOVIE, COMMUNICATIONS and NOTIFICATION streams. Advertise a single
+// DEFAULT processing mode so Windows can mix different application audio
+// categories in its shared-mode audio engine and expose their real samples
+// through WASAPI software loopback. This is an uninstalled driver candidate;
+// the existing six-mode driver remains unchanged on the diagnostics branch.
 static
 MODE_AND_DEFAULT_FORMAT SpeakerHostPinSupportedDeviceModes[] =
 {
     {
-        STATIC_AUDIO_SIGNALPROCESSINGMODE_RAW,
-        &SpeakerHostPinSupportedDeviceFormats[3].DataFormat  // 48KHz
-    },
-    {
         STATIC_AUDIO_SIGNALPROCESSINGMODE_DEFAULT,
-        &SpeakerHostPinSupportedDeviceFormats[3].DataFormat  // 48KHz
-    },
-    {
-        STATIC_AUDIO_SIGNALPROCESSINGMODE_MEDIA,
-        &SpeakerHostPinSupportedDeviceFormats[3].DataFormat  // 48KHz
-    },
-    {
-        STATIC_AUDIO_SIGNALPROCESSINGMODE_MOVIE,
-        &SpeakerHostPinSupportedDeviceFormats[3].DataFormat  // 48KHz
-    },
-    {
-        STATIC_AUDIO_SIGNALPROCESSINGMODE_COMMUNICATIONS,
-        &SpeakerHostPinSupportedDeviceFormats[0].DataFormat  // 24KHz
-    },
-    {
-        STATIC_AUDIO_SIGNALPROCESSINGMODE_NOTIFICATION,
-        &SpeakerHostPinSupportedDeviceFormats[3].DataFormat  // 48KHz
+        &SpeakerHostPinSupportedDeviceFormats[3].DataFormat  // 48 kHz
     }
 };
 
