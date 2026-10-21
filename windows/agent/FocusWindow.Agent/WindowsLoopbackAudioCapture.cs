@@ -21,7 +21,7 @@ namespace FocusWindow.Agent;
 /// </summary>
 internal sealed class WindowsLoopbackAudioCapture : IHostAudioCapture
 {
-    private readonly WasapiLoopbackCapture _capture;
+    private readonly WasapiCapture _capture;
     private readonly MMDevice? _device;
     private readonly WaveFormat _sourceFormat;
     private readonly int _sourceMask;
@@ -82,11 +82,13 @@ internal sealed class WindowsLoopbackAudioCapture : IHostAudioCapture
             }
             // The capture uses the device, so it has to outlive it.
             _device = device;
-            _capture = new WasapiLoopbackCapture(device);
+            _capture = new LowLatencyLoopbackCapture(device);
         }
         else
         {
-            _capture = new WasapiLoopbackCapture();
+            using var enumerator = new MMDeviceEnumerator();
+            _device = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
+            _capture = new LowLatencyLoopbackCapture(_device);
         }
         try
         {
@@ -133,6 +135,16 @@ internal sealed class WindowsLoopbackAudioCapture : IHostAudioCapture
             _capture.Dispose();
             throw;
         }
+    }
+
+    // NAudio's loopback helper uses a 100 ms capture buffer and polls every
+    // half-buffer, batching roughly 50 ms before any audio reaches the phone.
+    // Keep its loopback flags and shared mix, but poll a 20 ms buffer instead.
+    private sealed class LowLatencyLoopbackCapture(MMDevice device)
+        : WasapiCapture(device, false, 20)
+    {
+        protected override AudioClientStreamFlags GetAudioClientStreamFlags() =>
+            AudioClientStreamFlags.Loopback | base.GetAudioClientStreamFlags();
     }
 
     public void Start(Action<ReadOnlyMemory<byte>> onSamples)
