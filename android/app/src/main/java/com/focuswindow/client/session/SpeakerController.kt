@@ -70,10 +70,16 @@ class SpeakerController(
     }
 
     fun stop() {
+        // Cancellation does not interrupt a thread blocked on Socket.read().
+        // Explicitly tear down the authenticated TCP connection before the
+        // Service immediately cancels its scope.
+        reconnectJob?.cancel()
+        reconnectJob = null
         pumpJob?.cancel()
         audioJob?.cancel()
         pumpJob = null
         audioJob = null
+        transport.disconnectNow()
         output.stop()
         _state.value = State.Idle
     }
