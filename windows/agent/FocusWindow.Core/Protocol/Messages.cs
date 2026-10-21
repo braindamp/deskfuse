@@ -201,6 +201,19 @@ public static class ServerMessages
     };
 
     /// <summary>
+    /// Where an audio stream sits on the host's clock. The phone uses it to
+    /// measure how long the sound took to arrive and to align it with the
+    /// picture.
+    /// </summary>
+    public static JsonObject AudioClock(int streamId, long hostMicroseconds, int sampleRate) => new()
+    {
+        ["type"] = "audio_clock",
+        ["streamId"] = streamId,
+        ["hostUs"] = hostMicroseconds,
+        ["sampleRate"] = sampleRate,
+    };
+
+    /// <summary>
     /// The playback volume of the phone's Windows endpoint, 0..100. The
     /// phone applies it to its own output, so the Windows volume control
     /// and the phone volume control stay the same control.

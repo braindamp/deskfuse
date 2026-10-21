@@ -42,6 +42,8 @@ internal sealed class PhoneSession
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, int> _preferredFrameRates;
     private volatile bool _resync;
     private long _framesSeen;
+    // The picture and the sound share one clock, so the phone can measure
+    // each path and align them.
     private readonly long _ptsOrigin = Stopwatch.GetTimestamp();
     private long _lastPtsUs;
     public PhoneSession(HostOptions o, HostServices s, string encoderName, ILog log,
@@ -319,7 +321,7 @@ internal sealed class PhoneSession
         // Preserve capture timing through encoder/transport queues. The native
         // QPC uses the same clock as Stopwatch on Windows; no send-time restamp.
         var stamp = captureQpc == 0 ? Stopwatch.GetTimestamp() : checked((long)captureQpc);
-        var now = Math.Max(0, (long)(Stopwatch.GetElapsedTime(_ptsOrigin, stamp).TotalMilliseconds * 1000.0));
+        var now = Math.Max(0, FocusWindow.Core.Media.HostClock.ElapsedMicroseconds(stamp));
         var next = Math.Max(now, _lastPtsUs + 1); // strictly increasing: the client keys latency by pts
         _lastPtsUs = next;
         return next;

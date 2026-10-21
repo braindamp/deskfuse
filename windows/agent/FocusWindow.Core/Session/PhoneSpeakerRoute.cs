@@ -134,6 +134,10 @@ internal sealed class PhoneSpeakerRoute(
                 _paced.Writer.TryWrite(packet);
             });
             _paceTask = Task.Run(() => PaceAsync(streamId, capture.SampleRate, capture.Channels), CancellationToken.None);
+            // Tell the phone where this stream sits on the host's clock, so it
+            // can measure the sound's journey against the picture's.
+            conn.SendControl(ServerMessages.AudioClock(streamId,
+                FocusWindow.Core.Media.HostClock.NowMicroseconds(), capture.SampleRate));
         }
         catch (Exception ex)
         {
@@ -210,6 +214,11 @@ internal sealed class PhoneSpeakerRoute(
             try { await _endpoint.DisposeAsync().ConfigureAwait(false); }
             catch (Exception ex) { log.Warn("releasing the phone speaker endpoint: " + ex.Message); }
             _endpoint = null;
+            // Windows may still be playing through an endpoint that is about
+            // to disappear. Say so plainly rather than leaving the machine
+            // pointing at a device that is gone.
+            conn.SendControl(ServerMessages.Stage("speakers",
+                "The phone's speaker is no longer available. If Windows was playing through it, choose another output."));
         }
     }
 }

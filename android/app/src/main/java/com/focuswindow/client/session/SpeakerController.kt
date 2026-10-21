@@ -105,6 +105,8 @@ class SpeakerController(
         transport.control.collect { message ->
             when (message) {
                 is ServerMessage.BridgeState -> {
+                    Log.i(TAG, "bridge state: requested=" + message.requestedCapabilities
+                        + " active=" + message.activeCapabilities)
                     if (message.activeCapabilities.contains("speakers")) {
                         transport.send(ClientMessage.Audio("start_phone_speakers"))
                         _state.value = State.Waiting("The PC is sending sound to this phone.")

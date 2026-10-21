@@ -383,7 +383,11 @@ internal sealed class EndpointBroker
                         removed = current;
                     }
                 }
-                if (removed is not null) await DeviceInstance.RemoveAsync(removed.Device.InstancePath).ConfigureAwait(false);
+                // The endpoint stays. It belongs to the enrollment, not to
+                // one session: removing it here destroys the device Windows
+                // may be playing through, which empties the sound list and
+                // upsets the shell's sound interface. The device is removed
+                // when the phone is unenrolled.
             }
         }
         finally { _deviceGate.Release(); }
@@ -410,7 +414,9 @@ internal sealed class EndpointBroker
                     removed = current;
                 }
             }
-            if (removed is not null) await DeviceInstance.RemoveAsync(removed.Device.InstancePath).ConfigureAwait(false);
+            // The endpoint stays until the phone is unenrolled (see
+            // ReleaseOwnedAsync). Removing it here would destroy the device
+            // Windows may be playing through.
             return new BrokerResponse(true, PeerId: peerId);
         }
         finally { _deviceGate.Release(); }
