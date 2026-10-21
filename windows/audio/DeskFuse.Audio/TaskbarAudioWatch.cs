@@ -75,7 +75,7 @@ internal static class TaskbarAudioWatch
             }
 
             Console.WriteLine("Observation complete. Signal means loopback PCM exceeded 80/32768;");
-            Console.WriteLine("absence means no above-threshold samples, NOT proof Windows created no stream.");
+            Console.WriteLine("nonzero counts any finite nonzero loopback sample; frames show recorded PCM.");
             foreach (var watch in watches) watch.Summary();
             return 0;
         }
@@ -94,6 +94,9 @@ internal static class TaskbarAudioWatch
         private readonly Dictionary<string, bool> _activeSessions = new();
         private long _capturedPackets;
         private long _signalPackets;
+        private long _nonzeroPackets;
+        private long _capturedFrames;
+        private int _maxObservedPeakBits;
         private long _lastReportedPackets;
         private float _lastVolume = -1f;
         private bool _lastMute;
@@ -140,6 +143,7 @@ internal static class TaskbarAudioWatch
             float peak = 0;
             var frameBytes = _format.BlockAlign;
             var complete = args.BytesRecorded / frameBytes * frameBytes;
+            Interlocked.Add(ref _capturedFrames, complete / frameBytes);
             for (var offset = 0; offset < complete; offset += _bytesPerSample)
             {
                 var bytes = args.Buffer.AsSpan(offset, _bytesPerSample);
@@ -157,12 +161,29 @@ internal static class TaskbarAudioWatch
                     };
                 if (float.IsFinite(value)) peak = Math.Max(peak, Math.Abs(value));
             }
+            if (peak > 0f)
+            {
+                Interlocked.Increment(ref _nonzeroPackets);
+                UpdateMaximumPeak(ref _maxObservedPeakBits, peak);
+            }
             if (peak >= SignalThreshold)
             {
                 Interlocked.Increment(ref _signalPackets);
-                // Use integer bits: exchange is atomic on all supported architectures.
-                var bits = BitConverter.SingleToInt32Bits(peak);
-                Interlocked.Exchange(ref _peakBits, bits);
+                UpdateMaximumPeak(ref _peakBits, peak);
+            }
+        }
+
+        // All peaks are non-negative, finite IEEE floats; their positive int bit
+        // patterns sort in the same order as their numeric values.
+        private static void UpdateMaximumPeak(ref int destination, float peak)
+        {
+            var next = BitConverter.SingleToInt32Bits(peak);
+            var prior = Volatile.Read(ref destination);
+            while (next > prior)
+            {
+                var observed = Interlocked.CompareExchange(ref destination, next, prior);
+                if (observed == prior) return;
+                prior = observed;
             }
         }
 
@@ -221,7 +242,8 @@ internal static class TaskbarAudioWatch
                             var pid = session.GetProcessID;
                             Console.WriteLine($"{now:HH:mm:ss.fff}Z {Device.FriendlyName}: " +
                                 $"session={(system ? "SYSTEM" : "APP")} pid={pid} " +
-                                $"peak={peak:F4} muted={session.SimpleAudioVolume.Mute}");
+                                $"peak={peak:F4} gain={session.SimpleAudioVolume.Volume:F3} " +
+                                $"muted={session.SimpleAudioVolume.Mute}");
                         }
                         _activeSessions[key] = active;
                     }
@@ -235,7 +257,10 @@ internal static class TaskbarAudioWatch
         {
             Console.WriteLine($"{Device.FriendlyName} [{Device.ID}]: " +
                 $"{Interlocked.Read(ref _signalPackets)} signal / " +
-                $"{Interlocked.Read(ref _capturedPackets)} total loopback packets" +
+                $"{Interlocked.Read(ref _nonzeroPackets)} nonzero / " +
+                $"{Interlocked.Read(ref _capturedPackets)} total loopback packets, " +
+                $"{Interlocked.Read(ref _capturedFrames)} frames, " +
+                $"max raw peak={BitConverter.Int32BitsToSingle(Volatile.Read(ref _maxObservedPeakBits)):F8}" +
                 (_captureError is null ? "" : $"; capture error: {_captureError.Message}"));
         }
 
