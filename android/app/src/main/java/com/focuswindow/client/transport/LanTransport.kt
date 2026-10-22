@@ -100,6 +100,25 @@ class LanTransport(
     private var channel: SecureChannel? = null
     @Volatile private var writer: SecureRecordWriter? = null
     private val running = AtomicBoolean(false)
+    // A retired receive loop must never close a newer authenticated socket.
+    // Both a foreground-service Stop and an Android network handover can race
+    // with a blocking connect(), handshake, or readFully().
+    private val socketGate = Any()
+    private var socketGeneration = 0L
+
+    private fun isCurrent(generation: Long): Boolean = synchronized(socketGate) {
+        socketGeneration == generation && running.get()
+    }
+
+    private fun closeCurrent(generation: Long): Boolean = synchronized(socketGate) {
+        if (socketGeneration != generation || !running.get()) false
+        else {
+            socketGeneration++
+            running.set(false)
+            closeQuietly()
+            true
+        }
+    }
 
     sealed interface TransportEvent {
         data class Connecting(val host: String, val port: Int) : TransportEvent
@@ -118,25 +137,48 @@ class LanTransport(
     val isRunning: Boolean get() = running.get()
 
     suspend fun connect(payload: PairingPayload) = withContext(Dispatchers.IO) {
-        if (!running.compareAndSet(false, true)) {
+        val generation = synchronized(socketGate) {
+            if (running.get()) 0L
+            else {
+                running.set(true)
+                ++socketGeneration
+            }
+        }
+        if (generation == 0L) {
             android.util.Log.i("DeskFuseSession", "connect skipped: a connection is already live")
             return@withContext
         }
         android.util.Log.i("DeskFuseSession", "connecting to ${payload.host}:${payload.port}")
         _events.emit(TransportEvent.Connecting(payload.host, payload.port))
 
+        var attemptedSocket: Socket? = null
         try {
+            // Publish before connect(): disconnectNow() must be able to close
+            // a TCP connect blocked on the old Wi-Fi interface.
             val s = Socket().apply {
-                tcpNoDelay = true            // latency over throughput
+                tcpNoDelay = true
                 keepAlive = true
                 soTimeout = READ_TIMEOUT_MS
-                connect(InetSocketAddress(payload.host, payload.port), CONNECT_TIMEOUT_MS)
             }
-            socket = s
+            attemptedSocket = s
+            val installed = synchronized(socketGate) {
+                if (socketGeneration != generation || !running.get()) false
+                else {
+                    socket = s
+                    true
+                }
+            }
+            if (!installed) {
+                s.close()
+                return@withContext
+            }
+            s.connect(InetSocketAddress(payload.host, payload.port), CONNECT_TIMEOUT_MS)
             val inStream = DataInputStream(BufferedInputStream(s.getInputStream(), 1 shl 16))
             val outStream = DataOutputStream(BufferedOutputStream(s.getOutputStream(), 1 shl 15))
-            input = inStream
-            output = outStream
+            if (!isCurrent(generation)) {
+                s.close()
+                return@withContext
+            }
 
             val secure = SecureChannel.handshake(
                 input = inStream,
@@ -144,28 +186,40 @@ class LanTransport(
                 hostPublicKeyB64 = payload.hostPublicKeyB64,
                 pairingSecret = payload.pairingSecret,
             )
-            channel = secure
-            writer = SecureRecordWriter(outStream, secure)
+            val admitted = synchronized(socketGate) {
+                if (socketGeneration != generation || !running.get()) false
+                else {
+                    input = inStream
+                    output = outStream
+                    channel = secure
+                    writer = SecureRecordWriter(outStream, secure)
+                    true
+                }
+            }
+            if (!admitted) {
+                s.close()
+                return@withContext
+            }
+            if (!isCurrent(generation)) return@withContext
             _events.emit(TransportEvent.Verified(secure.verificationCode, payload.hostName))
+            if (!isCurrent(generation)) return@withContext
             _events.emit(TransportEvent.Ready)
-
-            scope.launch(Dispatchers.IO) { readLoop(inStream, secure) }
+            scope.launch(Dispatchers.IO) { readLoop(inStream, secure, generation) }
         } catch (t: Throwable) {
-            running.set(false)
-            // FR-OPS-03 — a failure is a NAMED stage with a remediation, never
-            // a black screen.
-            // Keep the raw socket diagnosis in developer logs, not on the
-            // phone's connection status screen.
-            android.util.Log.i("DeskFuseTransport",
-                "connection attempt failed: ${t.javaClass.simpleName}: ${t.message}")
-            _events.emit(diagnose(t, payload))
-            closeQuietly()
+            runCatching { attemptedSocket?.close() }
+            if (closeCurrent(generation)) {
+                // Low-level socket diagnostics belong in developer logs.
+                android.util.Log.i("DeskFuseTransport",
+                    "connection attempt failed: ${t.javaClass.simpleName}: ${t.message}")
+                _events.emit(diagnose(t, payload))
+            }
         }
     }
 
-    private suspend fun readLoop(inStream: DataInputStream, secure: SecureChannel) {
+    private suspend fun readLoop(inStream: DataInputStream, secure: SecureChannel,
+                                 generation: Long) {
         try {
-            while (scope.isActive && running.get()) {
+            while (scope.isActive && isCurrent(generation)) {
                 when (val kind = inStream.readByte().toInt()) {
                     KIND_CONTROL -> {
                         val len = inStream.readInt()
@@ -187,7 +241,7 @@ class LanTransport(
                             )
                             continue
                         }
-                        if (!dispatchControl(msg)) return
+                        if (!dispatchControl(msg, generation)) return
                     }
 
                     KIND_FRAME -> {
@@ -229,9 +283,7 @@ class LanTransport(
         } catch (t: Throwable) {
             // Clear running BEFORE notifying the session controller. Otherwise its
             // reconnect attempts see running=true and return without connecting.
-            val lost = running.getAndSet(false)
-            closeQuietly()
-            if (lost) {
+            if (closeCurrent(generation)) {
                 _events.emit(TransportEvent.Closed(t.message ?: "connection lost", recoverable = true))
             }
         }
@@ -240,13 +292,16 @@ class LanTransport(
     // A host-declared failure needs a manual retry, not another monitor/encoder
     // allocation when the socket closes. Deliver it on the lifecycle stream so
     // it cannot race a Closed event from a separate control collector.
-    internal suspend fun dispatchControl(msg: ServerMessage): Boolean {
+    internal suspend fun dispatchControl(
+        msg: ServerMessage, generation: Long = synchronized(socketGate) { socketGeneration }
+    ): Boolean {
         if (msg is ServerMessage.Stage && msg.fatal) {
-            running.set(false)
-            closeQuietly()
-            _events.emit(TransportEvent.Failed(msg.stage, msg.detail, msg.remediation, terminal = true))
+            if (closeCurrent(generation)) {
+                _events.emit(TransportEvent.Failed(msg.stage, msg.detail, msg.remediation, terminal = true))
+            }
             return false
         }
+        if (!isCurrent(generation)) return false
         _control.emit(msg)
         return true
     }
@@ -286,15 +341,17 @@ class LanTransport(
     }
 
     suspend fun send(message: ClientMessage) = withContext(Dispatchers.IO) {
-        val sender = writer ?: return@withContext
+        val (sender, generation) = synchronized(socketGate) {
+            (writer ?: return@withContext) to socketGeneration
+        }
         val bytes = json.encodeToString(ClientMessage.serializer(), message).toByteArray()
         try {
             sender.control(bytes)
         } catch (t: java.io.IOException) {
             // Never silently swallow a failed Hello or keyframe request.
-            val lost = running.getAndSet(false)
-            closeQuietly()
-            if (lost) _events.emit(TransportEvent.Closed(t.message ?: "send failed", recoverable = true))
+            if (closeCurrent(generation)) {
+                _events.emit(TransportEvent.Closed(t.message ?: "send failed", recoverable = true))
+            }
         }
     }
 
@@ -303,15 +360,15 @@ class LanTransport(
      */
     suspend fun sendPhoneMicrophone(streamId: Int, pcm16le: ByteArray): Boolean =
         withContext(Dispatchers.IO) {
-            val sender = writer ?: return@withContext false
-            if (!running.get()) return@withContext false
+            val (sender, generation) = synchronized(socketGate) {
+                (writer ?: return@withContext false) to socketGeneration
+            }
+            if (!isCurrent(generation)) return@withContext false
             try {
                 sender.microphone(streamId, pcm16le)
                 true
             } catch (ex: java.io.IOException) {
-                val lost = running.getAndSet(false)
-                closeQuietly()
-                if (lost) _events.emit(TransportEvent.Closed(
+                if (closeCurrent(generation)) _events.emit(TransportEvent.Closed(
                     ex.message ?: "microphone send failed", recoverable = true))
                 false
             }
@@ -331,17 +388,18 @@ class LanTransport(
      * wakes the blocking receive thread rather than leaving an orphan host
      * connection for the full socket-read timeout.
      */
-    fun disconnectNow() {
+    fun disconnectNow() = synchronized(socketGate) {
+        socketGeneration++
         running.set(false)
-        // Closing the socket first unblocks any concurrent readFully().
-        runCatching { socket?.close() }
         closeQuietly()
     }
 
+    /** Call only while holding socketGate. */
     private fun closeQuietly() {
+        // Close socket FIRST to unblock a pending reader or handshake.
+        runCatching { socket?.close() }
         runCatching { input?.close() }
         runCatching { output?.close() }
-        runCatching { socket?.close() }
         input = null
         output = null
         socket = null
