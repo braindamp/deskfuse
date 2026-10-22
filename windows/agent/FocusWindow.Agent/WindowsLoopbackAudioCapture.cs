@@ -22,6 +22,7 @@ namespace FocusWindow.Agent;
 internal sealed class WindowsLoopbackAudioCapture : IHostAudioCapture
 {
     private readonly WasapiCapture _capture;
+    private readonly bool _eventSync;
     private readonly MMDevice? _device;
     private readonly WaveFormat _sourceFormat;
     private readonly int _sourceMask;
@@ -34,7 +35,14 @@ internal sealed class WindowsLoopbackAudioCapture : IHostAudioCapture
     // an audible dropout, and it is not a dropped packet.
     private long _packets;
     private long _maxGapMs;
-    private long _lastArrival;
+    private long _lastArrivalQpc;
+    // Reset by the existing 2-second health reporter; callback only increments
+    // fixed-size counters. No per-packet logging, socket I/O or allocations.
+    private long _windowCallbacks;
+    private long _windowGapOver20;
+    private long _windowGapOver50;
+    private long _windowGapOver100;
+    private long _windowMaxGapMs;
 
     private const int Stereo = 0x3;
     private const int FiveOneBack = 0x3f;
@@ -66,6 +74,12 @@ internal sealed class WindowsLoopbackAudioCapture : IHostAudioCapture
     public WindowsLoopbackAudioCapture(
         string? endpointId, IReadOnlyList<string> supportedPhoneLayouts, int maxPcmBytes = 3840)
     {
+        // Explicit A/B experiment only. Preserve the empirically reliable
+        // polling mode unless the launcher opts into the Windows 10 1703+
+        // EVENTCALLBACK + LOOPBACK capture path.
+        _eventSync = string.Equals(
+            Environment.GetEnvironmentVariable("DESKFUSE_WASAPI_EVENT_SYNC"),
+            "1", StringComparison.Ordinal);
         if (endpointId is not null)
         {
             MMDevice device;
@@ -82,13 +96,13 @@ internal sealed class WindowsLoopbackAudioCapture : IHostAudioCapture
             }
             // The capture uses the device, so it has to outlive it.
             _device = device;
-            _capture = new LowLatencyLoopbackCapture(device);
+            _capture = new LowLatencyLoopbackCapture(device, _eventSync);
         }
         else
         {
             using var enumerator = new MMDeviceEnumerator();
             _device = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
-            _capture = new LowLatencyLoopbackCapture(_device);
+            _capture = new LowLatencyLoopbackCapture(_device, _eventSync);
         }
         try
         {
@@ -137,11 +151,12 @@ internal sealed class WindowsLoopbackAudioCapture : IHostAudioCapture
         }
     }
 
-    // NAudio's loopback helper uses a 100 ms capture buffer and polls every
-    // half-buffer, batching roughly 50 ms before any audio reaches the phone.
-    // Keep its loopback flags and shared mix, but poll a 20 ms buffer instead.
-    private sealed class LowLatencyLoopbackCapture(MMDevice device)
-        : WasapiCapture(device, false, 20)
+    // Retain the proven 20 ms NAudio loopback buffer for both A/B modes.
+    // Windows 10 1703+ supports event-driven loopback with EVENTCALLBACK;
+    // changing from polling is OPT-IN and does not alter endpoint flags,
+    // sample conversion, packet duration, encryption or Android playback.
+    private sealed class LowLatencyLoopbackCapture(MMDevice device, bool eventSync)
+        : WasapiCapture(device, eventSync, 20)
     {
         protected override AudioClientStreamFlags GetAudioClientStreamFlags() =>
             AudioClientStreamFlags.Loopback | base.GetAudioClientStreamFlags();
@@ -153,14 +168,21 @@ internal sealed class WindowsLoopbackAudioCapture : IHostAudioCapture
         if (_started) throw new InvalidOperationException("Audio capture already started");
         _capture.DataAvailable += (_, args) =>
         {
-            var now = Environment.TickCount64;
-            if (_lastArrival != 0)
+            var nowQpc = System.Diagnostics.Stopwatch.GetTimestamp();
+            var previousQpc = _lastArrivalQpc;
+            if (previousQpc != 0)
             {
-                var gap = now - _lastArrival;
-                if (gap > _maxGapMs) _maxGapMs = gap;
+                var gapMs = (long)((nowQpc - previousQpc) * 1000.0 /
+                    System.Diagnostics.Stopwatch.Frequency);
+                if (gapMs > _maxGapMs) _maxGapMs = gapMs;
+                if (gapMs > _windowMaxGapMs) _windowMaxGapMs = gapMs;
+                if (gapMs > 20) Interlocked.Increment(ref _windowGapOver20);
+                if (gapMs > 50) Interlocked.Increment(ref _windowGapOver50);
+                if (gapMs > 100) Interlocked.Increment(ref _windowGapOver100);
             }
-            _lastArrival = now;
-            _packets++;
+            _lastArrivalQpc = nowQpc;
+            Interlocked.Increment(ref _windowCallbacks);
+            Interlocked.Increment(ref _packets);
             var bytesPerFrame = _bytesPerSourceSample * _sourceFormat.Channels;
             var aligned = args.BytesRecorded / bytesPerFrame * bytesPerFrame;
             var readPosition = 0;
@@ -301,8 +323,19 @@ internal sealed class WindowsLoopbackAudioCapture : IHostAudioCapture
         BinaryPrimitives.WriteInt16LittleEndian(output.Slice(position, 2), sample);
     }
 
-    /// <summary>How the capture arrived: packets, and the longest hole.</summary>
-    public string? Health => $"{_packets} capture packets, longest hole {_maxGapMs} ms";
+    /// <summary>
+    /// WASAPI callback arrival timing, not a measure of missing audio samples.
+    /// The largest-gap counter is cumulative; window counters are reset every
+    /// time the 2-second reporter reads this snapshot.
+    /// </summary>
+    public string? Health =>
+        $"capMode={(_eventSync ? "event" : "poll")} " +
+        $"{Interlocked.Read(ref _packets)} capture callbacks, longest hole {Volatile.Read(ref _maxGapMs)} ms" +
+        $" | cap2s callbacks={Interlocked.Exchange(ref _windowCallbacks, 0)}" +
+        $" maxGapMs={Interlocked.Exchange(ref _windowMaxGapMs, 0)}" +
+        $" gap>20ms={Interlocked.Exchange(ref _windowGapOver20, 0)}" +
+        $" gap>50ms={Interlocked.Exchange(ref _windowGapOver50, 0)}" +
+        $" gap>100ms={Interlocked.Exchange(ref _windowGapOver100, 0)}";
 
     public void Dispose()
     {

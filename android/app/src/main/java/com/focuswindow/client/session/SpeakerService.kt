@@ -13,9 +13,11 @@ import com.focuswindow.client.R
 import com.focuswindow.client.media.PcAudioOutput
 import com.focuswindow.client.profile.PhoneProfile
 import com.focuswindow.client.transport.PairingPayload
+import com.focuswindow.client.transport.DefaultNetworkHandoff
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -35,13 +37,28 @@ class SpeakerService : Service() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var controller: SpeakerController? = null
+    private var stateJob: Job? = null
+    private var networkHandoff: DefaultNetworkHandoff? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_START -> start(intent)
-            ACTION_STOP -> stopSelf()
+            ACTION_STOP -> {
+                networkHandoff?.close()
+                networkHandoff = null
+                // Stop the socket immediately, not whenever Android later
+                // dispatches onDestroy(). stopSelf(startId) cannot tear down
+                // a newer ACTION_START that arrived after this STOP.
+                controller?.stop()
+                controller = null
+                stateJob?.cancel()
+                stateJob = null
+                running = false
+                state.value = SpeakerController.State.Idle
+                stopSelf(startId)
+            }
         }
         // The user ends the session explicitly. A killed service does not
         // silently reconnect to someone's PC.
@@ -70,11 +87,19 @@ class SpeakerService : Service() {
             stopSelf()
             return
         }
+        // Repeated ACTION_START must never orphan the previous authenticated
+        // socket, capture route or StateFlow collector.
+        networkHandoff?.close()
+        networkHandoff = null
+        controller?.stop()
+        stateJob?.cancel()
+        stateJob = null
+        controller = null
         running = true
         val output = PcAudioOutput(applicationContext)
         val speaker = SpeakerController(scope, clientVersion(), output)
         controller = speaker
-        scope.launch {
+        stateJob = scope.launch {
             speaker.state.collect { current ->
                 state.value = current
                 notificationManager()?.notify(
@@ -83,6 +108,15 @@ class SpeakerService : Service() {
                 )
             }
         }
+        // Register first, so starting the service in airplane mode never
+        // attempts a doomed TCP connect. A change in Android's default route
+        // retires only the old socket; absence of a route suspends forever.
+        networkHandoff = DefaultNetworkHandoff(applicationContext) { _ ->
+            scope.launch {
+                if (running && controller === speaker) speaker.onDefaultNetworkChanged(networkHandoff?.isAvailable == true)
+            }
+        }
+        speaker.onDefaultNetworkChanged(networkHandoff!!.isAvailable)
         speaker.start(payload, profile)
     }
 
@@ -92,6 +126,7 @@ class SpeakerService : Service() {
 
     private fun describe(current: SpeakerController.State): String = when (current) {
         is SpeakerController.State.Playing -> current.endpoint.ifEmpty { "Playing" }
+        SpeakerController.State.Suspended -> "Phone speaker"
         is SpeakerController.State.Waiting -> current.detail
         is SpeakerController.State.Failed -> current.detail
         is SpeakerController.State.Connecting -> "Connecting to ${current.host}"
@@ -143,9 +178,13 @@ class SpeakerService : Service() {
     }
 
     override fun onDestroy() {
+        networkHandoff?.close()
+        networkHandoff = null
         running = false
         controller?.stop()
         controller = null
+        stateJob?.cancel()
+        stateJob = null
         scope.cancel()
         // The session is over: the interface must show the speaker as off,
         // otherwise the next tap would only ever try to stop it again.

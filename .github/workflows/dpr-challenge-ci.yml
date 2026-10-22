@@ -48,6 +48,16 @@ jobs:
           cmake --version
       - name: Compile host and bundled production GPU DLL (never install FocusIdd)
         run: dotnet build windows/agent/FocusWindow.Agent/FocusWindow.Agent.csproj -c Release -p:Platform=x64 -warnaserror
+      - name: Publish standalone elevated audio broker (driver-free compile)
+        run: dotnet publish windows/audio/DeskFuse.AudioBroker/DeskFuse.AudioBroker.csproj -c Release -r win-x64 --self-contained true -p:Platform=x64 -warnaserror -o out/audio-broker
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deskfuse-audio-broker-x64
+          path: out/audio-broker/
+      - name: Compile standalone read-only taskbar audio watcher (no CMake dependency)
+        run: dotnet build windows/audio/DeskFuse.TaskbarWatch/DeskFuse.TaskbarWatch.csproj -c Release -warnaserror
+      - name: Compile explicit-opt-in WASAPI category probe (never run audio on CI)
+        run: dotnet build windows/audio/DeskFuse.AudioCategoryProbe/DeskFuse.AudioCategoryProbe.csproj -c Release -warnaserror
       - name: Run unit and simulated tests (no display changes)
         run: dotnet test windows/agent/FocusWindow.Tests/FocusWindow.Tests.csproj -c Release --verbosity minimal
       - name: Test native GPU ABI and capture pacing (no hardware access)

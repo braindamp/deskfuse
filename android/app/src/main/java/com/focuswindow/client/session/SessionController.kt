@@ -111,6 +111,9 @@ class SessionController(
 
     private var pumpJob: Job? = null
     private var reconnectJob: Job? = null
+    @Volatile private var networkAvailable = true
+    @Volatile private var recovering = false
+    @Volatile private var sessionActive = false
     private var preparingWatchdog: Job? = null
     private var staleJob: Job? = null
     private var attempt = 0
@@ -351,6 +354,10 @@ class SessionController(
         this.payload = payload
         this.profile = profile
         attempt = 0
+        reconnectJob?.cancel()
+        reconnectJob = null
+        recovering = false
+        sessionActive = false
 
         val problems = profile.validate()
         if (problems.isNotEmpty()) {
@@ -383,30 +390,44 @@ class SessionController(
         }
 
         pumpJob?.cancel()
+        sessionActive = true
         pumpJob = scope.launch {
             launch { pumpControl() }
             launch { pumpFrames() }
             launch { pumpAudio() }
             launch { pumpEvents() }
-            transport.connect(payload)
+            if (networkAvailable) transport.connect(payload)
+            else {
+                recovering = true
+                // Render nothing on top of the last video frame; the Android
+                // airplane-mode indicator is already visible to the user.
+                _state.value = SessionState.Reconnecting(0, 0, "", 0)
+            }
         }
     }
 
     private suspend fun pumpEvents() {
         transport.events.collect { event ->
             when (event) {
-                is LanTransport.TransportEvent.Connecting ->
-                    _state.value = SessionState.Connecting(event.host, event.port)
+                is LanTransport.TransportEvent.Connecting -> {
+                    if (!recovering && networkAvailable)
+                        _state.value = SessionState.Connecting(event.host, event.port)
+                }
 
-                is LanTransport.TransportEvent.Verified ->
-                    _state.value = SessionState.Verifying(event.code, event.hostName)
+                is LanTransport.TransportEvent.Verified -> {
+                    // Re-approval is not part of resuming an authenticated phone.
+                    if (!recovering && networkAvailable)
+                        _state.value = SessionState.Verifying(event.code, event.hostName)
+                }
 
                 is LanTransport.TransportEvent.Ready -> {
-                    _state.value = SessionState.PreparingTarget(
-                        stage = "Preparing your display",
-                        detail = "Setting up the phone-sized workspace.",
-                        progress = 0.35f,
-                    )
+                    if (!recovering && networkAvailable) {
+                        _state.value = SessionState.PreparingTarget(
+                            stage = "Preparing your display",
+                            detail = "Setting up the phone-sized workspace.",
+                            progress = 0.35f,
+                        )
+                    }
                     profile?.let {
                         transport.send(ClientMessage.Hello(clientVersion = clientVersion, profile = it))
                         transport.send(ClientMessage.Density(densityPreset))
@@ -415,6 +436,8 @@ class SessionController(
 
                 is LanTransport.TransportEvent.Failed -> {
                     if (event.terminal) {
+                        sessionActive = false
+                        recovering = false
                         reconnectJob?.cancel()
                         staleJob?.cancel()
                         record = null // late decoder stats must not revive a failed session
@@ -428,12 +451,17 @@ class SessionController(
                     stopPcAudioLocal()
                     uploadJob?.cancel()
                     abortDownload("Connection lost; incomplete download discarded")
-                    _state.value = SessionState.Failed(
-                        stage = event.stage,
-                        detail = event.detail,
-                        remediation = event.remediation,
-                        recoverable = true,
-                    )
+                    if (event.retryable) {
+                        // No default network means indefinite quiet suspension.
+                        scheduleReconnect()
+                    } else {
+                        _state.value = SessionState.Failed(
+                            stage = event.stage,
+                            detail = event.detail,
+                            remediation = event.remediation,
+                            recoverable = true,
+                        )
+                    }
                 }
 
                 is LanTransport.TransportEvent.Closed -> {
@@ -445,7 +473,7 @@ class SessionController(
                     stopPcAudioLocal()
                     uploadJob?.cancel()
                     abortDownload("Connection closed; incomplete download discarded")
-                    if (event.recoverable) scheduleReconnect(event.reason)
+                    if (event.recoverable) scheduleReconnect()
                     else _state.value = SessionState.Ended(event.reason)
                 }
             }
@@ -584,6 +612,7 @@ class SessionController(
         val p = profile ?: return
         record = incoming
         attempt = 0
+        recovering = false
 
         clearAdvisory("density")
         clearAdvisory("tokens")
@@ -664,6 +693,9 @@ class SessionController(
     }
 
     private fun refreshStreamingState() {
+        // Decoder callbacks from a previously decoded frame must not revive
+        // 'Streaming' after Android reports no default network.
+        if (recovering || !networkAvailable) return
         val p = profile ?: return
         val r = record ?: return
         val pres = surfaceView?.presentation ?: return
@@ -703,35 +735,62 @@ class SessionController(
         }
     }
 
-    private fun scheduleReconnect(reason: String) {
+    /**
+     * A default-network change has higher priority than a socket timeout.
+     * Airplane mode is an indefinite user-controlled suspension, NOT failure:
+     * no retry budget is spent, no alert is shown, and last video frame stays.
+     * A newly available route immediately reuses the approved device identity.
+     */
+    fun onDefaultNetworkChanged(available: Boolean) {
+        networkAvailable = available
+        if (!sessionActive || payload == null) return
+        android.util.Log.i("DeskFuseSession",
+            if (available) "default network available: resuming" else "no default network: suspended")
+        reconnectJob?.cancel()
+        reconnectJob = null
+        attempt = 0
+        recovering = true
+        transport.disconnectNow()
+        hostPcAudioAvailable = false
+        stopPcAudioLocal()
+        stopPhoneMicrophoneLocal()
+        uploadJob?.cancel()
+        abortDownload("Network interrupted; incomplete download discarded")
+        // StateScreen draws nothing here, leaving the most recent remote
+        // frame untouched. The native Android network indicator is enough.
+        _state.value = SessionState.Reconnecting(0, 0, "", 0)
+        if (available) scheduleReconnect()
+    }
+
+    /** Keep trying on reachable networks; never expire on flight mode. */
+    private fun scheduleReconnect() {
+        if (!sessionActive) return
+        if (!networkAvailable) {
+            recovering = true
+            _state.value = SessionState.Reconnecting(0, 0, "", 0)
+            return
+        }
         if (reconnectJob?.isActive == true) return
         val pl = payload ?: return
         val pf = profile ?: return
-
+        recovering = true
+        _state.value = SessionState.Reconnecting(0, 0, "", 0)
         reconnectJob = scope.launch {
-            while (attempt < MAX_RECONNECT) {
-                attempt++
-                // Exponential backoff, capped. Keeps a sleeping phone from
-                // hammering the host when it wakes on a dead network.
-                val wait = min(MAX_BACKOFF_MS, BASE_BACKOFF_MS * (1L shl (attempt - 1)))
-                _state.value = SessionState.Reconnecting(attempt, MAX_RECONNECT, reason, wait)
-                delay(wait)
+            while (sessionActive && recovering && networkAvailable) {
+                attempt = (attempt + 1).coerceAtMost(RECONNECT_DELAYS_MS.size)
+                delay(RECONNECT_DELAYS_MS[attempt - 1])
+                if (!sessionActive || !recovering || !networkAvailable) return@launch
                 transport.connect(pl)
-                // Give the handshake a window before trying again.
+                // Fresh authenticated Target restores the display, then a new
+                // keyframe is requested. Previous decoder output stays held.
                 delay(HANDSHAKE_WINDOW_MS)
+                if (!sessionActive || !recovering || !networkAvailable) return@launch
                 if (_state.value is SessionState.Streaming) {
-                    // FR-ENC-05 — resume needs a fresh keyframe.
                     transport.send(ClientMessage.RequestKeyframe)
                     transport.send(ClientMessage.Profile(pf))
                     return@launch
                 }
             }
-            _state.value = SessionState.Failed(
-                stage = "reconnect",
-                detail = "Lost the connection to ${pl.hostName} and could not get it back.",
-                remediation = "Check the PC is awake and on the same network, then reconnect.",
-                recoverable = true,
-            )
         }
     }
 
@@ -895,6 +954,8 @@ class SessionController(
     }
 
     fun stop(reason: String = "user ended the session") {
+        sessionActive = false
+        recovering = false
         stopPhoneMicrophoneLocal()
         hostMicAvailable = false
         _bridgeState.value = null
@@ -903,6 +964,7 @@ class SessionController(
         uploadJob?.cancel()
         abortDownload("Disconnected; incomplete download discarded")
         reconnectJob?.cancel()
+        reconnectJob = null
         staleJob?.cancel()
         pumpJob?.cancel()
         decoderOrNull()?.stop()
@@ -931,12 +993,10 @@ class SessionController(
 
     private companion object {
         /** How long the phone waits for the host to confirm a picture. */
+        val RECONNECT_DELAYS_MS = longArrayOf(250, 1_000, 2_000, 4_000, 8_000, 15_000)
         const val PREPARING_TIMEOUT_MS = 30_000L
         const val MAX_FILE_BYTES = 32L * 1024 * 1024
         const val FILE_CHUNK_BYTES = 24 * 1024
-        const val MAX_RECONNECT = 6
-        const val BASE_BACKOFF_MS = 400L
-        const val MAX_BACKOFF_MS = 8_000L
         const val HANDSHAKE_WINDOW_MS = 2_500L
         const val STALE_GRACE_MS = 2_000L
     }

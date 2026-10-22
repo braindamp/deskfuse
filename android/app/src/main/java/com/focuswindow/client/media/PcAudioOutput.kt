@@ -38,11 +38,15 @@ class PcAudioOutput(context: Context) {
     private var nativeRoute: AudioDeviceInfo? = null
     private var packets: Long = 0
     private var partialWrites: Long = 0
+    private var writeMaxMs: Long = 0
+    private var writeOver10Ms: Long = 0
+    private var writeOver30Ms: Long = 0
     private var writtenFrames: Long = 0
     private var bytesPerFrame = 4
     private var lastAppliedSystemIndex: Int = -1
     private var activeLayout = "stereo"
     private var routingRequestedAtMs = 0L
+    private var seamGuard: PcmSeamGuard? = null
 
     private data class Layout(val name: String, val channels: Int, val mask: Int)
     private val stereo = Layout("stereo", 2, AudioFormat.CHANNEL_OUT_STEREO)
@@ -133,7 +137,11 @@ class PcAudioOutput(context: Context) {
                 writtenFrames = 0
                 packets = 0
                 partialWrites = 0
+                writeMaxMs = 0
+                writeOver10Ms = 0
+                writeOver30Ms = 0
                 bytesPerFrame = channels * 2
+                seamGuard = PcmSeamGuard(channels, sampleRate)
                 activeLayout = layout
                 nativeRoute = route
                 routingRequestedAtMs = SystemClock.elapsedRealtime()
@@ -254,12 +262,20 @@ class PcAudioOutput(context: Context) {
         if (chunk.streamId != streamId) return@withContext true
         val current = track ?: return@withContext false
         if (!routeStillSupportsSurround()) return@withContext false
+        // Protect only severe packet-boundary waveform splices, without
+        // delaying or modifying continuous PCM.
+        seamGuard?.apply(chunk.pcm)
         val completed = writePcmPacket(chunk.pcm.size) { offset, count ->
             ensureActive()
             if (track !== current || streamId != chunk.streamId) return@writePcmPacket -1
+            val writeStartedNs = System.nanoTime()
             val written = runCatching {
                 current.write(chunk.pcm, offset, count, AudioTrack.WRITE_BLOCKING)
             }.getOrDefault(-1)
+            val writeMs = (System.nanoTime() - writeStartedNs).coerceAtLeast(0) / 1_000_000
+            if (writeMs > writeMaxMs) writeMaxMs = writeMs
+            if (writeMs > 10) writeOver10Ms++
+            if (writeMs > 30) writeOver30Ms++
             if (written > 0) {
                 writtenFrames += written / bytesPerFrame
                 if (offset + written < chunk.pcm.size) partialWrites++
@@ -280,12 +296,18 @@ class PcAudioOutput(context: Context) {
         val bufferMs = runCatching { (current?.bufferSizeInFrames ?: 0) * 1000 / rate }
             .getOrDefault(0)
         val underruns = runCatching { current?.underrunCount ?: 0 }.getOrDefault(0)
+        val timing = "writeMaxMs=$writeMaxMs write>10ms=$writeOver10Ms " +
+            "write>30ms=$writeOver30Ms seams=${seamGuard?.repaired ?: 0}"
+        writeMaxMs = 0
+        writeOver10Ms = 0
+        writeOver30Ms = 0
         return "packets=$packets partial=$partialWrites queued=${queued * 1000 / rate}ms " +
-            "buffer=${bufferMs}ms underruns=$underruns"
+            "buffer=${bufferMs}ms underruns=$underruns $timing"
     }
 
     fun stop() {
         streamId = -1
+        seamGuard = null
         activeLayout = "stereo"
         nativeRoute = null
         routingRequestedAtMs = 0L

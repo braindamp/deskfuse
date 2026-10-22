@@ -42,7 +42,7 @@ public sealed class PhoneConnection : IAsyncDisposable
         byteCount > 0 && byteCount <= MaxVideoAccessUnitBytes;
     // Audio chunks are independent PCM; dropping stale chunks is safe and helps latency.
     private sealed record Outbound(byte Kind, byte[]? Plain, bool IsFrame,
-        bool ReleasesSlot = false);
+        bool ReleasesSlot = false, long AudioEnqueueQpc = 0);
     private readonly TcpClient _tcp;
     private readonly Stream _stream;
     private readonly SecureChannel _chan;
@@ -55,8 +55,7 @@ public sealed class PhoneConnection : IAsyncDisposable
         new UnboundedChannelOptions { SingleReader = true });
     private readonly Channel<Outbound> _fileQueue = Channel.CreateUnbounded<Outbound>(
         new UnboundedChannelOptions { SingleReader = true });
-    private readonly Channel<Outbound> _audioQueue = Channel.CreateBounded<Outbound>(
-        new BoundedChannelOptions(8) { SingleReader = true, FullMode = BoundedChannelFullMode.DropOldest });
+    private readonly Channel<Outbound> _audioQueue;
     private readonly Channel<bool> _queued = Channel.CreateBounded<bool>(
         new BoundedChannelOptions(1) { SingleReader = true, FullMode = BoundedChannelFullMode.DropWrite });
     private readonly SemaphoreSlim _videoSlots = new(MaxFrameBacklog, MaxFrameBacklog);
@@ -73,6 +72,16 @@ public sealed class PhoneConnection : IAsyncDisposable
     private long _framesSent;
     private long _framesRejected;
     private long _wireBytesSent;
+    // These counters distinguish accepted PCM from true DropOldest evictions
+    // and completed local socket writes. A completed WriteAsync is NOT an ACK.
+    private long _audioEvicted;
+    private long _audioAccepted;
+    private long _audioWritten;
+    private long _audioQueueAgeMaxMs;
+    private long _audioQueueAgeOver50;
+    private long _audioWriteMaxMs;
+    private long _audioWriteOver20;
+    private long _audioWriteOver50;
     private int _disposed;
     public PhoneConnection(TcpClient tcp, Stream stream, SecureChannel chan, ILog log)
     {
@@ -80,6 +89,13 @@ public sealed class PhoneConnection : IAsyncDisposable
         _stream = stream;
         _chan = chan;
         _log = log;
+        _audioQueue = Channel.CreateBounded<Outbound>(
+            new BoundedChannelOptions(8)
+            {
+                SingleReader = true,
+                FullMode = BoundedChannelFullMode.DropOldest
+            },
+            itemDropped: _ => Interlocked.Increment(ref _audioEvicted));
     }
     public string VerificationCode => _chan.VerificationCode;
     public ChannelReader<ClientMessage> Messages => _incoming.Reader;
@@ -91,6 +107,20 @@ public sealed class PhoneConnection : IAsyncDisposable
     public long FramesSent => Interlocked.Read(ref _framesSent);
     public long FramesRejected => Interlocked.Read(ref _framesRejected);
     public long WireBytesSent => Interlocked.Read(ref _wireBytesSent);
+    /// <summary>
+    /// Host-side diagnostics only. "written" means WriteAsync + FlushAsync
+    /// completed locally, not acknowledged or played by the Android phone.
+    /// No protocol / network format change.
+    /// </summary>
+    public string AudioHealth =>
+        $"txAccept={Interlocked.Read(ref _audioAccepted)}" +
+        $" txEvict={Interlocked.Read(ref _audioEvicted)}" +
+        $" txWritten={Interlocked.Read(ref _audioWritten)}" +
+        $" txAgeMaxMs={Interlocked.Exchange(ref _audioQueueAgeMaxMs, 0)}" +
+        $" txAge>50ms={Interlocked.Exchange(ref _audioQueueAgeOver50, 0)}" +
+        $" txWriteMaxMs={Interlocked.Exchange(ref _audioWriteMaxMs, 0)}" +
+        $" txWrite>20ms={Interlocked.Exchange(ref _audioWriteOver20, 0)}" +
+        $" txWrite>50ms={Interlocked.Exchange(ref _audioWriteOver50, 0)}";
     /// <summary>
     /// Reads and AUTHENTICATES the first packet. A peer that completed the (anonymous) ECDH
     /// but does not hold the pairing secret derives different keys, so decryption fails
@@ -183,7 +213,11 @@ public sealed class PhoneConnection : IAsyncDisposable
         var plain = new byte[4 + pcm16le.Length];
         BinaryPrimitives.WriteInt32BigEndian(plain.AsSpan(0, 4), streamId);
         pcm16le.CopyTo(plain.AsSpan(4));
-        return Enqueue(_audioQueue, new Outbound(Wire.KindAudio, plain, false));
+        var accepted = Enqueue(_audioQueue,
+            new Outbound(Wire.KindAudio, plain, false,
+                AudioEnqueueQpc: Stopwatch.GetTimestamp()));
+        if (accepted) Interlocked.Increment(ref _audioAccepted);
+        return accepted;
     }
     private async Task<byte[]> ReadSealedControlAsync(CancellationToken ct)
     {
@@ -298,6 +332,13 @@ public sealed class PhoneConnection : IAsyncDisposable
                         continue;
                     }
                 }
+                if (o.Kind == Wire.KindAudio && o.AudioEnqueueQpc != 0)
+                {
+                    var queueAgeMs = (long)((Stopwatch.GetTimestamp() -
+                        o.AudioEnqueueQpc) * 1000.0 / Stopwatch.Frequency);
+                    if (queueAgeMs > _audioQueueAgeMaxMs) _audioQueueAgeMaxMs = queueAgeMs;
+                    if (queueAgeMs > 50) Interlocked.Increment(ref _audioQueueAgeOver50);
+                }
                 byte[] packet;
                 if (o.Kind == Wire.KindPing)
                 {
@@ -319,8 +360,19 @@ public sealed class PhoneConnection : IAsyncDisposable
                 }
                 try
                 {
+                    var writeStartedQpc = o.Kind == Wire.KindAudio
+                        ? Stopwatch.GetTimestamp() : 0L;
                     await _stream.WriteAsync(packet, ct).ConfigureAwait(false);
                     await _stream.FlushAsync(ct).ConfigureAwait(false);
+                    if (o.Kind == Wire.KindAudio)
+                    {
+                        Interlocked.Increment(ref _audioWritten);
+                        var writeMs = (long)((Stopwatch.GetTimestamp() -
+                            writeStartedQpc) * 1000.0 / Stopwatch.Frequency);
+                        if (writeMs > _audioWriteMaxMs) _audioWriteMaxMs = writeMs;
+                        if (writeMs > 20) Interlocked.Increment(ref _audioWriteOver20);
+                        if (writeMs > 50) Interlocked.Increment(ref _audioWriteOver50);
+                    }
                 }
                 finally
                 {

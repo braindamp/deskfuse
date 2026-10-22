@@ -58,6 +58,7 @@ import com.focuswindow.client.render.PhoneSurfaceView
 import com.focuswindow.client.session.SessionController
 import com.focuswindow.client.session.SpeakerController
 import com.focuswindow.client.session.SpeakerService
+import com.focuswindow.client.transport.DefaultNetworkHandoff
 import com.focuswindow.client.session.SessionState
 import com.focuswindow.client.transport.PairingPayload
 import com.focuswindow.client.transport.PairingRepository
@@ -85,6 +86,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var profiles: ProfileProvider
     private lateinit var pairings: PairingRepository
     private lateinit var controller: SessionController
+    private var networkHandoff: DefaultNetworkHandoff? = null
     private lateinit var surfaceView: PhoneSurfaceView
     private lateinit var input: InputMapper
 
@@ -168,6 +170,12 @@ class MainActivity : ComponentActivity() {
         controller.attachSurface(surfaceView)
         controller.attachPcAudioOutput(PcAudioOutput(applicationContext))
         controller.attachPhoneMicrophone(PhoneMicrophoneCapture(applicationContext))
+        // The display session has the same offline behavior as speaker-only:
+        // react to Android's actual default network, never to a retry timeout.
+        networkHandoff = DefaultNetworkHandoff(applicationContext) { _ ->
+            lifecycleScope.launch { controller.onDefaultNetworkChanged(networkHandoff?.isAvailable == true) }
+        }
+        controller.onDefaultNetworkChanged(networkHandoff!!.isAvailable)
         input = InputMapper(surfaceView)
         surfaceView.onCommittedText = { controller.sendInput(InputEvent.Text(it)) }
         surfaceView.onDeleteBackward = { sendSyntheticKey(KeyEvent.KEYCODE_DEL) }
@@ -192,6 +200,7 @@ class MainActivity : ComponentActivity() {
             val speakerState by SpeakerService.state.collectAsState()
             val speakerStatus = when (val current = speakerState) {
                 is SpeakerController.State.Playing -> "On"
+                SpeakerController.State.Suspended -> "On"
                 is SpeakerController.State.Waiting -> "Starting"
                 is SpeakerController.State.Connecting -> "Starting"
                 is SpeakerController.State.Failed -> "Unavailable"
@@ -753,6 +762,8 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        networkHandoff?.close()
+        networkHandoff = null
         controller.stop("activity destroyed")
         super.onDestroy()
     }
