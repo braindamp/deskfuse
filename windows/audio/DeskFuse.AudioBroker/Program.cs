@@ -19,8 +19,9 @@ namespace DeskFuse.AudioBroker;
 ///   * it only serves the Windows user that started it
 ///   * the phone identity it accepts is the enrollment hash the host already
 ///     authenticated, and the label is only ever a display name
-///   * the lifetime of every instance belongs to the pipe connection that
-///     created it, so a dead host takes its phone's endpoint with it
+///   * the endpoint survives a brief pipe/session interruption so Windows
+///     keeps the same selected output during authenticated reconnection;
+///     abandoned instances expire and an explicit release removes them now
 ///
 /// It never installs drivers, never changes system settings and never
 /// writes outside the DeskFuse endpoint registry.
@@ -113,6 +114,7 @@ internal static class Program
             await broker.RunAsync(stop.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException) { }
+        finally { await broker.ShutdownAsync().ConfigureAwait(false); }
         return 0;
     }
 
@@ -128,6 +130,11 @@ internal static class Program
 /// <summary>Owns the pipe and the device instances behind it.</summary>
 internal sealed class EndpointBroker
 {
+    // Longer than the two-minute offline/airplane-mode acceptance test.
+    // Only a new authenticated host lease for the same enrolled peer can reclaim the device.
+    private static readonly TimeSpan ReconnectGrace = TimeSpan.FromMinutes(3);
+    private static readonly TimeSpan RemoveRetryInterval = TimeSpan.FromSeconds(30);
+
     private sealed class Instance
     {
         public required string PeerId { get; init; }
@@ -365,35 +372,96 @@ internal sealed class EndpointBroker
     }
 
     /// <summary>
-    /// Removes this pipe's devices unless a newer connection took over.
+    /// A dropped pipe is not proof that a trusted phone has departed.
+    /// Retain the same PnP endpoint through a brief network handoff, then
+    /// remove it only if this exact lease generation was not reclaimed.
+    /// An explicit broker Release still removes immediately.
     /// </summary>
-    private async Task ReleaseOwnedAsync(List<(string PeerId, long Generation)> owned)
+    private Task ReleaseOwnedAsync(List<(string PeerId, long Generation)> owned)
+    {
+        foreach (var (peerId, generation) in owned.Distinct())
+        {
+            bool current;
+            lock (_gate)
+                current = _instances.TryGetValue(peerId, out var instance)
+                    && instance.Generation == generation;
+            if (!current) continue;
+
+            Console.WriteLine(
+                $"speaker-endpoint-grace=True peer={peerId} graceSeconds={ReconnectGrace.TotalSeconds:0}");
+            _ = RemoveAfterGraceAsync(peerId, generation);
+        }
+        return Task.CompletedTask;
+    }
+
+    private async Task RemoveAfterGraceAsync(string peerId, long generation)
+    {
+        // Retry a transient Windows PnP removal failure. Do not forget the
+        // instance until Windows confirms removal: a later reconnect must
+        // never create a duplicate PnP node for the same enrolled identity.
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            await Task.Delay(attempt == 0 ? ReconnectGrace : RemoveRetryInterval)
+                .ConfigureAwait(false);
+            await _deviceGate.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                Instance? expired;
+                lock (_gate)
+                {
+                    expired = _instances.TryGetValue(peerId, out var current)
+                        && current.Generation == generation ? current : null;
+                }
+                if (expired is null) return; // A newer authenticated session took over.
+
+                try
+                {
+                    await RemoveReleasedDeviceAsync(expired).ConfigureAwait(false);
+                    lock (_gate)
+                    {
+                        if (_instances.TryGetValue(peerId, out var current)
+                            && current.Generation == generation)
+                            _instances.Remove(peerId);
+                    }
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine(
+                        $"speaker endpoint grace removal failed (attempt {attempt + 1}/3): {ex.Message}");
+                }
+            }
+            finally { _deviceGate.Release(); }
+        }
+    }
+
+    /// <summary>
+    /// Broker shutdown is not a roaming handoff. Remove all owned nodes
+    /// immediately instead of leaving three-minute PnP orphans on Ctrl+C.
+    /// </summary>
+    public async Task ShutdownAsync()
     {
         await _deviceGate.WaitAsync().ConfigureAwait(false);
         try
         {
-            foreach (var (peerId, generation) in owned)
+            Instance[] instances;
+            lock (_gate) instances = _instances.Values.ToArray();
+            foreach (var instance in instances)
             {
-                Instance? removed = null;
-                lock (_gate)
+                try
                 {
-                    if (_instances.TryGetValue(peerId, out var current) && current.Generation == generation)
+                    await RemoveReleasedDeviceAsync(instance).ConfigureAwait(false);
+                    lock (_gate)
                     {
-                        _instances.Remove(peerId);
-                        removed = current;
+                        if (_instances.TryGetValue(instance.PeerId, out var current)
+                            && current.Generation == instance.Generation)
+                            _instances.Remove(instance.PeerId);
                     }
                 }
-                // The pipe was closed (e.g., Phone speaker Off or a crashed
-                // client). Only the current generation owns the device.
-                // Do not remove an endpoint taken over by a newer connection.
-                if (removed is not null)
+                catch (Exception ex)
                 {
-                    try { await RemoveReleasedDeviceAsync(removed).ConfigureAwait(false); }
-                    catch (Exception ex)
-                    {
-                        Console.Error.WriteLine(
-                            $"speaker endpoint removal failed on disconnect: {ex.Message}");
-                    }
+                    Console.Error.WriteLine(
+                        $"speaker endpoint shutdown removal failed: {ex.Message}");
                 }
             }
         }
