@@ -293,15 +293,21 @@ class LanTransport(
     // allocation when the socket closes. Deliver it on the lifecycle stream so
     // it cannot race a Closed event from a separate control collector.
     internal suspend fun dispatchControl(
-        msg: ServerMessage, generation: Long = synchronized(socketGate) { socketGeneration }
+        msg: ServerMessage, generation: Long? = null
     ): Boolean {
         if (msg is ServerMessage.Stage && msg.fatal) {
-            if (closeCurrent(generation)) {
+            // A caller with an epoch (the real socket reader) cannot retire
+            // a newer connection. The no-epoch form is only used in tests.
+            val ended = if (generation == null) {
+                disconnectNow()
+                true
+            } else closeCurrent(generation)
+            if (ended) {
                 _events.emit(TransportEvent.Failed(msg.stage, msg.detail, msg.remediation, terminal = true))
             }
             return false
         }
-        if (!isCurrent(generation)) return false
+        if (generation != null && !isCurrent(generation)) return false
         _control.emit(msg)
         return true
     }
