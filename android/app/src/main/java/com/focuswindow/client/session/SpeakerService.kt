@@ -111,9 +111,9 @@ class SpeakerService : Service() {
         // Register first, so starting the service in airplane mode never
         // attempts a doomed TCP connect. A change in Android's default route
         // retires only the old socket; absence of a route suspends forever.
-        networkHandoff = DefaultNetworkHandoff(applicationContext) { available ->
+        networkHandoff = DefaultNetworkHandoff(applicationContext) { _ ->
             scope.launch {
-                if (running && controller === speaker) speaker.onDefaultNetworkChanged(available)
+                if (running && controller === speaker) speaker.onDefaultNetworkChanged(networkHandoff?.isAvailable == true)
             }
         }
         speaker.onDefaultNetworkChanged(networkHandoff!!.isAvailable)
