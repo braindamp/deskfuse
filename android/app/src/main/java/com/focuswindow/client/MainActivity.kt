@@ -44,6 +44,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
@@ -56,7 +57,6 @@ import com.focuswindow.client.protocol.InputEvent
 import com.focuswindow.client.protocol.Modifiers
 import com.focuswindow.client.render.PhoneSurfaceView
 import com.focuswindow.client.session.SessionController
-import com.focuswindow.client.session.SpeakerController
 import com.focuswindow.client.session.SpeakerService
 import com.focuswindow.client.transport.DefaultNetworkHandoff
 import com.focuswindow.client.session.SessionState
@@ -87,6 +87,11 @@ class MainActivity : ComponentActivity() {
     private lateinit var pairings: PairingRepository
     private lateinit var controller: SessionController
     private var networkHandoff: DefaultNetworkHandoff? = null
+    // Display + speaker remain separate authenticated transports for now.
+    // Track whether THIS display session started the speaker service so a
+    // speaker-only connection is not stopped when the display disconnects.
+    private var displaySpeakerObserved = false
+    private var displayOwnsSpeaker = false
     private lateinit var surfaceView: PhoneSurfaceView
     private lateinit var input: InputMapper
 
@@ -180,6 +185,9 @@ class MainActivity : ComponentActivity() {
         surfaceView.onCommittedText = { controller.sendInput(InputEvent.Text(it)) }
         surfaceView.onDeleteBackward = { sendSyntheticKey(KeyEvent.KEYCODE_DEL) }
         lifecycleScope.launch {
+            controller.state.collect { synchronizeSpeakerPresence(it) }
+        }
+        lifecycleScope.launch {
             controller.fileStatus.collect { message ->
                 Toast.makeText(this@MainActivity, message, Toast.LENGTH_LONG).show()
             }
@@ -197,15 +205,6 @@ class MainActivity : ComponentActivity() {
             val state by controller.state.collectAsState()
             val advisories by controller.advisories.collectAsState()
             val pcAudioStatus by controller.pcAudioStatus.collectAsState()
-            val speakerState by SpeakerService.state.collectAsState()
-            val speakerStatus = when (val current = speakerState) {
-                is SpeakerController.State.Playing -> "On"
-                SpeakerController.State.Suspended -> "On"
-                is SpeakerController.State.Waiting -> "Starting"
-                is SpeakerController.State.Connecting -> "Starting"
-                is SpeakerController.State.Failed -> "Unavailable"
-                SpeakerController.State.Idle -> "Off"
-            }
             val phoneMicStatus by controller.phoneMicStatus.collectAsState()
             var modifierMask by remember { mutableIntStateOf(Modifiers.NONE) }
             var diagnostics by remember { mutableStateOf(false) }
@@ -433,8 +432,6 @@ class MainActivity : ComponentActivity() {
                     onSendFile = { controller.browsePc(); showPcFiles = true; appDialogVisible = true },
                     pcAudioStatus = pcAudioStatus,
                     onTogglePcAudio = { controller.togglePcAudio() },
-                    speakerStatus = speakerStatus,
-                    onToggleSpeaker = { togglePhoneSpeaker() },
                     phoneMicStatus = phoneMicStatus,
                     onTogglePhoneMic = {
                         if (phoneMicStatus == "Unavailable") {
@@ -551,6 +548,7 @@ class MainActivity : ComponentActivity() {
             val current = profile
             if (existing != null && current != null) controller.start(existing, current)
         }
+        synchronizeSpeakerPresence(controller.state.value)
         applyPreferredRefreshRate()
     }
 
@@ -680,17 +678,34 @@ class MainActivity : ComponentActivity() {
     // ── pairing ──────────────────────────────────────────────────────────────
 
     /**
-     * The phone becomes a speaker for this PC. The host creates a Windows
-     * playback endpoint for it; the PC's sound follows to this phone.
+     * Once display authentication and video are live, expose this same
+     * approved phone as an independent Windows speaker automatically.
+     * Airplane mode / route loss is NOT a disconnect: both transports
+     * suspend/recover independently, with the broker keeping the PnP node.
      */
-    private fun togglePhoneSpeaker() {
-        val current = profile ?: return
-        // The service is the source of truth: the state string can be a
-        // moment behind when the session is starting or failing.
-        if (SpeakerService.running) {
-            SpeakerService.stop(this)
-        } else {
-            SpeakerService.start(this, current)
+    private fun synchronizeSpeakerPresence(state: SessionState) {
+        when (state) {
+            is SessionState.Streaming -> {
+                // Starting a foreground service from a background Activity is
+                // forbidden on newer Android. If streaming resumes while the
+                // UI is backgrounded, onResume() performs this same check.
+                if (!displaySpeakerObserved &&
+                    lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+                    displaySpeakerObserved = true
+                    if (!SpeakerService.running) {
+                        displayOwnsSpeaker = true
+                        SpeakerService.start(this, state.profile)
+                    }
+                }
+            }
+            is SessionState.Idle, is SessionState.Ended -> {
+                if (displaySpeakerObserved) {
+                    if (displayOwnsSpeaker) SpeakerService.stop(this)
+                    displaySpeakerObserved = false
+                    displayOwnsSpeaker = false
+                }
+            }
+            else -> Unit // Not a departure: keep speaker presence during handoff.
         }
     }
 
@@ -764,6 +779,10 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         networkHandoff?.close()
         networkHandoff = null
+        // The display owned only the speaker session it started itself.
+        if (displayOwnsSpeaker) SpeakerService.stop(this)
+        displayOwnsSpeaker = false
+        displaySpeakerObserved = false
         controller.stop("activity destroyed")
         super.onDestroy()
     }
