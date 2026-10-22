@@ -172,8 +172,8 @@ class MainActivity : ComponentActivity() {
         controller.attachPhoneMicrophone(PhoneMicrophoneCapture(applicationContext))
         // The display session has the same offline behavior as speaker-only:
         // react to Android's actual default network, never to a retry timeout.
-        networkHandoff = DefaultNetworkHandoff(applicationContext) { available ->
-            lifecycleScope.launch { controller.onDefaultNetworkChanged(available) }
+        networkHandoff = DefaultNetworkHandoff(applicationContext) { _ ->
+            lifecycleScope.launch { controller.onDefaultNetworkChanged(networkHandoff?.isAvailable == true) }
         }
         controller.onDefaultNetworkChanged(networkHandoff!!.isAvailable)
         input = InputMapper(surfaceView)
