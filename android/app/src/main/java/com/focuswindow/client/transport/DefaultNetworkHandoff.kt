@@ -3,29 +3,31 @@ package com.focuswindow.client.transport
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.Network
-import android.os.SystemClock
 
 /**
- * Observes the OS-selected default network. There is no polling, location
- * permission, VPN, background scan, or Wi-Fi-only assumption.
+ * Tracks Android's currently selected network, not a socket timeout or a
+ * fixed retry budget. Airplane mode / no default network is a normal,
+ * user-controlled suspension: it must never become a connection failure.
  *
- * Wi-Fi -> mobile data creates a new default Network, but the old TCP socket
- * does NOT move with it. The caller must close the old socket, then establish
- * a newly authenticated session over the replacement network.
+ * In this LAN implementation "available" means an Android default network
+ * exists, not that the host is reachable across the internet. Local Wi-Fi can
+ * reach a DeskFuse PC even if it lacks validated public internet access.
  *
- * The listener reacts to network change, NOT "internet availability": we
- * currently only support reachable LAN/VPN endpoints. A future DeskFuse-owned
- * rendezvous/relay transport supplies an address valid across networks.
+ * onChanged fires for BOTH route replacement and loss/restoration. The
+ * controllers retire their existing TCP session and reauthenticate only
+ * when there is a usable route. No background polling or extra permissions.
  */
 internal class DefaultNetworkHandoff(
     context: Context,
-    private val onChanged: () -> Unit,
+    private val onChanged: (Boolean) -> Unit,
 ) : AutoCloseable {
     private val manager = context.getSystemService(ConnectivityManager::class.java)
     private val gate = Any()
     private var current: Network? = manager.activeNetwork
     private var closed = false
-    private var lastNotifiedMs = Long.MIN_VALUE / 2
+
+    val isAvailable: Boolean get() = synchronized(gate) { current != null }
+
     private val callback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
             val changed = synchronized(gate) {
@@ -35,7 +37,7 @@ internal class DefaultNetworkHandoff(
                     true
                 }
             }
-            if (changed) notifyChanged()
+            if (changed) onChanged(true)
         }
 
         override fun onLost(network: Network) {
@@ -46,27 +48,12 @@ internal class DefaultNetworkHandoff(
                     true
                 }
             }
-            if (changed) notifyChanged()
+            if (changed) onChanged(false)
         }
     }
 
     init {
         manager.registerDefaultNetworkCallback(callback)
-    }
-
-    private fun notifyChanged() {
-        val shouldNotify = synchronized(gate) {
-            if (closed) false
-            else {
-                val now = SystemClock.elapsedRealtime()
-                if (now - lastNotifiedMs < 300L) false
-                else {
-                    lastNotifiedMs = now
-                    true
-                }
-            }
-        }
-        if (shouldNotify) onChanged()
     }
 
     override fun close() {
