@@ -733,7 +733,7 @@ class SessionController(
             if (_state.value is SessionState.PreparingTarget) {
                 _state.value = SessionState.Failed(
                     stage = "preparing",
-                    detail = "Your PC could not open a window for this phone.",
+                    detail = "Your PC could not create a Fuse area for this phone.",
                     remediation = "Try again. If it keeps happening, ask the person at the PC to check DeskFuse.",
                     recoverable = true,
                     technical = "The host did not confirm a target within ${PREPARING_TIMEOUT_MS}ms.",
