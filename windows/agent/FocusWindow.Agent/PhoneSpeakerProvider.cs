@@ -8,8 +8,9 @@ namespace FocusWindow.Agent;
 ///
 /// The broker owns the privileged part (creating a Windows device is
 /// privileged). This class is the host side: it asks for the endpoint of
-/// one enrolled phone, keeps it for the length of the connection, and
-/// mirrors the Windows volume control onto the phone.
+/// one enrolled phone, keeps its pipe lease for the length of this session,
+/// and mirrors Windows volume. Pipe closure grants a brief reconnect grace
+/// in the broker rather than removing the selected Windows endpoint.
 /// </summary>
 internal sealed class BrokerPhoneSpeakerProvider : IPhoneSpeakerProvider
 {
@@ -34,7 +35,7 @@ internal sealed class BrokerPhoneSpeakerProvider : IPhoneSpeakerProvider
                 await client.DisposeAsync().ConfigureAwait(false);
                 return (null, error);
             }
-            return (new BrokerPhoneSpeakerEndpoint(client, endpointId, peerId), null);
+            return (new BrokerPhoneSpeakerEndpoint(client, endpointId), null);
         }
         catch (Exception ex) when (ex is System.Runtime.InteropServices.COMException
                                        or InvalidOperationException or ArgumentException)
@@ -58,17 +59,15 @@ internal sealed class BrokerPhoneSpeakerProvider : IPhoneSpeakerProvider
 internal sealed class BrokerPhoneSpeakerEndpoint : IPhoneSpeakerEndpoint
 {
     private readonly DeskFuse.Audio.PhoneEndpointBrokerClient _client;
-    private readonly string _peerId;
     private readonly MMDevice _device;
     private readonly AudioEndpointVolume? _volume;
     private readonly AudioEndpointVolumeNotificationDelegate? _volumeHandler;
     private int _released;
 
     public BrokerPhoneSpeakerEndpoint(DeskFuse.Audio.PhoneEndpointBrokerClient client,
-        string endpointId, string peerId)
+        string endpointId)
     {
         _client = client;
-        _peerId = peerId;
         EndpointId = endpointId;
         using var enumerator = new MMDeviceEnumerator();
         _device = enumerator.GetDevice(endpointId);
@@ -131,8 +130,10 @@ internal sealed class BrokerPhoneSpeakerEndpoint : IPhoneSpeakerEndpoint
             try { _device.Dispose(); }
             finally
             {
-                try { await _client.ReleaseAsync(_peerId, CancellationToken.None).ConfigureAwait(false); }
-                finally { await _client.DisposeAsync().ConfigureAwait(false); }
+                // A dying TCP session is not a user revoke: close this lease
+                // and let the broker retain/reclaim the same PnP endpoint
+                // during its bounded network-handoff grace period.
+                await _client.DisposeAsync().ConfigureAwait(false);
             }
         }
     }
