@@ -76,10 +76,19 @@ Options parse(int argc, char **argv) {
     if (a.room.size() < 8 || a.room.size() > 64 ||
         a.room.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-") != std::string::npos)
         throw std::runtime_error("invalid --room");
-    if (a.signal.rfind("wss://", 0) != 0 &&
-        a.signal.rfind("ws://127.0.0.1:", 0) != 0 && a.signal != "ws://127.0.0.1" &&
-        a.signal.rfind("ws://localhost:", 0) != 0 && a.signal != "ws://localhost")
-        throw std::runtime_error("public signaling must use wss://");
+    if (a.signal.rfind("wss://", 0) != 0) {
+        if (a.signal.rfind("ws://", 0) != 0)
+            throw std::runtime_error("public signaling must use wss://");
+        std::string authority = a.signal.substr(5);
+        authority.resize(authority.find('/'));
+        auto colon = authority.rfind(':');
+        std::string hostname = authority.substr(0, colon);
+        std::string port = colon == std::string::npos ? "" : authority.substr(colon + 1);
+        if ((hostname != "127.0.0.1" && hostname != "localhost") ||
+            authority.find('@') != std::string::npos ||
+            (!port.empty() && port.find_first_not_of("0123456789") != std::string::npos))
+            throw std::runtime_error("insecure signaling permitted only on loopback");
+    }
     if (a.seconds < 5 || a.seconds > 3600) throw std::runtime_error("--seconds outside 5..3600");
     if (a.relayOnly && a.ice.empty()) throw std::runtime_error("--relay-only requires TURN server");
     return a;
