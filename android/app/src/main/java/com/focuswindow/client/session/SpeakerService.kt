@@ -13,6 +13,7 @@ import com.focuswindow.client.R
 import com.focuswindow.client.media.PcAudioOutput
 import com.focuswindow.client.profile.PhoneProfile
 import com.focuswindow.client.transport.PairingPayload
+import com.focuswindow.client.transport.DefaultNetworkHandoff
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -37,6 +38,7 @@ class SpeakerService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var controller: SpeakerController? = null
     private var stateJob: Job? = null
+    private var networkHandoff: DefaultNetworkHandoff? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -44,6 +46,8 @@ class SpeakerService : Service() {
         when (intent?.action) {
             ACTION_START -> start(intent)
             ACTION_STOP -> {
+                networkHandoff?.close()
+                networkHandoff = null
                 // Stop the socket immediately, not whenever Android later
                 // dispatches onDestroy(). stopSelf(startId) cannot tear down
                 // a newer ACTION_START that arrived after this STOP.
@@ -85,6 +89,8 @@ class SpeakerService : Service() {
         }
         // Repeated ACTION_START must never orphan the previous authenticated
         // socket, capture route or StateFlow collector.
+        networkHandoff?.close()
+        networkHandoff = null
         controller?.stop()
         stateJob?.cancel()
         stateJob = null
@@ -103,6 +109,14 @@ class SpeakerService : Service() {
             }
         }
         speaker.start(payload, profile)
+        // Android reports default-route changes while the foreground service
+        // survives a Wi-Fi -> cellular handoff. Close the old TCP socket and
+        // authenticate again on the newly selected route without prompting.
+        networkHandoff = DefaultNetworkHandoff(applicationContext) {
+            scope.launch {
+                if (running && controller === speaker) speaker.onDefaultNetworkChanged()
+            }
+        }
     }
 
     private fun clientVersion(): String = runCatching {
@@ -162,6 +176,8 @@ class SpeakerService : Service() {
     }
 
     override fun onDestroy() {
+        networkHandoff?.close()
+        networkHandoff = null
         running = false
         controller?.stop()
         controller = null
