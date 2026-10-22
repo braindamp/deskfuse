@@ -40,6 +40,9 @@ class SpeakerController(
         data class Connecting(val host: String) : State
         data class Waiting(val detail: String) : State
         data class Playing(val endpoint: String) : State
+        // Android has no default network (e.g. airplane mode). Silence is a
+        // deliberate suspension, not a user-visible failure.
+        data object Suspended : State
         data class Failed(val detail: String) : State
     }
 
@@ -52,7 +55,8 @@ class SpeakerController(
     private var reconnectGraceJob: Job? = null
     // Keep the last "Playing" status briefly during a network handoff, but
     // never mistake that old status for successful recovery.
-    private var recovering = false
+    @Volatile private var recovering = false
+    @Volatile private var networkAvailable = true
     private var payload: PairingPayload? = null
     private var attempt: Int = 0
     private var profile: PhoneProfile? = null
@@ -73,7 +77,8 @@ class SpeakerController(
             launch { pumpAudio() }
             launch { pumpVolume() }
             launch { pumpEvents() }
-            transport.connect(payload)
+            if (networkAvailable) transport.connect(payload)
+            else _state.value = State.Suspended
         }
     }
 
@@ -92,6 +97,7 @@ class SpeakerController(
         audioJob = null
         transport.disconnectNow()
         output.stop()
+        payload = null
         _state.value = State.Idle
     }
 
@@ -99,9 +105,8 @@ class SpeakerController(
         transport.events.collect { event ->
             when (event) {
                 is LanTransport.TransportEvent.Connecting -> {
-                    // The reconnect loop must not expose every short-lived TCP
-                    // attempt to the user before the 2s grace has expired.
-                    if (!recovering) _state.value = State.Connecting(event.host)
+                    // Repeated attempts are not presented as new sessions.
+                    if (!recovering && networkAvailable) _state.value = State.Connecting(event.host)
                 }
 
                 is LanTransport.TransportEvent.Ready -> {
@@ -127,14 +132,14 @@ class SpeakerController(
                         // Old AudioTrack samples are no longer valid across an
                         // authenticated TCP session. The new stream restarts it.
                         output.stop()
-                        scheduleReconnect(event.reason)
+                        scheduleReconnect()
                     } else {
                         _state.value = State.Failed(event.reason)
                     }
                 }
 
                 is LanTransport.TransportEvent.Failed -> {
-                    if (event.retryable) scheduleReconnect(event.detail)
+                    if (event.retryable) scheduleReconnect()
                     else _state.value = State.Failed(event.detail)
                 }
 
@@ -144,14 +149,18 @@ class SpeakerController(
     }
 
     /**
-     * Android's default route changed (Wi-Fi -> mobile, mobile -> Wi-Fi, etc.).
-     * A TCP connection cannot migrate between interfaces: close it now rather
-     * than waiting for the OS 20-second read timeout. Persistent per-phone
-     * enrollment is reused; no owner approval or new pairing is requested.
+     * Called by the foreground service for both default-route replacement
+     * and loss/restoration. Also called once before start(), to prevent any
+     * TCP attempt while the phone is already in airplane mode.
+     *
+     * No network: close the old socket, pause indefinitely without polling,
+     * leave Android's own airplane-mode indicator to explain the situation.
+     * New network: reauthenticate with the saved phone credential silently.
      */
-    fun onDefaultNetworkChanged() {
+    fun onDefaultNetworkChanged(available: Boolean) {
+        networkAvailable = available
         if (payload == null || _state.value is State.Idle) return
-        Log.i(TAG, "default network changed; restarting authenticated connection")
+        Log.i(TAG, "default network " + if (available) "available: recovering" else "unavailable: suspended")
         reconnectJob?.cancel()
         reconnectJob = null
         reconnectGraceJob?.cancel()
@@ -160,39 +169,33 @@ class SpeakerController(
         transport.disconnectNow()
         output.stop()
         recovering = false
-        scheduleReconnect("Network changed")
+        if (available) scheduleReconnect()
+        else _state.value = State.Suspended
     }
 
-    /** Reconnect to the PC after it goes away, with a bounded backoff. */
-    private fun scheduleReconnect(reason: String) {
+    /** Network loss never consumes an attempt; reachable-network retries do not expire. */
+    private fun scheduleReconnect() {
+        if (!networkAvailable) {
+            _state.value = State.Suspended
+            return
+        }
         if (reconnectJob?.isActive == true) return
         val pl = payload ?: return
         recovering = true
         reconnectGraceJob?.cancel()
         reconnectGraceJob = scope.launch {
             delay(RECONNECT_GRACE_MS)
-            if (recovering) _state.value = State.Waiting("Reconnecting to the PC…")
+            if (recovering && networkAvailable) _state.value = State.Waiting("Connecting to the PC…")
         }
         reconnectJob = scope.launch {
-            while (attempt < MAX_RECONNECT && recovering) {
-                attempt++
-                // DeskLink C's recovery profile: short initial retries, then
-                // less aggressive 15s attempts on expensive cellular paths.
-                val wait = RECONNECT_DELAYS_MS[(attempt - 1).coerceAtMost(RECONNECT_DELAYS_MS.lastIndex)]
+            while (recovering && networkAvailable) {
+                attempt = (attempt + 1).coerceAtMost(RECONNECT_DELAYS_MS.size)
+                val wait = RECONNECT_DELAYS_MS[attempt - 1]
                 delay(wait)
-                if (!recovering) return@launch
+                if (!recovering || !networkAvailable) return@launch
                 transport.connect(pl)
-                // Wait for the new stream's AudioState(started), rather than
-                // confusing a stale pre-disconnect Playing label for success.
+                // Only a new authenticated AudioState(started) clears recovery.
                 delay(HANDSHAKE_WINDOW_MS)
-                if (!recovering) return@launch
-            }
-            if (recovering) {
-                recovering = false
-                reconnectGraceJob?.cancel()
-                _state.value = State.Failed(
-                    "Couldn't reach the PC. Check the network connection and that DeskFuse is running on Windows."
-                )
             }
         }
     }
@@ -314,7 +317,6 @@ class SpeakerController(
         // interrupted audio route or pretend previously queued sound is live.
         const val RECONNECT_GRACE_MS = 4_000L
         val RECONNECT_DELAYS_MS = longArrayOf(250, 1_000, 2_000, 4_000, 8_000, 15_000, 15_000, 15_000)
-        const val MAX_RECONNECT = 8
-        const val HANDSHAKE_WINDOW_MS = 2_500L
+         const val HANDSHAKE_WINDOW_MS = 2_500L
     }
 }
