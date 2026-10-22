@@ -68,8 +68,6 @@ fun SessionChrome(
     onSendFile: () -> Unit,
     pcAudioStatus: String,
     onTogglePcAudio: () -> Unit,
-    speakerStatus: String,
-    onToggleSpeaker: () -> Unit,
     phoneMicStatus: String,
     onTogglePhoneMic: () -> Unit,
     onAdvisoryAction: (SessionAdvisory) -> Unit,
@@ -123,8 +121,6 @@ fun SessionChrome(
                 onSendFile = onSendFile,
                 pcAudioStatus = pcAudioStatus,
                 onTogglePcAudio = onTogglePcAudio,
-                speakerStatus = speakerStatus,
-                onToggleSpeaker = onToggleSpeaker,
                 phoneMicStatus = phoneMicStatus,
                 onTogglePhoneMic = onTogglePhoneMic,
                 modifier = Modifier.align(Alignment.BottomCenter),
@@ -319,8 +315,6 @@ private fun ModifierBar(
     onSendFile: () -> Unit,
     pcAudioStatus: String,
     onTogglePcAudio: () -> Unit,
-    speakerStatus: String,
-    onToggleSpeaker: () -> Unit,
     phoneMicStatus: String,
     onTogglePhoneMic: () -> Unit,
     modifier: Modifier = Modifier,
@@ -336,7 +330,6 @@ private fun ModifierBar(
         ModKey("Apps", false) { onSelectWindow() }
         ModKey("PC files", false) { onSendFile() }
         ModKey("PC sound: $pcAudioStatus", pcAudioStatus.startsWith("On")) { onTogglePcAudio() }
-        ModKey("Phone speaker: $speakerStatus", speakerStatus.startsWith("On")) { onToggleSpeaker() }
         ModKey("Phone mic: $phoneMicStatus", phoneMicStatus == "On") { onTogglePhoneMic() }
     }
     Row(
