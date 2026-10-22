@@ -36,6 +36,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlin.math.min
 
 /**
  * Orchestrates one session. Owns the state machine; the UI is a pure function
@@ -996,9 +997,6 @@ class SessionController(
         const val PREPARING_TIMEOUT_MS = 30_000L
         const val MAX_FILE_BYTES = 32L * 1024 * 1024
         const val FILE_CHUNK_BYTES = 24 * 1024
-        const val MAX_RECONNECT = 6
-        const val BASE_BACKOFF_MS = 400L
-        const val MAX_BACKOFF_MS = 8_000L
         const val HANDSHAKE_WINDOW_MS = 2_500L
         const val STALE_GRACE_MS = 2_000L
     }
