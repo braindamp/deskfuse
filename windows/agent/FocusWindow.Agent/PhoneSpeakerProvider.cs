@@ -15,6 +15,7 @@ namespace FocusWindow.Agent;
 internal sealed class BrokerPhoneSpeakerProvider : IPhoneSpeakerProvider
 {
     private readonly DeskFuse.Audio.PhoneEndpointBrokerClient _client;
+    private readonly PhoneSpeakerDefaultRestorer _defaults = new();
 
     public BrokerPhoneSpeakerProvider(DeskFuse.Audio.PhoneEndpointBrokerClient client)
     {
@@ -35,7 +36,23 @@ internal sealed class BrokerPhoneSpeakerProvider : IPhoneSpeakerProvider
                 await client.DisposeAsync().ConfigureAwait(false);
                 return (null, error);
             }
-            return (new BrokerPhoneSpeakerEndpoint(client, endpointId, peerId), null);
+            var endpoint = new BrokerPhoneSpeakerEndpoint(client, endpointId, peerId);
+            var lease = _defaults.Attached(peerId);
+            endpoint.TrackDefaults(_defaults, lease.Generation);
+            // Give Windows' own audio-selection history the first chance.
+            // A private-policy fallback is attempted only if this phone was
+            // the prior default and no later user selection was observed.
+            try
+            {
+                await _defaults.RestoreOnReturnAsync(peerId, endpointId, lease, ct)
+                    .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                await endpoint.DisposeAsync().ConfigureAwait(false);
+                throw;
+            }
+            return (endpoint, null);
         }
         catch (Exception ex) when (ex is System.Runtime.InteropServices.COMException
                                        or InvalidOperationException or ArgumentException)
@@ -61,6 +78,8 @@ internal sealed class BrokerPhoneSpeakerEndpoint : IPhoneSpeakerEndpoint
     private readonly DeskFuse.Audio.PhoneEndpointBrokerClient _client;
     private readonly string _peerId;
     private readonly MMDevice _device;
+    private PhoneSpeakerDefaultRestorer? _defaults;
+    private long _leaseGeneration;
     private readonly AudioEndpointVolume? _volume;
     private readonly AudioEndpointVolumeNotificationDelegate? _volumeHandler;
     private int _released;
@@ -85,6 +104,12 @@ internal sealed class BrokerPhoneSpeakerEndpoint : IPhoneSpeakerEndpoint
             _device.Dispose();
             throw;
         }
+    }
+
+    internal void TrackDefaults(PhoneSpeakerDefaultRestorer defaults, long generation)
+    {
+        _defaults = defaults;
+        _leaseGeneration = generation;
     }
 
     public string EndpointId { get; }
@@ -127,6 +152,9 @@ internal sealed class BrokerPhoneSpeakerEndpoint : IPhoneSpeakerEndpoint
         }
         finally
         {
+            // Record the user's selected output BEFORE releasing the device.
+            // After PnP departure Windows picks a fallback automatically.
+            var hint = _defaults?.BeforeDeparture(_peerId, _leaseGeneration, EndpointId);
             // MMDevice owns its cached AudioEndpointVolume COM wrapper.
             // Keep both alive together and let the device dispose it once.
             try { _device.Dispose(); }
@@ -136,7 +164,11 @@ internal sealed class BrokerPhoneSpeakerEndpoint : IPhoneSpeakerEndpoint
                 // Windows speaker. Remove the endpoint immediately; the
                 // durable pairing credential is retained for the next join.
                 try { await _client.ReleaseAsync(_peerId, CancellationToken.None).ConfigureAwait(false); }
-                finally { await _client.DisposeAsync().ConfigureAwait(false); }
+                finally
+                {
+                    await _client.DisposeAsync().ConfigureAwait(false);
+                    _defaults?.Departed(_peerId, _leaseGeneration, hint);
+                }
             }
         }
     }
