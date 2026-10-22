@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from websockets.asyncio.server import ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
 
-ROOM = re.compile(r"[A-Za-z0-9_-]{8,64}\\Z")
+ROOM = re.compile(r"[A-Za-z0-9_-]{8,64}")
 ROLES = frozenset(("host", "phone"))
 FORWARDED = frozenset(("offer", "answer", "candidate"))
 MAX_MESSAGE = 256 * 1024
