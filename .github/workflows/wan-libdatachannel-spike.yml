@@ -31,7 +31,7 @@ jobs:
           cmake -S upstream-libdatachannel -B upstream-build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/lib-install" \
             -DNO_MEDIA=ON -DNO_WEBSOCKET=OFF \
-            -DBUILD_EXAMPLES=OFF -DBUILD_TESTING=OFF
+            -DNO_EXAMPLES=ON -DNO_TESTS=ON
           cmake --build upstream-build -j 2
           cmake --install upstream-build
       - name: Build DeskFuse standalone C API probe
