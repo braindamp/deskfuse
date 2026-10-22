@@ -324,11 +324,10 @@ internal sealed class PhoneSpeakerRoute(
             try { await _endpoint.DisposeAsync().ConfigureAwait(false); }
             catch (Exception ex) { log.Warn("releasing the phone speaker endpoint: " + ex.Message); }
             _endpoint = null;
-            // Windows may still be playing through an endpoint that is about
-            // to disappear. Say so plainly rather than leaving the machine
-            // pointing at a device that is gone.
-            conn.SendControl(ServerMessages.Stage("speakers",
-                "The phone's speaker is no longer available. If Windows was playing through it, choose another output."));
+            // A deliberate disconnect or network handoff is not a speaker
+            // failure. Windows will select another output when its endpoint
+            // departs; do not send a late "speaker unavailable" Stage over
+            // a closing socket and turn silent recovery into a phone alert.
         }
     }
 }
