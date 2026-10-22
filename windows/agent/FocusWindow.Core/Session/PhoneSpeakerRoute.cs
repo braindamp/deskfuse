@@ -42,6 +42,14 @@ internal sealed class PhoneSpeakerRoute(
     private long _routeAgeOver50;
     private long _routeAgeOver100;
     private long _lastReport;
+    // Windows may produce dozens of CoreAudio notifications while a tray
+    // volume thumb is dragged. Do not forward each event to Android's
+    // discrete system media-volume API: it triggers audible gain steps.
+    // Only the newest level is sent, at most once per short interval.
+    private int _pendingVolume = -1;
+    private int _lastForwardedVolume = -1;
+    private CancellationTokenSource? _volumeStop;
+    private Task? _volumePump;
     private int _streamId;
     private int _disposed;
     private IReadOnlyList<string> _requested = Array.Empty<string>();
@@ -74,7 +82,11 @@ internal sealed class PhoneSpeakerRoute(
         _endpoint = endpoint;
         endpoint.VolumeChanged += OnVolumeChanged;
         log.Info($"Phone speaker endpoint ready: {endpoint.FriendlyName}");
-        conn.SendControl(ServerMessages.AudioVolume(VolumePercent(endpoint.Volume)));
+        var initialVolume = VolumePercent(endpoint.Volume);
+        Volatile.Write(ref _lastForwardedVolume, initialVolume);
+        conn.SendControl(ServerMessages.AudioVolume(initialVolume));
+        _volumeStop = new CancellationTokenSource();
+        _volumePump = ForwardVolumeChangesAsync(_volumeStop.Token);
         return new[] { DeviceCapabilities.Speakers };
     }
 
@@ -85,6 +97,9 @@ internal sealed class PhoneSpeakerRoute(
     public void HandleVolume(int level)
     {
         if (_endpoint is null) return;
+        // Prevent echo of the Android slider back to the same phone.
+        Interlocked.Exchange(ref _pendingVolume, -1);
+        Volatile.Write(ref _lastForwardedVolume, level);
         try { _endpoint.SetVolume(level / 100f); }
         catch (Exception ex) { log.Warn("applying the phone volume: " + ex.Message); }
     }
@@ -254,7 +269,23 @@ internal sealed class PhoneSpeakerRoute(
     }
 
     private void OnVolumeChanged(float volume) =>
-        conn.SendControl(ServerMessages.AudioVolume(VolumePercent(volume)));
+        Interlocked.Exchange(ref _pendingVolume, VolumePercent(volume));
+
+    private async Task ForwardVolumeChangesAsync(CancellationToken ct)
+    {
+        try
+        {
+            using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(80));
+            while (await timer.WaitForNextTickAsync(ct).ConfigureAwait(false))
+            {
+                var level = Interlocked.Exchange(ref _pendingVolume, -1);
+                if (level < 0 || level == Volatile.Read(ref _lastForwardedVolume)) continue;
+                Volatile.Write(ref _lastForwardedVolume, level);
+                conn.SendControl(ServerMessages.AudioVolume(level));
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
+    }
 
     private static int VolumePercent(float volume) =>
         (int)Math.Round(Math.Clamp(volume, 0f, 1f) * 100f);
@@ -283,6 +314,13 @@ internal sealed class PhoneSpeakerRoute(
         if (_endpoint is not null)
         {
             _endpoint.VolumeChanged -= OnVolumeChanged;
+            var volumeStop = _volumeStop;
+            _volumeStop = null;
+            volumeStop?.Cancel();
+            var volumePump = _volumePump;
+            _volumePump = null;
+            try { if (volumePump is not null) await volumePump.ConfigureAwait(false); }
+            finally { volumeStop?.Dispose(); }
             try { await _endpoint.DisposeAsync().ConfigureAwait(false); }
             catch (Exception ex) { log.Warn("releasing the phone speaker endpoint: " + ex.Message); }
             _endpoint = null;
