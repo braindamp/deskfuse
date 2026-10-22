@@ -108,15 +108,16 @@ class SpeakerService : Service() {
                 )
             }
         }
-        speaker.start(payload, profile)
-        // Android reports default-route changes while the foreground service
-        // survives a Wi-Fi -> cellular handoff. Close the old TCP socket and
-        // authenticate again on the newly selected route without prompting.
-        networkHandoff = DefaultNetworkHandoff(applicationContext) {
+        // Register first, so starting the service in airplane mode never
+        // attempts a doomed TCP connect. A change in Android's default route
+        // retires only the old socket; absence of a route suspends forever.
+        networkHandoff = DefaultNetworkHandoff(applicationContext) { available ->
             scope.launch {
-                if (running && controller === speaker) speaker.onDefaultNetworkChanged()
+                if (running && controller === speaker) speaker.onDefaultNetworkChanged(available)
             }
         }
+        speaker.onDefaultNetworkChanged(networkHandoff!!.isAvailable)
+        speaker.start(payload, profile)
     }
 
     private fun clientVersion(): String = runCatching {
@@ -125,6 +126,7 @@ class SpeakerService : Service() {
 
     private fun describe(current: SpeakerController.State): String = when (current) {
         is SpeakerController.State.Playing -> current.endpoint.ifEmpty { "Playing" }
+        SpeakerController.State.Suspended -> "Phone speaker"
         is SpeakerController.State.Waiting -> current.detail
         is SpeakerController.State.Failed -> current.detail
         is SpeakerController.State.Connecting -> "Connecting to ${current.host}"
