@@ -8,7 +8,6 @@ import com.focuswindow.client.protocol.ServerMessage
 import com.focuswindow.client.transport.AudioConsumptionMeter
 import com.focuswindow.client.transport.LanTransport
 import com.focuswindow.client.transport.PairingPayload
-import kotlin.math.min
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -144,6 +143,26 @@ class SpeakerController(
         }
     }
 
+    /**
+     * Android's default route changed (Wi-Fi -> mobile, mobile -> Wi-Fi, etc.).
+     * A TCP connection cannot migrate between interfaces: close it now rather
+     * than waiting for the OS 20-second read timeout. Persistent per-phone
+     * enrollment is reused; no owner approval or new pairing is requested.
+     */
+    fun onDefaultNetworkChanged() {
+        if (payload == null || _state.value is State.Idle) return
+        Log.i(TAG, "default network changed; restarting authenticated connection")
+        reconnectJob?.cancel()
+        reconnectJob = null
+        reconnectGraceJob?.cancel()
+        reconnectGraceJob = null
+        attempt = 0
+        transport.disconnectNow()
+        output.stop()
+        recovering = false
+        scheduleReconnect("Network changed")
+    }
+
     /** Reconnect to the PC after it goes away, with a bounded backoff. */
     private fun scheduleReconnect(reason: String) {
         if (reconnectJob?.isActive == true) return
@@ -157,7 +176,9 @@ class SpeakerController(
         reconnectJob = scope.launch {
             while (attempt < MAX_RECONNECT && recovering) {
                 attempt++
-                val wait = min(MAX_BACKOFF_MS, BASE_BACKOFF_MS * (1L shl (attempt - 1)))
+                // DeskLink C's recovery profile: short initial retries, then
+                // less aggressive 15s attempts on expensive cellular paths.
+                val wait = RECONNECT_DELAYS_MS[(attempt - 1).coerceAtMost(RECONNECT_DELAYS_MS.lastIndex)]
                 delay(wait)
                 if (!recovering) return@launch
                 transport.connect(pl)
@@ -289,10 +310,11 @@ class SpeakerController(
 
     private companion object {
         const val TAG = "DeskFuseSpeaker"
-        const val RECONNECT_GRACE_MS = 2_000L
-        const val MAX_RECONNECT = 6
-        const val BASE_BACKOFF_MS = 400L
-        const val MAX_BACKOFF_MS = 8_000L
+        // UX-only grace; retries start immediately. Do not hide a truly
+        // interrupted audio route or pretend previously queued sound is live.
+        const val RECONNECT_GRACE_MS = 4_000L
+        val RECONNECT_DELAYS_MS = longArrayOf(250, 1_000, 2_000, 4_000, 8_000, 15_000, 15_000, 15_000)
+        const val MAX_RECONNECT = 8
         const val HANDSHAKE_WINDOW_MS = 2_500L
     }
 }
