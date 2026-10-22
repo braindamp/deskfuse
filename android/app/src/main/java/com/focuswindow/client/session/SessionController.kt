@@ -113,6 +113,10 @@ class SessionController(
     private var reconnectJob: Job? = null
     @Volatile private var networkAvailable = true
     @Volatile private var recovering = false
+    // Once a real Target has been shown, transient TCP/network recovery must
+    // not surface the initial "setting up" progression over the held frame.
+    // Reset only when starting an entirely new display session.
+    private var hasPresentedTarget = false
     @Volatile private var sessionActive = false
     private var preparingWatchdog: Job? = null
     private var staleJob: Job? = null
@@ -357,6 +361,7 @@ class SessionController(
         reconnectJob?.cancel()
         reconnectJob = null
         recovering = false
+        hasPresentedTarget = false
         sessionActive = false
 
         val problems = profile.validate()
@@ -421,7 +426,7 @@ class SessionController(
                 }
 
                 is LanTransport.TransportEvent.Ready -> {
-                    if (!recovering && networkAvailable) {
+                    if (!recovering && !hasPresentedTarget && networkAvailable) {
                         _state.value = SessionState.PreparingTarget(
                             stage = "Preparing your display",
                             detail = "Setting up the phone-sized workspace.",
@@ -504,7 +509,8 @@ class SessionController(
                             msg.stage, msg.detail, msg.remediation, recoverable = true,
                             technical = msg.technical,
                         )
-                    } else if (_state.value !is SessionState.Streaming) {
+                    } else if (!hasPresentedTarget && !recovering &&
+                        _state.value !is SessionState.Streaming) {
                         _state.value = SessionState.PreparingTarget(
                             stage = msg.stage,
                             detail = msg.detail,
@@ -611,6 +617,7 @@ class SessionController(
     private fun onTarget(incoming: TargetRecord) {
         val p = profile ?: return
         record = incoming
+        hasPresentedTarget = true
         attempt = 0
         recovering = false
 
