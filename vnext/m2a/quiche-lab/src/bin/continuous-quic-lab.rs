@@ -298,7 +298,7 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
     let mut late = 0u64;
     let mut audio_queue_full = 0u64;
     let mut audio: Option<AndroidAudio> = None;
-    let mut last_source_frame = None;
+    let mut last_source_frame: Option<u64> = None;
     let mut source_gap_frames = 0u64;
     let mut source_concealed_frames = 0u64;
     let mut source_unconcealed_frames = 0u64;
