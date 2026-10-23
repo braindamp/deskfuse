@@ -426,15 +426,21 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                                 // plaintext queue across a long cwnd/pacing
                                 // stall: this original QPC check is the last
                                 // admission opportunity before queuing.
-                                match source_age::classify(
-                                    source_age::local_qpc_100ns()?,
-                                    block.first_qpc_100ns,
-                                ) {
-                                    AgeDecision::Fresh { .. } => {}
-                                    _ => {
-                                        expired_source_qpc += 1;
-                                        continue;
+                                let offer_qpc_now=source_age::local_qpc_100ns()?;
+                                let offer_age=source_age::classify(
+                                    offer_qpc_now,block.first_qpc_100ns
+                                );
+                                if !matches!(offer_age,AgeDecision::Fresh { .. }) {
+                                    expired_source_qpc += 1;
+                                    if expired_source_qpc<=8 || expired_source_qpc%128==0 {
+                                        eprintln!(
+                                            "TRACE Windows SOURCE_FILTER_DROP stage=after_sequence_qpc reason={:?} sequence={} frame={} frames={} source_qpc100={} now_qpc100={} count={}",
+                                            offer_age,assigned_sequence,block.first_device_frame,
+                                            AUDIO_FRAMES,block.first_qpc_100ns,
+                                            offer_qpc_now,expired_source_qpc
+                                        );
                                     }
+                                    continue;
                                 }
                                 match outstanding.admit(c, &pcm, block.first_qpc_100ns,
                                                         source_age::local_qpc_100ns()?) {
@@ -457,9 +463,10 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                                         // Source frame is the cross-machine key;
                                         // clocks are NOT assumed synchronized.
                                         if not_queued <= 4 || not_queued % 16 == 0 {
-                                            eprintln!("TRACE Windows QUIC_QUEUE_DROP source_frame={} qpc100={} count={} age_max_100ns={}",
-                                                block.first_device_frame, block.first_qpc_100ns,
-                                                not_queued, max_observed_source_age_100ns);
+                                            eprintln!("TRACE Windows QUIC_QUEUE_DROP sequence={} source_frame={} qpc100={} count={} age_max_100ns={}",
+                                                assigned_sequence,block.first_device_frame,
+                                                block.first_qpc_100ns,not_queued,
+                                                max_observed_source_age_100ns);
                                         }
                                     }
                                     Err(e) => return Err(format!("captured PCM QUIC enqueue: {e:?}").into()),
