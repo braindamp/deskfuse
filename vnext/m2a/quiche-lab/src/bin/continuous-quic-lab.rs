@@ -16,6 +16,7 @@ use deskfuse_quiche_lab::android_audio::{Admission, AndroidAudio};
 use deskfuse_quiche_lab::source_age::{self, AgeDecision};
 use deskfuse_quiche_lab::plaintext_expiry::{PlaintextExpiry, Identity as OutgoingIdentity};
 use deskfuse_quiche_lab::receive_frontier::{ReceiveFrontier, Context as SourceContext, Reject as SourceReject};
+use deskfuse_quiche_lab::fresh_anchor::{self, Message as AnchorMessage};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
@@ -133,6 +134,9 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
     let mut skipped_source_blocks = 0u64;
     let mut egress = Egress::default();
     let mut outstanding = PlaintextExpiry::default();
+    let mut pending_capture_anchor: Option<AnchorMessage> = None;
+    let mut anchor_nonce_frontier = 0u64;
+    let mut anchor_replies_sent = 0u64;
     let mut bytes = [0u8; 65535];
     let mut source = None;
     let mut assembler = Assembler::default();
@@ -184,6 +188,32 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                     println!("AUTH Windows: Android client verified; native WASAPI capture process started");
                 } else {
                     println!("AUTH Windows: Android client CA and certificate verified; starting synthetic source-clock blocks");
+                }
+            }
+            // QUIC-authenticated control DATAGRAMs are never treated as PCM.
+            // A repeated nonce is a retry; a smaller nonce cannot revive a
+            // retired request. Only a source block captured AFTER the request
+            // is observed can satisfy the challenge.
+            for _ in 0..16 {
+                let n = match c.dgram_recv(&mut bytes) {
+                    Ok(n) => n,
+                    Err(quiche::Error::Done) => break,
+                    Err(e) => return Err(format!("Windows recovery request: {e:?}").into()),
+                };
+                if capture.is_some() {
+                    if let Some(req) = AnchorMessage::decode(&bytes[..n]) {
+                        if req.kind != fresh_anchor::REQUEST ||
+                            req.context != (SourceContext{epoch:1,stream:1,format:1}) ||
+                            req.nonce == 0 {
+                            return Err("Windows rejected authenticated anchor request context".into());
+                        }
+                        if req.nonce >= anchor_nonce_frontier {
+                            anchor_nonce_frontier = req.nonce;
+                            pending_capture_anchor = Some(req);
+                        }
+                    } else {
+                        return Err("Windows rejected unknown authenticated recovery control".into());
+                    }
                 }
             }
             if let Some(ref receiver) = source {
@@ -244,6 +274,27 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                                     AgeDecision::Expired => {
                                         expired_source_qpc += 1;
                                         continue;
+                                    }
+                                }
+                                if let Some(req) = pending_capture_anchor {
+                                    if block.first_device_frame >= req.frame {
+                                        // Anchored to actual fresh post-request
+                                        // WASAPI capture; the control response
+                                        // travels over the same authenticated
+                                        // QUIC connection as the media.
+                                        let response = AnchorMessage {
+                                            kind: fresh_anchor::ANCHOR,
+                                            frame: block.first_device_frame,
+                                            ..req
+                                        };
+                                        match c.dgram_send(&response.encode()) {
+                                            Ok(()) => {
+                                                anchor_replies_sent += 1;
+                                                pending_capture_anchor = None;
+                                            }
+                                            Err(quiche::Error::Done) => {}
+                                            Err(e) => return Err(format!("Windows recovery response: {e:?}").into()),
+                                        }
                                     }
                                 }
                                 if next_sequence > u64::from(u32::MAX) {
@@ -339,13 +390,13 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                     let stats = c.stats();
                     if capture.is_some() {
                         println!(
-                            "DONE Windows WASAPI source duration={}s real_pcm_blocks_queued={} quiche_queue_full={} source_queue_old={} qpc_expired={} qpc_invalid={} qpc_future={} qpc_max_age_100ns={} quiche_plaintext_expired={} quiche_plaintext_orphans={} quiche_plaintext_absent={} quiche_identity_high_water={} capture_discontinuities={} last_wasapi_qpc_100ns={} udp_packets={} udp_would_block={} quic_dgram_sent={} quic_lost={}",
+                            "DONE Windows WASAPI source duration={}s real_pcm_blocks_queued={} quiche_queue_full={} source_queue_old={} qpc_expired={} qpc_invalid={} qpc_future={} qpc_max_age_100ns={} quiche_plaintext_expired={} quiche_plaintext_orphans={} quiche_plaintext_absent={} quiche_identity_high_water={} anchor_replies={} capture_discontinuities={} last_wasapi_qpc_100ns={} udp_packets={} udp_would_block={} quic_dgram_sent={} quic_lost={}",
                             seconds, offered, not_queued, source_chunks_too_old,
                             expired_source_qpc, invalid_source_qpc, future_source_qpc,
                             max_observed_source_age_100ns,
                             outstanding.expired, outstanding.orphaned,
                             outstanding.absent, outstanding.high_water,
-                            assembler.discontinuities, last_capture_qpc, egress.udp_packets_sent,
+                            anchor_replies_sent, assembler.discontinuities, last_capture_qpc, egress.udp_packets_sent,
                             egress.would_block_count, stats.dgram_sent, stats.lost
                         );
                     } else {
