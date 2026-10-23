@@ -86,6 +86,35 @@ class EvidenceTests(unittest.TestCase):
             self.assertEqual(report["session_log_consistency"], "FAIL")
             self.assertTrue(any("Strict PCM" in x for x in report["failures"]))
 
+    def test_operator_events_are_time_windowed_and_not_independent_proof(self):
+        with tempfile.TemporaryDirectory() as t:
+            folder = self.create(Path(t) / "events")
+            import csv
+            from datetime import datetime, timedelta, timezone
+            start = datetime(2026, 10, 23, 9, tzinfo=timezone.utc)
+            with (folder / "operator-events.csv").open("w", newline="", encoding="utf-8") as file:
+                writer = csv.writer(file)
+                writer.writerow(["utc", "event", "note"])
+                for i in range(16):
+                    writer.writerow([(start + timedelta(seconds=300+i)).isoformat(),
+                                     "brave_restored", ""])
+                for i in range(15):
+                    writer.writerow([(start + timedelta(seconds=1200+i)).isoformat(),
+                                     "brave_restored", ""])
+                writer.writerow([(start + timedelta(seconds=601)).isoformat(),
+                                 "volume_changed", "phone media slider"])
+                writer.writerow([(start + timedelta(seconds=602)).isoformat(),
+                                 "pop_heard", "short"])
+            report = evaluation.check_session(folder)
+            events = report["operator_observations"]
+            self.assertEqual(events["brave_restored_5min"], 16)
+            self.assertEqual(events["brave_restored_20min"], 15)
+            self.assertEqual(events["volume_changed"], 1)
+            self.assertEqual(events["pop_heard"], 1)
+            self.assertEqual(report["physical_acceptance"], "OPEN")
+            self.assertTrue(any("operator observations" in s for s in
+                                report["qualification_still_required"]))
+
     def test_three_clean_runs_are_count_only_not_acceptance(self):
         with tempfile.TemporaryDirectory() as t:
             root = Path(t)
