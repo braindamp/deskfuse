@@ -17,7 +17,7 @@ ctest --test-dir vnext/wp001/build --output-on-failure
 .\vnext\wp001\build\df_timing_lab.exe idle_reset
 ```
 
-**The complete source files must be present before these commands can build.** This README is an initial repository landing point. The C++ source is to be committed separately, without any downloaded PowerShell scripts.
+**The full WP-001 source is committed on this branch.** The user reported a successful native Windows CTest run; GitHub contains source and tests, not user-specific test logs.
 
 Never execute old ZIP-bundled PowerShell scripts or disable Microsoft Defender to run this experiment. Use a separate Git worktree; don't switch the working DeskFuse checkout away from its current branch.
 
@@ -31,4 +31,4 @@ Never execute old ZIP-bundled PowerShell scripts or disable Microsoft Defender t
 - Actual producer/consumer threads tested in addition to deterministic interleavings.
 - No driver install, audio-route change, network traffic or Android APK modification.
 
-**Test status:** Linux WP-001 standalone validation completed previously; Windows native build and source publication into this branch are pending. Do not claim Windows success before its CTest results are collected.
+**Test status:** Linux local tests passed; the user reported 100% Windows CTest success with Visual Studio 2022, but a Windows log/CTest manifest has not yet been uploaded. The next step is the independent M2a wire-parser build under `vnext/m2a`. No authenticated QUIC/Android link has been built or tested yet.
