@@ -1,6 +1,6 @@
 //! Bounded connection-owner-only audio plaintext tracking. Hooked before
 //! EVERY quiche Connection::send packet construction. No seal callback assumed.
-use crate::source_age::{classify, AgeDecision, MAX_SOURCE_AGE_100NS};
+use crate::source_age::{classify_wasapi, AgeDecision, MAX_SOURCE_AGE_100NS};
 use quiche::Connection;
 use std::time::Duration;
 
@@ -11,7 +11,7 @@ pub struct Identity {
     pub sequence: u32, pub source_frame: u64,
 }
 #[derive(Debug, Clone, Copy)]
-struct Pending { id: Identity, source_qpc: u64 }
+struct Pending { id: Identity, source_qpc: u64, original_packet_offset_frames: u32 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueAdmission { Queued, Expired, Full }
 pub struct PlaintextExpiry {
@@ -42,17 +42,20 @@ impl PlaintextExpiry {
     /// drop; a failed enqueue never leaves a reservation behind.
     pub fn admit(
         &mut self, conn: &mut Connection, wire: &[u8],
-        source_qpc: u64, now_qpc: u64,
+        source_qpc: u64, original_packet_offset_frames: u32, now_qpc: u64,
     ) -> Result<QueueAdmission, quiche::Error> {
         self.purge(conn, now_qpc);
-        if !matches!(classify(now_qpc, source_qpc), AgeDecision::Fresh { .. }) {
+        if !matches!(
+            classify_wasapi(now_qpc, source_qpc, original_packet_offset_frames),
+            AgeDecision::Fresh { .. }
+        ) {
             return Ok(QueueAdmission::Expired);
         }
         let id = Identity::from_wire(wire).ok_or(quiche::Error::InvalidState)?;
         if self.entries.iter().any(|entry| entry.id == id) {
             return Err(quiche::Error::InvalidState);
         }
-        if self.accept(id, source_qpc).is_err() {
+        if self.accept(id, source_qpc, original_packet_offset_frames).is_err() {
             return Ok(QueueAdmission::Full);
         }
         match conn.dgram_send(wire) {
@@ -65,10 +68,11 @@ impl PlaintextExpiry {
         }
     }
 
-    fn accept(&mut self, id: Identity, source_qpc: u64) -> Result<(), &'static str> {
+    fn accept(&mut self, id: Identity, source_qpc: u64,
+              original_packet_offset_frames: u32) -> Result<(), &'static str> {
         if self.entries.len() >= CAPACITY { return Err("plaintext metadata bound"); }
         if self.entries.iter().any(|p| p.id == id) { return Err("duplicate plaintext identity"); }
-        self.entries.push(Pending{id, source_qpc});
+        self.entries.push(Pending{id, source_qpc, original_packet_offset_frames});
         self.high_water=self.high_water.max(self.entries.len());
         Ok(())
     }
@@ -87,8 +91,11 @@ impl PlaintextExpiry {
                         .find(|(_, item)| item.id == id)
                     {
                         present[index].set(true);
-                        expired[index].set(!matches!(classify(now_qpc,entry.source_qpc),
-                                             AgeDecision::Fresh{..}));
+                        expired[index].set(!matches!(
+                            classify_wasapi(now_qpc, entry.source_qpc,
+                                            entry.original_packet_offset_frames),
+                            AgeDecision::Fresh { .. }
+                        ));
                         expired[index].get()
                     } else {
                         unknown.set(unknown.get() + 1);
@@ -121,7 +128,11 @@ impl PlaintextExpiry {
     /// QPC/Instant values are compared and no periodic media tick is created.
     pub fn next_expiry_wait(&self, now_qpc: u64) -> Option<Duration> {
         self.entries.iter().filter_map(|entry| {
-            if !matches!(classify(now_qpc, entry.source_qpc), AgeDecision::Fresh { .. }) {
+            if !matches!(
+                classify_wasapi(now_qpc, entry.source_qpc,
+                                entry.original_packet_offset_frames),
+                AgeDecision::Fresh { .. }
+            ) {
                 return Some(Duration::ZERO);
             }
             entry.source_qpc.checked_add(MAX_SOURCE_AGE_100NS)?
@@ -147,9 +158,9 @@ mod tests {
         assert_eq!(i.epoch,9);assert_eq!(i.stream,5);assert_eq!(i.format,3);
         assert_eq!(i.sequence,11);assert_eq!(i.source_frame,48000);
         let mut ledger=PlaintextExpiry::default();
-        for n in 0..4 {ledger.accept(Identity{sequence:n,..i},100).unwrap();}
-        assert!(ledger.accept(i,100).is_err());
-        assert!(ledger.accept(Identity{sequence:9,..i},100).is_err());
+        for n in 0..4 {ledger.accept(Identity{sequence:n,..i},100,0).unwrap();}
+        assert!(ledger.accept(i,100,0).is_err());
+        assert!(ledger.accept(Identity{sequence:9,..i},100,0).is_err());
         assert_eq!(ledger.high_water,4);
         ledger.clear();assert_eq!(ledger.len(),0);
     }
