@@ -74,6 +74,33 @@ pub enum Admission {
     Discontinuity,
     Stale,
 }
+pub fn validate_abi_v4(actual: u32) -> Result<(), String> {
+    if actual == 4 { Ok(()) }
+    else {
+        Err(format!(
+            "AAudio ABI mismatch expected v4, got v{actual}: redeploy both Android binaries"
+        ))
+    }
+}
+
+#[cfg(test)]
+mod abi_tests {
+    use super::*;
+    #[test]
+    fn reject_mismatched_library_versions_before_struct_io() {
+        for version in [0, 1, 2, 3, 5, u32::MAX] {
+            assert!(validate_abi_v4(version).is_err());
+        }
+        assert!(validate_abi_v4(4).is_ok());
+    }
+    #[test]
+    fn historical_struct_prefixes_and_new_coherent_record_size_remain_exact() {
+        assert_eq!(std::mem::size_of::<AudioStats>(),80);
+        assert_eq!(std::mem::size_of::<RenderIdentity>(),48);
+        assert_eq!(std::mem::size_of::<RenderSnapshot>(),144);
+    }
+}
+
 #[cfg(target_os = "android")]
 mod native {
     use super::{Admission, AudioStats, RenderIdentity, RenderSnapshot};
@@ -123,9 +150,9 @@ mod native {
                 Err(e)=>{unsafe{dlclose(library)};return Err(e);}
             };
             let actual=unsafe{abi()};
-            if actual!=4 {
+            if let Err(error)=super::validate_abi_v4(actual) {
                 unsafe{dlclose(library)};
-                return Err(format!("AAudio ABI mismatch expected v4, got v{actual}: redeploy both Android binaries"));
+                return Err(error);
             }
             let funcs=(||Ok::<_,String>((
                 sym(b"df_audio_open\0")?,
