@@ -93,6 +93,7 @@ public:
     bool has_committed_identity = false; // callback only
     uint64_t callback_last_source_frame = 0;
     uint32_t callback_last_epoch = 0, callback_last_generation = 0;
+    uint32_t callback_last_fraction_q32 = 0;
     std::atomic<uint64_t> reprime_events{0};
     std::atomic<int32_t> current_correction_ppm{0};
     std::atomic<int32_t> stream_error{AAUDIO_OK};
@@ -108,6 +109,7 @@ public:
         std::memset(output, 0, static_cast<size_t>(requested) * kChannels * sizeof(int16_t));
 
         uint64_t rd = self->read_pos.load(std::memory_order_relaxed);
+        const uint64_t initially_read = rd;
         const uint64_t wr = self->write_pos.load(std::memory_order_acquire);
         if (wr < rd || wr - rd > kCapacityFrames) {
             self->stream_error.store(-10001, std::memory_order_release);
@@ -133,6 +135,26 @@ public:
 
         const uint32_t modes = self->diagnostic_modes.load(std::memory_order_acquire);
         uint64_t produced = 0;
+        uint64_t concealed_committed = 0;
+        auto commit_tag = [&](uint64_t slot, uint32_t fraction) noexcept {
+            const auto& tag = self->tags[slot % kCapacityFrames];
+            if (self->has_committed_identity &&
+                tag.epoch == self->callback_last_epoch &&
+                tag.generation == self->callback_last_generation &&
+                (tag.source_frame < self->callback_last_source_frame ||
+                 (tag.source_frame == self->callback_last_source_frame &&
+                  fraction < self->callback_last_fraction_q32))) {
+                self->stream_error.store(-10002, std::memory_order_release);
+                return false;
+            }
+            self->has_committed_identity = true;
+            self->callback_last_source_frame = tag.source_frame;
+            self->callback_last_epoch = tag.epoch;
+            self->callback_last_generation = tag.generation;
+            self->callback_last_fraction_q32 = fraction;
+            if (tag.kind == 1) ++concealed_committed;
+            return true;
+        };
         if ((modes & 2u) != 0) {
             // The controller integrates by OUTPUT FRAMES (elapsed sample time),
             // uses projected post-callback occupancy, clips disturbances,
@@ -151,6 +173,8 @@ public:
             self->current_correction_ppm.store(
                 static_cast<int32_t>(commanded_ppm), std::memory_order_relaxed);
             while (produced < requested && wr - rd >= 2) {
+                if (!commit_tag(rd, self->follower.fraction_q32))
+                    return AAUDIO_CALLBACK_RESULT_STOP;
                 self->follower.consume_one(
                     self->ring.data(), rd,
                     output + static_cast<size_t>(produced) * kChannels,
@@ -168,6 +192,10 @@ public:
             if (produced > first)
                 std::memcpy(output + first * kChannels, self->ring.data(),
                             static_cast<size_t>(produced - first) * kChannels * sizeof(int16_t));
+            for (uint64_t frame = 0; frame < produced; ++frame) {
+                if (!commit_tag(rd + frame, 0))
+                    return AAUDIO_CALLBACK_RESULT_STOP;
+            }
             rd += produced;
             self->current_correction_ppm.store(0, std::memory_order_relaxed);
         }
@@ -208,6 +236,9 @@ public:
             // A partial callback has already played the newest contiguous
             // interval. Drop any isolated final lookahead frame (at most one),
             // reset the rate follower and prime fresh data before resuming.
+            const uint64_t discarded = wr - rd;
+            self->discarded_source_frames.fetch_add(
+                discarded, std::memory_order_relaxed);
             rd = wr;
             self->primed = false;
             self->follower.reset();
@@ -216,6 +247,19 @@ public:
             self->underrun_events.fetch_add(1, std::memory_order_relaxed);
         }
         self->read_pos.store(rd, std::memory_order_release);
+        self->released_source_frames.fetch_add(
+            rd - initially_read,
+            std::memory_order_relaxed);
+        self->concealed_output_frames.fetch_add(
+            concealed_committed, std::memory_order_relaxed);
+        self->committed_source_frame.store(
+            self->callback_last_source_frame, std::memory_order_relaxed);
+        self->committed_fraction_q32.store(
+            self->callback_last_fraction_q32, std::memory_order_relaxed);
+        self->committed_epoch.store(
+            self->callback_last_epoch, std::memory_order_relaxed);
+        self->committed_generation.store(
+            self->callback_last_generation, std::memory_order_relaxed);
         self->rendered_frames.fetch_add(produced, std::memory_order_relaxed);
         self->silence_frames.fetch_add(requested - produced, std::memory_order_relaxed);
         self->callback_count.fetch_add(1, std::memory_order_relaxed);
