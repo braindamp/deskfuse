@@ -48,5 +48,17 @@ if(DESKFUSE_QUALIFY_LIBSAMPLERATE)
   else()
     target_compile_options(mp001_libsamplerate_streaming PRIVATE -Wall -Wextra -Werror)
   endif()
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_library(df_allocation_probe SHARED allocation_probe_linux.cpp)
+    target_compile_features(df_allocation_probe PRIVATE cxx_std_20)
+    # Strong interposition through LD_PRELOAD catches dynamic libsamplerate
+    # libc allocations, not merely allocations in our caller's compilation unit.
+    target_link_libraries(mp001_libsamplerate_streaming PRIVATE df_allocation_probe)
+    target_compile_definitions(mp001_libsamplerate_streaming PRIVATE DESKFUSE_TEST_ALLOC_PROBE=1)
+  endif()
   add_test(NAME mp001_libsamplerate_streaming COMMAND mp001_libsamplerate_streaming)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set_tests_properties(mp001_libsamplerate_streaming PROPERTIES
+      ENVIRONMENT "LD_PRELOAD=$<TARGET_FILE:df_allocation_probe>")
+  endif()
 endif()
