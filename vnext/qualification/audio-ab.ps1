@@ -2,7 +2,7 @@
 # No signed-driver/APK changes, endpoint rerouting, or edits in the active checkout.
 [CmdletBinding()]
 param(
-    [ValidateSet('PrepareAll','Prepare','Run','Suite','Report','Rate','Status','Next','BeginSteps','Firewall')]
+    [ValidateSet('PrepareAll','Prepare','Run','Suite','Report','Rate','Status','Next','NextCode','BeginSteps','Firewall')]
     [string]$Action='Status',
     [ValidateSet('reference','candidate')][string]$Version='reference',
     [string]$CandidateSha='',
@@ -394,6 +394,23 @@ switch ($Action) {
         if ($at -lt 0) { throw 'Candidate is not on first-parent progression' }
         if ($at -ge $history.Count) { throw 'Candidate is already at development HEAD' }
         Prepare 'candidate' $history[$at]
+        Status
+    }
+    'NextCode' {
+        $p=ReadPair 'candidate'
+        if ($null -eq $p) { throw 'Prepare candidate first' }
+        # Preserve historical commits. Skip only commits without changes to
+        # the native audio source, transport or Android renderer trees.
+        $history=@(& git -C $LabRoot rev-list --first-parent --reverse ($referenceSha + '..' + $tip) -- 'vnext/m1' 'vnext/m2a/quiche-lab' 'vnext/m2b/android-native')
+        if ($LASTEXITCODE -ne 0) { throw 'Cannot read audio-code commit progression' }
+        $nextSha=$null
+        foreach ($sha in $history) {
+            if ($sha -eq $p.commit) { continue }
+            & git -C $LabRoot merge-base --is-ancestor $p.commit $sha
+            if ($LASTEXITCODE -eq 0) { $nextSha=$sha; break }
+        }
+        if (-not $nextSha) { throw 'No later audio-code commit before development HEAD' }
+        Prepare 'candidate' $nextSha
         Status
     }
     'Run' { Run $Version $Mode ([bool]$Strict) }
