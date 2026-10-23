@@ -87,7 +87,7 @@ fn genuine_quiche_queued_plaintext_expires_before_sealing()->Result<()>{
     let mut track=PlaintextExpiry::default();
     for i in 0..4{
         let (_,bytes)=block(i);
-        assert_eq!(track.admit(&mut sender,&bytes,100_000,100_001)?,QueueAdmission::Queued);
+        assert_eq!(track.admit(&mut sender,&bytes,100_000,0,100_001)?,QueueAdmission::Queued);
     }
     assert_eq!(sender.dgram_send_queue_len(),4);
     track.purge(&mut sender,600_000); // 50ms age => still fresh
@@ -108,7 +108,7 @@ fn seal_is_irreversible_and_metadata_is_reclaimed()->Result<()>{
     let (mut sender,_receiver)=established_pair()?;
     let (_,bytes)=block(1);
     let mut track=PlaintextExpiry::default();
-    assert_eq!(track.admit(&mut sender,&bytes,100_000,100_001)?,QueueAdmission::Queued);
+    assert_eq!(track.admit(&mut sender,&bytes,100_000,0,100_001)?,QueueAdmission::Queued);
     track.purge(&mut sender,100_001);
     let mut sealed=[0u8;MTU];
     // A send call can also issue protocol-only packets, so keep servicing
@@ -137,7 +137,7 @@ fn repeated_scheduling_opportunities_purge_before_construction()->Result<()>{
     let mut track=PlaintextExpiry::default();
     for attempt in 0..4 {
         let (_,bytes)=block(attempt);
-        assert_eq!(track.admit(&mut sender,&bytes,100_000,100_001)?,QueueAdmission::Queued);
+        assert_eq!(track.admit(&mut sender,&bytes,100_000,0,100_001)?,QueueAdmission::Queued);
         // Simulated service path: receive, QUIC timeout, pacing wake,
         // post-stall readiness. ALL must run the same hook before conn.send.
         track.purge(&mut sender,900_000);
@@ -161,7 +161,7 @@ fn blocked_sealed_packet_allows_four_more_plaintexts_and_independent_expiry()->R
     let mut egress=Egress::default();
     let mut track=PlaintextExpiry::default();
     let (_,first)=block(0);
-    assert_eq!(track.admit(&mut sender,&first,100_000,100_001)?,QueueAdmission::Queued);
+    assert_eq!(track.admit(&mut sender,&first,100_000,0,100_001)?,QueueAdmission::Queued);
     let mut original_ciphertext=Vec::new();
     egress.service_with_io(local,&mut sender,false,
         |c|{track.purge(c,100_001);Ok(())},
@@ -178,7 +178,7 @@ fn blocked_sealed_packet_allows_four_more_plaintexts_and_independent_expiry()->R
     // metadata entry for the sealed packet made accept() terminate the lab.
     for sequence in 1..=4 {
         let (_,bytes)=block(sequence);
-        assert_eq!(track.admit(&mut sender,&bytes,100_000,100_001)?,QueueAdmission::Queued);
+        assert_eq!(track.admit(&mut sender,&bytes,100_000,0,100_001)?,QueueAdmission::Queued);
         egress.service_with_io(local,&mut sender,false,
             |c|{track.purge(c,100_001);Ok(())},
             |_,_|panic!("blocked socket must not be retried without readiness"))?;
@@ -189,7 +189,7 @@ fn blocked_sealed_packet_allows_four_more_plaintexts_and_independent_expiry()->R
     assert_eq!(track.high_water,4);
     assert!(track.absent>=1,"sealed media no longer occupies plaintext metadata");
     let (_,overflow)=block(5);
-    assert_eq!(track.admit(&mut sender,&overflow,100_000,100_001)?,QueueAdmission::Full);
+    assert_eq!(track.admit(&mut sender,&overflow,100_000,0,100_001)?,QueueAdmission::Full);
     assert_eq!(sender.dgram_send_queue_len(),4,"controlled full drop is atomic");
     assert_eq!(track.len(),4);
 
@@ -244,13 +244,41 @@ fn queue_full_rolls_back_metadata_and_expired_offer_is_not_admitted()->Result<()
     for _ in 0..4 {sender.dgram_send(b"control")?;}
     let mut track=PlaintextExpiry::default();
     let (_,bytes)=block(0);
-    assert_eq!(track.admit(&mut sender,&bytes,100_000,100_001)?,QueueAdmission::Full);
+    assert_eq!(track.admit(&mut sender,&bytes,100_000,0,100_001)?,QueueAdmission::Full);
     assert_eq!(track.len(),0,"failed quiche admission rolls reservation back");
     assert_eq!(sender.dgram_send_queue_len(),4);
-    assert_eq!(track.admit(&mut sender,&bytes,100_000,700_001)?,QueueAdmission::Expired);
+    assert_eq!(track.admit(&mut sender,&bytes,100_000,0,700_001)?,QueueAdmission::Expired);
     assert_eq!(track.len(),0);
     assert_eq!(sender.dgram_send_queue_len(),4,"control plaintext is preserved");
     assert_eq!(track.next_expiry_wait(700_001),None);
+    Ok(())
+}
+
+#[test]
+fn proven_wasapi_second_half_passes_real_quiche_queue_and_still_expires()->Result<()> {
+    let (mut sender,_receiver)=established_pair()?;
+    let mut track=PlaintextExpiry::default();
+    let (_,bytes)=block(33);
+    let now=2_000_000u64;
+    let second_qpc=now+145_650; // 14.565ms ahead; original head +9.565ms
+    assert_eq!(
+        track.admit(&mut sender,&bytes,second_qpc,0,now)?,
+        QueueAdmission::Expired,
+        "unproven future timestamp remains strictly rejected"
+    );
+    assert_eq!(track.len(),0);
+    assert_eq!(
+        track.admit(&mut sender,&bytes,second_qpc,240,now)?,
+        QueueAdmission::Queued,
+        "same real PCM with explicit 240-frame native provenance is admitted"
+    );
+    assert_eq!(sender.dgram_send_queue_len(),1);
+    track.purge(&mut sender,now+1000);
+    assert_eq!(track.len(),1,"provenance persists across QUIC plaintext purge");
+    track.purge(&mut sender,second_qpc+600_001);
+    assert_eq!(sender.dgram_send_queue_len(),0);
+    assert_eq!(track.len(),0);
+    assert_eq!(track.expired,1,"unchanged 60ms stale-source limit still purges");
     Ok(())
 }
 
