@@ -15,7 +15,6 @@ const DATAGRAM_BYTES: usize = 1350;
 const PAYLOAD_BYTES: usize = 960;
 const PACKETS: u32 = 16;
 const LIMIT: Duration = Duration::from_secs(30);
-const FINISH_GRACE: Duration = Duration::from_millis(750);
 
 fn config(ca: &str, cert: &str, key: &str) -> Result<quiche::Config> {
     let mut c = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
@@ -104,8 +103,15 @@ fn tls_peer_verified(conn: &quiche::Connection) -> Result<()> {
 
 fn client(server: SocketAddr, ca: &str, cert: &str, key: &str) -> Result<()> {
     let mut cfg = config(ca, cert, key)?;
-    let socket = UdpSocket::bind("0.0.0.0:0")?;
-    socket.connect(server)?; // Choose routed interface / concrete local IP.
+    // Determine the actual routed source IP using a temporary UDP socket.
+    // Keep the QUIC socket UNCONNECTED because send_to on a connected UDP
+    // socket fails with EISCONN on macOS, and can surface late ICMP
+    // ConnectionRefused on Linux after our one-shot server exits.
+    let route_probe = UdpSocket::bind("0.0.0.0:0")?;
+    route_probe.connect(server)?;
+    let routed_ip = route_probe.local_addr()?.ip();
+    drop(route_probe);
+    let socket = UdpSocket::bind(SocketAddr::new(routed_ip, 0))?;
     socket.set_nonblocking(true)?;
     let local = socket.local_addr()?;
     let scid = quiche::ConnectionId::from_ref(&[0x51; 16]); // One-shot test only, not production CID.
@@ -113,7 +119,7 @@ fn client(server: SocketAddr, ca: &str, cert: &str, key: &str) -> Result<()> {
 
     let start = Instant::now();
     let mut next_to_receive = 0u32;
-    let mut complete: Option<Instant> = None;
+    let mut complete = false;
     let mut authenticated = false;
     let mut input = [0u8; 65535];
     let mut datagram = [0u8; 1500];
@@ -161,7 +167,7 @@ fn client(server: SocketAddr, ca: &str, cert: &str, key: &str) -> Result<()> {
                         next_to_receive += 1;
                         progressed += 1;
                         if next_to_receive == PACKETS {
-                            complete = Some(Instant::now());
+                            complete = true;
                         }
                     }
                     Err(quiche::Error::Done) => break,
@@ -169,13 +175,15 @@ fn client(server: SocketAddr, ca: &str, cert: &str, key: &str) -> Result<()> {
                 }
             }
         }
-        timeout(&mut conn);
-        // Flush echo of last sample packet before exiting the isolated lab.
-        // Android success proves ingress and enqueue, not Windows echo delivery.
-        if complete.is_some_and(|t| t.elapsed() >= FINISH_GRACE) {
-            println!("PASS Android received {} source-indexed Windows QUIC DATAGRAMs and queued encrypted echoes", PACKETS);
+        // Flush the final echo before exiting rather than sending further
+        // packets to a server that may already have completed and closed.
+        // Windows independently verifies delivery of the final echo.
+        if complete {
+            flush(&socket, &mut conn)?;
+            println!("PASS Android received {} source-indexed Windows QUIC DATAGRAMs and flushed encrypted echoes", PACKETS);
             return Ok(());
         }
+        timeout(&mut conn);
         if progressed == 0 { thread::sleep(Duration::from_millis(2)); }
     }
     Err(format!("Android timeout: verified {next_to_receive}/{PACKETS} Windows DATAGRAMs; no retransmission of DATAGRAM payloads").into())
