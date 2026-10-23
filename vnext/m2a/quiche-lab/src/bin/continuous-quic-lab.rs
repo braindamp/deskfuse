@@ -11,7 +11,7 @@ use std::env;
 use std::error::Error;
 use std::io;
 use std::sync::mpsc::TryRecvError;
-use deskfuse_quiche_lab::wasapi_pipe::{self, Assembler};
+use deskfuse_quiche_lab::wasapi_pipe::{self, Assembler, CaptureEvent};
 use deskfuse_quiche_lab::android_audio::{Admission, AndroidAudio};
 use deskfuse_quiche_lab::source_age::{self, AgeDecision};
 use deskfuse_quiche_lab::plaintext_expiry::{PlaintextExpiry, QueueAdmission};
@@ -231,12 +231,13 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                     }
                 }
             }
+            let mut capture_completed = false;
             if let Some(ref receiver) = source {
                 // Real WASAPI events wake this QUIC owner via the local UDP socket.
                 // Never synthesize a 5-ms send tick or use ACKs as an audio clock.
                 for _ in 0..128 {
                     match receiver.try_recv() {
-                        Ok(chunk) => {
+                        Ok(CaptureEvent::Chunk(chunk)) => {
                             // Observe before ALL age/QPC filters, so a source
                             // ingress gap cannot be confused with a filter drop.
                             ingress_chunks += 1;
@@ -541,8 +542,22 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                                 }
                             }
                         }
+                        Ok(CaptureEvent::Finished(outcome)) => {
+                            if let Err(reason) = outcome {
+                                return Err(format!("native WASAPI source failed: {reason}").into());
+                            }
+                            // Successful native exit before the requested
+                            // acquisition interval is not a healthy transport.
+                            if origin.is_some_and(|start| start.elapsed() < run_for) {
+                                return Err("native WASAPI capture ended before requested duration".into());
+                            }
+                            capture_completed = true;
+                            break;
+                        }
                         Err(TryRecvError::Empty) => break,
-                        Err(TryRecvError::Disconnected) => break,
+                        Err(TryRecvError::Disconnected) => {
+                            return Err("native WASAPI reader disconnected without completion status".into());
+                        },
                     }
                 }
             } else if capture.is_none() {
@@ -570,6 +585,7 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                 }
     
             }
+            if capture_completed { source = None; }
             // QUIC and this kernel socket have exactly one egress owner.
             source_egress(&mut egress, &udp, c, false, &mut outstanding, capture.is_some())?;
             if let Some(start) = origin {
