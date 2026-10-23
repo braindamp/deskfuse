@@ -69,7 +69,11 @@ def analyze(folder: Path) -> dict:
     sender_pairs = 0
     exact_match = 0
     mismatched = 0
+    compared_pairs = 0
+    unmatched_sampled_pairs = 0
     examples = []
+    conflict_examples = []
+    sender_first_frames = []
     log = sender_log.read_text(encoding="utf-8-sig", errors="replace")
     for match in SENDER_PAIR.finditer(log):
         first, second, first_qpc, second_qpc, first_now, second_now, first_decision, second_decision, _ = match.groups()
@@ -77,20 +81,53 @@ def analyze(folder: Path) -> dict:
                 and second_decision == "FutureTimestamp"):
             continue
         sender_pairs += 1
-        first, second, first_qpc, second_qpc = map(int, (first, second, first_qpc, second_qpc))
-        packet = packets.get(first)
-        if packet is None:
-            continue  # Native trace is intentionally sampled, not exhaustive.
-        if (packet["second_fragment_frame"] != second
-                or packet["first_fragment_qpc100"] != first_qpc
-                or packet["second_fragment_qpc100"] != second_qpc):
+        first, second, first_qpc, second_qpc = map(
+            int, (first, second, first_qpc, second_qpc))
+        sender_first_frames.append(first)
+
+        # Match both fragments against the ORIGINAL GetBuffer span, not
+        # merely its first 240-frame pair. Large OS packets can contain
+        # 3+ fragments. Do not match a pair that straddles two packets.
+        containing = [
+            p for p in packets.values()
+            if p["first_frame"] <= first
+            and second == first + 240
+            and first + 480 <= p["first_frame"] + p["packet_frames"]
+            and (first - p["first_frame"]) % 240 == 0
+        ]
+        if not containing:
+            unmatched_sampled_pairs += 1
+            continue  # Two independently sampled logs may not overlap.
+        compared_pairs += 1
+        packet = containing[0]
+        offset = first - packet["first_frame"]
+        packet_qpc = packet["packet_qpc100"]
+        expected_first_qpc = (
+            0 if packet_qpc == 0 else
+            packet_qpc + offset * 10_000_000 // 48_000)
+        expected_second_qpc = (
+            0 if packet_qpc == 0 else
+            packet_qpc + (offset + 240) * 10_000_000 // 48_000)
+        if (first_qpc != expected_first_qpc
+                or second_qpc != expected_second_qpc):
             mismatched += 1
+            if len(conflict_examples) < 4:
+                conflict_examples.append({
+                    "first_frame": first,
+                    "original_packet_frame": packet["first_frame"],
+                    "expected_first_qpc100": expected_first_qpc,
+                    "observed_first_qpc100": first_qpc,
+                    "expected_second_qpc100": expected_second_qpc,
+                    "observed_second_qpc100": second_qpc,
+                })
             continue
         exact_match += 1
         if len(examples) < 4:
             examples.append({
                 "first_frame": first,
                 "second_frame": second,
+                "original_packet_first_frame": packet["first_frame"],
+                "offset_inside_original_packet": offset,
                 "capture_first_lead_100ns":
                     first_qpc - packet["local_getbuffer_qpc100"],
                 "capture_second_lead_100ns":
@@ -98,15 +135,28 @@ def analyze(folder: Path) -> dict:
                 "sender_first_lead_100ns": first_qpc - int(first_now),
                 "sender_second_lead_100ns": second_qpc - int(second_now),
             })
+    sampled_span = (
+        (min(packets), max(p["first_frame"] + p["packet_frames"]
+                           for p in packets.values())) if packets else None
+    )
+    sender_span = (
+        (min(sender_first_frames), max(sender_first_frames) + 480)
+        if sender_first_frames else None
+    )
     return {
         "sampled_original_packets": len(packets),
         "malformed_original_rows": malformed,
         "original_packet_cutoff_straddles_at_capture":
             first_fresh_second_future_at_capture,
         "sender_fresh_then_future_pairs": sender_pairs,
+        "sender_pairs_within_sampled_packet": compared_pairs,
+        "sender_pairs_outside_sampled_packet_samples": unmatched_sampled_pairs,
         "sender_pairs_matching_original_packet_exactly": exact_match,
         "sender_pairs_conflicting_with_original_packet": mismatched,
+        "sampled_original_frame_span": sampled_span,
+        "logged_sender_pair_frame_span": sender_span,
         "examples": examples,
+        "conflicts": conflict_examples,
     }
 
 
@@ -116,18 +166,24 @@ def main() -> None:
     args = parser.parse_args()
     report = analyze(args.folder)
     for name, value in report.items():
-        if name != "examples":
+        if name not in ("examples", "conflicts"):
             print(f"{name}={value}")
     for example in report["examples"]:
         print("exact_original_packet_match " +
               " ".join(f"{key}={value}" for key, value in example.items()))
-    if report["sender_pairs_matching_original_packet_exactly"]:
-        print("CONCLUSION=Original GetBuffer packet provenance matches a "
-              "240-frame QPC-pass / 240-frame QPC-future-reject pair.")
+    for example in report["conflicts"]:
+        print("original_packet_qpc_CONFLICT " +
+              " ".join(f"{key}={value}" for key, value in example.items()))
+    if report["sender_pairs_conflicting_with_original_packet"]:
+        print("CONCLUSION=CONFLICT: sampled original packet and sender QPC "
+              "disagree on a shared source-frame interval. Review raw logs.")
+    elif report["sender_pairs_matching_original_packet_exactly"]:
+        print("CONCLUSION=EXACT_MATCH: sampled original GetBuffer packet "
+              "contains a 240-frame QPC-pass / QPC-future-reject pair.")
     else:
-        print("CONCLUSION=INCONCLUSIVE: trace sampling did not match an "
-              "original 480-frame packet to both sender decisions. "
-              "Do not change source timing based on this report alone.")
+        print("CONCLUSION=NO_SAMPLE_OVERLAP: sender mixed-decision pairs do "
+              "not fall wholly inside sampled original GetBuffer packets. "
+              "This is NOT evidence against the timestamp-cutoff hypothesis.")
     print("NOTE=Rate-limited diagnostic samples; never complete frame accounting.")
 
 
