@@ -12,6 +12,15 @@ pub const ANCHOR: u8 = 2;
 pub const RETRY_MS: u64 = 120;
 pub const TIMEOUT_MS: u64 = 1_200;
 
+/// Validate at every acceptance boundary, including after descheduling.
+pub fn require_live(started: std::time::Instant, now: std::time::Instant)
+    -> Result<(), &'static str> {
+    if now.saturating_duration_since(started) >=
+        std::time::Duration::from_millis(TIMEOUT_MS) {
+        Err("authenticated fresh-anchor deadline expired")
+    } else { Ok(()) }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetryAction { Send, Wait, Expired }
 pub fn retry_action(

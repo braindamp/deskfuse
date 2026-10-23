@@ -1,11 +1,14 @@
 //! In-memory authenticated quiche fixture. No flaky UDP or clock sleeps:
 //! exercises the real outgoing DATAGRAM queue/purge/seal API.
 mod common;
-use deskfuse_quiche_lab::plaintext_expiry::{PlaintextExpiry,Identity};
+use deskfuse_quiche_lab::plaintext_expiry::{PlaintextExpiry,Identity,QueueAdmission};
+use deskfuse_quiche_lab::reactor::Egress;
 use deskfuse_quiche_lab::{encode,Header,HEADER_BYTES,VERSION,KIND_AUDIO};
+use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::error::Error;
+use std::time::Duration;
 
 type Result<T> = std::result::Result<T,Box<dyn Error>>;
 const ALPN:&[u8]=b"df-inmemory-mp001-1";
@@ -83,9 +86,8 @@ fn genuine_quiche_queued_plaintext_expires_before_sealing()->Result<()>{
     assert!(sender.dgram_max_writable_len().unwrap_or(0)>=1000);
     let mut track=PlaintextExpiry::default();
     for i in 0..4{
-        let (id,bytes)=block(i);
-        sender.dgram_send(&bytes)?;
-        track.accept(id,100_000)?;
+        let (_,bytes)=block(i);
+        assert_eq!(track.admit(&mut sender,&bytes,100_000,100_001)?,QueueAdmission::Queued);
     }
     assert_eq!(sender.dgram_send_queue_len(),4);
     track.purge(&mut sender,600_000); // 50ms age => still fresh
@@ -104,10 +106,9 @@ fn genuine_quiche_queued_plaintext_expires_before_sealing()->Result<()>{
 #[test]
 fn seal_is_irreversible_and_metadata_is_reclaimed()->Result<()>{
     let (mut sender,_receiver)=established_pair()?;
-    let (id,bytes)=block(1);
-    sender.dgram_send(&bytes)?;
+    let (_,bytes)=block(1);
     let mut track=PlaintextExpiry::default();
-    track.accept(id,100_000)?;
+    assert_eq!(track.admit(&mut sender,&bytes,100_000,100_001)?,QueueAdmission::Queued);
     track.purge(&mut sender,100_001);
     let mut sealed=[0u8;MTU];
     // A send call can also issue protocol-only packets, so keep servicing
@@ -135,9 +136,8 @@ fn repeated_scheduling_opportunities_purge_before_construction()->Result<()>{
     let (mut sender,_receiver)=established_pair()?;
     let mut track=PlaintextExpiry::default();
     for attempt in 0..4 {
-        let (id,bytes)=block(attempt);
-        sender.dgram_send(&bytes)?;
-        track.accept(id,100_000)?;
+        let (_,bytes)=block(attempt);
+        assert_eq!(track.admit(&mut sender,&bytes,100_000,100_001)?,QueueAdmission::Queued);
         // Simulated service path: receive, QUIC timeout, pacing wake,
         // post-stall readiness. ALL must run the same hook before conn.send.
         track.purge(&mut sender,900_000);
@@ -146,6 +146,111 @@ fn repeated_scheduling_opportunities_purge_before_construction()->Result<()>{
     assert_eq!(track.expired,4);
     track.clear();
     assert_eq!(track.len(),0);
+    Ok(())
+}
+
+#[test]
+fn blocked_sealed_packet_allows_four_more_plaintexts_and_independent_expiry()->Result<()> {
+    let (mut sender,mut receiver)=established_pair()?;
+    // Drain handshake/control leftovers through the real library before
+    // holding an actual encrypted media packet in the real Egress slot.
+    for _ in 0..8 {
+        if pump(&mut sender,&mut receiver)?+pump(&mut receiver,&mut sender)?==0 {break;}
+    }
+    let local:SocketAddr="127.0.0.1:48235".parse()?;
+    let mut egress=Egress::default();
+    let mut track=PlaintextExpiry::default();
+    let (_,first)=block(0);
+    assert_eq!(track.admit(&mut sender,&first,100_000,100_001)?,QueueAdmission::Queued);
+    let mut original_ciphertext=Vec::new();
+    egress.service_with_io(local,&mut sender,false,
+        |c|{track.purge(c,100_001);Ok(())},
+        |bytes,_|{
+            original_ciphertext=bytes.to_vec();
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
+        })?;
+    assert!(egress.has_pending_ciphertext() && egress.needs_write_readiness());
+    assert_eq!(sender.dgram_send_queue_len(),0,"first audio really constructed");
+    let constructed=sender.stats().sent;
+
+    // Regression: five fresh admissions in total, with one sealed and FOUR
+    // still plaintext. Previously the fifth enqueue succeeded and the stale
+    // metadata entry for the sealed packet made accept() terminate the lab.
+    for sequence in 1..=4 {
+        let (_,bytes)=block(sequence);
+        assert_eq!(track.admit(&mut sender,&bytes,100_000,100_001)?,QueueAdmission::Queued);
+        egress.service_with_io(local,&mut sender,false,
+            |c|{track.purge(c,100_001);Ok(())},
+            |_,_|panic!("blocked socket must not be retried without readiness"))?;
+    }
+    assert_eq!(sender.stats().sent,constructed,"no construction behind sealed slot");
+    assert_eq!(sender.dgram_send_queue_len(),4);
+    assert_eq!(track.len(),4);
+    assert_eq!(track.high_water,4);
+    assert!(track.absent>=1,"sealed media no longer occupies plaintext metadata");
+    let (_,overflow)=block(5);
+    assert_eq!(track.admit(&mut sender,&overflow,100_000,100_001)?,QueueAdmission::Full);
+    assert_eq!(sender.dgram_send_queue_len(),4,"controlled full drop is atomic");
+    assert_eq!(track.len(),4);
+
+    assert_eq!(track.next_expiry_wait(100_001),Some(Duration::from_millis(60)));
+    assert_eq!(track.next_expiry_wait(700_000),Some(Duration::from_nanos(100)));
+    assert_eq!(track.next_expiry_wait(700_001),Some(Duration::ZERO));
+    // Simulate ONLY the one-shot expiry wake: no source event and no socket
+    // writability. The production reactor still reconciles stale plaintext.
+    egress.service_with_io(local,&mut sender,false,
+        |c|{track.purge(c,700_001);Ok(())},
+        |_,_|panic!("expiry cleanup cannot send or reconstruct ciphertext"))?;
+    assert_eq!(sender.stats().sent,constructed);
+    assert!(egress.has_pending_ciphertext());
+    assert_eq!(sender.dgram_send_queue_len(),0);
+    assert_eq!(track.len(),0);
+    assert_eq!(track.expired,4);
+    assert_eq!(track.next_expiry_wait(700_001),None,"no idle periodic expiry wake");
+
+    // Diagnostic post-seal policy A is preserved: once writable, retry the
+    // EXACT ciphertext, not a reconstructed packet. QUIC/control stays usable.
+    let mut transmissions=0;
+    egress.service_with_io(local,&mut sender,true,
+        |c|{track.purge(c,700_001);Ok(())},
+        |bytes,_|{
+            if transmissions==0 {assert_eq!(bytes,original_ciphertext.as_slice());}
+            transmissions+=1;
+            let mut packet=bytes.to_vec();
+            receiver.recv(&mut packet,quiche::RecvInfo {
+                from:local,to:"127.0.0.1:48234".parse().unwrap(),
+            }).map_err(|error|io::Error::other(format!("receive sealed packet: {error:?}")))?;
+            Ok(bytes.len())
+        })?;
+    assert!(transmissions>=1 && !egress.has_pending_ciphertext());
+    // Both sides still exchange authenticated reliable protocol work after
+    // the blocked packet and stale plaintext purge, without a reconnect.
+    sender.stream_send(1,b"alive",true)?;
+    for _ in 0..16 {
+        pump(&mut sender,&mut receiver)?;
+        pump(&mut receiver,&mut sender)?;
+    }
+    let mut reply=[0u8;16];
+    let (n,fin)=receiver.stream_recv(1,&mut reply)?;
+    assert_eq!(&reply[..n],b"alive");assert!(fin);
+    assert!(!sender.is_closed() && !receiver.is_closed());
+    Ok(())
+}
+
+#[test]
+fn queue_full_rolls_back_metadata_and_expired_offer_is_not_admitted()->Result<()> {
+    let (mut sender,_receiver)=established_pair()?;
+    // Non-audio protocol DATAGRAMs share quiche's four-item send queue.
+    for _ in 0..4 {sender.dgram_send(b"control")?;}
+    let mut track=PlaintextExpiry::default();
+    let (_,bytes)=block(0);
+    assert_eq!(track.admit(&mut sender,&bytes,100_000,100_001)?,QueueAdmission::Full);
+    assert_eq!(track.len(),0,"failed quiche admission rolls reservation back");
+    assert_eq!(sender.dgram_send_queue_len(),4);
+    assert_eq!(track.admit(&mut sender,&bytes,100_000,700_001)?,QueueAdmission::Expired);
+    assert_eq!(track.len(),0);
+    assert_eq!(sender.dgram_send_queue_len(),4,"control plaintext is preserved");
+    assert_eq!(track.next_expiry_wait(700_001),None);
     Ok(())
 }
 

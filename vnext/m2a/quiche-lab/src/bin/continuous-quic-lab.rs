@@ -14,7 +14,7 @@ use std::sync::mpsc::TryRecvError;
 use deskfuse_quiche_lab::wasapi_pipe::{self, Assembler};
 use deskfuse_quiche_lab::android_audio::{Admission, AndroidAudio};
 use deskfuse_quiche_lab::source_age::{self, AgeDecision};
-use deskfuse_quiche_lab::plaintext_expiry::{PlaintextExpiry, Identity as OutgoingIdentity};
+use deskfuse_quiche_lab::plaintext_expiry::{PlaintextExpiry, QueueAdmission};
 use deskfuse_quiche_lab::receive_frontier::{ReceiveFrontier, Context as SourceContext, Reject as SourceReject};
 use deskfuse_quiche_lab::fresh_anchor::{self, Message as AnchorMessage};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
@@ -333,16 +333,16 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                                         continue;
                                     }
                                 }
-                                match c.dgram_send(&pcm) {
-                                    Ok(()) => {
+                                match outstanding.admit(c, &pcm, block.first_qpc_100ns,
+                                                        source_age::local_qpc_100ns()?) {
+                                    Ok(QueueAdmission::Queued) => {
                                         offered += 1;
-                                        let id = OutgoingIdentity::from_wire(&pcm)
-                                            .ok_or("outgoing PCM header identity missing")?;
-                                        outstanding.accept(id, block.first_qpc_100ns)
-                                            .map_err(|e| format!("quiche plaintext bound violated: {e}"))?;
                                         source_egress(&mut egress, &udp, c, false, &mut outstanding, capture.is_some())?;
                                     }
-                                    Err(quiche::Error::Done) => {
+                                    Ok(QueueAdmission::Expired) => {
+                                        expired_source_qpc += 1;
+                                    }
+                                    Ok(QueueAdmission::Full) => {
                                         not_queued += 1;
                                         // Source frame is the cross-machine key;
                                         // clocks are NOT assumed synchronized.
@@ -421,8 +421,18 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
             else { start.checked_add(SYNTHETIC_BLOCK.saturating_mul(next_sequence.min(u32::MAX as u64) as u32)) }
         }) };
         let quic_wake = conn.as_ref().and_then(|c| c.timeout_instant());
+        // Plaintext cleanup is an independent one-shot obligation, including
+        // when an immutable sealed packet is waiting for socket writability.
+        // Capture the Instant BEFORE sampling QPC so sampling overhead cannot
+        // push the intended cleanup deadline later. Recheck on every wake.
+        let expiry_wake = if capture.is_some() && outstanding.len() != 0 {
+            let observed = Instant::now();
+            outstanding.next_expiry_wait(source_age::local_qpc_100ns()?)
+                .and_then(|wait| observed.checked_add(wait))
+        } else { None };
         let wake = deadline(&[
             next_deadline(quic_wake, egress.deadline(), source_wake),
+            expiry_wake,
             if origin.is_none() { Some(end_waiting) } else { origin.and_then(|x| x.checked_add(run_for + Duration::from_secs(3))) },
         ]);
         let writable = egress.needs_write_readiness();
@@ -470,6 +480,22 @@ struct PendingAnchor {
     started: Instant,
     retry_at: Instant,
     confirmed: Option<u64>,
+}
+
+impl PendingAnchor {
+    fn confirm(&mut self, reply: AnchorMessage, now: Instant) -> Result<bool> {
+        fresh_anchor::require_live(self.started, now)?;
+        if !reply.confirms(&self.challenge) { return Ok(false); }
+        self.confirmed = Some(reply.frame);
+        Ok(true)
+    }
+    fn authorizes(&self, context: SourceContext, frame: u64,
+                  applied: u64, now: Instant) -> Result<bool> {
+        fresh_anchor::require_live(self.started, now)?;
+        Ok(context == self.challenge.context &&
+           self.confirmed.is_some_and(|anchor| frame >= anchor) &&
+           applied == self.recovery_ticket)
+    }
 }
 
 fn begin_fresh_anchor(
@@ -530,7 +556,8 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
     let mut session_context: Option<SourceContext> = None;
     let mut anchor_pending: Option<PendingAnchor> = None;
     let mut fresh_anchor_nonce = 1u64;
-    let mut last_handled_invalidation = 0u64;
+    // Critical recovery authorization is never derived from lossy telemetry.
+    let mut authorized_recovery = 0u64;
     let mut confirmed_reanchors = 0u64;
     let mut audio: Option<AndroidAudio> = None;
     let mut latest_render_record: Option<(deskfuse_quiche_lab::android_audio::RenderSnapshot, u64)> = None;
@@ -577,13 +604,16 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
             for _ in 0..128 {
                 match conn.dgram_recv(&mut datagram) {
                     Ok(n) => {
+                        if let Some(ref pending) = anchor_pending {
+                            fresh_anchor::require_live(pending.started, Instant::now())
+                                .map_err(|e| format!("recovery exchange: {e}"))?;
+                        }
                         if let Some(reply) = AnchorMessage::decode(&datagram[..n]) {
                             if reply.kind != fresh_anchor::ANCHOR {
                                 return Err("Android rejected unexpected server recovery request".into());
                             }
                             if let Some(ref mut pending) = anchor_pending {
-                                if reply.confirms(&pending.challenge) {
-                                    pending.confirmed = Some(reply.frame);
+                                if pending.confirm(reply, Instant::now())? {
                                     eprintln!("TRACE Android ANCHOR_CONFIRMED nonce={} source={}",
                                         reply.nonce, reply.frame);
                                 } // retired challenge responses are never fresh.
@@ -595,17 +625,26 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                         if n != APP_BYTES || (synthetic && datagram[..n] != packet(h.packet_sequence)) {
                             return Err("Android rejected PCM source-frame or synthetic payload identity".into());
                         }
+                        if anchor_pending.is_none() {
+                            if let Some(ref mut speaker) = audio {
+                                if speaker.recovery_applied() != authorized_recovery {
+                                    begin_fresh_anchor(
+                                        &mut anchor_pending, &mut fresh_anchor_nonce, speaker,
+                                        SourceContext { epoch:h.media_epoch, stream:h.source_stream_id,
+                                                        format:h.format_config_id },
+                                        ingress_frontier.floor(),
+                                    )?;
+                                    recover_started += 1;
+                                }
+                            }
+                        }
                         if let Some(ref pending) = anchor_pending {
-                            let fresh = pending.confirmed.is_some_and(|anchor| {
-                                h.first_source_frame >= anchor &&
-                                (SourceContext {
-                                    epoch:h.media_epoch, stream:h.source_stream_id,
-                                    format:h.format_config_id,
-                                }) == pending.challenge.context
-                            });
-                            let applied = audio.as_ref().is_some_and(|speaker|
-                                speaker.recovery_applied() >= pending.recovery_ticket);
-                            if !fresh || !applied {
+                            let applied = audio.as_ref().map_or(0, |speaker|
+                                speaker.recovery_applied());
+                            if !pending.authorizes(SourceContext {
+                                epoch:h.media_epoch, stream:h.source_stream_id,
+                                format:h.format_config_id,
+                            }, h.first_source_frame, applied, Instant::now())? {
                                 // No old or merely future-looking packet
                                 // becomes fresh without a matching server
                                 // post-request capture anchor.
@@ -615,6 +654,9 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                             // to the server's *post-request* fresh observation.
                             // Old dropped playback intervals must never be
                             // synthesized back into the newly primed ring.
+                            fresh_anchor::require_live(pending.started, Instant::now())
+                                .map_err(|e| format!("recovery authorization: {e}"))?;
+                            authorized_recovery = pending.recovery_ticket;
                             ingress_frontier.accept_fresh_anchor(
                                 pending.confirmed.expect("fresh and applied above")
                             ).map_err(|e|
@@ -641,7 +683,7 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                             }
                             Err(SourceReject::RetiredContext) => {
                                 denied_reanchor += 1;
-                                return Err("retired media identity requires a new authenticated configuration".into());
+                                return Err(format!("retired media identity requires a new authenticated configuration; rejected={denied_reanchor}").into());
                             }
                             Err(SourceReject::Overflow) =>
                                 return Err("authenticated source-frame range overflow".into()),
@@ -671,7 +713,7 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                                                 &ZERO_PCM,
                                                 expected + offset * AUDIO_FRAMES,
                                                 h.media_epoch, h.source_stream_id,
-                                                h.format_config_id, 1, true)
+                                                h.format_config_id, 1, true, authorized_recovery)
                                                 .map_err(|e| format!("Android concealment: {e}"))?;
                                             match state {
                                                 Admission::Accepted => {
@@ -745,7 +787,7 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                             match speaker.push_media(
                                 samples, h.first_source_frame,
                                 h.media_epoch, h.source_stream_id,
-                                h.format_config_id, 1, false)
+                                h.format_config_id, 1, false, authorized_recovery)
                                 .map_err(|e| format!("Android audio renderer: {e}"))? {
                                 Admission::Accepted => {}
                                 Admission::Overflow |
@@ -806,16 +848,11 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
         // Consumer of coherent callback snapshots is the QUIC owner, not
         // the Android real-time thread. Bound draining work and retain only
         // the most recent complete callback record for diagnostics.
-        let mut callback_recovery_needed = false;
         if let Some(ref speaker) = audio {
             for _ in 0..16 {
                 match speaker.pop_snapshot()
                     .map_err(|e| format!("AAudio off-callback telemetry: {e}"))? {
                     Some((record, dropped)) => {
-                        if record.invalidations > last_handled_invalidation {
-                            last_handled_invalidation = record.invalidations;
-                            callback_recovery_needed = true;
-                        }
                         latest_render_record = Some((record, dropped));
                         coherent_records_read += 1;
                     }
@@ -823,15 +860,18 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                 }
             }
         }
-        if callback_recovery_needed && anchor_pending.is_none() &&
-            authenticated_at.is_some_and(|at|
-                at.elapsed() < Duration::from_secs(seconds.saturating_sub(1))) {
+        // Telemetry is diagnostic only. Authoritative recovery tickets drive
+        // the challenge even when callback records are delayed or dropped.
+        if anchor_pending.is_none() && authenticated_at.is_some_and(|at|
+            at.elapsed() < Duration::from_secs(seconds.saturating_sub(1))) {
             if let (Some(context), Some(speaker)) = (session_context, audio.as_mut()) {
-                begin_fresh_anchor(
-                    &mut anchor_pending, &mut fresh_anchor_nonce, speaker,
-                    context, ingress_frontier.floor(),
-                )?;
-                recover_started += 1;
+                if speaker.recovery_applied() != authorized_recovery {
+                    begin_fresh_anchor(
+                        &mut anchor_pending, &mut fresh_anchor_nonce, speaker,
+                        context, ingress_frontier.floor(),
+                    )?;
+                    recover_started += 1;
+                }
             }
         }
         if let Some(ref mut pending) = anchor_pending {
@@ -886,6 +926,9 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                     println!("AUDIO Android authenticated_reanchors={} outstanding_anchor={} last_receiver_frontier={}",
                         confirmed_reanchors, anchor_pending.is_some(),
                         ingress_frontier.floor());
+                    println!("AUDIO Android recovery_started={} recovery_pending_drops={} native_stale={} denied_contexts={} authorized_ticket={}",
+                        recover_started, recover_pending, native_stale,
+                        denied_reanchor, authorized_recovery);
                     if a.stream_error != 0 { return Err(format!("AAudio stream failure code={}", a.stream_error).into()); }
                     if a.rendered_frames == 0 { return Err("AAudio played no authenticated PCM frames".into()); }
                 }
@@ -919,6 +962,31 @@ fn positive_seconds(s: &str) -> Result<u64> {
     let n = s.parse::<u64>()?;
     if !(1..=60).contains(&n) { return Err("duration must be 1..60 seconds in the isolated lab".into()); }
     Ok(n)
+}
+
+#[cfg(test)]
+mod recovery_boundary_tests {
+    use super::*;
+    fn exchange(started: Instant) -> PendingAnchor {
+        PendingAnchor {
+            challenge: AnchorMessage { kind:fresh_anchor::REQUEST, nonce:7,
+                frame:48000, context:SourceContext {epoch:1,stream:1,format:1} },
+            recovery_ticket:3, started, retry_at:started, confirmed:None,
+        }
+    }
+    #[test]
+    fn buffered_reply_and_media_after_owner_stall_cannot_complete_expired_exchange() {
+        let start=Instant::now();
+        let mut p=exchange(start);
+        let reply=AnchorMessage {kind:fresh_anchor::ANCHOR, frame:48240,..p.challenge};
+        let expired=start+Duration::from_millis(fresh_anchor::TIMEOUT_MS);
+        assert!(p.confirm(reply,expired).is_err());
+        assert!(p.confirmed.is_none());
+        assert!(p.confirm(reply,start+Duration::from_millis(10)).unwrap());
+        assert!(p.authorizes(p.challenge.context,48240,3,expired).is_err());
+        assert!(p.authorizes(p.challenge.context,48240,3,start+Duration::from_millis(11)).unwrap());
+        assert!(!p.authorizes(p.challenge.context,48240,4,start+Duration::from_millis(11)).unwrap());
+    }
 }
 
 fn run() -> Result<()> {

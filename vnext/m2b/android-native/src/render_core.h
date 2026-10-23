@@ -75,6 +75,9 @@ enum class Admission : int32_t {
     RecoverPending = -3, Discontinuity = -4, Stale = -5
 };
 struct RenderOptions { bool fade = true, linear = true; };
+#ifdef DESKFUSE_TEST_PROBE
+enum class RenderProbe { BeforePublicationCommit, BeforeRecoveryTailRelease };
+#endif
 
 class RenderCore {
 public:
@@ -101,12 +104,37 @@ public:
 
     Admission publish(const int16_t* samples, uint32_t frames,
                       MediaIdentity first) noexcept {
+        return publish_impl(samples, frames, first, false, 0);
+    }
+    // The authenticated receiver authorizes exactly one applied recovery.
+    // Publication ownership keeps that authorization valid through commit.
+    Admission publish_guarded(const int16_t* samples, uint32_t frames,
+                              MediaIdentity first,
+                              uint64_t expected_applied) noexcept {
+        return publish_impl(samples, frames, first, true, expected_applied);
+    }
+
+private:
+    static constexpr uint32_t kIdle = 0, kPublishing = 1, kRecovering = 2;
+    struct PublicationRelease {
+        std::atomic<uint32_t>& state;
+        ~PublicationRelease() noexcept { state.store(kIdle, std::memory_order_release); }
+    };
+    Admission publish_impl(const int16_t* samples, uint32_t frames,
+                           MediaIdentity first, bool guarded,
+                           uint64_t expected_applied) noexcept {
         if (!samples || frames != kBlockFrames || first.concealed > 1 ||
             first.source_frame > UINT64_MAX - frames)
             return Admission::Invalid;
+        uint32_t idle = kIdle;
+        if (!publication_state_.compare_exchange_strong(idle, kPublishing,
+                std::memory_order_acq_rel, std::memory_order_acquire))
+            return Admission::RecoverPending;
+        const PublicationRelease release{publication_state_};
         const uint64_t ticket = requested_recoveries();
         const uint64_t applied = applied_recoveries();
-        if (ticket != applied) return Admission::RecoverPending;
+        if (ticket != applied || (guarded && expected_applied != applied))
+            return Admission::RecoverPending;
         if (applied != last_observed_recovery_) {
             // Callback applied an autonomous underrun/format invalidation.
             // Producer can resume ONLY from a forward source anchor.
@@ -151,10 +179,15 @@ public:
             tag.source_frame += i;
             tags_[(wr + i) % capacity] = tag;
         }
-        // Callback may trigger autonomous underrun while producer is writing.
-        // Don't publish the partial reservation under a retired ticket.
+        // A callback can REQUEST recovery during this reservation, but cannot
+        // APPLY it until publication ownership is released. Even if preempted
+        // after this check, these tags cannot outlive a completed reset: the
+        // callback defers recovery without waiting, then discards this commit.
         if (recovery_ticket_.load(std::memory_order_acquire) != ticket)
             return Admission::RecoverPending;
+#ifdef DESKFUSE_TEST_PROBE
+        probe(RenderProbe::BeforePublicationCommit);
+#endif
         write_.store(wr + frames, std::memory_order_release);
         published_.fetch_add(frames, std::memory_order_relaxed);
         expected_source_ = first.source_frame + frames;
@@ -164,12 +197,13 @@ public:
         return Admission::Accepted;
     }
 
+public:
     void render(int16_t* out, uint32_t count, RenderOptions options) noexcept {
         if (!out || !count) return;
         std::memset(out, 0, size_t(count) * kChannels * sizeof(int16_t));
         const uint64_t start = read_.load(std::memory_order_relaxed);
         uint64_t rd = start;
-        const uint64_t wr = write_.load(std::memory_order_acquire);
+        uint64_t wr = write_.load(std::memory_order_acquire);
         if (wr < rd || wr - rd > capacity) {
             invalidations_++;
             request_from_callback();
@@ -177,16 +211,30 @@ public:
         }
         const uint64_t target_ticket =
             recovery_ticket_.load(std::memory_order_acquire);
+        bool recovery_owned = false, recovery_deferred = false;
         if (target_ticket != recovery_applied_.load(std::memory_order_relaxed)) {
-            discarded_ += wr - rd;
-            rd = wr;
-            reset_output();
-            recovery_applied_.store(target_ticket, std::memory_order_release);
-            ++invalidations_;
+            uint32_t idle = kIdle;
+            recovery_owned = publication_state_.compare_exchange_strong(
+                idle, kRecovering, std::memory_order_acq_rel,
+                std::memory_order_acquire);
+            if (recovery_owned) {
+                // Refresh AFTER claiming ownership: a producer may have
+                // finished since the initial write snapshot. No reservation
+                // can commit behind this reset while we own kRecovering.
+                wr = write_.load(std::memory_order_acquire);
+                discarded_ += wr - rd;
+                rd = wr;
+                reset_output();
+                ++invalidations_;
+            } else {
+                // Never wait for an unscheduled producer in the callback.
+                // Commit defined silence until its reservation is resolved.
+                recovery_deferred = true;
+            }
         }
         uint32_t emitted = 0;
         const uint64_t ready = wr - rd;
-        if (!primed_) {
+        if (!primed_ && !recovery_deferred) {
             if (ready >= prime) {
                 primed_ = true;
                 if (ever_primed_) ++reprimes_;
@@ -196,7 +244,7 @@ public:
                 fraction_q32_ = 0;
             }
         }
-        if (primed_) {
+        if (primed_ && !recovery_deferred) {
             double ppm = 0;
             uint64_t step = kOneQ32;
             if (options.linear) {
@@ -212,7 +260,8 @@ public:
                 const uint64_t position = fraction_q32_;
                 const MediaIdentity* b = options.linear ?
                     &tags_[(rd + 1) % capacity] : nullptr;
-                if (b && !adjacent(a, *b)) {
+                if (a.playout != playout_generation_.load(std::memory_order_relaxed) ||
+                    (b && !adjacent(a, *b))) {
                     // NEVER interpolate across a missing interval or changed
                     // epoch/format/connection/playout identity.
                     request_from_callback();
@@ -284,7 +333,16 @@ public:
         // release only AFTER all two-tap support reads for committed output.
         if (rd > wr) rd = wr;
         released_ += rd - start;
+#ifdef DESKFUSE_TEST_PROBE
+        if (recovery_owned) probe(RenderProbe::BeforeRecoveryTailRelease);
+#endif
         read_.store(rd, std::memory_order_release);
+        if (recovery_owned) {
+            // Acknowledgement promises that discarded storage is reusable.
+            // Keep producers excluded until BOTH tail and ticket are visible.
+            recovery_applied_.store(target_ticket, std::memory_order_release);
+            publication_state_.store(kIdle, std::memory_order_release);
+        }
         rendered_ += emitted;
         silence_ += count - emitted;
         committed_output_ += count - emitted;
@@ -349,6 +407,12 @@ public:
     void test_set_tag(uint64_t slot, MediaIdentity value) noexcept {
         tags_[slot % capacity] = value;
     }
+    using Probe = void (*)(void*, RenderProbe) noexcept;
+    // Install only before either owner starts; absent from production builds.
+    void test_set_probe(Probe hook, void* context) noexcept {
+        probe_ = hook;
+        probe_context_ = context;
+    }
 #endif
     uint64_t published() const noexcept { return published_.load(std::memory_order_relaxed); }
     uint64_t overflow() const noexcept { return overflow_.load(std::memory_order_relaxed); }
@@ -356,6 +420,16 @@ public:
     uint64_t write() const noexcept { return write_.load(std::memory_order_acquire); }
 
 private:
+#ifdef DESKFUSE_TEST_PROBE
+    void probe(RenderProbe point) noexcept {
+        if (probe_) probe_(probe_context_, point);
+    }
+    Probe probe_ = nullptr;
+    void* probe_context_ = nullptr;
+    // Keep the host-only seam on a complete cache line before aligned PCM.
+    // This also avoids implicit alignment padding under MSVC /W4 /WX.
+    std::array<uint8_t, 64 - sizeof(Probe) - sizeof(void*)> probe_padding_{};
+#endif
     static bool same_source_timeline(const MediaIdentity& a,
                                      const MediaIdentity& b) noexcept {
         // Local playout reset must never make old wire source positions fresh.
@@ -390,6 +464,9 @@ private:
     std::array<MediaIdentity, capacity> tags_{};
     std::atomic<uint64_t> read_{0}, write_{0};
     std::atomic<uint64_t> recovery_ticket_{0}, recovery_applied_{0};
+    // A single try-transition, never a spin/wait: producer reservation and
+    // callback reset cannot pass one another. Normal rendering stays SPSC.
+    std::atomic<uint32_t> publication_state_{kIdle};
     std::atomic<uint32_t> playout_generation_{1};
     std::atomic<uint64_t> published_{0}, overflow_{0};
     // Producer-only fields:

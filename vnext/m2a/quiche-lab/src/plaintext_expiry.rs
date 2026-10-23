@@ -1,7 +1,8 @@
 //! Bounded connection-owner-only audio plaintext tracking. Hooked before
 //! EVERY quiche Connection::send packet construction. No seal callback assumed.
-use crate::source_age::{classify, AgeDecision};
+use crate::source_age::{classify, AgeDecision, MAX_SOURCE_AGE_100NS};
 use quiche::Connection;
+use std::time::Duration;
 
 const CAPACITY: usize = 4;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11,11 +12,18 @@ pub struct Identity {
 }
 #[derive(Debug, Clone, Copy)]
 struct Pending { id: Identity, source_qpc: u64 }
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueAdmission { Queued, Expired, Full }
 pub struct PlaintextExpiry {
     entries: Vec<Pending>,
     pub expired: u64, pub orphaned: u64, pub absent: u64,
     pub high_water: usize,
+}
+impl Default for PlaintextExpiry {
+    fn default() -> Self {
+        Self { entries: Vec::with_capacity(CAPACITY), expired: 0,
+               orphaned: 0, absent: 0, high_water: 0 }
+    }
 }
 impl Identity {
     pub fn from_wire(w: &[u8]) -> Option<Self> {
@@ -29,7 +37,35 @@ impl Identity {
     }
 }
 impl PlaintextExpiry {
-    pub fn accept(&mut self, id: Identity, source_qpc: u64) -> Result<(), &'static str> {
+    /// Reconcile even when ciphertext is pending, then reserve metadata BEFORE
+    /// quiche takes a plaintext copy. Queue pressure is a controlled source
+    /// drop; a failed enqueue never leaves a reservation behind.
+    pub fn admit(
+        &mut self, conn: &mut Connection, wire: &[u8],
+        source_qpc: u64, now_qpc: u64,
+    ) -> Result<QueueAdmission, quiche::Error> {
+        self.purge(conn, now_qpc);
+        if !matches!(classify(now_qpc, source_qpc), AgeDecision::Fresh { .. }) {
+            return Ok(QueueAdmission::Expired);
+        }
+        let id = Identity::from_wire(wire).ok_or(quiche::Error::InvalidState)?;
+        if self.entries.iter().any(|entry| entry.id == id) {
+            return Err(quiche::Error::InvalidState);
+        }
+        if self.accept(id, source_qpc).is_err() {
+            return Ok(QueueAdmission::Full);
+        }
+        match conn.dgram_send(wire) {
+            Ok(()) => Ok(QueueAdmission::Queued),
+            Err(error) => {
+                self.entries.retain(|entry| entry.id != id);
+                if error == quiche::Error::Done { Ok(QueueAdmission::Full) }
+                else { Err(error) }
+            }
+        }
+    }
+
+    fn accept(&mut self, id: Identity, source_qpc: u64) -> Result<(), &'static str> {
         if self.entries.len() >= CAPACITY { return Err("plaintext metadata bound"); }
         if self.entries.iter().any(|p| p.id == id) { return Err("duplicate plaintext identity"); }
         self.entries.push(Pending{id, source_qpc});
@@ -63,12 +99,35 @@ impl PlaintextExpiry {
             }
         });
         self.orphaned += unknown.get();
-        let old = std::mem::take(&mut self.entries);
-        for (index, entry) in old.into_iter().enumerate() {
-            if !present[index].get() { self.absent += 1; }
-            else if expired[index].get() { self.expired += 1; }
-            else { self.entries.push(entry); }
-        }
+        // Compact in place: cleanup must not allocate a new metadata Vec on
+        // every send opportunity. The ciphertext needs no plaintext entry.
+        let mut index = 0;
+        let mut absent_count = 0;
+        let mut expired_count = 0;
+        self.entries.retain(|_| {
+            let i = index;
+            index += 1;
+            if !present[i].get() { absent_count += 1; false }
+            else if expired[i].get() { expired_count += 1; false }
+            else { true }
+        });
+        self.absent += absent_count;
+        self.expired += expired_count;
+    }
+
+    /// Relative one-shot obligation in the host QPC domain. Freshness includes
+    /// the exact 60-ms boundary, so cleanup becomes due one 100-ns tick later.
+    /// The caller pairs this QPC observation with its local Instant; no raw
+    /// QPC/Instant values are compared and no periodic media tick is created.
+    pub fn next_expiry_wait(&self, now_qpc: u64) -> Option<Duration> {
+        self.entries.iter().filter_map(|entry| {
+            if !matches!(classify(now_qpc, entry.source_qpc), AgeDecision::Fresh { .. }) {
+                return Some(Duration::ZERO);
+            }
+            entry.source_qpc.checked_add(MAX_SOURCE_AGE_100NS)?
+                .checked_add(1)
+                .map(|expiry| Duration::from_nanos(expiry.saturating_sub(now_qpc) * 100))
+        }).min()
     }
     pub fn len(&self) -> usize { self.entries.len() }
     pub fn clear(&mut self) { self.entries.clear(); }

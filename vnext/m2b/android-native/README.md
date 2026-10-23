@@ -90,8 +90,12 @@ and reports drift correction (ppm), true underrun events, and rebuffer events.
 After a true underrun, it resets correction and re-primes; no retroactive
 rewrite of audio that has already played.
 
-**Native renderer ABI is now v2.** New Rust receiver requires
-`df_audio_abi_version() == 2` before accessing the extended statistics.
+**Native renderer ABI is now v5.** New Rust receiver requires
+`df_audio_abi_version() == 5` before accessing the library. PCM publication
+uses `df_audio_push_guarded_v5` with the exact authenticated recovery ticket;
+autonomous recovery blocks publication until a fresh anchor authorizes that
+ticket. Lossy callback snapshots are diagnostic only. The v1/v2/v3 statistics
+layouts, v4 snapshot layout and historical entry points remain unchanged.
 Redeploy BOTH the native `libdeskfuse_android_audio.so` and Android
 `deskfuse-vnext-continuous` executable together; an old shared library is
 deliberately rejected before its statistics can be read with a mismatched

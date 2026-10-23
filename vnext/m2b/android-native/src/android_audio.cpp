@@ -86,7 +86,7 @@ public:
 #else
 #define DF_EXPORT extern "C"
 #endif
-DF_EXPORT uint32_t df_audio_abi_version() noexcept { return 4; }
+DF_EXPORT uint32_t df_audio_abi_version() noexcept { return 5; }
 
 DF_EXPORT int32_t df_audio_open(void** out) noexcept {
     if (!out) return -1;
@@ -136,6 +136,18 @@ DF_EXPORT int32_t df_audio_push_v4(
     return static_cast<int32_t>(static_cast<Renderer*>(ctx)->core.publish(
         pcm, frames, {source, epoch, stream, format, connection, 0,
                        static_cast<uint8_t>(kind)}));
+}
+// ABI compatibility: old publication methods are retained; the new receiver
+// authorizes each block against a specific completed recovery. Record layouts
+// and historical entry points remain unchanged.
+DF_EXPORT int32_t df_audio_push_guarded_v5(
+    void* ctx, const int16_t* pcm, uint32_t frames, uint64_t source,
+    uint32_t epoch, uint32_t stream, uint32_t format,
+    uint32_t connection, uint32_t kind, uint64_t authorized_recovery) noexcept {
+    if (!ctx || kind > 1) return -2;
+    return static_cast<int32_t>(static_cast<Renderer*>(ctx)->core.publish_guarded(
+        pcm, frames, {source, epoch, stream, format, connection, 0,
+                      static_cast<uint8_t>(kind)}, authorized_recovery));
 }
 // ABI compatibility: old publication methods are retained; the new receiver
 // uses only push_v4. Both old forms refer to one isolated stream/context.

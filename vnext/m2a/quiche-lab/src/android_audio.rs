@@ -74,11 +74,11 @@ pub enum Admission {
     Discontinuity,
     Stale,
 }
-pub fn validate_abi_v4(actual: u32) -> Result<(), String> {
-    if actual == 4 { Ok(()) }
+pub fn validate_abi_v5(actual: u32) -> Result<(), String> {
+    if actual == 5 { Ok(()) }
     else {
         Err(format!(
-            "AAudio ABI mismatch expected v4, got v{actual}: redeploy both Android binaries"
+            "AAudio ABI mismatch expected v5, got v{actual}: redeploy both Android binaries"
         ))
     }
 }
@@ -88,10 +88,10 @@ mod abi_tests {
     use super::*;
     #[test]
     fn reject_mismatched_library_versions_before_struct_io() {
-        for version in [0, 1, 2, 3, 5, u32::MAX] {
-            assert!(validate_abi_v4(version).is_err());
+        for version in [0, 1, 2, 3, 4, 6, u32::MAX] {
+            assert!(validate_abi_v5(version).is_err());
         }
-        assert!(validate_abi_v4(4).is_ok());
+        assert!(validate_abi_v5(5).is_ok());
     }
     #[test]
     fn historical_struct_prefixes_and_new_coherent_record_size_remain_exact() {
@@ -118,8 +118,8 @@ mod native {
     type Open=unsafe extern "C" fn(*mut *mut c_void)->i32;
     type Close=unsafe extern "C" fn(*mut c_void);
     type Modes=unsafe extern "C" fn(*mut c_void,u32)->i32;
-    type PushV4=unsafe extern "C" fn(
-        *mut c_void,*const i16,u32,u64,u32,u32,u32,u32,u32)->i32;
+    type PushV5=unsafe extern "C" fn(
+        *mut c_void,*const i16,u32,u64,u32,u32,u32,u32,u32,u64)->i32;
     type Stats=unsafe extern "C" fn(*mut c_void,*mut AudioStats)->i32;
     type IdentityStats=unsafe extern "C" fn(*mut c_void,*mut RenderIdentity)->i32;
     type Request=unsafe extern "C" fn(*mut c_void)->u64;
@@ -129,7 +129,7 @@ mod native {
 
     pub struct Renderer {
         library:*mut c_void, ctx:*mut c_void,
-        push:PushV4, stats:Stats, identity_stats:IdentityStats,
+        push:PushV5, stats:Stats, identity_stats:IdentityStats,
         modes:Modes, close:Close, request:Request, applied:Applied,
         snapshot:Snapshot,
     }
@@ -150,7 +150,7 @@ mod native {
                 Err(e)=>{unsafe{dlclose(library)};return Err(e);}
             };
             let actual=unsafe{abi()};
-            if let Err(error)=super::validate_abi_v4(actual) {
+            if let Err(error)=super::validate_abi_v5(actual) {
                 unsafe{dlclose(library)};
                 return Err(error);
             }
@@ -158,7 +158,7 @@ mod native {
                 sym(b"df_audio_open\0")?,
                 sym(b"df_audio_close\0")?,
                 sym(b"df_audio_set_diagnostic_modes\0")?,
-                sym(b"df_audio_push_v4\0")?,
+                sym(b"df_audio_push_guarded_v5\0")?,
                 sym(b"df_audio_stats_v2\0")?,
                 sym(b"df_audio_identity_stats_v3\0")?,
                 sym(b"df_audio_request_recovery_v4\0")?,
@@ -196,7 +196,7 @@ mod native {
         }
         pub fn push_media(
             &mut self,bytes:&[u8],source:u64,epoch:u32,stream:u32,
-            format:u32,connection:u32,concealed:bool
+            format:u32,connection:u32,concealed:bool,authorized_recovery:u64
         )->Result<Admission,String>{
             if bytes.len()!=960 {return Err("expected 240-frame PCM16 block".into());}
             let mut pcm=[0i16;480];
@@ -204,7 +204,7 @@ mod native {
                 *v=i16::from_le_bytes([bytes[2*i],bytes[2*i+1]]);
             }
             let code=unsafe{(self.push)(self.ctx,pcm.as_ptr(),240,source,epoch,
-                stream,format,connection,u32::from(concealed))};
+                stream,format,connection,u32::from(concealed),authorized_recovery)};
             match code {
                 0=>Ok(Admission::Accepted),
                 1=>Ok(Admission::Overflow),
@@ -252,7 +252,7 @@ impl AndroidAudio{
     }
     pub fn push_media(&mut self,_bytes:&[u8],_source:u64,_epoch:u32,
                       _stream:u32,_format:u32,_connection:u32,
-                      _concealed:bool)->Result<Admission,String>{
+                      _concealed:bool,_authorized_recovery:u64)->Result<Admission,String>{
         Err("Android AAudio required".into())
     }
     pub fn request_recovery(&mut self)->u64{0}

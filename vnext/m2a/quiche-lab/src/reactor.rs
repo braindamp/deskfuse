@@ -51,32 +51,46 @@ impl Egress {
         self.service_with_hook(socket, conn, writable, |_| Ok(()))
     }
 
-    /// The hook runs IMMEDIATELY before *every* quiche::Connection::send()
-    /// construction attempt. For PCM, it purges expired queued plaintext using
-    /// quiche's supported dgram_purge_outgoing. It is never called while
-    /// ciphertext is occupying the one sealed slot; subsequent code cannot
-    /// construct another packet behind blocked/sealed ciphertext.
+    /// Run owner maintenance on service entry, INCLUDING while a sealed slot
+    /// is paced/blocked, and immediately before every packet construction.
+    /// Plaintext may be reconciled/purged without constructing or modifying
+    /// the already-sealed packet. No conn.send runs behind that packet.
     pub fn service_with_hook(
         &mut self,
         socket: &UdpSocket,
         conn: &mut quiche::Connection,
         writable: bool,
-        mut before_construct: impl FnMut(&mut quiche::Connection)
+        before_construct: impl FnMut(&mut quiche::Connection)
             -> Result<(), Box<dyn std::error::Error>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        self.service_with_io(socket.local_addr()?, conn, writable,
+                             before_construct, |bytes, to| socket.send_to(bytes, to))
+    }
+
+    /// Same reactor path with an explicit nonblocking datagram sender. The
+    /// socket adapter above and deterministic WouldBlock tests share packet
+    /// construction, maintenance and immutable sealed-slot ownership.
+    pub fn service_with_io(
+        &mut self, local: SocketAddr, conn: &mut quiche::Connection,
+        writable: bool,
+        mut maintain: impl FnMut(&mut quiche::Connection)
+            -> Result<(), Box<dyn std::error::Error>>,
+        mut send: impl FnMut(&[u8], SocketAddr) -> io::Result<usize>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        maintain(conn)?;
         if self.blocked && !writable {
             return Ok(());
         }
         for _ in 0..MAX_BURST {
             if self.pending.is_none() {
-                before_construct(conn)?;
+                maintain(conn)?;
                 let mut buf = [0u8; MAX_QUIC_UDP_BYTES];
                 let (len, info) = match conn.send(&mut buf) {
                     Ok(packet) => packet,
                     Err(quiche::Error::Done) => return Ok(()),
                     Err(e) => return Err(format!("QUIC egress send: {e:?}").into()),
                 };
-                if info.from != socket.local_addr()? {
+                if info.from != local {
                     return Err("QUIC send address does not match the local UDP socket".into());
                 }
                 if len == 0 || len > MAX_QUIC_UDP_BYTES {
@@ -86,7 +100,7 @@ impl Egress {
                 self.blocked = false;
             }
 
-            if !self.flush_owned_slot(|bytes, to| socket.send_to(bytes, to))? {
+            if !self.flush_owned_slot(&mut send)? {
                 return Ok(()); // paced or blocked; same exact sealed bytes retained
             }
         }
@@ -136,11 +150,13 @@ mod ciphertext_slot_tests {
         e.pending=Some(Pending{bytes:sealed.clone(),to:remote,at:Instant::now()});
         e.blocked=true;
         let mut hooks=0;
-        for _ in 0..5 {
+        let constructed = conn.stats().sent;
+        for attempt in 0..5 {
             e.service_with_hook(&udp,&mut conn,false, |_|{
                 hooks+=1;Ok(())
             }).unwrap();
-            assert_eq!(hooks,0,"no conn.send behind occupied sealed slot");
+            assert_eq!(hooks,1 + attempt,"maintenance runs behind occupied sealed slot");
+            assert_eq!(conn.stats().sent,constructed,"no conn.send behind occupied sealed slot");
             assert_eq!(e.pending.as_ref().unwrap().bytes,sealed);
         }
         e.service_with_hook(&udp,&mut conn,true, |_|{
