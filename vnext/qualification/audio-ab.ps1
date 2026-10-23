@@ -13,6 +13,7 @@ param(
     [ValidateRange(1,5)][int]$Rating=3,
     [ValidateSet('heard','not-heard','uncertain')][string]$Heard='uncertain',
     [string]$Notes='',
+    [string]$RunFolder='',
     [string]$LabRoot='D:\Coding\DeskFuse\vnext-wp001',
     [string]$ABRoot='D:\DeskFuseLocalData\cp001\audio-ab',
     [string]$KeysDir='D:\DeskFuseLocalKeys\m2a-physical-lab',
@@ -328,9 +329,17 @@ function Report {
 function Rate {
     $runsPath=Join-Path $ABRoot 'runs'
     if (-not (Test-Path -LiteralPath $runsPath -PathType Container)) { throw 'No audible A/B sessions exist' }
-    $folders=@(Get-ChildItem -LiteralPath $runsPath -Directory | Sort-Object LastWriteTimeUtc -Descending)
-    if ($folders.Count -eq 0) { throw 'No A/B sessions exist' }
-    $latest=$folders[0].FullName
+    if ($RunFolder) {
+        $base=(Resolve-Path -LiteralPath $runsPath).Path.TrimEnd('\')
+        $latest=(Resolve-Path -LiteralPath $RunFolder).Path
+        if (-not $latest.StartsWith($base + '\',[StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Listening evidence folder must be inside the A/B runs directory'
+        }
+    } else {
+        $folders=@(Get-ChildItem -LiteralPath $runsPath -Directory | Sort-Object LastWriteTimeUtc -Descending)
+        if ($folders.Count -eq 0) { throw 'No A/B sessions exist' }
+        $latest=$folders[0].FullName
+    }
     $runPath=Join-Path $latest 'run.json'
     if (-not (Test-Path -LiteralPath $runPath -PathType Leaf)) { throw 'Latest session has no run manifest' }
     $record=Get-Content -LiteralPath $runPath -Raw | ConvertFrom-Json
@@ -353,6 +362,7 @@ function Status {
         else { Write-Host "$slot : $($p.commit) / $($p.mode)" }
     }
 }
+if ($Strict -and $Action -ne 'Run') { throw '-Strict applies only to -Action Run with audible candidate receiver' }
 switch ($Action) {
     'Status' { Status }
     'Firewall' {
