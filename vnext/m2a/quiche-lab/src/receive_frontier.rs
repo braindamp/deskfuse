@@ -48,6 +48,15 @@ impl ReceiveFrontier {
         self.next_frame=first_frame+frames;
         Ok(decision)
     }
+    /// Called only after a matching, authenticated Windows fresh-capture
+    /// nonce response. Advance the irrecoverable floor to that NEW source
+    /// observation. Never decrease it, even across AAudio re-prime.
+    pub fn accept_fresh_anchor(&mut self, frame:u64)->Result<(),Reject>{
+        if frame<self.next_frame{return Err(Reject::Overlapping);}
+        if self.context.is_none(){return Err(Reject::RetiredContext);}
+        self.next_frame=frame;
+        Ok(())
+    }
     pub fn floor(&self)->u64{self.next_frame}
     pub fn last_sequence(&self)->Option<u32>{self.last_sequence}
 }
@@ -72,5 +81,10 @@ mod tests {
         assert_eq!(f.floor(),49440);
         assert_eq!(f.ingest(a,16,49440,240).unwrap().missing_frames,0);
         assert_eq!(f.last_sequence(),Some(16));
+        assert_eq!(f.accept_fresh_anchor(60000),Ok(()));
+        assert_eq!(f.floor(),60000);
+        assert_eq!(f.accept_fresh_anchor(59999),Err(Reject::Overlapping));
+        assert_eq!(f.ingest(a,17,60000,240).unwrap().missing_frames,0);
+        assert_eq!(f.ingest(a,18,59000,240),Err(Reject::Overlapping));
     }
 }
