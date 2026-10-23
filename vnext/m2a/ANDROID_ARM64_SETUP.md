@@ -62,9 +62,13 @@ if (-not (Test-Path "$env:ANDROID_NDK_HOME\source.properties")) {
 # cargo-ndk is a build-time tool, not an Android app or phone package.
 cargo install cargo-ndk --locked
 
+# IMPORTANT cargo-ndk 4.1.x: -P is the Android platform, -p selects a Cargo package.
+# Run the next command FROM vnext/m2a/quiche-lab, where Cargo.toml lives.
+cd 'D:\\Coding\\DeskFuse\\vnext-wp001\\vnext\\m2a\\quiche-lab'
+
 # API 35 is compatible with the tested Android API 36 phone.
 # First cross-build compiles BoringSSL for ARM64 and may take longer.
-cargo ndk -t arm64-v8a -p 35 -- build --manifest-path vnext/m2a/quiche-lab/Cargo.toml --bin android-arm64-smoke
+cargo ndk -t arm64-v8a -P 35 build --bin android-arm64-smoke
 ```
 
 **Only after the build succeeds**, run these direct USB ADB commands (single executable; no APK, no install):
