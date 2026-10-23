@@ -459,6 +459,45 @@ impl PlayModes {
     }
 }
 
+struct PendingAnchor {
+    challenge: AnchorMessage,
+    recovery_ticket: u64,
+    started: Instant,
+    retry_at: Instant,
+    confirmed: Option<u64>,
+}
+
+fn begin_fresh_anchor(
+    pending: &mut Option<PendingAnchor>,
+    next_nonce: &mut u64,
+    renderer: &mut AndroidAudio,
+    context: SourceContext,
+    rejection_frontier: u64,
+) -> Result<()> {
+    if pending.is_none() {
+        let nonce = *next_nonce;
+        *next_nonce = next_nonce.checked_add(1)
+            .ok_or("recovery challenge nonce exhausted")?;
+        if nonce == 0 { return Err("recovery challenge nonce invalid".into()); }
+        let now = Instant::now();
+        *pending = Some(PendingAnchor {
+            challenge: AnchorMessage {
+                kind: fresh_anchor::REQUEST,
+                nonce,
+                frame: rejection_frontier,
+                context,
+            },
+            recovery_ticket: renderer.request_recovery(),
+            started: now,
+            retry_at: now,
+            confirmed: None,
+        });
+        eprintln!("TRACE Android ANCHOR_REQUEST nonce={} floor={}",
+            nonce, rejection_frontier);
+    }
+    Ok(())
+}
+
 fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, synthetic: bool, playback_library: Option<&str>, modes: PlayModes) -> Result<()> {
     let mut cfg = config(ca, cert, key)?;
     let route = UdpSocket::bind("0.0.0.0:0")?;
@@ -483,6 +522,11 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
     let mut native_stale = 0u64;
     let mut denied_reanchor = 0u64;
     let mut ingress_frontier = ReceiveFrontier::default();
+    let mut session_context: Option<SourceContext> = None;
+    let mut anchor_pending: Option<PendingAnchor> = None;
+    let mut fresh_anchor_nonce = 1u64;
+    let mut last_handled_invalidation = 0u64;
+    let mut confirmed_reanchors = 0u64;
     let mut audio: Option<AndroidAudio> = None;
     let mut latest_render_record: Option<(deskfuse_quiche_lab::android_audio::RenderSnapshot, u64)> = None;
     let mut coherent_records_read = 0u64;
@@ -528,10 +572,44 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
             for _ in 0..128 {
                 match conn.dgram_recv(&mut datagram) {
                     Ok(n) => {
+                        if let Some(reply) = AnchorMessage::decode(&datagram[..n]) {
+                            if reply.kind != fresh_anchor::ANCHOR {
+                                return Err("Android rejected unexpected server recovery request".into());
+                            }
+                            if let Some(ref mut pending) = anchor_pending {
+                                if reply.nonce == pending.challenge.nonce &&
+                                    reply.context == pending.challenge.context &&
+                                    reply.frame >= pending.challenge.frame {
+                                    pending.confirmed = Some(reply.frame);
+                                    eprintln!("TRACE Android ANCHOR_CONFIRMED nonce={} source={}",
+                                        reply.nonce, reply.frame);
+                                } // retired challenge responses are never fresh.
+                            }
+                            continue;
+                        }
                         let (h, _) = parse(&datagram[..n], &Configuration::default())
                             .map_err(|e| format!("Android rejected PCM header: {e:?}"))?;
                         if n != APP_BYTES || (synthetic && datagram[..n] != packet(h.packet_sequence)) {
                             return Err("Android rejected PCM source-frame or synthetic payload identity".into());
+                        }
+                        if let Some(ref pending) = anchor_pending {
+                            let fresh = pending.confirmed.is_some_and(|anchor| {
+                                h.first_source_frame >= anchor &&
+                                (SourceContext {
+                                    epoch:h.media_epoch, stream:h.source_stream_id,
+                                    format:h.format_config_id,
+                                }) == pending.challenge.context
+                            });
+                            let applied = audio.as_ref().is_some_and(|speaker|
+                                speaker.recovery_applied() >= pending.recovery_ticket);
+                            if !fresh || !applied {
+                                // No old or merely future-looking packet
+                                // becomes fresh without a matching server
+                                // post-request capture anchor.
+                                continue;
+                            }
+                            anchor_pending = None;
+                            confirmed_reanchors += 1;
                         }
                         // QUIC peer authentication alone does not revive a
                         // retired stream epoch or a previously committed
@@ -557,6 +635,10 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                             Err(SourceReject::Overflow) =>
                                 return Err("authenticated source-frame range overflow".into()),
                         };
+                        session_context.get_or_insert(SourceContext {
+                            epoch:h.media_epoch, stream:h.source_stream_id,
+                            format:h.format_config_id,
+                        });
                         gaps += accepted.missing_sequences;
                         source_gap_frames += accepted.missing_frames;
                         let expected = accepted.expected_source;
@@ -588,7 +670,16 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                                                     complete_concealment = false;
                                                     source_unconcealed_frames +=
                                                         missing - offset * AUDIO_FRAMES;
-                                                    speaker.request_recovery();
+                                                    begin_fresh_anchor(
+                                                        &mut anchor_pending,
+                                                        &mut fresh_anchor_nonce, speaker,
+                                                        SourceContext {
+                                                            epoch:h.media_epoch,
+                                                            stream:h.source_stream_id,
+                                                            format:h.format_config_id,
+                                                        },
+                                                        ingress_frontier.floor(),
+                                                    )?;
                                                     recover_started += 1;
                                                     break;
                                                 }
@@ -610,7 +701,16 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                                         // Account for it; later renderer generation and
                                         // drift recovery will handle this explicitly.
                                         source_unconcealed_frames += missing;
-                                        speaker.request_recovery();
+                                        begin_fresh_anchor(
+                                            &mut anchor_pending, &mut fresh_anchor_nonce,
+                                            speaker,
+                                            SourceContext {
+                                                epoch:h.media_epoch,
+                                                stream:h.source_stream_id,
+                                                format:h.format_config_id,
+                                            },
+                                            ingress_frontier.floor(),
+                                        )?;
                                         recover_started += 1;
                                         // The current packet establishes a
                                         // forward AUTHENTICATED source cursor,
@@ -637,15 +737,31 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                                 h.format_config_id, 1, false)
                                 .map_err(|e| format!("Android audio renderer: {e}"))? {
                                 Admission::Accepted => {}
-                                Admission::Overflow => {
+                                Admission::Overflow |
+                                Admission::Discontinuity => {
                                     audio_queue_full += 1;
                                     recover_started += 1;
+                                    begin_fresh_anchor(
+                                        &mut anchor_pending, &mut fresh_anchor_nonce,
+                                        speaker,
+                                        SourceContext {
+                                            epoch:h.media_epoch, stream:h.source_stream_id,
+                                            format:h.format_config_id,
+                                        },
+                                        ingress_frontier.floor(),
+                                    )?;
                                 }
                                 Admission::RecoverPending => {
                                     recover_pending += 1;
-                                }
-                                Admission::Discontinuity => {
-                                    recover_started += 1;
+                                    begin_fresh_anchor(
+                                        &mut anchor_pending, &mut fresh_anchor_nonce,
+                                        speaker,
+                                        SourceContext {
+                                            epoch:h.media_epoch, stream:h.source_stream_id,
+                                            format:h.format_config_id,
+                                        },
+                                        ingress_frontier.floor(),
+                                    )?;
                                 }
                                 Admission::Stale => { native_stale += 1; }
                             }
