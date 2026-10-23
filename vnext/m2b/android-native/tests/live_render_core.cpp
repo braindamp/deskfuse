@@ -139,11 +139,8 @@ int main() {
         expect(core.publish(sample.data(),240,tag(48100))==Admission::Stale,
                "late packet after underrun rejected");
         // Callback-induced recovery has new playout identity; re-anchor.
-        expect(core.publish(sample.data(),240,tag(50000))==Admission::Discontinuity,
-               "native callback recovery requests producer identity reset");
-        core.render(out.data(),96,{false,false});
         expect(core.publish(sample.data(),240,tag(50000))==Admission::Accepted,
-               "fresh forward source anchor");
+               "fresh forward source anchor after callback-owned generation reset");
     }
     {   // Concurrent producer and callback, with a third off-callback
         // telemetry reader. All mailbox slots use CAS ownership, not
