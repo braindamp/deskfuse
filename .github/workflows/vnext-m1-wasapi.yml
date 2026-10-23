@@ -28,6 +28,9 @@ jobs:
       - name: Assert local physical-run evidence evaluator fails closed
         shell: pwsh
         run: python vnext/qualification/test_evaluate_physical_audio.py
+      - name: Compare reference and candidate audible A/B logs without false acoustic claims
+        shell: pwsh
+        run: python vnext/qualification/test_analyze_audio_ab.py
       - name: Qualify exact native WASAPI packet/QPC pairing report offline
         shell: pwsh
         run: python vnext/qualification/test_analyze_wasapi_qpc_pairs.py
