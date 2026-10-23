@@ -15,7 +15,8 @@ must not be modified.
 ## Installed tools
 
 - Android SDK: `D:\Android\Sdk` (platform API 35)
-- Android NDK: `D:\Android\Sdk\ndk\30.0.16248370`
+- Android NDK: `D:\Android\Sdk
+dk\30.0.16248370`
 - `rustup target add aarch64-linux-android`
 - Rust Windows MSVC, `cargo-ndk`, Visual Studio 2022 developer PowerShell,
   CMake, Ninja, LLVM/libclang, NASM
@@ -57,7 +58,8 @@ git pull --ff-only origin feature/vnext-wp001-native-lab
 cd 'vnext\m2a\quiche-lab'
 
 $env:ANDROID_SDK_ROOT = 'D:\Android\Sdk'
-$env:ANDROID_NDK_HOME = 'D:\Android\Sdk\ndk\30.0.16248370'
+$env:ANDROID_NDK_HOME = 'D:\Android\Sdk
+dk\30.0.16248370'
 
 # IMPORTANT: Build-script target-specific overrides, not global CMake settings.
 $env:CMAKE_TOOLCHAIN_FILE_aarch64_linux_android = (
@@ -122,7 +124,13 @@ PASS DeskFuse vNext target=android arch=aarch64 real-quiche-config=true audio-fr
 NO NETWORKING: smoke test only; no QUIC peer authentication or Android playback.
 ```
 
-If the device reports a missing `std::__ndk1::__libcpp_verbose_abort` symbol,\nthe matching NDK `libc++_shared.so` is probably not available to the\nstandalone executable. The above push and one-command `LD_LIBRARY_PATH`\nfix are necessary because there is no APK/Gradle step to package it.\nDo not replace any system libraries on the phone.\n\nThis only verifies the executable and linked quiche config run on the phone,
+If the device reports a missing `std::__ndk1::__libcpp_verbose_abort` symbol,
+the matching NDK `libc++_shared.so` is probably not available to the
+standalone executable. The above push and one-command `LD_LIBRARY_PATH`
+fix are necessary because there is no APK/Gradle step to package it.
+Do not replace any system libraries on the phone.
+
+This only verifies the executable and linked quiche config run on the phone,
 plus the PCM wire-format roundtrip. It is *not* proof of QUIC connectivity,
 mutual endpoint authentication, time sync, Wi-Fi latency, or native audio.
 It opens no UDP socket and installs no APK.
