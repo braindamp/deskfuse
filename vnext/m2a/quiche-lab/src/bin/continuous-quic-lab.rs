@@ -260,9 +260,9 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                             next_capture_frame = chunk.device_frame.checked_add(chunk.frames as u64);
                             if ingress_chunks<=3 || ingress_chunks%512==0 {
                                 eprintln!(
-                                    "TRACE Windows SOURCE_INGRESS ordinal={} frame={} frames={} flags={} qpc100={}",
+                                    "TRACE Windows SOURCE_INGRESS ordinal={} frame={} frames={} flags={} qpc100={} original_packet_offset_frames={}",
                                     ingress_chunks,chunk.device_frame,chunk.frames,
-                                    chunk.flags,chunk.qpc_100ns
+                                    chunk.flags,chunk.qpc_100ns,chunk.original_packet_offset_frames
                                 );
                             }
                             if wasapi_pipe::queue_too_old(&chunk) {
@@ -282,7 +282,10 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                             // is not a source-age bound. Fail closed on QPC
                             // timestamp errors or excessive age.
                             let qpc_now = source_age::local_qpc_100ns()?;
-                            let age = source_age::classify(qpc_now, chunk.qpc_100ns);
+                            let age = source_age::classify_wasapi(
+                                qpc_now, chunk.qpc_100ns,
+                                chunk.original_packet_offset_frames
+                            );
                             // Pure diagnostics: an adjacent QPC pair may span
                             // a single GetBuffer packet. Match with the native
                             // original-packet CSV by first_device_frame before
@@ -357,15 +360,16 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                                 assembled_blocks += 1;
                                 if assembled_blocks<=3 || assembled_blocks%512==0 {
                                     eprintln!(
-                                        "TRACE Windows ASSEMBLED_PCM ordinal={} frame={} frames={} source_qpc100={}",
+                                        "TRACE Windows ASSEMBLED_PCM ordinal={} frame={} frames={} source_qpc100={} original_packet_offset_frames={}",
                                         assembled_blocks,block.first_device_frame,AUDIO_FRAMES,
-                                        block.first_qpc_100ns
+                                        block.first_qpc_100ns,block.original_packet_offset_frames
                                     );
                                 }
                                 let assembled_now_qpc=source_age::local_qpc_100ns()?;
-                                match source_age::classify(
+                                match source_age::classify_wasapi(
                                     assembled_now_qpc,
                                     block.first_qpc_100ns,
+                                    block.original_packet_offset_frames,
                                 ) {
                                     AgeDecision::Fresh { age_100ns } => {
                                         max_observed_source_age_100ns =
@@ -458,8 +462,9 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                                 // stall: this original QPC check is the last
                                 // admission opportunity before queuing.
                                 let offer_qpc_now=source_age::local_qpc_100ns()?;
-                                let offer_age=source_age::classify(
-                                    offer_qpc_now,block.first_qpc_100ns
+                                let offer_age=source_age::classify_wasapi(
+                                    offer_qpc_now,block.first_qpc_100ns,
+                                    block.original_packet_offset_frames
                                 );
                                 if !matches!(offer_age,AgeDecision::Fresh { .. }) {
                                     expired_source_qpc += 1;
@@ -474,8 +479,10 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                                     continue;
                                 }
                                 let admit_now_qpc = source_age::local_qpc_100ns()?;
-                                match outstanding.admit(c, &pcm, block.first_qpc_100ns,
-                                                        admit_now_qpc) {
+                                match outstanding.admit(
+                                    c, &pcm, block.first_qpc_100ns,
+                                    block.original_packet_offset_frames, admit_now_qpc
+                                ) {
                                     Ok(QueueAdmission::Queued) => {
                                         offered += 1;
                                         if offered<=3 || offered%512==0 {
@@ -492,7 +499,8 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                                         if expired_source_qpc<=8 || expired_source_qpc%128==0 {
                                             eprintln!(
                                                 "TRACE Windows SOURCE_FILTER_DROP stage=quiche_admit_expired reason={:?} sequence={} frame={} frames={} source_qpc100={} now_qpc100={} count={}",
-                                                source_age::classify(admit_now_qpc,block.first_qpc_100ns),
+                                                source_age::classify_wasapi(admit_now_qpc,block.first_qpc_100ns,
+                                                    block.original_packet_offset_frames),
                                                 assigned_sequence,block.first_device_frame,
                                                 AUDIO_FRAMES,block.first_qpc_100ns,
                                                 admit_now_qpc,expired_source_qpc
