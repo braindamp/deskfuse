@@ -27,6 +27,40 @@ pub fn classify(now_100ns: u64, source_100ns: u64) -> AgeDecision {
     if age > MAX_SOURCE_AGE_100NS { AgeDecision::Expired }
     else { AgeDecision::Fresh { age_100ns: age } }
 }
+/// Qualify already-delivered WASAPI loopback PCM using the original
+/// GetBuffer packet's first-frame QPC when its native 240-frame splitting
+/// advances a *derived* timestamp beyond the normal future-skew cutoff.
+///
+/// Only the second 5ms fragment of a real original packet may use the
+/// exception. The original first-frame QPC must still satisfy the exact
+/// existing 10ms future bound. The fragment's own timestamp still controls
+/// the unchanged 60ms stale-source bound. No normalization, waiting,
+/// synthetic pacing or expanded packet queue is permitted.
+pub fn classify_wasapi(
+    now_100ns: u64, source_100ns: u64, original_offset_frames: u32
+) -> AgeDecision {
+    let ordinary = classify(now_100ns, source_100ns);
+    if ordinary != AgeDecision::FutureTimestamp {
+        return ordinary; // In particular, never relax Missing or Expired.
+    }
+    if original_offset_frames == 0 || original_offset_frames > 240 {
+        return ordinary;
+    }
+    let offset_100ns = u64::from(original_offset_frames) * 10_000_000 / 48_000;
+    let Some(original_first_qpc) = source_100ns.checked_sub(offset_100ns) else {
+        return AgeDecision::MissingTimestamp;
+    };
+    // A fragment is eligible only if the FIRST frame of the same original
+    // packet would have passed the unmodified QPC classifier at this moment.
+    // Thus the largest newly eligible lead is 15ms, not an unlimited future.
+    if matches!(classify(now_100ns, original_first_qpc),
+                AgeDecision::Fresh { .. }) {
+        AgeDecision::Fresh { age_100ns: 0 }
+    } else {
+        ordinary
+    }
+}
+
 pub fn max_source_age() -> Duration {
     Duration::from_nanos(MAX_SOURCE_AGE_100NS * 100)
 }
@@ -95,6 +129,34 @@ mod tests {
         assert_eq!(classify(now, now - MAX_SOURCE_AGE_100NS - 1),
                    AgeDecision::Expired);
         assert_eq!(classify(now, 0), AgeDecision::MissingTimestamp);
+    }
+    #[test]
+    fn original_getbuffer_240_frame_halves_pass_without_erasing_source_time() {
+        let now = 2_000_000u64;
+        let first = now + 95_650;
+        let second = first + 50_000;
+        assert_eq!(classify_wasapi(now, first, 0),
+                   AgeDecision::Fresh { age_100ns: 0 });
+        assert_eq!(classify(now, second), AgeDecision::FutureTimestamp);
+        assert_eq!(classify_wasapi(now, second, 240),
+                   AgeDecision::Fresh { age_100ns: 0 });
+        // The same timestamp without verified native packet membership
+        // still fails closed; this is not a blanket 15ms skew increase.
+        assert_eq!(classify_wasapi(now, second, 0), AgeDecision::FutureTimestamp);
+        assert_eq!(classify_wasapi(now, second, 480), AgeDecision::FutureTimestamp);
+        // A first packet timestamp that is truly too far ahead cannot
+        // bootstrap the exception for its later 5ms fragment.
+        assert_eq!(classify_wasapi(now, now + 165_000, 240),
+                   AgeDecision::FutureTimestamp);
+        assert_eq!(classify_wasapi(now, now + 150_001, 240),
+                   AgeDecision::FutureTimestamp);
+        // Past-age protection applies to the actual first PCM frame.
+        assert_eq!(classify_wasapi(now, now - 600_001, 240),
+                   AgeDecision::Expired);
+        assert_eq!(classify_wasapi(now, 0, 240),
+                   AgeDecision::MissingTimestamp);
+        assert_eq!(classify_wasapi(now, 1, 240),
+                   AgeDecision::Expired); // old audio is never accepted.
     }
     #[test]
     fn no_silent_wraparound() {
