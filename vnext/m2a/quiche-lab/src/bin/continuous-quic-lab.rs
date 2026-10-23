@@ -334,7 +334,36 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
     }
 }
 
-fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, synthetic: bool, playback_library: Option<&str>) -> Result<()> {
+#[derive(Copy, Clone)]
+struct PlayModes {
+    fades: bool,
+    conceal: bool,
+    linear: bool,
+}
+impl Default for PlayModes {
+    fn default() -> Self {
+        Self { fades: true, conceal: true, linear: true }
+    }
+}
+impl PlayModes {
+    // Exact, deliberately boring mode specification: f1c0r1
+    // f: fade; c: short-gap concealment; r: linear resampling comparator.
+    fn parse(flags: &str) -> Result<Self> {
+        let x = flags.as_bytes();
+        if x.len() != 6 || x[0] != b'f' || x[2] != b'c' || x[4] != b'r'
+           || ![x[1], x[3], x[5]].iter().all(|b| *b == b'0' || *b == b'1')
+        {
+            return Err("diagnostic modes must be exactly f0c0r0 .. f1c1r1".into());
+        }
+        Ok(Self {
+            fades: x[1] == b'1',
+            conceal: x[3] == b'1',
+            linear: x[5] == b'1',
+        })
+    }
+}
+
+fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, synthetic: bool, playback_library: Option<&str>, modes: PlayModes) -> Result<()> {
     let mut cfg = config(ca, cert, key)?;
     let route = UdpSocket::bind("0.0.0.0:0")?;
     route.connect(remote)?;
@@ -384,9 +413,13 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
             authenticated_at = Some(Instant::now());
             println!("AUTH Android: verified Windows server CA chain and deskfuse-lab.local");
             if let Some(library) = playback_library {
-                audio = Some(AndroidAudio::open(library)
-                    .map_err(|e| format!("Android speaker renderer initialization failed: {e}"))?);
-                println!("AUDIO Android: native AAudio output started, stereo PCM16 48000 Hz");
+                let mut renderer = AndroidAudio::open(library)
+                    .map_err(|e| format!("Android speaker renderer initialization failed: {e}"))?;
+                renderer.set_diagnostic_modes(modes.fades, modes.linear)
+                    .map_err(|e| format!("Android diagnostic mode configuration failed: {e}"))?;
+                audio = Some(renderer);
+                println!("AUDIO Android: native AAudio output started, stereo PCM16 48000 Hz; modes fades={} concealment={} linear_asrc={}",
+                         modes.fades, modes.conceal, modes.linear);
             }
         }
         if authenticated_at.is_some() {
@@ -412,7 +445,7 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                             source_gap_frames += missing;
                             if missing != 0 {
                                 if let Some(ref mut speaker) = audio {
-                                    if missing <= MAX_CONCEALMENT_FRAMES && missing % AUDIO_FRAMES == 0 {
+                                    if modes.conceal && missing <= MAX_CONCEALMENT_FRAMES && missing % AUDIO_FRAMES == 0 {
                                         // A genuine 5- or 10-ms media hole. Preserve
                                         // output position with bounded zero-valued PCM
                                         // BEFORE the next valid source interval.
@@ -513,19 +546,23 @@ fn run() -> Result<()> {
             server(bind.parse()?, allow_ip.parse()?, ca, cert, key, positive_seconds(secs)?, None)
         }
         [_, mode, remote, ca, cert, key, secs] if mode == "client" => {
-            client(remote.parse()?, ca, cert, key, positive_seconds(secs)?, true, None)
+            client(remote.parse()?, ca, cert, key, positive_seconds(secs)?, true, None, PlayModes::default())
         }
         [_, mode, bind, allow_ip, ca, cert, key, exe, device, secs] if mode == "server-wasapi" => {
             server(bind.parse()?, allow_ip.parse()?, ca, cert, key,
                    positive_seconds(secs)?, Some((exe, device)))
         }
         [_, mode, remote, ca, cert, key, secs] if mode == "client-capture" => {
-            client(remote.parse()?, ca, cert, key, positive_seconds(secs)?, false, None)
+            client(remote.parse()?, ca, cert, key, positive_seconds(secs)?, false, None, PlayModes::default())
         }
         [_, mode, remote, ca, cert, key, library, secs] if mode == "client-playback" => {
-            client(remote.parse()?, ca, cert, key, positive_seconds(secs)?, false, Some(library))
+            client(remote.parse()?, ca, cert, key, positive_seconds(secs)?, false, Some(library), PlayModes::default())
         }
-        _ => Err("usage: continuous-quic-lab server <bind:port> <allowed-ip> <ca> <server-cert> <server-key> <secs> | server-wasapi <bind:port> <allowed-ip> <ca> <server-cert> <server-key> <wasapi-capture.exe> <endpoint-id|default> <secs> | client|client-capture <windows-ip:port> <ca> <client-cert> <client-key> <secs> | client-playback <windows-ip:port> <ca> <client-cert> <client-key> <libdeskfuse_android_audio.so> <secs>".into()),
+        [_, mode, remote, ca, cert, key, library, flags, secs] if mode == "client-playback-modes" => {
+            client(remote.parse()?, ca, cert, key, positive_seconds(secs)?,
+                   false, Some(library), PlayModes::parse(flags)?)
+        }
+        _ => Err("usage: continuous-quic-lab server <bind:port> <allowed-ip> <ca> <server-cert> <server-key> <secs> | server-wasapi <bind:port> <allowed-ip> <ca> <server-cert> <server-key> <wasapi-capture.exe> <endpoint-id|default> <secs> | client|client-capture <windows-ip:port> <ca> <client-cert> <client-key> <secs> | client-playback <windows-ip:port> <ca> <client-cert> <client-key> <libdeskfuse_android_audio.so> <secs> | client-playback-modes <windows-ip:port> <ca> <client-cert> <client-key> <libdeskfuse_android_audio.so> <f1c1r1> <secs>".into()),
     }
 }
 
