@@ -1,0 +1,98 @@
+// Host-only test of the exact queue used by event-driven Windows capture.
+// No WASAPI device, audio endpoint, QUIC, driver, phone or network required.
+#include "../src/spsc_capture_queue.h"
+
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <iostream>
+#include <thread>
+
+struct Packet {
+    uint64_t frame = 0;
+    std::array<uint8_t, 960> pcm{};
+};
+
+using Queue = df_wasapi::SpscCaptureQueue<Packet, 8>;
+
+int main() {
+    // Full means bounded producer drop, not a block or overwritten PCM.
+    {
+        Queue q;
+        for (uint64_t n = 0; n < 8; ++n) {
+            Packet p{};
+            p.frame = n * 240;
+            p.pcm[0] = static_cast<uint8_t>(n);
+            if (!q.try_push(p)) return 1;
+        }
+        Packet extra{};
+        extra.frame = 8 * 240;
+        if (q.try_push(extra) || q.dropped() != 1) return 2;
+        Packet read{};
+        if (!q.pop(read) || read.frame != 0 || read.pcm[0] != 0) return 3;
+        if (!q.try_push(extra)) return 4;
+        q.finish();
+        for (uint64_t n = 1; n <= 8; ++n) {
+            if (!q.pop(read) || read.frame != n * 240 ||
+                read.pcm[0] != static_cast<uint8_t>(n == 8 ? 0 : n)) return 5;
+        }
+        if (q.pop(read)) return 6;
+        if (q.try_push(extra) || q.dropped() != 2) return 7;
+    }
+
+    // Writer sleeping BEFORE first publication must wake correctly.
+    {
+        Queue q;
+        std::atomic<uint64_t> observed{UINT64_MAX};
+        std::thread writer([&] {
+            Packet p{};
+            if (q.pop(p)) observed.store(p.frame);
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        Packet p{};
+        p.frame = 12345;
+        if (!q.try_push(p)) { q.finish(); writer.join(); return 8; }
+        q.finish();
+        writer.join();
+        if (observed.load() != 12345) return 9;
+    }
+
+    // Concurrent wraparound: accepted data remains ordered and unchanged,
+    // even while the producer drops entire packets during writer stalls.
+    {
+        Queue q;
+        std::atomic<bool> valid{true};
+        std::atomic<uint64_t> received{0};
+        std::thread writer([&] {
+            Packet p{};
+            uint64_t previous = 0;
+            bool first = true;
+            while (q.pop(p)) {
+                if ((!first && p.frame <= previous) ||
+                    p.pcm[0] != static_cast<uint8_t>(p.frame & 0xff) ||
+                    p.pcm[959] != static_cast<uint8_t>((p.frame >> 8) & 0xff)) {
+                    valid.store(false);
+                }
+                first = false;
+                previous = p.frame;
+                received.fetch_add(1);
+            }
+        });
+        uint64_t accepted = 0;
+        constexpr uint64_t count = 200000;
+        for (uint64_t n = 0; n < count; ++n) {
+            Packet p{};
+            p.frame = n;
+            p.pcm[0] = static_cast<uint8_t>(n & 0xff);
+            p.pcm[959] = static_cast<uint8_t>((n >> 8) & 0xff);
+            if (q.try_push(p)) ++accepted;
+        }
+        q.finish();
+        writer.join();
+        if (!valid.load() || received.load() != accepted ||
+            accepted + q.dropped() != count) return 10;
+    }
+    std::cout << "PASS: nonblocking capture, FIFO, exact PCM, bounded drops, close/drain, idle wake\n";
+    return 0;
+}
