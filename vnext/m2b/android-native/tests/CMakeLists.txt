@@ -1,0 +1,13 @@
+# Host-side deterministic clock qualification, no Android/AAudio runtime.
+cmake_minimum_required(VERSION 3.24)
+project(DeskFuseClockQualification LANGUAGES CXX)
+enable_testing()
+add_executable(cp001_controller controller_qualification.cpp)
+target_compile_features(cp001_controller PRIVATE cxx_std_20)
+target_include_directories(cp001_controller PRIVATE ../src)
+if(MSVC)
+  target_compile_options(cp001_controller PRIVATE /W4 /WX /permissive-)
+else()
+  target_compile_options(cp001_controller PRIVATE -Wall -Wextra -Werror)
+endif()
+add_test(NAME cp001_controller COMMAND cp001_controller)
