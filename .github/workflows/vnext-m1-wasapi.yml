@@ -39,6 +39,11 @@ jobs:
         run: |
           & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File vnext/qualification/test-invoke-native-audio.ps1
           if ($LASTEXITCODE -ne 0) { throw 'Windows PowerShell 5.1 native stderr or exit-status regression failed' }
+      - name: Exercise A-B switcher with fake Git and playback, no hardware
+        shell: pwsh
+        run: |
+          & pwsh -NoProfile -NonInteractive -File vnext/qualification/test-audio-ab-runner.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'Offline A-B runner behavior regression' }
       - name: Statically parse physical qualification PowerShell (no devices contacted)
         shell: pwsh
         run: |
@@ -49,6 +54,7 @@ jobs:
             'vnext/qualification/mark-audio-event.ps1',
             'vnext/qualification/build-audio-pair.ps1',
             'vnext/qualification/audio-ab.ps1',
+            'vnext/qualification/test-audio-ab-runner.ps1',
             'vnext/qualification/invoke-native-audio.ps1',
             'vnext/qualification/test-invoke-native-audio.ps1'
           )) {
