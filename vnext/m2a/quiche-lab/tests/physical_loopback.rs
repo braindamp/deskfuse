@@ -41,7 +41,7 @@ fn physical_lab_mutual_tls_and_windows_origin_pcm_roundtrip() -> common::LabResu
         .output();
 
     // If the client exits early, don't leave the server listening 30 seconds.
-    if client_result.as_ref().is_err_or(|v| !v.status.success()) {
+    if client_result.as_ref().map_or(true, |v| !v.status.success()) {
         let _ = server.kill();
     }
     let server_output = server.wait_with_output()?;
