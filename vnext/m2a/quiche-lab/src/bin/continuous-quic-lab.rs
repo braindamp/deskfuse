@@ -161,7 +161,10 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
             // QUIC and this kernel socket have exactly one egress owner.
             egress.service(&udp, c, false)?;
             if let Some(start) = origin {
-                if start.elapsed() >= run_for {
+                // Stop source production at run_for, but leave the authenticated
+                // QUIC socket open long enough for final sealed packets and
+                // receiver ACK/control work; this is NOT new PCM pacing.
+                if start.elapsed() >= run_for + Duration::from_secs(3) {
                     let stats = c.stats();
                     println!(
                         "DONE Windows source duration={}s offered={} quiche_queue_full={} skipped_source={} udp_packets={} udp_would_block={} quic_dgram_sent={} quic_lost={}",
