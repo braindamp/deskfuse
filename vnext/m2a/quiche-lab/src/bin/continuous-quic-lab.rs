@@ -181,8 +181,19 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                                 if c.dgram_max_writable_len().unwrap_or(0) < pcm.len() {
                                     return Err("QUIC DATAGRAM cannot fit 1000-byte captured PCM".into());
                                 }
+                                // The 240-frame WASAPI blocks can be delivered
+                                // in an OS-callback burst. Service QUIC egress
+                                // *between* blocks, rather than filling its
+                                // four-packet DATAGRAM queue before the transport
+                                // owner gets a chance to seal available packets.
+                                // Egress retains a paced/blocked sealed packet,
+                                // and we never overwrite it or add a send timer.
+                                egress.service(&udp, c, false)?;
                                 match c.dgram_send(&pcm) {
-                                    Ok(()) => offered += 1,
+                                    Ok(()) => {
+                                        offered += 1;
+                                        egress.service(&udp, c, false)?;
+                                    }
                                     Err(quiche::Error::Done) => not_queued += 1,
                                     Err(e) => return Err(format!("captured PCM QUIC enqueue: {e:?}").into()),
                                 }
