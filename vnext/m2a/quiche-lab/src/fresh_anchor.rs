@@ -12,6 +12,22 @@ pub const ANCHOR: u8 = 2;
 pub const RETRY_MS: u64 = 120;
 pub const TIMEOUT_MS: u64 = 1_200;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryAction { Send, Wait, Expired }
+pub fn retry_action(
+    started: std::time::Instant, retry_at: std::time::Instant,
+    now: std::time::Instant, confirmed: bool,
+) -> RetryAction {
+    if now.saturating_duration_since(started) >=
+        std::time::Duration::from_millis(TIMEOUT_MS) {
+        RetryAction::Expired
+    } else if !confirmed && now >= retry_at {
+        RetryAction::Send
+    } else {
+        RetryAction::Wait
+    }
+}
+
 // A source block already buffered before receiving the challenge does
 // not establish a fresh anchor. The QPC source observation must occur
 // strictly after receipt plus the allowed WASAPI future-timestamp skew.
@@ -74,6 +90,22 @@ mod tests {
         assert!(after_request_capture_qpc(receipt, receipt + 100_001));
         assert!(!after_request_capture_qpc(0, 1_000_000));
         assert!(!after_request_capture_qpc(u64::MAX - 1, u64::MAX));
+    }
+    #[test]
+    fn retry_and_hard_timeout_are_bounded_and_loss_tolerant() {
+        use std::time::{Duration, Instant};
+        let start=Instant::now();
+        assert_eq!(retry_action(start,start,start,false),RetryAction::Send);
+        assert_eq!(retry_action(start,start+Duration::from_millis(RETRY_MS),
+            start+Duration::from_millis(RETRY_MS-1),false),RetryAction::Wait);
+        assert_eq!(retry_action(start,start+Duration::from_millis(RETRY_MS),
+            start+Duration::from_millis(RETRY_MS),false),RetryAction::Send);
+        assert_eq!(retry_action(start,start+Duration::from_millis(RETRY_MS),
+            start+Duration::from_millis(RETRY_MS),true),RetryAction::Wait);
+        assert_eq!(retry_action(start,start,
+            start+Duration::from_millis(TIMEOUT_MS),true),RetryAction::Expired);
+        assert_eq!(retry_action(start,start,
+            start+Duration::from_millis(TIMEOUT_MS+1),false),RetryAction::Expired);
     }
     #[test]
     fn challenge_binding_and_canonical_wire() {
