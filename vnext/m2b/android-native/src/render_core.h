@@ -121,7 +121,7 @@ public:
         // After controlled reset accept ONLY a fresh explicit anchor >=
         // frontier for the same context, or a new authenticated context.
         if (has_expected_ && producer_anchor_needed_ &&
-            same_context(first, last_published_) &&
+            same_source_timeline(first, last_published_) &&
             first.source_frame < expected_source_)
             return Admission::Stale;
         const uint64_t wr = write_.load(std::memory_order_relaxed);
@@ -342,6 +342,12 @@ public:
     uint64_t write() const noexcept { return write_.load(std::memory_order_acquire); }
 
 private:
+    static bool same_source_timeline(const MediaIdentity& a,
+                                     const MediaIdentity& b) noexcept {
+        // Local playout reset must never make old wire source positions fresh.
+        return a.epoch == b.epoch && a.stream == b.stream &&
+            a.format == b.format && a.connection == b.connection;
+    }
     static bool same_context(const MediaIdentity& a,
                              const MediaIdentity& b) noexcept {
         return a.epoch == b.epoch && a.stream == b.stream &&
