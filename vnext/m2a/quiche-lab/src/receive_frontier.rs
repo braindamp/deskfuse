@@ -14,6 +14,33 @@ pub struct Accepted {
     pub expected_source:u64,
     pub newly_anchored:bool,
 }
+/// An uninterrupted authenticated sequence with a source-frame hole is
+/// NOT QUIC packet loss: the sender/capture pipeline omitted PCM before
+/// assigning media sequences. Isolated holes remain observable; a sustained
+/// 5-ms-on / 5-ms-missing pattern must stop adaptive playback rather than
+/// generate a full-scale burst of alternating concealment and real audio.
+#[derive(Default)]
+pub struct ContinuityWatch {
+    repeated_gaps:u32,
+}
+impl ContinuityWatch {
+    pub const LIMIT:u32=8;
+    /// Called only for accepted packets. `previous_sequence` is read from
+    /// the authenticated receive frontier immediately BEFORE ingest.
+    pub fn observe(&mut self,previous_sequence:Option<u32>,sequence:u32,
+                   missing_frames:u64)->bool {
+        let contiguous=previous_sequence.is_some_and(|last|
+            last.checked_add(1)==Some(sequence));
+        if contiguous && missing_frames>0 {
+            self.repeated_gaps=self.repeated_gaps.saturating_add(1);
+        } else {
+            self.repeated_gaps=0;
+        }
+        self.repeated_gaps>=Self::LIMIT
+    }
+    pub fn repeated_gaps(&self)->u32 {self.repeated_gaps}
+}
+
 #[derive(Default)]
 pub struct ReceiveFrontier {
     context:Option<Context>,
@@ -63,6 +90,38 @@ impl ReceiveFrontier {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sustained_source_holes_with_contiguous_packet_sequences_fail_closed(){
+        let context=Context{epoch:1,stream:1,format:1};
+        let mut f=ReceiveFrontier::default();
+        let mut watch=ContinuityWatch::default();
+        let first=f.ingest(context,0,48000,240).unwrap();
+        assert!(!watch.observe(None,0,first.missing_frames));
+        for seq in 1..ContinuityWatch::LIMIT {
+            let last=f.last_sequence();
+            let accepted=f.ingest(context,seq,48000+u64::from(seq)*480,240).unwrap();
+            assert_eq!(accepted.missing_frames,240);
+            assert_eq!(accepted.missing_sequences,0);
+            assert_eq!(watch.observe(last,seq,accepted.missing_frames),
+                       seq==ContinuityWatch::LIMIT-1);
+        }
+        assert_eq!(watch.repeated_gaps(),ContinuityWatch::LIMIT-1);
+        let last=f.last_sequence();
+        let seq=ContinuityWatch::LIMIT;
+        let next=f.ingest(context,seq,48000+u64::from(seq)*480,240).unwrap();
+        assert!(watch.observe(last,seq,next.missing_frames));
+        // No successive-hole state survives a genuine continuous 240-frame
+        // source interval or a packet-sequence discontinuity.
+        let last=f.last_sequence();
+        let good=f.ingest(context,seq+1,48000+u64::from(seq)*480+240,240).unwrap();
+        assert!(!watch.observe(last,seq+1,good.missing_frames));
+        assert_eq!(watch.repeated_gaps(),0);
+        let last=f.last_sequence();
+        let gap=f.ingest(context,seq+4,60000,240).unwrap();
+        assert!(gap.missing_frames>0 && gap.missing_sequences>0);
+        assert!(!watch.observe(last,seq+4,gap.missing_frames));
+    }
+
     #[test]
     fn delayed_and_repeated_packets_can_never_revive_retired_ranges(){
         let a=Context{epoch:1,stream:7,format:3};
