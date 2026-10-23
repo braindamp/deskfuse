@@ -435,7 +435,6 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
     let mut audio: Option<AndroidAudio> = None;
     let mut latest_render_record: Option<(deskfuse_quiche_lab::android_audio::RenderSnapshot, u64)> = None;
     let mut coherent_records_read = 0u64;
-    let mut last_source_frame: Option<u64> = None;
     let mut source_gap_frames = 0u64;
     let mut source_concealed_frames = 0u64;
     let mut source_unconcealed_frames = 0u64;
@@ -549,7 +548,6 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                                             // the authenticated irreversible
                                             // reception frontier. Never
                                             // re-insert this range on retry.
-                                            last_source_frame = Some(h.first_source_frame);
                                             first_sequence.get_or_insert(h.packet_sequence);
                                             last_sequence = Some(h.packet_sequence);
                                             received += 1;
@@ -568,7 +566,6 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                                         // but is NOT offered into retired FIFO.
                                         // Only subsequent future packets may
                                         // re-anchor after callback recovery.
-                                        last_source_frame = Some(h.first_source_frame);
                                         first_sequence.get_or_insert(h.packet_sequence);
                                         last_sequence = Some(h.packet_sequence);
                                         received += 1;
@@ -576,7 +573,6 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                                     }
                                 }
                             }
-                        last_source_frame = Some(h.first_source_frame);
                         first_sequence.get_or_insert(h.packet_sequence);
                         last_sequence = Some(h.packet_sequence);
                         received += 1;
