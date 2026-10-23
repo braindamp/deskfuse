@@ -105,7 +105,14 @@ public:
             first.source_frame > UINT64_MAX - frames)
             return Admission::Invalid;
         const uint64_t ticket = requested_recoveries();
-        if (ticket != applied_recoveries()) return Admission::RecoverPending;
+        const uint64_t applied = applied_recoveries();
+        if (ticket != applied) return Admission::RecoverPending;
+        if (applied != last_observed_recovery_) {
+            // Callback applied an autonomous underrun/format invalidation.
+            // Producer can resume ONLY from a forward source anchor.
+            last_observed_recovery_ = applied;
+            producer_anchor_needed_ = true;
+        }
         const uint32_t local_generation =
             playout_generation_.load(std::memory_order_acquire);
         first.playout = local_generation;
@@ -381,6 +388,7 @@ private:
     // Producer-only fields:
     bool has_expected_ = false, producer_anchor_needed_ = true;
     uint64_t expected_source_ = 0;
+    uint64_t last_observed_recovery_ = 0;
     MediaIdentity last_published_{};
     // Callback-only:
     bool primed_ = false, ever_primed_ = false, last_commit_valid_ = false;
