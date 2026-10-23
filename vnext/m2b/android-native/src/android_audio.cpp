@@ -25,6 +25,24 @@ constexpr uint64_t kCapacityFrames = df_audio::kRingFrames; // hard cap: 80 ms
 constexpr uint64_t kPrimeFrames = df_audio::kPrimeFrames; // 30 ms
 constexpr uint32_t kFadeFrames = 96;                  // 2 ms click-reduction edge
 
+// Tags occupy the same SPSC lifetime as their corresponding PCM samples.
+struct SourceTag {
+    uint64_t source_frame;
+    uint32_t epoch;
+    uint32_t generation;
+    uint32_t kind; // 0=captured, 1=concealed
+};
+struct IdentityStats {
+    uint64_t last_committed_source_frame;
+    uint32_t last_fraction_q32;
+    uint32_t last_epoch;
+    uint32_t last_generation;
+    uint32_t reserved;
+    uint64_t released_source_frames;
+    uint64_t discarded_on_rebuffer_frames;
+    uint64_t concealed_output_frames;
+};
+
 struct Stats {
     uint64_t accepted_frames;
     uint64_t rendered_frames;
@@ -47,6 +65,7 @@ public:
     std::atomic<uint64_t> read_pos{0};
     std::atomic<uint64_t> write_pos{0};
     std::array<int16_t, kCapacityFrames * kChannels> ring{};
+    std::array<SourceTag, kCapacityFrames> tags{};
 
     // Callback-private state: only the renderer's AAudio callback touches this.
     bool primed = false;
@@ -64,6 +83,16 @@ public:
     std::atomic<uint64_t> overflow_packets{0};
     std::atomic<uint64_t> callback_count{0};
     std::atomic<uint64_t> underrun_events{0};
+    std::atomic<uint64_t> committed_source_frame{0};
+    std::atomic<uint32_t> committed_fraction_q32{0};
+    std::atomic<uint32_t> committed_epoch{0};
+    std::atomic<uint32_t> committed_generation{0};
+    std::atomic<uint64_t> released_source_frames{0};
+    std::atomic<uint64_t> discarded_source_frames{0};
+    std::atomic<uint64_t> concealed_output_frames{0};
+    bool has_committed_identity = false; // callback only
+    uint64_t callback_last_source_frame = 0;
+    uint32_t callback_last_epoch = 0, callback_last_generation = 0;
     std::atomic<uint64_t> reprime_events{0};
     std::atomic<int32_t> current_correction_ppm{0};
     std::atomic<int32_t> stream_error{AAUDIO_OK};
@@ -197,8 +226,11 @@ public:
         static_cast<Renderer*>(user_data)->stream_error.store(error, std::memory_order_release);
     }
 
-    int32_t push(const int16_t* samples, uint32_t frames) noexcept {
-        if (!samples || frames != kBlockFrames) return -2;
+    int32_t push(const int16_t* samples, uint32_t frames,
+                 uint64_t first_source_frame, uint32_t epoch,
+                 uint32_t generation, uint32_t kind) noexcept {
+        if (!samples || frames != kBlockFrames || kind > 1 ||
+            first_source_frame > UINT64_MAX - frames) return -2;
         if (stream_error.load(std::memory_order_acquire) != AAUDIO_OK) return -3;
 
         const uint64_t wr = write_pos.load(std::memory_order_relaxed);
@@ -216,11 +248,32 @@ public:
             std::memcpy(ring.data(), samples + first * kChannels,
                         static_cast<size_t>(frames - first) * kChannels * sizeof(int16_t));
         }
+        // Tags are completed before the PCM publication release. The
+        // callback reads them only after acquiring write_pos.
+        for (uint32_t n = 0; n < frames; ++n) {
+            tags[(wr + n) % kCapacityFrames] =
+                SourceTag{first_source_frame + n, epoch, generation, kind};
+        }
         write_pos.store(wr + frames, std::memory_order_release);
         accepted_frames.fetch_add(frames, std::memory_order_relaxed);
         return 0;
     }
 
+    void identity_stats(IdentityStats* s) const noexcept {
+        s->last_committed_source_frame =
+            committed_source_frame.load(std::memory_order_acquire);
+        s->last_fraction_q32 =
+            committed_fraction_q32.load(std::memory_order_acquire);
+        s->last_epoch = committed_epoch.load(std::memory_order_acquire);
+        s->last_generation = committed_generation.load(std::memory_order_acquire);
+        s->reserved = 0;
+        s->released_source_frames =
+            released_source_frames.load(std::memory_order_acquire);
+        s->discarded_on_rebuffer_frames =
+            discarded_source_frames.load(std::memory_order_acquire);
+        s->concealed_output_frames =
+            concealed_output_frames.load(std::memory_order_acquire);
+    }
     void get_stats(Stats* s) const noexcept {
         s->accepted_frames = accepted_frames.load(std::memory_order_relaxed);
         s->rendered_frames = rendered_frames.load(std::memory_order_relaxed);
@@ -248,7 +301,7 @@ public:
 #endif
 
 // Explicit C-ABI guard: an older .so must not write past a newer Rust Stats.
-DF_EXPORT uint32_t df_audio_abi_version() noexcept { return 2; }
+DF_EXPORT uint32_t df_audio_abi_version() noexcept { return 3; }
 
 DF_EXPORT int32_t df_audio_open(void** output) noexcept {
     if (!output) return -1;
@@ -304,12 +357,31 @@ DF_EXPORT int32_t df_audio_set_diagnostic_modes(void* ctx, uint32_t flags) noexc
 
 DF_EXPORT int32_t df_audio_push(void* ctx, const int16_t* pcm, uint32_t frames) noexcept {
     if (!ctx) return -1;
-    return static_cast<Renderer*>(ctx)->push(pcm, frames);
+    const auto* r = static_cast<Renderer*>(ctx);
+    const auto next = r->write_pos.load(std::memory_order_relaxed);
+    return static_cast<Renderer*>(ctx)->push(
+        pcm, frames, next, 0, 0, 0);
 }
 
 // ABI v1 statistic consumers allocate only the original prefix.
 // Never write the v2 extension into an old caller's smaller buffer.
 // First 9 fields are unchanged and are copied byte-for-byte.
+DF_EXPORT int32_t df_audio_push_identified(
+    void* ctx, const int16_t* pcm, uint32_t frames,
+    uint64_t first_source_frame, uint32_t epoch, uint32_t generation,
+    uint32_t kind) noexcept {
+    if (!ctx) return -1;
+    return static_cast<Renderer*>(ctx)->push(
+        pcm, frames, first_source_frame, epoch, generation, kind);
+}
+
+// A new versioned entry point; the v1 and v2 stats records stay byte stable.
+DF_EXPORT int32_t df_audio_identity_stats_v3(void* ctx, void* output) noexcept {
+    if (!ctx || !output) return -1;
+    static_cast<Renderer*>(ctx)->identity_stats(static_cast<IdentityStats*>(output));
+    return 0;
+}
+
 DF_EXPORT int32_t df_audio_stats(void* ctx, void* output) noexcept {
     if (!ctx || !output) return -1;
     Stats snapshot{};
