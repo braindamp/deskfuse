@@ -9,6 +9,10 @@
 #include <stdexcept>
 #include <vector>
 
+#ifdef DESKFUSE_TEST_ALLOC_PROBE
+extern "C" void df_probe_start() noexcept;
+extern "C" uint64_t df_probe_finish() noexcept;
+#endif
 using namespace df_audio;
 static void require(bool b,const char* msg){if(!b)throw std::runtime_error(msg);}
 static constexpr double fs=48000.0;
@@ -46,8 +50,21 @@ static Measure run(double frequency,double drift_ppm,int blocks,bool transient=f
         // desired source-input consumption rate; step smoothly +/-400ppm.
         const double ratio=1.0/(1.0+drift_ppm/1e6);
         uint32_t produced=0;
-        require(src.process(out.data(),960,ratio,produced)==SrcResult::Ok,
-                "persistent libsamplerate processing");
+#ifdef DESKFUSE_TEST_ALLOC_PROBE
+        // Includes the actual DSO src_process call and caller bookkeeping,
+        // but not the test's own sine generation or C++ assertions. Warm
+        // initial filter state before enforcing steady-state zero malloc.
+        if(block>=8)df_probe_start();
+#endif
+        const SrcResult result=src.process(out.data(),960,ratio,produced);
+#ifdef DESKFUSE_TEST_ALLOC_PROBE
+        if(block>=8) {
+            const auto dynamic_allocations=df_probe_finish();
+            require(dynamic_allocations==0,
+                    "libsamplerate attempted a real-time libc allocation");
+        }
+#endif
+        require(result==SrcResult::Ok,"persistent libsamplerate processing");
         for(unsigned i=0;i<produced;++i){
             const double left=out[i*2],right=out[i*2+1];
             require(std::isfinite(left)&&std::isfinite(right),"finite output");
@@ -72,6 +89,68 @@ static Measure run(double frequency,double drift_ppm,int blocks,bool transient=f
     }
     return m;
 }
+static void ratio_sweep_and_impulse_delay() {
+    PersistentSrcCandidate src;
+    require(src.ready() && src.reset(timeline,0),"ratio-sweep state");
+    std::array<float,480> in{};
+    std::array<float,1920> out{};
+    uint64_t output_so_far=0;
+    int64_t impulse_peak_offset=INT64_MIN;
+    double impulse_peak=0;
+    uint64_t alloc_attempts=0;
+    double ratio_min=10.0,ratio_max=0.0;
+    for(int block=0;block<800;++block) {
+        for(int i=0;i<240;++i) {
+            const int64_t source=block*240+i;
+            // An isolated impulse is an exact known source position.
+            const float signal=source==12000 ? 1.0f :
+                               source==24000 ? -1.0f : 0.0f;
+            in[i*2]=signal;in[i*2+1]=signal;
+        }
+        require(src.submit(in.data(),240,block*240,timeline)==SrcResult::Ok,
+                "varying-ratio continuous input");
+        const double drift_ppm=400.0*std::sin(block*0.025);
+        const double ratio=1.0/(1.0+drift_ppm/1e6);
+        ratio_min=std::min(ratio_min,ratio);
+        ratio_max=std::max(ratio_max,ratio);
+        uint32_t generated=0;
+#ifdef DESKFUSE_TEST_ALLOC_PROBE
+        if(block>=8)df_probe_start();
+#endif
+        const auto status=src.process(out.data(),960,ratio,generated);
+#ifdef DESKFUSE_TEST_ALLOC_PROBE
+        if(block>=8)alloc_attempts+=df_probe_finish();
+#endif
+        require(status==SrcResult::Ok,"in-state ratio sweeps remain valid");
+        for(uint32_t i=0;i<generated;++i){
+            const double amplitude=std::abs(out[i*2]);
+            require(std::abs(out[i*2]-out[i*2+1])<1e-6,
+                    "changing ratio cannot skew stereo");
+            if(amplitude>impulse_peak && block<160) {
+                impulse_peak=amplitude;
+                impulse_peak_offset=static_cast<int64_t>(output_so_far+i)-12000;
+            }
+        }
+        output_so_far+=generated;
+    }
+    std::printf("ASRC_MEDIUM ratio_sweep min=%.9f max=%.9f impulse_source=12000 peak_output_offset=%lld peak=%.5f input_used=%llu nominal_phase_q32=%llu alloc_after_warm=%llu\n",
+        ratio_min,ratio_max,static_cast<long long>(impulse_peak_offset),
+        impulse_peak,
+        static_cast<unsigned long long>(src.report().input_released_to_library),
+        static_cast<unsigned long long>(src.report().estimated_phase_q32),
+        static_cast<unsigned long long>(alloc_attempts));
+    require(ratio_min<1 && ratio_max>1,"genuine changing ratio around unity");
+    require(impulse_peak>0.5,"filter transient visible");
+    require(impulse_peak_offset>-256 && impulse_peak_offset<256,
+            "actual impulse latency must be bounded by 5ms");
+    require(alloc_attempts==0,
+            "persistent converter must not allocate in warmed src_process during ratio sweeps");
+    // Library release is deliberately NOT interpreted as the represented
+    // output source phase. Filter support/calibration are a separate contract.
+    require(src.report().input_released_to_library>0 &&
+            src.report().output_generated>0,"library and presentation counters distinct");
+}
+
 int main(){
     for(const double frequency:{1000.0,10000.0,20000.0}){
         const auto m=run(frequency,0.0,300);
@@ -96,6 +175,7 @@ int main(){
         require(m.right_difference<1e-6,"stereo drift alignment");
         require(m.avg_us_per_240<5000,"ratio-change CPU budget");
     }
+    ratio_sweep_and_impulse_delay();
     auto impulse=run(0,0,100,true);
     std::printf("ASRC_MEDIUM impulse/max full_scale=%.4f avg_us_5ms=%.1f\n",
                 impulse.max_absolute,impulse.avg_us_per_240);
