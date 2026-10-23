@@ -582,9 +582,7 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                                 return Err("Android rejected unexpected server recovery request".into());
                             }
                             if let Some(ref mut pending) = anchor_pending {
-                                if reply.nonce == pending.challenge.nonce &&
-                                    reply.context == pending.challenge.context &&
-                                    reply.frame >= pending.challenge.frame {
+                                if reply.confirms(&pending.challenge) {
                                     pending.confirmed = Some(reply.frame);
                                     eprintln!("TRACE Android ANCHOR_CONFIRMED nonce={} source={}",
                                         reply.nonce, reply.frame);
