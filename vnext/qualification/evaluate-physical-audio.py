@@ -8,9 +8,11 @@ and externally measured gains cannot be inferred from PCM/transport counters.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
+from datetime import datetime
 from pathlib import Path
 
 METRIC = re.compile(r"\b([a-zA-Z_][a-zA-Z_0-9]*)=([^\s]+)")
@@ -41,6 +43,33 @@ def integer(field: dict[str, str], name: str) -> int | None:
         return int(field[name])
     except (KeyError, ValueError):
         return None
+
+
+def operator_events(folder: Path, started: str | None) -> dict[str, int]:
+    observed: Counter[str] = Counter()
+    path = folder / "operator-events.csv"
+    if not path.exists():
+        return {}
+    try:
+        start = datetime.fromisoformat((started or "").replace("Z", "+00:00"))
+        with path.open(encoding="utf-8-sig", newline="") as file:
+            for row in csv.DictReader(file):
+                try:
+                    event = row["event"]
+                    observed[event] += 1
+                    timestamp = datetime.fromisoformat(
+                        row["utc"].replace("Z", "+00:00")
+                    )
+                    seconds = (timestamp - start).total_seconds()
+                    if event == "brave_restored" and 240 <= seconds <= 420:
+                        observed["brave_restored_5min"] += 1
+                    if event == "brave_restored" and 1140 <= seconds <= 1320:
+                        observed["brave_restored_20min"] += 1
+                except (KeyError, ValueError, TypeError):
+                    observed["malformed_event_rows"] += 1
+    except (OSError, ValueError):
+        observed["unreadable_event_log"] += 1
+    return dict(observed)
 
 
 def check_session(folder: Path) -> dict:
@@ -102,12 +131,19 @@ def check_session(folder: Path) -> dict:
     if "panicked at" in phone or "panicked at" in windows or "panicked at" in err:
         failures.append("Runtime panic in audio session")
     duration = integer(kv, "duration_seconds")
+    events = operator_events(folder, kv.get("start_utc"))
+    if events.get("malformed_event_rows") or events.get("unreadable_event_log"):
+        failures.append("Malformed or unreadable operator event record")
     if not duration or duration < 1800:
         pending.append("This is not a preregistered 30-minute exposure")
-    if kv.get("brave_restoration_at_5min") == "OPERATOR_REQUIRED":
-        pending.append("Brave restoration at minute 5 not independently evidenced")
-    if kv.get("brave_restoration_at_20min") == "OPERATOR_REQUIRED":
-        pending.append("Brave restoration at minute 20 not independently evidenced")
+    if events.get("brave_restored_5min", 0) < 15:
+        pending.append("Fewer than 15 operator-reported Brave restorations near minute 5")
+    else:
+        pending.append("Minute-5 Brave reports are operator observations, not independent window-event verification")
+    if events.get("brave_restored_20min", 0) < 15:
+        pending.append("Fewer than 15 operator-reported Brave restorations near minute 20")
+    else:
+        pending.append("Minute-20 Brave reports are operator observations, not independent window-event verification")
     if kv.get("competing_load", "").startswith("NONE"):
         pending.append("Matched competing-load and pressure exposure not evidenced")
     pending.append("Acoustic capture-to-sound latency needs external measured evidence")
@@ -121,6 +157,7 @@ def check_session(folder: Path) -> dict:
         "duration_s": duration,
         "session_log_consistency": "FAIL" if failures else "PASS",
         "physical_acceptance": "OPEN",
+        "operator_observations": events,
         "observations": {
             "windows_source_frames": integer(capture_fields, "source_frames_observed"),
             "windows_writer_drops": integer(capture_fields, "dropped_blocks_bounded_writer"),
