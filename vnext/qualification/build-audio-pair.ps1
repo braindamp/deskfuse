@@ -78,13 +78,7 @@ foreach ($file in $files) {
 $sha = (& git -C $LabRoot rev-parse HEAD).Trim()
 foreach ($tree in @($wasapiBuild, $nativeBuild)) {
     $cache = Join-Path $tree 'CMakeCache.txt'
-    $buildType = @(Select-String -LiteralPath $cache -Pattern '^CMAKE_BUILD_TYPE:STRING=Release
-foreach ($file in $files) {
-    $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
-    Write-Host ($hash + '  ' + $file)
-}
-Write-Host 'Built locally. No device or driver was changed.'
-)
+    $buildType = @(Select-String -LiteralPath $cache -Pattern '^CMAKE_BUILD_TYPE:STRING=Release$')
     if ($buildType.Count -ne 1) {
         throw ('Expected single-config Release native build: ' + $cache)
     }
