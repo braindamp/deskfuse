@@ -836,19 +836,22 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
         }
         if let Some(ref mut pending) = anchor_pending {
             let now = Instant::now();
-            if now.duration_since(pending.started) >=
-                Duration::from_millis(fresh_anchor::TIMEOUT_MS) {
-                return Err(format!(
+            match fresh_anchor::retry_action(
+                pending.started, pending.retry_at, now,
+                pending.confirmed.is_some(),
+            ) {
+                fresh_anchor::RetryAction::Expired => return Err(format!(
                     "authenticated post-recovery source anchor timed out nonce={} floor={}",
                     pending.challenge.nonce, pending.challenge.frame
-                ).into());
-            }
-            if pending.confirmed.is_none() && now >= pending.retry_at {
-                match conn.dgram_send(&pending.challenge.encode()) {
-                    Ok(()) | Err(quiche::Error::Done) => {}
-                    Err(e) => return Err(format!("Android source anchor request: {e:?}").into()),
+                ).into()),
+                fresh_anchor::RetryAction::Send => {
+                    match conn.dgram_send(&pending.challenge.encode()) {
+                        Ok(()) | Err(quiche::Error::Done) => {}
+                        Err(e) => return Err(format!("Android source anchor request: {e:?}").into()),
+                    }
+                    pending.retry_at = now + Duration::from_millis(fresh_anchor::RETRY_MS);
                 }
-                pending.retry_at = now + Duration::from_millis(fresh_anchor::RETRY_MS);
+                fresh_anchor::RetryAction::Wait => {}
             }
         }
         egress.service(&udp, &mut conn, false)?;
