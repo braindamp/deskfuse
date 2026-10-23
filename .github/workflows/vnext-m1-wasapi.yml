@@ -45,6 +45,7 @@ jobs:
             'vnext/qualification/run-physical-audio.ps1',
             'vnext/qualification/mark-audio-event.ps1',
             'vnext/qualification/build-audio-pair.ps1',
+            'vnext/qualification/audio-ab.ps1',
             'vnext/qualification/invoke-native-audio.ps1',
             'vnext/qualification/test-invoke-native-audio.ps1'
           )) {
