@@ -95,7 +95,10 @@ rewrite of audio that has already played.
 Redeploy BOTH the native `libdeskfuse_android_audio.so` and Android
 `deskfuse-vnext-continuous` executable together; an old shared library is
 deliberately rejected before its statistics can be read with a mismatched
-layout. Rebuild Windows `continuous-quic-lab.exe` after pulling any sender
+layout. The updated native library retains the original `df_audio_stats`
+ABI entry point for older clients and offers `df_audio_stats_v2` only to
+new clients, avoiding a buffer overwrite if an older receiver is still
+installed. Rebuild Windows `continuous-quic-lab.exe` after pulling any sender
 changes. **The working branch `reference/vnext-audio-first-audible-20261023`
 remains untouched**.
 
