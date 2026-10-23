@@ -252,7 +252,16 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                                         offered += 1;
                                         egress.service(&udp, c, false)?;
                                     }
-                                    Err(quiche::Error::Done) => not_queued += 1,
+                                    Err(quiche::Error::Done) => {
+                                        not_queued += 1;
+                                        // Source frame is the cross-machine key;
+                                        // clocks are NOT assumed synchronized.
+                                        if not_queued <= 4 || not_queued % 16 == 0 {
+                                            eprintln!("TRACE Windows QUIC_QUEUE_DROP source_frame={} qpc100={} count={} age_max_100ns={}",
+                                                block.first_device_frame, block.first_qpc_100ns,
+                                                not_queued, max_observed_source_age_100ns);
+                                        }
+                                    }
                                     Err(e) => return Err(format!("captured PCM QUIC enqueue: {e:?}").into()),
                                 }
                             }
@@ -444,6 +453,10 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                             let missing = h.first_source_frame - expected;
                             source_gap_frames += missing;
                             if missing != 0 {
+                                eprintln!("TRACE Android SOURCE_GAP epoch={} sequence={} first_source_frame={} gap_frames={} elapsed_ms={}",
+                                    h.media_epoch, h.packet_sequence, h.first_source_frame,
+                                    missing,
+                                    authenticated_at.map(|t| t.elapsed().as_millis()).unwrap_or(0));
                                 if let Some(ref mut speaker) = audio {
                                     if modes.conceal && missing <= MAX_CONCEALMENT_FRAMES && missing % AUDIO_FRAMES == 0 {
                                         // A genuine 5- or 10-ms media hole. Preserve
@@ -483,8 +496,17 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                             }
                         }
                         if received % 200 == 0 {
-                            println!("ANDROID PCM received={} last_seq={} source_frame={} missing_before={} stale={}",
-                                received, h.packet_sequence, h.first_source_frame, gaps, late);
+                            println!("ANDROID PCM received={} last_seq={} source_frame={} missing_before={} stale={} elapsed_ms={}",
+                                received, h.packet_sequence, h.first_source_frame,
+                                gaps, late,
+                                authenticated_at.map(|t| t.elapsed().as_millis()).unwrap_or(0));
+                            if let Some(ref speaker) = audio {
+                                let a = speaker.snapshot()
+                                    .map_err(|e| format!("AAudio periodic diagnostics: {e}"))?;
+                                println!("TRACE Android RENDER source_frame={} queued_frames={} drift_ppm={} underruns={} rebuffer={} silence_frames={} queue_full={}",
+                                    h.first_source_frame, a.queued_frames, a.drift_correction_ppm,
+                                    a.underrun_events, a.reprime_events, a.silence_frames, audio_queue_full);
+                            }
                         }
                     }
                     Err(quiche::Error::Done) => break,
