@@ -304,8 +304,34 @@ public:
         record.connection = last_commit_.connection;
         record.playout = last_commit_.playout;
         record.drift_ppm = drift_ppm_;
+        // Legacy fields are published atomically for ABI v1/v2/v3
+        // compatibility. They are NOT the coherent v4 callback record.
+        legacy_rendered_.store(rendered_, std::memory_order_release);
+        legacy_silence_.store(silence_, std::memory_order_release);
+        legacy_underruns_.store(underruns_, std::memory_order_release);
+        legacy_reprimes_.store(reprimes_, std::memory_order_release);
+        legacy_released_.store(released_, std::memory_order_release);
+        legacy_discarded_.store(discarded_, std::memory_order_release);
+        legacy_concealed_.store(concealed_outputs_, std::memory_order_release);
+        legacy_source_.store(last_commit_.source_frame, std::memory_order_release);
+        legacy_phase_.store(last_fraction_, std::memory_order_release);
+        legacy_epoch_.store(last_commit_.epoch, std::memory_order_release);
+        legacy_playout_.store(last_commit_.playout, std::memory_order_release);
+        legacy_ppm_.store(drift_ppm_, std::memory_order_release);
         snapshots_.publish(record);
     }
+    uint64_t legacy_rendered() const noexcept { return legacy_rendered_.load(std::memory_order_acquire); }
+    uint64_t legacy_silence() const noexcept { return legacy_silence_.load(std::memory_order_acquire); }
+    uint64_t legacy_underruns() const noexcept { return legacy_underruns_.load(std::memory_order_acquire); }
+    uint64_t legacy_reprimes() const noexcept { return legacy_reprimes_.load(std::memory_order_acquire); }
+    uint64_t legacy_released() const noexcept { return legacy_released_.load(std::memory_order_acquire); }
+    uint64_t legacy_discarded() const noexcept { return legacy_discarded_.load(std::memory_order_acquire); }
+    uint64_t legacy_concealed() const noexcept { return legacy_concealed_.load(std::memory_order_acquire); }
+    uint64_t legacy_source() const noexcept { return legacy_source_.load(std::memory_order_acquire); }
+    uint32_t legacy_phase() const noexcept { return legacy_phase_.load(std::memory_order_acquire); }
+    uint32_t legacy_epoch() const noexcept { return legacy_epoch_.load(std::memory_order_acquire); }
+    uint32_t legacy_playout() const noexcept { return legacy_playout_.load(std::memory_order_acquire); }
+    int32_t legacy_ppm() const noexcept { return legacy_ppm_.load(std::memory_order_acquire); }
     bool pop_snapshot(CoreSnapshot& record) noexcept {
         return snapshots_.pop(record);
     }
@@ -361,5 +387,11 @@ private:
     uint64_t invalidations_ = 0;
     int32_t drift_ppm_ = 0;
     SnapshotMailbox snapshots_{};
+    std::atomic<uint64_t> legacy_rendered_{0}, legacy_silence_{0};
+    std::atomic<uint64_t> legacy_underruns_{0}, legacy_reprimes_{0};
+    std::atomic<uint64_t> legacy_released_{0}, legacy_discarded_{0};
+    std::atomic<uint64_t> legacy_concealed_{0}, legacy_source_{0};
+    std::atomic<uint32_t> legacy_phase_{0}, legacy_epoch_{0}, legacy_playout_{0};
+    std::atomic<int32_t> legacy_ppm_{0};
 };
 } // namespace df_audio
