@@ -177,8 +177,13 @@ try {
     $verb = if ($Strict) { 'client-playback-strict' } else { 'client-playback-modes' }
     $modeArg = if ($Strict) { '' } else { $Modes + ' ' }
     $cmd = 'LD_LIBRARY_PATH=/data/local/tmp /data/local/tmp/deskfuse-vnext-continuous ' + $verb + ' ' + $WindowsIP + ':48235 /data/local/tmp/df-lab-ca.pem /data/local/tmp/df-lab-client.pem /data/local/tmp/df-lab-client.key /data/local/tmp/libdeskfuse_android_audio.so ' + $modeArg + $Seconds
-    & adb shell $cmd 2>&1 | Tee-Object -FilePath $clientLog
-    $exitCode = $LASTEXITCODE
+    # Android Rust emits normal diagnostics on stderr. Windows PowerShell
+    # 5.1 must not terminate on those lines under ErrorActionPreference=Stop.
+    # The helper still returns the REAL adb/remote process exit code.
+    $exitCode = & (Join-Path $PSScriptRoot 'invoke-native-audio.ps1') `
+        -Executable (Get-Command adb).Source `
+        -Arguments @('shell', $cmd) `
+        -LogFile $clientLog
     ('client_exit=' + $exitCode) | Add-Content -LiteralPath $manifest
     if ($exitCode -ne 0) { throw ('Android receiver exit=' + $exitCode) }
 } finally {
