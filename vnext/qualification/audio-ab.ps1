@@ -10,6 +10,7 @@ param(
     [ValidatePattern('^f[01]c[01]r[01]$')][string]$Mode='f1c1r1',
     [ValidateSet('Quick','Matrix','Repeat','Full')][string]$Suite='Quick',
     [ValidateRange(1,5)][int]$Rating=3,
+    [ValidateSet('heard','not-heard','uncertain')][string]$Heard='uncertain',
     [string]$Notes='',
     [string]$LabRoot='D:\Coding\DeskFuse\vnext-wp001',
     [string]$ABRoot='D:\DeskFuseLocalData\cp001\audio-ab',
@@ -264,8 +265,77 @@ function Run([string]$slot,[string]$flags='f1c1r1') {
     }
     if ($proc.ExitCode -ne 0) { throw "Windows sender failed (exit=$($proc.ExitCode))" }
     Write-Host 'Playback test completed; acoustic quality is judged by listener.'
-    return $evidence
 }
+
+function RunSuite([string]$kind) {
+    $null=CheckPair 'reference'
+    $candidate=CheckPair 'candidate'
+    # Each item is version/mode; every trial always starts real AAudio.
+    # Quick falls back to identical native playback when stepping through old
+    # commits that do not yet expose the processing flags.
+    $plan=@(switch ($kind) {
+        'Quick' {
+            if ($candidate.mode -eq 'client-playback-modes') {
+                'reference/f1c1r1';'candidate/f0c0r0';'candidate/f1c1r1';'reference/f1c1r1'
+            } else {
+                'reference/f1c1r1';'candidate/f1c1r1';'candidate/f1c1r1';'reference/f1c1r1'
+            }
+        }
+        'Repeat' { 'reference/f1c1r1';'candidate/f1c1r1';'candidate/f1c1r1';'reference/f1c1r1' }
+        'Matrix' {
+            if ($candidate.mode -ne 'client-playback-modes') { throw 'Candidate revision does not support selectable DSP matrix' }
+            'reference/f1c1r1'
+            foreach ($flags in @('f0c0r0','f1c0r0','f0c1r0','f0c0r1','f1c1r0','f1c0r1','f0c1r1','f1c1r1')) {
+                'candidate/' + $flags
+            }
+            'reference/f1c1r1'
+        }
+        'Full' {
+            if ($candidate.mode -ne 'client-playback-modes') { throw 'Full suite requires candidate with selectable modes; use Quick or Repeat' }
+            'reference/f1c1r1';'candidate/f0c0r0';'candidate/f1c1r1';'reference/f1c1r1'
+            foreach ($flags in @('f1c0r0','f0c1r0','f0c0r1','f1c1r0','f1c0r1','f0c1r1')) {
+                'candidate/' + $flags
+            }
+            'reference/f1c1r1';'candidate/f1c1r1'
+        }
+    })
+    for ($i=0;$i -lt $plan.Count;$i++) {
+        $parts=$plan[$i].Split('/')
+        if ($parts.Count -ne 2) { throw 'Invalid built-in audible suite' }
+        Write-Host ("AUDIBLE SUITE $kind trial $($i+1)/$($plan.Count) : $($parts[0]) $($parts[1])")
+        # Keep failures visible, stop immediately, never claim unattended
+        # acoustic qualification. Per-run evidence persists on failure.
+        Run $parts[0] $parts[1]
+    }
+    Write-Host "All $($plan.Count) $kind A/B audio trials completed. Run -Action Report."
+}
+function Report {
+    $analyzer=Join-Path $PSScriptRoot 'analyze-audio-ab.py'
+    if (-not (Test-Path -LiteralPath $analyzer -PathType Leaf)) { throw 'A/B analyzer missing' }
+    $python=Get-Command python.exe -ErrorAction Stop
+    & $python.Source $analyzer (Join-Path $ABRoot 'runs')
+    if ($LASTEXITCODE -ne 0) { throw 'A/B analyzer failed' }
+}
+function Rate {
+    $runsPath=Join-Path $ABRoot 'runs'
+    if (-not (Test-Path -LiteralPath $runsPath -PathType Container)) { throw 'No audible A/B sessions exist' }
+    $folders=@(Get-ChildItem -LiteralPath $runsPath -Directory | Sort-Object LastWriteTimeUtc -Descending)
+    if ($folders.Count -eq 0) { throw 'No A/B sessions exist' }
+    $latest=$folders[0].FullName
+    $runPath=Join-Path $latest 'run.json'
+    if (-not (Test-Path -LiteralPath $runPath -PathType Leaf)) { throw 'Latest session has no run manifest' }
+    $record=Get-Content -LiteralPath $runPath -Raw | ConvertFrom-Json
+    if ($record.slot -ne $Version) {
+        throw "Last run is $($record.slot); specify -Version $($record.slot) to avoid misattributed listening notes."
+    }
+    [ordered]@{
+        utc=[DateTime]::UtcNow.ToString('o'); heard=$Heard
+        rating_1_to_5=$Rating; notes=$Notes
+        method='human operator report; no microphone measurement'
+    } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $latest 'listening.json') -Encoding UTF8
+    Write-Host "Listening notes saved for $Version $($record.commit) in $latest"
+}
+
 function Status {
     Write-Host "REFERENCE=$referenceSha; DEV_TIP=$tip"
     foreach ($slot in @('reference','candidate')) {
@@ -307,5 +377,8 @@ switch ($Action) {
         Prepare 'candidate' $history[$at]
         Status
     }
-    'Run' { Run $Version }
+    'Run' { Run $Version $Mode }
+    'Suite' { RunSuite $Suite }
+    'Report' { Report }
+    'Rate' { Rate }
 }
