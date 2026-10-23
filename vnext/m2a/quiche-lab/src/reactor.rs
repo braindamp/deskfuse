@@ -86,26 +86,68 @@ impl Egress {
                 self.blocked = false;
             }
 
-            let pending = self.pending.as_ref().expect("pending assigned above");
-            if Instant::now() < pending.at {
-                return Ok(()); // arm deadline; do NOT sleep after sealing
-            }
-            match socket.send_to(&pending.bytes, pending.to) {
-                Ok(n) if n == pending.bytes.len() => {
-                    self.pending = None;
-                    self.blocked = false;
-                    self.udp_packets_sent += 1;
-                }
-                Ok(_) => return Err("UDP partial send".into()),
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    self.blocked = true;
-                    self.would_block_count += 1;
-                    return Ok(()); // retain ciphertext, arm writable readiness
-                }
-                Err(e) => return Err(e.into()),
+            if !self.flush_owned_slot(|bytes, to| socket.send_to(bytes, to))? {
+                return Ok(()); // paced or blocked; same exact sealed bytes retained
             }
         }
         Ok(())
+    }
+
+    // Production and deterministic fault injection share this exact path.
+    // The already-sealed bytes are immutable until one successful UDP send.
+    fn flush_owned_slot(
+        &mut self, mut send: impl FnMut(&[u8], SocketAddr)->io::Result<usize>
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let Some(pending)=self.pending.as_ref() else{return Ok(false)};
+        if Instant::now() < pending.at {return Ok(false)}
+        match send(&pending.bytes,pending.to) {
+            Ok(n) if n==pending.bytes.len() => {
+                self.pending=None;
+                self.blocked=false;
+                self.udp_packets_sent+=1;
+                Ok(true)
+            }
+            Ok(_)=>Err("UDP partial send".into()),
+            Err(e) if e.kind()==io::ErrorKind::WouldBlock=>{
+                self.blocked=true;
+                self.would_block_count+=1;
+                Ok(false)
+            }
+            Err(e)=>Err(e.into()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod ciphertext_slot_tests {
+    use super::*;
+    #[test]
+    fn repeated_wouldblock_preserves_identical_ciphertext_and_one_slot() {
+        let target:SocketAddr="127.0.0.1:443".parse().unwrap();
+        let original=vec![0x4au8;1200];
+        let mut e=Egress::default();
+        e.pending=Some(Pending{bytes:original.clone(),to:target,at:Instant::now()});
+        for _ in 0..12 {
+            let mut called=0;
+            assert!(!e.flush_owned_slot(|bytes,to|{
+                called+=1;
+                assert_eq!(bytes,original.as_slice());
+                assert_eq!(to,target);
+                Err(io::Error::from(io::ErrorKind::WouldBlock))
+            }).unwrap());
+            assert_eq!(called,1);
+            assert!(e.has_pending_ciphertext());
+            assert!(e.needs_write_readiness());
+            assert_eq!(e.pending.as_ref().unwrap().bytes,original);
+            assert_eq!(e.udp_packets_sent,0);
+        }
+        assert!(e.flush_owned_slot(|bytes,_| {
+            assert_eq!(bytes,original.as_slice());Ok(bytes.len())
+        }).unwrap());
+        assert!(!e.has_pending_ciphertext());
+        assert!(!e.needs_write_readiness());
+        assert_eq!(e.would_block_count,12);
+        assert_eq!(e.udp_packets_sent,1);
     }
 }
 
