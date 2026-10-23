@@ -271,7 +271,11 @@ void capture(IMMDeviceEnumerator& enumerator, const std::wstring& device_id,
         try {
             Block b;
             while (queue.pop(b)) write_block(out, b);
+        } catch (const std::exception& e) {
+            std::cerr << "FAIL WASAPI writer: " << e.what() << "\n";
+            failed.store(true);
         } catch (...) {
+            std::cerr << "FAIL WASAPI writer: unexpected exception\n";
             failed.store(true);
         }
     });
@@ -318,7 +322,17 @@ void capture(IMMDeviceEnumerator& enumerator, const std::wstring& device_id,
                     b.flags = offset == 0 ? flags : (flags & ~AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY);
                     b.frame_count = std::min<UINT32>(kMaxFrames, frames - offset);
                     convert(raw_data, is_float, flags, offset, b);
-                    queue.try_push(b);
+                    if (!queue.try_push(b)) {
+                        const uint64_t dropped = queue.dropped();
+                        if (dropped <= 8 || dropped % 128 == 0) {
+                            std::cerr << "TRACE Windows WASAPI_NATIVE_WRITER_DROP"
+                                      << " frame=" << b.first_device_frame
+                                      << " frames=" << b.frame_count
+                                      << " qpc100=" << b.qpc_100ns
+                                      << " flags=" << b.flags
+                                      << " count=" << dropped << "\n";
+                        }
+                    }
                     observed += b.frame_count;
                 }
                 check(reader->ReleaseBuffer(frames), "IAudioCaptureClient::ReleaseBuffer");
@@ -328,6 +342,9 @@ void capture(IMMDeviceEnumerator& enumerator, const std::wstring& device_id,
         audio->Stop();
         queue.finish();
         writer.join();
+        std::cerr << "EARLY WASAPI capture source_frames_observed=" << observed
+                  << " dropped_blocks_bounded_writer=" << queue.dropped()
+                  << " writer_failed=" << failed.load() << "\n";
         throw;
     }
     check(audio->Stop(), "IAudioClient::Stop");
