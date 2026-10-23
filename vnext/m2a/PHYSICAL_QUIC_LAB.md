@@ -1,9 +1,51 @@
 # M2a Physical QUIC lab: Windows source -> Android sink
 
-Status: isolated test source committed, physical Wi-Fi test not yet passed.
+Status: **physical Windows-to-Xiaomi Wi-Fi QUIC connectivity PASS** on 2026-10-23,
+reported from both endpoint terminals; **M2a overall is still IN PROGRESS**.
 Android INITIATES QUIC, but Windows SENDS 16 indexed PCM DATAGRAMs.
 Android verifies and echoes them. No APK, driver or real audio device is touched.
 Temporary certificates and private keys remain OUTSIDE public GitHub.
+
+## 2026-10-23 physical hardware evidence (developer-reported)
+
+Tested source HEAD: `9b62a1d003849b382b4a77c504caf2fbc871c0c6`,
+isolated feature branch `feature/vnext-wp001-native-lab`.
+Windows 10 Ethernet source/listener to Xiaomi Android ARM64 Wi-Fi initiator/sink,
+on the same private LAN. Local disposable CA, server and client identity files
+were generated outside the Git checkout. **Do not commit keys, live certificates,
+pairing secrets, local test key directories, or machine-specific IPs.**
+
+- **Positive mutual-TLS and physical UDP test: PASS.** Android verified the
+  Windows server's CA chain and `deskfuse-lab.local` identity. Windows verified
+  the Android client's CA-issued TLS certificate was presented.
+- **Source-indexed payload integrity: PASS.** Android verified all 16 Windows-origin
+  1,000-byte app DATAGRAMs: packet sequences 0–15, source frames 48000–51600
+  at 240-frame intervals, with exact expected payloads. Windows verified all
+  16 encrypted echoes. User-observed mean *sequential application QUIC roundtrip*
+  was **7.42 ms**; not a one-way network RTT, streaming throughput, acoustic
+  latency, or A/V synchronization result.
+- **Untrusted Android client CA rejection: PASS.** Windows with its original
+  trusted CA reported `server QUIC recv failed: TlsFail` when the client
+  presented an independently issued cert; Android reported that the connection
+  closed before exchange completed. Android's server-authentication message
+  in that run did not authorize the client.
+- **Untrusted Windows server CA rejection: PASS.** With Android explicitly
+  configured to trust an unrelated CA while using its original client identity,
+  Android reported `client recv failed: TlsFail`; Windows reported the
+  connection closed before exchange completed. No 16-packet exchange succeeded.
+
+**Evidence scope:** observations above are from developer-supplied terminal logs
+on physical hardware, not an independent device run or a reproducible CI archive.
+The CLI fixture is stop-and-wait (16 packets), uses 2 ms sleeps, and is not a
+continuous event-driven media transport. Remaining security cases include missing
+client certificate, wrong server name, wrong certificate role, and identity-specific
+authorization. M2a release-time ownership, sealed-packet `WouldBlock` retention,
+clock freshness, bounded reactor, recovery and sustained-load acceptance are **not
+yet qualified**; retain the thresholds in `PREREGISTERED_GATES.md`.
+The older `udp_loopback` test failed on Intel macOS in CI run
+[39902315232](https://github.com/braindamp/deskfuse/actions/runs/39902315232);
+do not claim the four-platform suite is green.
+
 
 ## 1. Windows test binary and disposable local credentials
 
