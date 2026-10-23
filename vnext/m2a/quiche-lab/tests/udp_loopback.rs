@@ -1,6 +1,7 @@
 //! Real OS UDP sockets + authenticated QUIC v0.30.0 DATAGRAMs.
 //! Transport test only: NOT a Xiaomi, Wi-Fi, mutual-client-auth, or audio sink test.
 use deskfuse_quiche_lab::{encode, parse, Configuration, Header, HEADER_BYTES, KIND_AUDIO, VERSION};
+use deskfuse_quiche_lab::reactor::Egress;
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose,
     IsCa, KeyPair, KeyUsagePurpose,
@@ -32,33 +33,9 @@ fn config() -> TestResult<quiche::Config> {
     Ok(c)
 }
 
-// No extra periodic audio sender pacing: QUIC service opportunities are driven
-// by the test loop. Respect quiche's own send_info.at when emitting a packet.
-// This blocks the test thread only; production needs a readiness/timer reactor.
-fn flush_udp(socket: &UdpSocket, conn: &mut quiche::Connection) -> TestResult<usize> {
-    let mut buf = [0u8; UDP_MTU];
-    let mut emitted = 0;
-    for _ in 0..256 {
-        let (size, meta) = match conn.send(&mut buf) {
-            Ok(v) => v,
-            Err(quiche::Error::Done) => break,
-            Err(e) => return Err(format!("QUIC send error: {e:?}").into()),
-        };
-        if meta.from != socket.local_addr()? {
-            return Err("unexpected QUIC send source address".into());
-        }
-        let delay = meta.at.saturating_duration_since(Instant::now());
-        if delay > Duration::from_millis(500) {
-            return Err("unexpectedly long QUIC test pacing deadline".into());
-        }
-        if !delay.is_zero() { thread::sleep(delay); }
-        let n = socket.send_to(&buf[..size], meta.to)?;
-        if n != size { return Err("partial UDP send".into()); }
-        emitted += 1;
-    }
-    Ok(emitted)
-}
-
+// Reuse the actual bounded reactor's sealed-packet/pacing implementation:
+// the previous fixture slept INSIDE a 256-packet QUIC send drain, starving
+// peer receive and timeout service on slower Apple Silicon CI runners.
 fn receive_udp(socket: &UdpSocket, conn: &mut quiche::Connection) -> TestResult<usize> {
     let mut buf = [0u8; 65535];
     let mut count = 0;
@@ -90,15 +67,31 @@ fn drive(
     server_udp: &UdpSocket,
     client: &mut quiche::Connection,
     server: &mut quiche::Connection,
+    client_egress: &mut Egress,
+    server_egress: &mut Egress,
 ) -> TestResult<usize> {
+    // Service inbound ACKs before constructing new outbound packets.
+    // Bounded receive/service/receive alternation avoids a single producer
+    // starving the other QUIC state machine while paced output is pending.
     let mut progressed = 0;
-    progressed += flush_udp(client_udp, client)?;
-    progressed += flush_udp(server_udp, server)?;
     progressed += receive_udp(client_udp, client)?;
     progressed += receive_udp(server_udp, server)?;
     tick_timeout(client);
     tick_timeout(server);
-    if progressed == 0 { thread::sleep(Duration::from_millis(1)); }
+    let emitted_before = client_egress.udp_packets_sent + server_egress.udp_packets_sent;
+    // Already-sealed ciphertext remains in Egress until pacing or socket
+    // readiness permits its *unchanged* send; never call quiche::send behind it.
+    client_egress.service(client_udp, client, true)?;
+    server_egress.service(server_udp, server, true)?;
+    progressed += (client_egress.udp_packets_sent + server_egress.udp_packets_sent
+        - emitted_before) as usize;
+    progressed += receive_udp(client_udp, client)?;
+    progressed += receive_udp(server_udp, server)?;
+    if progressed == 0 {
+        // Test-only cooperative yield, NOT a source send clock. The existing
+        // 5-second QUIC idle deadline and 12-second test deadline are unchanged.
+        thread::sleep(Duration::from_millis(1));
+    }
     Ok(progressed)
 }
 
@@ -183,11 +176,14 @@ fn verified_quiche_datagram_over_real_udp_loopback() -> TestResult<()> {
     server_udp.set_nonblocking(true)?;
     client_udp.set_nonblocking(true)?;
     let start = Instant::now();
+    let mut client_egress = Egress::default();
+    let mut server_egress = Egress::default();
     while !(client.is_established() && server.is_established()) {
         if start.elapsed() > DEADLINE || client.is_closed() || server.is_closed() {
             return Err(format!("real UDP authenticated QUIC handshake did not establish; {}", connection_status("handshake", start, &client, &server)).into());
         }
-        drive(&client_udp, &server_udp, &mut client, &mut server)?;
+        drive(&client_udp, &server_udp, &mut client, &mut server,
+              &mut client_egress, &mut server_egress)?;
     }
 
     // Fixed PCM16 block indexed to source frame 48,000, not arrival time.
@@ -218,7 +214,8 @@ fn verified_quiche_datagram_over_real_udp_loopback() -> TestResult<()> {
         if start.elapsed() > DEADLINE || client.is_closed() || server.is_closed() {
             return Err(format!("real UDP QUIC DATAGRAM exchange timed out or connection closed; {}", connection_status("forward_datagram", start, &client, &server)).into());
         }
-        drive(&client_udp, &server_udp, &mut client, &mut server)?;
+        drive(&client_udp, &server_udp, &mut client, &mut server,
+              &mut client_egress, &mut server_egress)?;
         match server.dgram_recv(&mut inbound) {
             Ok(received) => {
                 let (parsed, pcm) = parse(&inbound[..received], &cfg)
@@ -240,7 +237,8 @@ fn verified_quiche_datagram_over_real_udp_loopback() -> TestResult<()> {
         if start.elapsed() > DEADLINE || client.is_closed() || server.is_closed() {
             return Err(format!("return UDP QUIC DATAGRAM timed out or connection closed; {}", connection_status("echo_datagram", start, &client, &server)).into());
         }
-        drive(&client_udp, &server_udp, &mut client, &mut server)?;
+        drive(&client_udp, &server_udp, &mut client, &mut server,
+              &mut client_egress, &mut server_egress)?;
         match client.dgram_recv(&mut inbound) {
             Ok(n) => {
                 let (parsed, pcm) = parse(&inbound[..n], &cfg)
