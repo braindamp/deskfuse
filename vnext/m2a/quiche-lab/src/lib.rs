@@ -2,6 +2,7 @@
 //! by the surrounding QUIC connection**; this parser does not authenticate it.
 //! No heap allocation is needed in encode/decode.
 pub mod reactor;
+pub mod wasapi_pipe;
 
 pub const HEADER_BYTES: usize = 40;
 pub const VERSION: u8 = 1;
