@@ -30,7 +30,7 @@ jobs:
           set -euo pipefail
           cmake -S vnext/m2b/android-native/tests -B vnext/m2b/android-native/build-clock-tests -G Ninja -DCMAKE_BUILD_TYPE=Release -DDESKFUSE_QUALIFY_LIBSAMPLERATE=ON
           cmake --build vnext/m2b/android-native/build-clock-tests --parallel 2
-          ctest --test-dir vnext/m2b/android-native/build-clock-tests --output-on-failure
+          ctest --test-dir vnext/m2b/android-native/build-clock-tests --output-on-failure --verbose
       - name: Install Android NDK r30 in runner SDK
         shell: bash
         run: |
