@@ -308,7 +308,9 @@ void capture(IMMDeviceEnumerator& enumerator, const std::wstring& device_id,
                     b.first_device_frame = device_pos + offset;
                     b.qpc_100ns = (flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR)
                         ? 0 : qpc100 + static_cast<uint64_t>(offset) * 10'000'000 / kSampleRate;
-                    b.flags = flags;
+                    // Engine discontinuity belongs to the first fragment of
+                    // this GetBuffer packet, not every 240-frame slice.
+                    b.flags = offset == 0 ? flags : (flags & ~AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY);
                     b.frame_count = std::min<UINT32>(kMaxFrames, frames - offset);
                     convert(raw_data, is_float, flags, offset, b);
                     queue.try_push(b);
