@@ -17,7 +17,7 @@ include(CTest)
 if(BUILD_TESTING)
   add_executable(deskfuse-wasapi-queue-test tests/spsc_capture_queue_test.cpp)
   target_compile_features(deskfuse-wasapi-queue-test PRIVATE cxx_std_20)
-  target_compile_definitions(deskfuse-wasapi-queue-test PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+  target_compile_definitions(deskfuse-wasapi-queue-test PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN) DESKFUSE_QUEUE_TEST_PROBE
   if(MSVC)
     target_compile_options(deskfuse-wasapi-queue-test PRIVATE /W4 /permissive- /EHsc)
   endif()
