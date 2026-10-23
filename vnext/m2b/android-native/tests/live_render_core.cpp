@@ -107,6 +107,25 @@ int main() {
         expect(core.pop_snapshot(s) && s.concealed_outputs>0,
                "concealed output uses actual tagged interpolation taps");
     }
+    {   // Two-block concealment under pressure: first concealed block fits,
+        // second is rejected. That partial concealment MUST be retired before
+        // any later real PCM can share the ring with it.
+        RenderCore core;
+        for (int i=0;i<15;++i) enqueue(core,i*240,12);
+        enqueue(core,15*240,0,true);
+        const auto zero=block(0), real=block(500);
+        expect(core.publish(zero.data(),240,tag(16*240,1,7,1,11,true))==
+               Admission::Overflow, "second concealment partial admission overflows");
+        expect(core.publish(real.data(),240,tag(17*240))==
+               Admission::RecoverPending, "no real audio joins partial concealment");
+        std::array<int16_t,192> out{};
+        core.render(out.data(),96,{false,false});
+        CoreSnapshot rec{};
+        expect(core.pop_snapshot(rec) && rec.discarded==3840,
+               "callback discards partial concealment and all retired old PCM");
+        expect(core.publish(real.data(),240,tag(17*240))==
+               Admission::Accepted, "next authenticated forward anchor starts fresh playback");
+    }
     {   // Duplicate, overlapping or changed identities cannot join FIFO.
         RenderCore core;
         prime(core,0);
