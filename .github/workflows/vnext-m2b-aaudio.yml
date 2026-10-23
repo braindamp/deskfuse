@@ -1,0 +1,38 @@
+name: vNext M2b Android AAudio native build
+
+on:
+  push:
+    branches:
+      - feature/vnext-wp001-native-lab
+    paths:
+      - 'vnext/m2b/android-native/**'
+      - '.github/workflows/vnext-m2b-aaudio.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  android-aaudio:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Android NDK r30 in runner SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "ANDROID_HOME=${ANDROID_HOME:-unset}"
+          test -n "${ANDROID_HOME:-}"
+          yes | "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" "ndk;30.0.16248370"
+      - name: Configure Android ARM64 native audio output
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S vnext/m2b/android-native -B vnext/m2b/android-native/build-android -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="${ANDROID_HOME}/ndk/30.0.16248370/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-35 -DANDROID_STL=c++_shared
+      - name: Build Android AAudio shared library
+        shell: bash
+        run: cmake --build vnext/m2b/android-native/build-android --parallel 2
