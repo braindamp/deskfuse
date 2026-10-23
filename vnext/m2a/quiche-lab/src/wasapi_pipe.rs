@@ -6,7 +6,7 @@
 use std::io::{self, Read};
 use std::net::{SocketAddr, UdpSocket};
 use std::process::{Command, Stdio};
-use std::sync::mpsc::{self, Receiver, TrySendError};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -26,6 +26,14 @@ pub struct CaptureChunk {
     pub frames: usize,
     pub pcm: [u8; PCM_BYTES],
     pub enqueued_at: Instant,
+}
+
+// Completion travels through the same bounded channel as PCM, after all
+// preceding chunks. A malformed pipe or failed native capture must never
+// masquerade as an ordinary end-of-stream.
+pub enum CaptureEvent {
+    Chunk(CaptureChunk),
+    Finished(Result<(), String>),
 }
 
 pub struct CompleteBlock {
@@ -106,11 +114,17 @@ fn le64(bytes: &[u8]) -> u64 {
 
 fn read_chunk(input: &mut impl Read) -> io::Result<Option<CaptureChunk>> {
     let mut h = [0u8; HEADER];
-    match input.read_exact(&mut h) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
-    }
+    // A clean EOF is possible only *between* headers. read_exact on the
+    // entire header would incorrectly accept a truncated header as EOF.
+    let first_byte = loop {
+        match input.read(&mut h[..1]) {
+            Ok(count) => break count,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    };
+    if first_byte == 0 { return Ok(None); }
+    input.read_exact(&mut h[1..])?;
     let count = le32(&h[24..28]) as usize;
     let size = le32(&h[32..36]) as usize;
     let offset = le32(&h[36..40]);
@@ -142,9 +156,46 @@ fn read_chunk(input: &mut impl Read) -> io::Result<Option<CaptureChunk>> {
 /// channel. Dropped source blocks retain source-index gaps. A local one-byte
 /// wake datagram wakes the QUIC owner's OS readiness wait; its source IP is
 /// *not* the authenticated Android peer and the server ignores it.
+// Reader-side queue drops remain bounded and source-index visible. Unlike
+// the capture callback this thread may report a *terminal* status only after
+// the stream has ended. No error event is silently dropped on a full queue.
+fn forward_chunks(
+    input: &mut impl Read, sender: &SyncSender<CaptureEvent>,
+    notifier: Option<&UdpSocket>, wake_addr: SocketAddr
+) -> (u64, Result<(), String>) {
+    let mut reader_queue_drops = 0u64;
+    loop {
+        match read_chunk(input) {
+            Ok(Some(chunk)) => match sender.try_send(CaptureEvent::Chunk(chunk)) {
+                Ok(()) => {
+                    if let Some(wake) = notifier {
+                        let _ = wake.send_to(&[0xA1], wake_addr);
+                    }
+                }
+                Err(TrySendError::Full(event)) => {
+                    reader_queue_drops += 1;
+                    if reader_queue_drops <= 8 || reader_queue_drops % 128 == 0 {
+                        if let CaptureEvent::Chunk(dropped) = event {
+                            eprintln!(
+                                "TRACE Windows WASAPI_READER_QUEUE_DROP source_frame={} frames={} reader_queue_drops={}",
+                                dropped.device_frame, dropped.frames, reader_queue_drops
+                            );
+                        }
+                    }
+                } // bounded drop; never wait to send PCM from reader thread
+                Err(TrySendError::Disconnected(_)) => {
+                    return (reader_queue_drops, Err("WASAPI consumer disconnected".into()));
+                }
+            },
+            Ok(None) => return (reader_queue_drops, Ok(())),
+            Err(e) => return (reader_queue_drops, Err(format!("WASAPI pipe error: {e}"))),
+        }
+    }
+}
+
 pub fn spawn(
     exe: &str, device_id: &str, seconds: u64, wake_addr: SocketAddr
-) -> io::Result<Receiver<CaptureChunk>> {
+) -> io::Result<Receiver<CaptureEvent>> {
     if !cfg!(windows) {
         return Err(io::Error::new(io::ErrorKind::Unsupported, "WASAPI is Windows-only"));
     }
@@ -161,38 +212,34 @@ pub fn spawn(
     let (sender, receiver) = mpsc::sync_channel(QUEUE_SLOTS);
     thread::spawn(move || {
         let notifier = UdpSocket::bind("0.0.0.0:0").ok();
-        let mut reader_queue_drops=0u64;
-        loop {
-            match read_chunk(&mut stdout) {
-                Ok(Some(chunk)) => match sender.try_send(chunk) {
-                    Ok(()) => {
-                        if let Some(ref wake) = notifier {
-                            let _ = wake.send_to(&[0xA1], wake_addr);
-                        }
-                    }
-                    Err(TrySendError::Full(dropped)) => {
-                        reader_queue_drops+=1;
-                        if reader_queue_drops<=8 || reader_queue_drops%128==0 {
-                            eprintln!(
-                                "TRACE Windows WASAPI_READER_QUEUE_DROP source_frame={} frames={} reader_queue_drops={}",
-                                dropped.device_frame,dropped.frames,reader_queue_drops
-                            );
-                        }
-                    } // bounded drop, never wait on capture-reader thread
-                    Err(TrySendError::Disconnected(_)) => break,
-                },
-                Ok(None) => break,
-                Err(e) => {
-                    eprintln!("WASAPI pipe error: {e}");
-                    break;
-                }
+        let (reader_queue_drops, mut outcome) =
+            forward_chunks(&mut stdout, &sender, notifier.as_ref(), wake_addr);
+        // Do not kill a normally finishing process before its exit status is
+        // available; terminate only when the pipe was invalid or owner exited.
+        if outcome.is_err() && child.try_wait().ok().flatten().is_none() {
+            let _ = child.kill();
+        }
+        match child.wait() {
+            Ok(status) if !status.success() => {
+                let reason = format!("WASAPI capture process exited with {status}");
+                if outcome.is_ok() { outcome = Err(reason); }
             }
+            Err(e) if outcome.is_ok() => {
+                outcome = Err(format!("WASAPI capture wait failed: {e}"));
+            }
+            _ => {}
         }
         eprintln!("DONE Windows WASAPI pipe reader_queue_drops={reader_queue_drops}");
-        // If the QUIC owner exits while the capture process is still alive,
-        // don't orphan the native child process or leak a pipe handle.
-        if child.try_wait().ok().flatten().is_none() { let _ = child.kill(); }
-        let _ = child.wait();
+        if let Err(ref reason) = outcome {
+            eprintln!("FAIL Windows WASAPI capture source: {reason}");
+        }
+        // A terminal event is ordered after any queued chunks. Blocking here
+        // is safe: this is no longer the WASAPI callback or PCM read hot path.
+        // If the QUIC owner has exited, send() returns Disconnected.
+        let _ = sender.send(CaptureEvent::Finished(outcome));
+        if let Some(wake) = notifier.as_ref() {
+            let _ = wake.send_to(&[0xA1], wake_addr);
+        }
     });
     Ok(receiver)
 }
@@ -237,6 +284,31 @@ mod tests {
         assert_eq!(second.first_qpc_100ns, packet_qpc + 50_000);
         assert_eq!(second.original_packet_offset_frames, 240);
         assert_eq!(second.first_device_frame, frame + 240);
+    }
+
+    #[test]
+    fn partial_header_or_pcm_is_error_not_successful_eof() {
+        assert!(read_chunk(&mut Cursor::new(Vec::<u8>::new())).unwrap().is_none());
+        assert!(read_chunk(&mut Cursor::new(vec![b'D', b'F', b'W'])).is_err());
+        let mut short_payload = record(2, 240, 2_000_000, 0);
+        short_payload.truncate(HEADER + 30);
+        assert!(read_chunk(&mut Cursor::new(short_payload)).is_err());
+    }
+
+    #[test]
+    fn mixed_live_versions_stop_forwarding_after_valid_pcm() {
+        let (tx, rx) = mpsc::sync_channel(QUEUE_SLOTS);
+        let mut wire = record(2, 240, 2_000_000, 0);
+        wire.extend(record(1, 480, 2_050_000, 240));
+        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let (drops, outcome) = forward_chunks(&mut Cursor::new(wire), &tx, None, addr);
+        assert_eq!(drops, 0);
+        assert!(outcome.unwrap_err().contains("invalid WASAPI pipe frame"));
+        match rx.try_recv().unwrap() {
+            CaptureEvent::Chunk(chunk) => assert_eq!(chunk.device_frame, 240),
+            CaptureEvent::Finished(_) => panic!("terminal before accepted PCM"),
+        }
+        assert!(rx.try_recv().is_err()); // incompatible PCM never forwarded
     }
 
     #[test]
