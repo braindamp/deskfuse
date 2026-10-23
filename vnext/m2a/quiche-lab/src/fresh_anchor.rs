@@ -12,6 +12,19 @@ pub const ANCHOR: u8 = 2;
 pub const RETRY_MS: u64 = 120;
 pub const TIMEOUT_MS: u64 = 1_200;
 
+// A source block already buffered before receiving the challenge does
+// not establish a fresh anchor. The QPC source observation must occur
+// strictly after receipt plus the allowed WASAPI future-timestamp skew.
+pub fn after_request_capture_qpc(
+    request_received_qpc_100ns: u64,
+    captured_source_qpc_100ns: u64,
+) -> bool {
+    request_received_qpc_100ns != 0 &&
+    captured_source_qpc_100ns >
+        request_received_qpc_100ns.saturating_add(
+            crate::source_age::MAX_FUTURE_SKEW_100NS
+        )
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Message {
     pub kind: u8,
@@ -48,6 +61,15 @@ impl Message {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn buffered_old_capture_cannot_satisfy_fresh_request() {
+        let receipt = 1_000_000u64;
+        assert!(!after_request_capture_qpc(receipt, 999_999));
+        assert!(!after_request_capture_qpc(receipt, receipt + 100_000));
+        assert!(after_request_capture_qpc(receipt, receipt + 100_001));
+        assert!(!after_request_capture_qpc(0, 1_000_000));
+        assert!(!after_request_capture_qpc(u64::MAX - 1, u64::MAX));
+    }
     #[test]
     fn challenge_binding_and_canonical_wire() {
         let v = Message {kind: REQUEST, nonce: 0x1102,frame:48000,
