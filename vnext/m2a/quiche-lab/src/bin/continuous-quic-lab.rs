@@ -15,6 +15,7 @@ use deskfuse_quiche_lab::wasapi_pipe::{self, Assembler};
 use deskfuse_quiche_lab::android_audio::{Admission, AndroidAudio};
 use deskfuse_quiche_lab::source_age::{self, AgeDecision};
 use deskfuse_quiche_lab::plaintext_expiry::{PlaintextExpiry, Identity as OutgoingIdentity};
+use deskfuse_quiche_lab::receive_frontier::{ReceiveFrontier, Context as SourceContext, Reject as SourceReject};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
@@ -430,8 +431,7 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
     let mut recover_started = 0u64;
     let mut native_stale = 0u64;
     let mut denied_reanchor = 0u64;
-    let mut active_context: Option<(u32,u32,u32)> = None;
-    let mut receiver_frontier: u64 = 0;
+    let mut ingress_frontier = ReceiveFrontier::default();
     let mut audio: Option<AndroidAudio> = None;
     let mut latest_render_record: Option<(deskfuse_quiche_lab::android_audio::RenderSnapshot, u64)> = None;
     let mut coherent_records_read = 0u64;
@@ -483,38 +483,35 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                         if n != APP_BYTES || (synthetic && datagram[..n] != packet(h.packet_sequence)) {
                             return Err("Android rejected PCM source-frame or synthetic payload identity".into());
                         }
-                        // Session auth binds one media context. A new
-                        // source epoch/stream/format requires an explicitly
-                        // authenticated new configuration, never a local
-                        // playout generation bump alone.
-                        let incoming_context = (
-                            h.media_epoch, h.source_stream_id, h.format_config_id
-                        );
-                        if active_context.is_some_and(|ctx| ctx != incoming_context) {
-                            denied_reanchor += 1;
-                            return Err("retired media context or epoch change without authenticated new source anchor".into());
-                        }
-                        active_context.get_or_insert(incoming_context);
-                        if let Some(last) = last_sequence {
-                            if h.packet_sequence <= last { late += 1; continue; }
-                            gaps += u64::from(h.packet_sequence - last - 1);
-                        }
-                        // A packet from before an accepted frontier is stale
-                        // even if it is delivered after a local re-prime.
-                        if h.first_source_frame < receiver_frontier {
-                            native_stale += 1;
-                            continue;
-                        }
-                        receiver_frontier = h.first_source_frame.saturating_add(AUDIO_FRAMES);
-                        if let Some(previous) = last_source_frame {
-                            let expected = previous.checked_add(AUDIO_FRAMES)
-                                .ok_or("Android source-frame index exhausted")?;
-                            if h.first_source_frame < expected {
-                                return Err("nonmonotonic or overlapping authenticated source frames".into());
+                        // QUIC peer authentication alone does not revive a
+                        // retired stream epoch or a previously committed
+                        // source-frame interval. This irreversible frontier
+                        // outlives every local AAudio re-prime.
+                        let accepted = match ingress_frontier.ingest(
+                            SourceContext {
+                                epoch: h.media_epoch,
+                                stream: h.source_stream_id,
+                                format: h.format_config_id,
+                            },
+                            h.packet_sequence, h.first_source_frame, AUDIO_FRAMES,
+                        ) {
+                            Ok(v) => v,
+                            Err(SourceReject::Late) => { late += 1; continue; }
+                            Err(SourceReject::Overlapping) => {
+                                native_stale += 1; continue;
                             }
-                            let missing = h.first_source_frame - expected;
-                            source_gap_frames += missing;
-                            if missing != 0 {
+                            Err(SourceReject::RetiredContext) => {
+                                denied_reanchor += 1;
+                                return Err("retired media identity requires a new authenticated configuration".into());
+                            }
+                            Err(SourceReject::Overflow) =>
+                                return Err("authenticated source-frame range overflow".into()),
+                        };
+                        gaps += accepted.missing_sequences;
+                        source_gap_frames += accepted.missing_frames;
+                        let expected = accepted.expected_source;
+                        let missing = accepted.missing_frames;
+                        if missing != 0 {
                                 eprintln!("TRACE Android SOURCE_GAP epoch={} sequence={} first_source_frame={} gap_frames={} elapsed_ms={}",
                                     h.media_epoch, h.packet_sequence, h.first_source_frame,
                                     missing,
@@ -579,7 +576,6 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                                     }
                                 }
                             }
-                        }
                         last_source_frame = Some(h.first_source_frame);
                         first_sequence.get_or_insert(h.packet_sequence);
                         last_sequence = Some(h.packet_sequence);
