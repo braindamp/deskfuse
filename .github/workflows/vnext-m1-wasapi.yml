@@ -28,6 +28,9 @@ jobs:
       - name: Assert local physical-run evidence evaluator fails closed
         shell: pwsh
         run: python vnext/qualification/test_evaluate_physical_audio.py
+      - name: Qualify exact native WASAPI packet/QPC pairing report offline
+        shell: pwsh
+        run: python vnext/qualification/test_analyze_wasapi_qpc_pairs.py
       - name: Prove diagnostic stderr is not fatal but real receiver errors remain fatal in Windows PowerShell 5.1
         shell: pwsh
         run: |
