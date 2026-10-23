@@ -45,6 +45,32 @@ int main() {
                s.last_source == 48599 && s.fraction_q32 == 0,
                "commit/release input and exact output source phase");
     }
+    {   // No fractional output may combine a captured source frame
+        // with an incompatible gap/epoch/format/connection lookahead.
+        // This directly invokes the production callback guard with a
+        // host-only corrupt-tag seam; normal publish never creates it.
+        for (int mode=0;mode<4;++mode) {
+            RenderCore core;
+            prime(core,0);
+            auto wrong=tag(1);
+            if (mode==0) wrong.source_frame=99; // missing interval
+            if (mode==1) wrong.epoch=2;
+            if (mode==2) wrong.format=2;
+            if (mode==3) wrong.connection=12;
+            core.test_set_tag(1,wrong);
+            std::array<int16_t,96> out{};
+            core.render(out.data(),48,{false,true});
+            CoreSnapshot rec{};
+            expect(core.pop_snapshot(rec),"discontinuity must publish record");
+            expect(rec.rendered==0 && rec.silence==48,
+                   "bad support pair never contributes to output");
+            expect(core.requested_recoveries()>core.applied_recoveries(),
+                   "incompatible interpolation support forces callback recovery");
+            core.render(out.data(),48,{false,true});
+            expect(core.applied_recoveries()==core.requested_recoveries(),
+                   "callback exclusively applies source-generation invalidation");
+        }
+    }
     {   // Both interpolation taps must be contiguous within one identity.
         RenderCore core;
         prime(core);
