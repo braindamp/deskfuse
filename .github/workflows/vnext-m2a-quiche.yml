@@ -18,7 +18,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-15, macos-15-intel]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
@@ -39,6 +39,16 @@ jobs:
             throw 'NASM missing: BoringSSL cannot compile'
           }
           "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Append
+      - name: Install native prerequisites (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v nasm >/dev/null 2>&1; then brew install nasm; fi
+          if ! command -v cmake >/dev/null 2>&1; then brew install cmake; fi
+          echo "macOS architecture: $(uname -m)"
+          nasm -v
+          cmake --version | head -n 1
       - name: Select current Rust stable
         shell: bash
         run: |
