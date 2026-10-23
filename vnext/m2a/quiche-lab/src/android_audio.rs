@@ -38,191 +38,203 @@ pub struct RenderIdentity {
     pub concealed_output_frames: u64,
 }
 
+// V4 exactly matches CoreSnapshot in render_core.h. V1/V2/V3 ABI
+// structures remain unchanged and are never resized behind old symbols.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RenderSnapshot {
+    pub callback_seq: u64,
+    pub committed_output: u64,
+    pub rendered: u64,
+    pub silence: u64,
+    pub released: u64,
+    pub discarded: u64,
+    pub concealed_outputs: u64,
+    pub underruns: u64,
+    pub reprimes: u64,
+    pub invalidations: u64,
+    pub last_source: u64,
+    pub last_support_source: u64,
+    pub earliest_needed: u64,
+    pub published_tail: u64,
+    pub fraction_q32: u32,
+    pub epoch: u32,
+    pub stream: u32,
+    pub format: u32,
+    pub connection: u32,
+    pub playout: u32,
+    pub drift_ppm: i32,
+    pub reserved: u32,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admission {
+    Accepted,
+    Overflow,
+    RecoverPending,
+    Discontinuity,
+    Stale,
+}
 #[cfg(target_os = "android")]
 mod native {
-    use super::{AudioStats, RenderIdentity};
+    use super::{Admission, AudioStats, RenderIdentity, RenderSnapshot};
     use std::ffi::{c_char, c_int, c_void, CString};
     use std::ptr;
 
     const RTLD_NOW: c_int = 2;
-    #[link(name = "dl")]
+    #[link(name="dl")]
     unsafe extern "C" {
-        fn dlopen(name: *const c_char, flags: c_int) -> *mut c_void;
-        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
-        fn dlclose(handle: *mut c_void) -> c_int;
+        fn dlopen(path: *const c_char, flags:c_int) -> *mut c_void;
+        fn dlsym(handle:*mut c_void, sym:*const c_char) -> *mut c_void;
+        fn dlclose(handle:*mut c_void) -> c_int;
     }
-
-    type AbiVersion = unsafe extern "C" fn() -> u32;
-    type Open = unsafe extern "C" fn(*mut *mut c_void) -> i32;
-    type Push = unsafe extern "C" fn(*mut c_void, *const i16, u32) -> i32;
-    type PushIdentified = unsafe extern "C" fn(
-        *mut c_void, *const i16, u32, u64, u32, u32, u32
-    ) -> i32;
-    type IdentityStats = unsafe extern "C" fn(*mut c_void, *mut RenderIdentity) -> i32;
-    type Stats = unsafe extern "C" fn(*mut c_void, *mut AudioStats) -> i32;
-    type Close = unsafe extern "C" fn(*mut c_void);
-    type DiagnosticModes = unsafe extern "C" fn(*mut c_void, u32) -> i32;
+    type Abi=unsafe extern "C" fn() -> u32;
+    type Open=unsafe extern "C" fn(*mut *mut c_void)->i32;
+    type Close=unsafe extern "C" fn(*mut c_void);
+    type Modes=unsafe extern "C" fn(*mut c_void,u32)->i32;
+    type PushV4=unsafe extern "C" fn(
+        *mut c_void,*const i16,u32,u64,u32,u32,u32,u32,u32)->i32;
+    type Stats=unsafe extern "C" fn(*mut c_void,*mut AudioStats)->i32;
+    type IdentityStats=unsafe extern "C" fn(*mut c_void,*mut RenderIdentity)->i32;
+    type Request=unsafe extern "C" fn(*mut c_void)->u64;
+    type Applied=unsafe extern "C" fn(*mut c_void)->u64;
+    type Snapshot=unsafe extern "C" fn(
+        *mut c_void,*mut RenderSnapshot,*mut u64)->i32;
 
     pub struct Renderer {
-        library: *mut c_void,
-        ctx: *mut c_void,
-        push: Push,
-        identified_push: PushIdentified,
-        identity_stats: IdentityStats,
-        stats: Stats,
-        close: Close,
-        configure: DiagnosticModes,
+        library:*mut c_void, ctx:*mut c_void,
+        push:PushV4, stats:Stats, identity_stats:IdentityStats,
+        modes:Modes, close:Close, request:Request, applied:Applied,
+        snapshot:Snapshot,
     }
-
     impl Renderer {
-        pub fn open(path: &str) -> Result<Self, String> {
-            let file = CString::new(path).map_err(|_| "invalid Android library path")?;
-            let library = unsafe { dlopen(file.as_ptr(), RTLD_NOW) };
-            if library.is_null() { return Err(format!("cannot load Android audio library: {path}")); }
-
-            let functions = (|| {
-                let symbol = |name: &[u8]| {
-                    let ptr = unsafe { dlsym(library, name.as_ptr().cast::<c_char>()) };
-                    if ptr.is_null() { Err(format!("missing native audio symbol: {}", String::from_utf8_lossy(name))) }
-                    else { Ok(ptr) }
-                };
-                Ok::<_, String>((
-                    symbol(b"df_audio_abi_version\0")?,
-                    symbol(b"df_audio_open\0")?,
-                    symbol(b"df_audio_push\0")?,
-                    symbol(b"df_audio_stats_v2\0")?,
-                    symbol(b"df_audio_close\0")?,
-                    symbol(b"df_audio_set_diagnostic_modes\0")?,
-                    symbol(b"df_audio_push_identified\0")?,
-                    symbol(b"df_audio_identity_stats_v3\0")?,
-                ))
-            })();
-
-            let (version_fn, open_fn, push_fn, stats_fn, close_fn, modes_fn,
-                 identified_fn, identity_fn) = match functions {
-                Ok(v) => v,
-                Err(e) => {
-                    unsafe { dlclose(library); }
-                    return Err(e);
-                }
+        pub fn open(path:&str)->Result<Self,String> {
+            let path_c=CString::new(path).map_err(|_|"invalid library path")?;
+            let library=unsafe{dlopen(path_c.as_ptr(),RTLD_NOW)};
+            if library.is_null() {return Err(format!("cannot load Android audio library: {path}"));}
+            let sym=|name:&[u8]|->Result<*mut c_void,String>{
+                let p=unsafe{dlsym(library,name.as_ptr().cast::<c_char>())};
+                if p.is_null(){Err(format!("missing Android symbol {}",String::from_utf8_lossy(name)))}
+                else{Ok(p)}
             };
-            let version: AbiVersion = unsafe { std::mem::transmute(version_fn) };
-            let actual_version = unsafe { version() };
-            if actual_version != 3 {
-                unsafe { dlclose(library); }
-                return Err(format!(
-                    "Android renderer ABI mismatch: expected v3, got v{actual_version}; redeploy AAudio .so and QUIC executable together"
-                ));
-            }
-            let open: Open = unsafe { std::mem::transmute(open_fn) };
-            let push: Push = unsafe { std::mem::transmute(push_fn) };
-            let stats: Stats = unsafe { std::mem::transmute(stats_fn) };
-            let close: Close = unsafe { std::mem::transmute(close_fn) };
-            let configure: DiagnosticModes = unsafe { std::mem::transmute(modes_fn) };
-            let identified_push: PushIdentified = unsafe { std::mem::transmute(identified_fn) };
-            let identity_stats: IdentityStats = unsafe { std::mem::transmute(identity_fn) };
-
-            let mut ctx = ptr::null_mut();
-            let code = unsafe { open(&mut ctx) };
-            if code != 0 || ctx.is_null() {
-                unsafe { dlclose(library); }
-                return Err(format!("AAudio output open/start failed code={code}"));
-            }
-            Ok(Self { library, ctx, push, identified_push, identity_stats, stats, close, configure })
-        }
-
-        pub fn set_diagnostic_modes(&mut self, fades: bool, linear_resample: bool) -> Result<(), String> {
-            let flags = u32::from(fades) | (u32::from(linear_resample) << 1);
-            let code = unsafe { (self.configure)(self.ctx, flags) };
-            if code == 0 { Ok(()) }
-            else { Err(format!("AAudio diagnostic modes must be chosen before publishing PCM, code={code}")) }
-        }
-
-        pub fn push_pcm16(&mut self, wire_pcm: &[u8]) -> Result<bool, String> {
-            if wire_pcm.len() != 960 { return Err("expected exact 240-frame stereo PCM16".into()); }
-            // QUIC bytes are not guaranteed aligned for i16 reads.
-            let mut native_pcm = [0i16; 480];
-            for (i, sample) in native_pcm.iter_mut().enumerate() {
-                *sample = i16::from_le_bytes([wire_pcm[i * 2], wire_pcm[i * 2 + 1]]);
-            }
-            match unsafe { (self.push)(self.ctx, native_pcm.as_ptr(), 240) } {
-                0 => Ok(true),
-                1 => Ok(false), // bounded queue full; never overwrite played frames
-                code => Err(format!("Android AAudio queue error code={code}")),
-            }
-        }
-
-        pub fn push_pcm16_identified(
-            &mut self, wire_pcm: &[u8], first_source_frame: u64,
-            epoch: u32, generation: u32, concealed: bool,
-        ) -> Result<bool, String> {
-            if wire_pcm.len() != 960 { return Err("expected exact 240-frame stereo PCM16".into()); }
-            let mut native_pcm = [0i16; 480];
-            for (i, sample) in native_pcm.iter_mut().enumerate() {
-                *sample = i16::from_le_bytes([wire_pcm[i * 2], wire_pcm[i * 2 + 1]]);
-            }
-            let code = unsafe {
-                (self.identified_push)(self.ctx, native_pcm.as_ptr(), 240,
-                    first_source_frame, epoch, generation, u32::from(concealed))
+            // Reject mismatched library BEFORE requesting or calling any
+            // symbols with evolving structure layouts.
+            let abi=match sym(b"df_audio_abi_version\0"){
+                Ok(p)=>unsafe{std::mem::transmute::<*mut c_void,Abi>(p)},
+                Err(e)=>{unsafe{dlclose(library)};return Err(e);}
             };
+            let actual=unsafe{abi()};
+            if actual!=4 {
+                unsafe{dlclose(library)};
+                return Err(format!("AAudio ABI mismatch expected v4, got v{actual}: redeploy both Android binaries"));
+            }
+            let funcs=(||Ok::<_,String>((
+                sym(b"df_audio_open\0")?,
+                sym(b"df_audio_close\0")?,
+                sym(b"df_audio_set_diagnostic_modes\0")?,
+                sym(b"df_audio_push_v4\0")?,
+                sym(b"df_audio_stats_v2\0")?,
+                sym(b"df_audio_identity_stats_v3\0")?,
+                sym(b"df_audio_request_recovery_v4\0")?,
+                sym(b"df_audio_recovery_applied_v4\0")?,
+                sym(b"df_audio_snapshot_v4\0")?,
+            )))();
+            let (open,close,modes,push,stats,identity_stats,request,applied,snapshot)=match funcs{
+                Ok(parts)=>parts,
+                Err(e)=>{unsafe{dlclose(library)};return Err(e);}
+            };
+            let open:Open=unsafe{std::mem::transmute(open)};
+            let mut ctx=ptr::null_mut();
+            let code=unsafe{open(&mut ctx)};
+            if code!=0||ctx.is_null(){
+                unsafe{dlclose(library)};
+                return Err(format!("AAudio open error={code}"));
+            }
+            Ok(Self{
+                library,ctx,
+                close:unsafe{std::mem::transmute(close)},
+                modes:unsafe{std::mem::transmute(modes)},
+                push:unsafe{std::mem::transmute(push)},
+                stats:unsafe{std::mem::transmute(stats)},
+                identity_stats:unsafe{std::mem::transmute(identity_stats)},
+                request:unsafe{std::mem::transmute(request)},
+                applied:unsafe{std::mem::transmute(applied)},
+                snapshot:unsafe{std::mem::transmute(snapshot)},
+            })
+        }
+        pub fn set_diagnostic_modes(&mut self,fades:bool,linear:bool)->Result<(),String>{
+            let flags=u32::from(fades)|(u32::from(linear)<<1);
+            let code=unsafe{(self.modes)(self.ctx,flags)};
+            if code!=0{return Err(format!("cannot configure renderer before first PCM: code={code}"));}
+            Ok(())
+        }
+        pub fn push_media(
+            &mut self,bytes:&[u8],source:u64,epoch:u32,stream:u32,
+            format:u32,connection:u32,concealed:bool
+        )->Result<Admission,String>{
+            if bytes.len()!=960 {return Err("expected 240-frame PCM16 block".into());}
+            let mut pcm=[0i16;480];
+            for(i,v)in pcm.iter_mut().enumerate(){
+                *v=i16::from_le_bytes([bytes[2*i],bytes[2*i+1]]);
+            }
+            let code=unsafe{(self.push)(self.ctx,pcm.as_ptr(),240,source,epoch,
+                stream,format,connection,u32::from(concealed))};
             match code {
-                0 => Ok(true),
-                1 => Ok(false),
-                _ => Err(format!("AAudio identified PCM push failed code={code}")),
+                0=>Ok(Admission::Accepted),
+                1=>Ok(Admission::Overflow),
+                -3=>Ok(Admission::RecoverPending),
+                -4=>Ok(Admission::Discontinuity),
+                -5=>Ok(Admission::Stale),
+                x=>Err(format!("invalid native PCM publication code={x}")),
             }
         }
-
-        pub fn identity_snapshot(&self) -> Result<RenderIdentity, String> {
-            let mut s = RenderIdentity::default();
-            let code = unsafe { (self.identity_stats)(self.ctx, &mut s) };
-            if code == 0 { Ok(s) }
-            else { Err(format!("AAudio identity stats error={code}")) }
+        pub fn request_recovery(&mut self)->u64{unsafe{(self.request)(self.ctx)}}
+        pub fn recovery_applied(&self)->u64{unsafe{(self.applied)(self.ctx)}}
+        pub fn pop_snapshot(&self)->Result<Option<(RenderSnapshot,u64)>,String>{
+            let mut value=RenderSnapshot::default();
+            let mut dropped=0;
+            match unsafe{(self.snapshot)(self.ctx,&mut value,&mut dropped)}{
+                1=>Ok(Some((value,dropped))),
+                0=>Ok(None),
+                x=>Err(format!("AAudio coherent snapshot error={x}")),
+            }
         }
-
-        pub fn snapshot(&self) -> Result<AudioStats, String> {
-            let mut s = AudioStats::default();
-            let code = unsafe { (self.stats)(self.ctx, &mut s) };
-            if code == 0 { Ok(s) } else { Err(format!("AAudio stats error code={code}")) }
+        pub fn snapshot(&self)->Result<AudioStats,String>{
+            let mut value=AudioStats::default();
+            let code=unsafe{(self.stats)(self.ctx,&mut value)};
+            if code==0{Ok(value)}else{Err(format!("AAudio stats code={code}"))}
+        }
+        pub fn identity_snapshot(&self)->Result<RenderIdentity,String>{
+            let mut value=RenderIdentity::default();
+            let code=unsafe{(self.identity_stats)(self.ctx,&mut value)};
+            if code==0{Ok(value)}else{Err(format!("AAudio identity stats code={code}"))}
         }
     }
-
-    impl Drop for Renderer {
-        fn drop(&mut self) {
-            unsafe {
-                (self.close)(self.ctx); // ensures callback has stopped
-                dlclose(self.library);
-            }
-        }
+    impl Drop for Renderer{
+        fn drop(&mut self){unsafe{(self.close)(self.ctx);dlclose(self.library);}}
     }
 }
-
-#[cfg(target_os = "android")]
+#[cfg(target_os="android")]
 pub use native::Renderer as AndroidAudio;
-
-#[cfg(not(target_os = "android"))]
+#[cfg(not(target_os="android"))]
 pub struct AndroidAudio;
-
-#[cfg(not(target_os = "android"))]
-impl AndroidAudio {
-    pub fn open(_path: &str) -> Result<Self, String> {
-        Err("AAudio playback requires the Android ARM64 executable".into())
+#[cfg(not(target_os="android"))]
+impl AndroidAudio{
+    pub fn open(_p:&str)->Result<Self,String>{Err("Android AAudio required".into())}
+    pub fn set_diagnostic_modes(&mut self,_f:bool,_r:bool)->Result<(),String>{
+        Err("Android AAudio required".into())
     }
-    pub fn set_diagnostic_modes(&mut self, _fades: bool, _linear_resample: bool) -> Result<(), String> {
-        Err("AAudio diagnostic modes require Android".into())
+    pub fn push_media(&mut self,_bytes:&[u8],_source:u64,_epoch:u32,
+                      _stream:u32,_format:u32,_connection:u32,
+                      _concealed:bool)->Result<Admission,String>{
+        Err("Android AAudio required".into())
     }
-    pub fn push_pcm16(&mut self, _bytes: &[u8]) -> Result<bool, String> {
-        Err("AAudio playback requires Android".into())
+    pub fn request_recovery(&mut self)->u64{0}
+    pub fn recovery_applied(&self)->u64{0}
+    pub fn pop_snapshot(&self)->Result<Option<(RenderSnapshot,u64)>,String>{
+        Err("Android AAudio required".into())
     }
-    pub fn push_pcm16_identified(
-        &mut self, _bytes: &[u8], _source_frame: u64, _epoch: u32,
-        _generation: u32, _concealed: bool
-    ) -> Result<bool, String> {
-        Err("AAudio source identity requires Android".into())
-    }
-    pub fn identity_snapshot(&self) -> Result<RenderIdentity, String> {
-        Err("AAudio source identity requires Android".into())
-    }
-    pub fn snapshot(&self) -> Result<AudioStats, String> {
-        Err("AAudio playback requires Android".into())
+    pub fn snapshot(&self)->Result<AudioStats,String>{Err("Android AAudio required".into())}
+    pub fn identity_snapshot(&self)->Result<RenderIdentity,String>{
+        Err("Android AAudio required".into())
     }
 }
