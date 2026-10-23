@@ -850,6 +850,12 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                             if let Some(ref speaker) = audio {
                                 let a = speaker.snapshot()
                                     .map_err(|e| format!("AAudio periodic diagnostics: {e}"))?;
+                                let presentation = speaker.presentation_time()
+                                    .map_err(|e| format!("AAudio off-callback presentation time: {e}"))?;
+                                println!("TRACE Android OUTPUT_HAL frame={} monotonic_ns={} timestamp_result={} (not acoustic latency)",
+                                    presentation.output_frame_position,
+                                    presentation.monotonic_nanoseconds,
+                                    presentation.aaudio_result);
                                 if let Some((record, dropped)) = latest_render_record {
                                     println!("TRACE Android RENDER committed_source={} support={} phase_q32={} epoch={} stream={} format={} connection={} playout={} released={} discarded={} concealed_output={} callbacks_record={} dropped_callback_records={} queued_frames={} drift_ppm={} underruns={} rebuffer={} silence_frames={} queue_full={}",
                                         record.last_source, record.last_support_source,
