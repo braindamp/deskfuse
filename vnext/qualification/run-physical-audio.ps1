@@ -34,14 +34,20 @@ $sha = (& git -C $LabRoot rev-parse HEAD).Trim()
 if ($LASTEXITCODE -ne 0 -or $branch -ne 'feature/vnext-wp001-native-lab') {
     throw 'Only the isolated development branch is permitted'
 }
-$worktree = (& git -C $LabRoot status --porcelain) -join [Environment]::NewLine
-if ($worktree) { throw 'Commit or remove worktree modifications to preserve exact evidence first' }
+$worktree = @(& git -C $LabRoot status --porcelain)
+if ($LASTEXITCODE -ne 0) { throw 'Unable to inspect local Git worktree' }
+$worktreeClean = ($worktree.Count -eq 0)
+if (-not $worktreeClean) {
+    Write-Warning ('Running audio diagnostic with {0} local Git worktree change(s). No local changes will be deleted or stashed. This is not clean-commit qualification evidence.' -f $worktree.Count)
+}
 $device = (& adb get-serialno).Trim()
 if ($LASTEXITCODE -ne 0 -or $device -eq 'unknown') { throw 'Physical ADB device not ready' }
 $events = @(
     'start_utc=' + (Get-Date).ToUniversalTime().ToString('o'),
     'git_branch=' + $branch,
     'git_commit=' + $sha,
+    'git_worktree_clean=' + $worktreeClean.ToString().ToLowerInvariant(),
+    'git_worktree_change_count=' + $worktree.Count,
     'profile=' + $Profile,
     'modes=' + $Modes,
     'strict_pcm=' + [bool]$Strict,
