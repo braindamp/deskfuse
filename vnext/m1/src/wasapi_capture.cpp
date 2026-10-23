@@ -104,6 +104,43 @@ struct Block {
 };
 
 
+// Only the capture producer touches this fixed storage. No I/O, allocation,
+// mutex or wait on packet drops. Preserve the first and latest eight source
+// positions so an overflow can still be localized AFTER WASAPI stops.
+class NativeDropLedger {
+    struct Entry {
+        uint64_t frame = 0, qpc = 0;
+        uint32_t frames = 0, flags = 0;
+    };
+public:
+    void record(const Block& b) noexcept {
+        const uint64_t ordinal = ++count_;
+        const size_t slot = ordinal <= 8
+            ? static_cast<size_t>(ordinal - 1)
+            : 8 + static_cast<size_t>((ordinal - 9) % 8);
+        entries_[slot] = {b.first_device_frame, b.qpc_100ns,
+                          b.frame_count, b.flags};
+    }
+    void report() const {
+        auto emit = [&](size_t slot, uint64_t ordinal) {
+            const auto& b = entries_[slot];
+            std::cerr << "TRACE Windows WASAPI_NATIVE_WRITER_DROP"
+                      << " frame=" << b.frame << " frames=" << b.frames
+                      << " qpc100=" << b.qpc << " flags=" << b.flags
+                      << " count=" << ordinal << "\n";
+        };
+        const uint64_t first = std::min<uint64_t>(count_, 8);
+        for (uint64_t n = 1; n <= first; ++n)
+            emit(static_cast<size_t>(n - 1), n);
+        const uint64_t recent = std::min<uint64_t>(count_ - first, 8);
+        for (uint64_t n = count_ - recent + 1; n <= count_; ++n)
+            emit(8 + static_cast<size_t>((n - 9) % 8), n);
+    }
+private:
+    std::array<Entry, 16> entries_{};
+    uint64_t count_ = 0;
+};
+
 void write_all(HANDLE h, const uint8_t* data, size_t size) {
     while (size != 0) {
         DWORD written = 0;
@@ -353,6 +390,7 @@ void capture(IMMDeviceEnumerator& enumerator, const std::wstring& device_id,
             failed.store(true);
         }
     });
+    NativeDropLedger native_drops;
     uint64_t observed = 0;
     const auto start = std::chrono::steady_clock::now();
     std::cerr << "WASAPI capturing selected render endpoint, 48k stereo PCM16; "
@@ -403,17 +441,7 @@ void capture(IMMDeviceEnumerator& enumerator, const std::wstring& device_id,
                     // treating a 5-ms derived fragment as independent input.
                     b.original_packet_offset_frames = offset;
                     convert(raw_data, is_float, flags, offset, b);
-                    if (!queue.try_push(b)) {
-                        const uint64_t dropped = queue.dropped();
-                        if (dropped <= 8 || dropped % 128 == 0) {
-                            std::cerr << "TRACE Windows WASAPI_NATIVE_WRITER_DROP"
-                                      << " frame=" << b.first_device_frame
-                                      << " frames=" << b.frame_count
-                                      << " qpc100=" << b.qpc_100ns
-                                      << " flags=" << b.flags
-                                      << " count=" << dropped << "\n";
-                        }
-                    }
+                    if (!queue.try_push(b)) native_drops.record(b);
                     observed += b.frame_count;
                 }
                 check(reader->ReleaseBuffer(frames), "IAudioCaptureClient::ReleaseBuffer");
@@ -423,6 +451,7 @@ void capture(IMMDeviceEnumerator& enumerator, const std::wstring& device_id,
         audio->Stop();
         queue.finish();
         writer.join();
+        native_drops.report();
         std::cerr << "EARLY WASAPI capture source_frames_observed=" << observed
                   << " dropped_blocks_bounded_writer=" << queue.dropped()
                   << " writer_failed=" << failed.load() << "\n";
@@ -435,6 +464,7 @@ void capture(IMMDeviceEnumerator& enumerator, const std::wstring& device_id,
     check(audio->Stop(), "IAudioClient::Stop");
     queue.finish();
     writer.join();
+    native_drops.report();
     packet_trace.save();
     if (failed.load()) throw std::runtime_error("binary output writer failed");
     std::cerr << "DONE WASAPI capture source_frames_observed=" << observed
