@@ -4,6 +4,7 @@
 // calls, locks, syscalls, or network operations in the audio callback.
 // This is the initial audible integration, not yet a drift-qualified renderer.
 #include <aaudio/AAudio.h>
+#include "adaptive_clock.h"
 
 #include <algorithm>
 #include <array>
@@ -18,8 +19,8 @@ namespace {
 constexpr int32_t kSampleRate = 48000;
 constexpr int32_t kChannels = 2;
 constexpr uint32_t kBlockFrames = 240;
-constexpr uint64_t kCapacityFrames = kBlockFrames * 16; // hard cap: 80 ms
-constexpr uint64_t kPrimeFrames = kBlockFrames * 4;     // initial 20 ms
+constexpr uint64_t kCapacityFrames = df_audio::kRingFrames; // hard cap: 80 ms
+constexpr uint64_t kPrimeFrames = df_audio::kPrimeFrames; // 30 ms
 constexpr uint32_t kFadeFrames = 96;                  // 2 ms click-reduction edge
 
 struct Stats {
@@ -32,6 +33,9 @@ struct Stats {
     int32_t stream_error;
     int32_t actual_sample_rate;
     int32_t actual_channels;
+    int32_t drift_correction_ppm;
+    uint64_t underrun_events;
+    uint64_t reprime_events;
 };
 
 class Renderer {
@@ -44,13 +48,18 @@ public:
 
     // Callback-private state: only the renderer's AAudio callback touches this.
     bool primed = false;
+    bool has_primed = false;
     uint32_t fade_in_remaining = kFadeFrames; // callback thread only
+    df_audio::DriftFollower follower; // AAudio callback exclusively owns drift correction
 
     std::atomic<uint64_t> accepted_frames{0};
     std::atomic<uint64_t> rendered_frames{0};
     std::atomic<uint64_t> silence_frames{0};
     std::atomic<uint64_t> overflow_packets{0};
     std::atomic<uint64_t> callback_count{0};
+    std::atomic<uint64_t> underrun_events{0};
+    std::atomic<uint64_t> reprime_events{0};
+    std::atomic<int32_t> current_correction_ppm{0};
     std::atomic<int32_t> stream_error{AAUDIO_OK};
 
     static aaudio_data_callback_result_t callback(
@@ -58,48 +67,53 @@ public:
         auto* self = static_cast<Renderer*>(user_data);
         auto* output = static_cast<int16_t*>(audio_data);
         if (nframes <= 0) return AAUDIO_CALLBACK_RESULT_CONTINUE;
-        const auto requested = static_cast<uint64_t>(nframes);
-        // Always define the entire output; silence is the underrun policy.
+        const uint64_t requested = static_cast<uint64_t>(nframes);
+        // Output thread is the sole media clock. Never wait for the network;
+        // every frame outside the authenticated PCM range is zero-valued.
         std::memset(output, 0, static_cast<size_t>(requested) * kChannels * sizeof(int16_t));
 
-        const uint64_t rd = self->read_pos.load(std::memory_order_relaxed);
+        uint64_t rd = self->read_pos.load(std::memory_order_relaxed);
         const uint64_t wr = self->write_pos.load(std::memory_order_acquire);
-        const uint64_t ready = wr - rd;
-        // Verify the producer's bounded ring invariant without blocking.
-        if (ready > kCapacityFrames) {
+        if (wr < rd || wr - rd > kCapacityFrames) {
             self->stream_error.store(-10001, std::memory_order_release);
             return AAUDIO_CALLBACK_RESULT_STOP;
         }
+        const uint64_t ready = wr - rd;
         if (!self->primed) {
             if (ready >= kPrimeFrames) {
                 self->primed = true;
                 self->fade_in_remaining = kFadeFrames;
-            }
-            else {
+                self->follower.reset();
+                if (self->has_primed) {
+                    self->reprime_events.fetch_add(1, std::memory_order_relaxed);
+                }
+                self->has_primed = true;
+            } else {
                 self->silence_frames.fetch_add(requested, std::memory_order_relaxed);
                 self->callback_count.fetch_add(1, std::memory_order_relaxed);
                 return AAUDIO_CALLBACK_RESULT_CONTINUE;
             }
         }
 
-        const uint64_t take = std::min(ready, requested);
-        const uint64_t pos = rd % kCapacityFrames;
-        const uint64_t first = std::min(take, kCapacityFrames - pos);
-        if (first) {
-            std::memcpy(output, self->ring.data() + pos * kChannels,
-                        static_cast<size_t>(first) * kChannels * sizeof(int16_t));
-        }
-        if (take > first) {
-            std::memcpy(output + first * kChannels, self->ring.data(),
-                        static_cast<size_t>(take - first) * kChannels * sizeof(int16_t));
+        // Occupancy-based drift adaptation is deliberately gentle, bounded to
+        // +/-400 ppm, and integrates only on the Android output callback.
+        // AAudio's real output demand defines requested, NOT sender pacing.
+        const uint64_t step_q32 = self->follower.step(ready);
+        self->current_correction_ppm.store(self->follower.ppm, std::memory_order_relaxed);
+
+        uint64_t produced = 0;
+        while (produced < requested && wr - rd >= 2) {
+            self->follower.consume_one(
+                self->ring.data(), rd,
+                output + static_cast<size_t>(produced) * kChannels, step_q32);
+            ++produced;
         }
 
-        // Real-time, bounded integer fades at output START / true UNDERRUN.
-        // These avoid a hard zero-to-sample or sample-to-zero discontinuity
-        // without moving sample positions or changing the phone's media clock.
-        // In particular this is NOT a Windows/Android volume automation fix.
-        if (self->fade_in_remaining && take) {
-            const auto ramp = std::min<uint64_t>(take, self->fade_in_remaining);
+        // The first and final few output frames are multiplied by a bounded
+        // gain ramp to reduce abrupt edges. Do not change already committed
+        // audio, real WASAPI source identity, or any QUIC send deadline.
+        if (self->fade_in_remaining && produced) {
+            const auto ramp = std::min<uint64_t>(produced, self->fade_in_remaining);
             const uint32_t begun = kFadeFrames - self->fade_in_remaining;
             for (uint64_t frame = 0; frame < ramp; ++frame) {
                 const int32_t gain = static_cast<int32_t>(begun + frame + 1);
@@ -111,25 +125,36 @@ public:
             }
             self->fade_in_remaining -= static_cast<uint32_t>(ramp);
         }
-        if (take < requested && take) {
-            const auto tail = std::min<uint64_t>(take, kFadeFrames);
-            const auto begin = take - tail;
+        if (produced < requested && produced) {
+            const auto tail = std::min<uint64_t>(produced, kFadeFrames);
+            const auto begin = produced - tail;
             for (uint64_t frame = 0; frame < tail; ++frame) {
                 const int32_t gain = static_cast<int32_t>(tail - frame - 1);
                 for (int ch = 0; ch < kChannels; ++ch) {
                     const auto i = static_cast<size_t>(begin + frame) * kChannels + ch;
                     output[i] = static_cast<int16_t>(
-                        static_cast<int32_t>(output[i]) * gain / static_cast<int32_t>(tail));
+                        static_cast<int32_t>(output[i]) * gain /
+                        static_cast<int32_t>(tail));
                 }
             }
         }
 
-        // Sole reader publishes release BEFORE producer reuses the slots.
-        self->read_pos.store(rd + take, std::memory_order_release);
-        self->rendered_frames.fetch_add(take, std::memory_order_relaxed);
-        self->silence_frames.fetch_add(requested - take, std::memory_order_relaxed);
+        // Sole reader releases consumed slots once all interpolation reads
+        // finish; producer sees the release before reusing that region.
+        if (produced < requested) {
+            // A partial callback has already played the newest contiguous
+            // interval. Drop any isolated final lookahead frame (at most one),
+            // reset the rate follower and prime fresh data before resuming.
+            rd = wr;
+            self->primed = false;
+            self->follower.reset();
+            self->current_correction_ppm.store(0, std::memory_order_relaxed);
+            self->underrun_events.fetch_add(1, std::memory_order_relaxed);
+        }
+        self->read_pos.store(rd, std::memory_order_release);
+        self->rendered_frames.fetch_add(produced, std::memory_order_relaxed);
+        self->silence_frames.fetch_add(requested - produced, std::memory_order_relaxed);
         self->callback_count.fetch_add(1, std::memory_order_relaxed);
-        if (take < requested) self->primed = false; // re-prime after underrun
         return AAUDIO_CALLBACK_RESULT_CONTINUE;
     }
 
@@ -173,6 +198,9 @@ public:
         s->stream_error = stream_error.load(std::memory_order_acquire);
         s->actual_sample_rate = stream ? AAudioStream_getSampleRate(stream) : 0;
         s->actual_channels = stream ? AAudioStream_getChannelCount(stream) : 0;
+        s->drift_correction_ppm = current_correction_ppm.load(std::memory_order_relaxed);
+        s->underrun_events = underrun_events.load(std::memory_order_relaxed);
+        s->reprime_events = reprime_events.load(std::memory_order_relaxed);
     }
 };
 
@@ -183,6 +211,9 @@ public:
 #else
 #define DF_EXPORT extern "C"
 #endif
+
+// Explicit C-ABI guard: an older .so must not write past a newer Rust Stats.
+DF_EXPORT uint32_t df_audio_abi_version() noexcept { return 2; }
 
 DF_EXPORT int32_t df_audio_open(void** output) noexcept {
     if (!output) return -1;
