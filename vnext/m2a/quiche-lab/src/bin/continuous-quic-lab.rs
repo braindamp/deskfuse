@@ -10,6 +10,8 @@ use deskfuse_quiche_lab::{encode, parse, Configuration, Header, HEADER_BYTES, KI
 use std::env;
 use std::error::Error;
 use std::io;
+use std::sync::mpsc::TryRecvError;
+use deskfuse_quiche_lab::wasapi_pipe::{self, Assembler};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
@@ -57,6 +59,19 @@ fn packet(sequence: u32) -> Vec<u8> {
     let mut bytes = encode(&header).to_vec();
     bytes.extend((0..PAYLOAD_BYTES).map(|i| (i as u8).wrapping_add(sequence as u8)));
     bytes
+}
+
+fn captured_packet(sequence: u32, device_frame: u64, pcm: &[u8; 960]) -> Vec<u8> {
+    let h = Header {
+        version: VERSION, kind: KIND_AUDIO, flags: 0,
+        header_bytes: HEADER_BYTES as u16, frame_count: AUDIO_FRAMES as u16,
+        media_epoch: 1, source_stream_id: 1, format_config_id: 1,
+        packet_sequence: sequence, first_source_frame: device_frame,
+        payload_bytes: PAYLOAD_BYTES as u32, clock_anchor_id: 17,
+    };
+    let mut wire = encode(&h).to_vec();
+    wire.extend_from_slice(pcm);
+    wire
 }
 
 fn verified(conn: &quiche::Connection) -> Result<()> {
