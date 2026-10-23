@@ -76,6 +76,7 @@ struct Block {
     uint64_t qpc_100ns = 0;
     uint32_t flags = 0;
     uint32_t frame_count = 0;
+    uint32_t original_packet_offset_frames = 0;
     std::array<uint8_t, kPayloadLimit> pcm{};
 };
 
@@ -144,16 +145,21 @@ void put64(uint8_t* at, uint64_t v) {
 
 // 40-byte little-endian narrow IPC header, followed by 1..240 stereo PCM16
 // frames. No authentication: pipe/file is local. QUIC transport remains Rust-owned.
+// DFWC v2 preserves its original fixed 40-byte local header size.
 // Offset: magic[4], version[4], first_device_frame[8], qpc_100ns[8],
-//         frame_count[4], flags[4], payload_bytes[4], reserved[4].
+//         frame_count[4], flags[4], payload_bytes[4],
+//         original_GetBuffer_packet_offset_frames[4].
+// This offset is provenance, not an audio-clock offset or a send timer.
+// A v1 reader MUST reject this wire version rather than misread the field.
 void write_block(HANDLE out, const Block& b) {
     uint8_t header[kHeaderSize] = { 'D', 'F', 'W', 'C' };
-    put32(header + 4, 1);
+    put32(header + 4, 2);
     put64(header + 8, b.first_device_frame);
     put64(header + 16, b.qpc_100ns);
     put32(header + 24, b.frame_count);
     put32(header + 28, b.flags);
     put32(header + 32, b.frame_count * kChannels * sizeof(int16_t));
+    put32(header + 36, b.original_packet_offset_frames);
     write_all(out, header, sizeof(header));
     write_all(out, b.pcm.data(), b.frame_count * kChannels * sizeof(int16_t));
 }
@@ -401,6 +407,10 @@ void capture(IMMDeviceEnumerator& enumerator, const std::wstring& device_id,
                     // this GetBuffer packet, not every 240-frame slice.
                     b.flags = offset == 0 ? flags : (flags & ~AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY);
                     b.frame_count = std::min<UINT32>(kMaxFrames, frames - offset);
+                    // Preserve original WASAPI GetBuffer membership. This
+                    // lets Rust check the packet's first-frame QPC rather than
+                    // treating a 5-ms derived fragment as independent input.
+                    b.original_packet_offset_frames = offset;
                     convert(raw_data, is_float, flags, offset, b);
                     if (!queue.try_push(b)) {
                         const uint64_t dropped = queue.dropped();
