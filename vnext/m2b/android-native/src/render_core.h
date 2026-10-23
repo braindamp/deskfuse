@@ -343,6 +343,13 @@ public:
         return snapshots_.pop(record);
     }
     uint64_t dropped_snapshots() const noexcept { return snapshots_.dropped(); }
+#ifdef DESKFUSE_TEST_PROBE
+    // Deterministic corruption injection *only* in host regression builds.
+    // Production publisher cannot write incompatible support tags.
+    void test_set_tag(uint64_t slot, MediaIdentity value) noexcept {
+        tags_[slot % capacity] = value;
+    }
+#endif
     uint64_t published() const noexcept { return published_.load(std::memory_order_relaxed); }
     uint64_t overflow() const noexcept { return overflow_.load(std::memory_order_relaxed); }
     uint64_t read() const noexcept { return read_.load(std::memory_order_acquire); }
