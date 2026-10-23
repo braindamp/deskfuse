@@ -169,7 +169,7 @@ struct PacketTimingTrace {
     // Fixed 160-KiB budget, sufficient for every 480-frame original
     // GetBuffer packet during the short <=20s silent diagnostic. No
     // allocation, lock, log write or wait on the capture thread.
-    std::array<PacketObservation, 4096> samples{};
+    std::unique_ptr<std::array<PacketObservation, 4096>> samples;
     size_t recorded = 0;
     uint64_t eligible = 0;
 
@@ -182,6 +182,9 @@ struct PacketTimingTrace {
         path.assign(value, value + n);
         if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0)
             throw std::runtime_error("packet trace QPC frequency unavailable");
+        // Allocate the fixed diagnostic budget ONCE at startup, only for an
+        // explicit silent trace. The production capture path allocates none.
+        samples = std::make_unique<std::array<PacketObservation, 4096>>();
     }
     void observe(UINT64 frame, UINT32 frames, UINT64 first_qpc100, DWORD flags) {
         if (path.empty() || frames < 480) return;
@@ -189,14 +192,14 @@ struct PacketTimingTrace {
         // No disk I/O, allocations, locks or waits on WASAPI capture
         // thread. An exhaustive bounded trace prevents independently
         // sampled native/sender diagnostics from missing the same packet.
-        if (recorded == samples.size()) return;
+        if (recorded == samples->size()) return;
         LARGE_INTEGER now{};
         if (!QueryPerformanceCounter(&now) || now.QuadPart < 0) return;
         const uint64_t ticks = uint64_t(now.QuadPart);
         const uint64_t hz = uint64_t(frequency.QuadPart);
         const uint64_t current = ticks / hz * 10'000'000ULL +
                                  (ticks % hz) * 10'000'000ULL / hz;
-        samples[recorded++] = {frame, first_qpc100, current, frames, flags};
+        (*samples)[recorded++] = {frame, first_qpc100, current, frames, flags};
     }
     void save() const {
         if (path.empty()) return;
@@ -211,7 +214,7 @@ struct PacketTimingTrace {
             "first_future_100ns,second_future_100ns\n";
         write_all(file.get(), reinterpret_cast<const uint8_t*>(header.data()), header.size());
         for (size_t i = 0; i < recorded; ++i) {
-            const auto& p = samples[i];
+            const auto& p = (*samples)[i];
             const uint64_t later = p.packet_qpc100 == 0 ? 0 :
                                    p.packet_qpc100 + 240ULL * 10'000'000ULL / kSampleRate;
             const auto first_future = int64_t(p.packet_qpc100) - int64_t(p.local_qpc100);
