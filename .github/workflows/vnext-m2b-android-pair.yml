@@ -45,6 +45,16 @@ jobs:
             -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-35 -DANDROID_STL=c++_shared
           cmake --build /tmp/df-aaudio --parallel 2
           test -s /tmp/df-aaudio/libdeskfuse_android_audio.so
+      - name: Verify versioned C ABI symbols required by Rust renderer
+        shell: bash
+        run: |
+          set -euo pipefail
+          nm="$ANDROID_HOME/ndk/30.0.16248370/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
+          "$nm" -D /tmp/df-aaudio/libdeskfuse_android_audio.so > /tmp/df-aaudio/exported-symbols.txt
+          for symbol in df_audio_abi_version df_audio_push_guarded_v5 df_audio_stats df_audio_stats_v2 df_audio_snapshot_v4 df_audio_presentation_time_v5 df_audio_close; do
+            grep -Eq "[[:space:]]$symbol$" /tmp/df-aaudio/exported-symbols.txt ||
+              { echo "Missing native ABI symbol $symbol"; exit 1; }
+          done
       - name: Install pinned cargo-ndk host tool
         shell: bash
         run: |
