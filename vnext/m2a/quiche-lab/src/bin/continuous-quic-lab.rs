@@ -450,13 +450,17 @@ struct PlayModes {
     fades: bool,
     conceal: bool,
     linear: bool,
+    strict: bool,
 }
 impl Default for PlayModes {
     fn default() -> Self {
-        Self { fades: true, conceal: true, linear: true }
+        Self { fades: true, conceal: true, linear: true, strict: false }
     }
 }
 impl PlayModes {
+    fn strict() -> Self {
+        Self { fades: false, conceal: false, linear: false, strict: true }
+    }
     // Exact, deliberately boring mode specification: f1c0r1
     // f: fade; c: short-gap concealment; r: linear resampling comparator.
     fn parse(flags: &str) -> Result<Self> {
@@ -470,6 +474,7 @@ impl PlayModes {
             fades: x[1] == b'1',
             conceal: x[3] == b'1',
             linear: x[5] == b'1',
+            strict: false,
         })
     }
 }
@@ -598,6 +603,9 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                 audio = Some(renderer);
                 println!("AUDIO Android: native AAudio output started, stereo PCM16 48000 Hz; modes fades={} concealment={} linear_asrc={}",
                          modes.fades, modes.conceal, modes.linear);
+                if modes.strict {
+                    println!("STRICT Android: no resampling, concealment or gain ramps; any source gap, overflow, recovery or callback telemetry loss fails; startup prime silence excluded");
+                }
             }
         }
         if authenticated_at.is_some() {
@@ -677,8 +685,12 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                             h.packet_sequence, h.first_source_frame, AUDIO_FRAMES,
                         ) {
                             Ok(v) => v,
-                            Err(SourceReject::Late) => { late += 1; continue; }
+                            Err(SourceReject::Late) => {
+                                if modes.strict { return Err("STRICT PCM violation: duplicate or reordered packet".into()); }
+                                late += 1; continue;
+                            }
                             Err(SourceReject::Overlapping) => {
+                                if modes.strict { return Err("STRICT PCM violation: overlapping authenticated source interval".into()); }
                                 native_stale += 1; continue;
                             }
                             Err(SourceReject::RetiredContext) => {
@@ -696,6 +708,12 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                         source_gap_frames += accepted.missing_frames;
                         let expected = accepted.expected_source;
                         let missing = accepted.missing_frames;
+                        if modes.strict && missing != 0 {
+                            return Err(format!(
+                                "STRICT PCM violation: authenticated source gap frames={} at={} (no concealment or skip permitted)",
+                                missing, h.first_source_frame
+                            ).into());
+                        }
                         if missing != 0 {
                                 eprintln!("TRACE Android SOURCE_GAP epoch={} sequence={} first_source_frame={} gap_frames={} elapsed_ms={}",
                                     h.media_epoch, h.packet_sequence, h.first_source_frame,
@@ -792,6 +810,7 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                                 Admission::Accepted => {}
                                 Admission::Overflow |
                                 Admission::Discontinuity => {
+                                    if modes.strict { return Err("STRICT PCM violation: native overflow or discontinuity".into()); }
                                     audio_queue_full += 1;
                                     recover_started += 1;
                                     begin_fresh_anchor(
@@ -805,6 +824,7 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                                     )?;
                                 }
                                 Admission::RecoverPending => {
+                                    if modes.strict { return Err("STRICT PCM violation: recovery pending".into()); }
                                     recover_pending += 1;
                                     begin_fresh_anchor(
                                         &mut anchor_pending, &mut fresh_anchor_nonce,
@@ -816,7 +836,10 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                                         ingress_frontier.floor(),
                                     )?;
                                 }
-                                Admission::Stale => { native_stale += 1; }
+                                Admission::Stale => {
+                                    if modes.strict { return Err("STRICT PCM violation: stale PCM admission".into()); }
+                                    native_stale += 1;
+                                }
                             }
                         }
                         if received % 200 == 0 {
@@ -853,6 +876,17 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                 match speaker.pop_snapshot()
                     .map_err(|e| format!("AAudio off-callback telemetry: {e}"))? {
                     Some((record, dropped)) => {
+                        if modes.strict && (
+                            record.underruns != 0 || record.invalidations != 0 ||
+                            record.discarded != 0 || record.concealed_outputs != 0 ||
+                            record.reprimes != 0 || dropped != 0
+                        ) {
+                            return Err(format!(
+                                "STRICT PCM violation: underruns={} invalidations={} discarded={} concealment={} reprimes={} telemetry_lost={}",
+                                record.underruns, record.invalidations, record.discarded,
+                                record.concealed_outputs, record.reprimes, dropped
+                            ).into());
+                        }
                         latest_render_record = Some((record, dropped));
                         coherent_records_read += 1;
                     }
@@ -1008,11 +1042,15 @@ fn run() -> Result<()> {
         [_, mode, remote, ca, cert, key, library, secs] if mode == "client-playback" => {
             client(remote.parse()?, ca, cert, key, positive_seconds(secs)?, false, Some(library), PlayModes::default())
         }
+        [_, mode, remote, ca, cert, key, library, secs] if mode == "client-playback-strict" => {
+            client(remote.parse()?, ca, cert, key, positive_seconds(secs)?,
+                   false, Some(library), PlayModes::strict())
+        }
         [_, mode, remote, ca, cert, key, library, flags, secs] if mode == "client-playback-modes" => {
             client(remote.parse()?, ca, cert, key, positive_seconds(secs)?,
                    false, Some(library), PlayModes::parse(flags)?)
         }
-        _ => Err("usage: continuous-quic-lab server <bind:port> <allowed-ip> <ca> <server-cert> <server-key> <secs> | server-wasapi <bind:port> <allowed-ip> <ca> <server-cert> <server-key> <wasapi-capture.exe> <endpoint-id|default> <secs> | client|client-capture <windows-ip:port> <ca> <client-cert> <client-key> <secs> | client-playback <windows-ip:port> <ca> <client-cert> <client-key> <libdeskfuse_android_audio.so> <secs> | client-playback-modes <windows-ip:port> <ca> <client-cert> <client-key> <libdeskfuse_android_audio.so> <f1c1r1> <secs>".into()),
+        _ => Err("usage: continuous-quic-lab server <bind:port> <allowed-ip> <ca> <server-cert> <server-key> <secs> | server-wasapi <bind:port> <allowed-ip> <ca> <server-cert> <server-key> <wasapi-capture.exe> <endpoint-id|default> <secs> | client|client-capture <windows-ip:port> <ca> <client-cert> <client-key> <secs> | client-playback <windows-ip:port> <ca> <client-cert> <client-key> <libdeskfuse_android_audio.so> <secs> | client-playback-modes <windows-ip:port> <ca> <client-cert> <client-key> <libdeskfuse_android_audio.so> <f1c1r1> <secs> | client-playback-strict <windows-ip:port> <ca> <client-cert> <client-key> <libdeskfuse_android_audio.so> <secs>".into()),
     }
 }
 
