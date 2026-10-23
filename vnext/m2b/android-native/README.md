@@ -8,8 +8,11 @@ before publication to the native C++ renderer. The native AAudio callback is
 the sole consumer of a bounded 80 ms (16 x 240-frame) SPSC PCM16 stereo ring.
 It requests audio independently of network arrival or transport ACKs.
 Callback writes zeros on underrun, performs no allocation, sleeping, locks
-or network I/O. The source may use an independent 48 kHz clock: final drift
-correction is NOT implemented in this first audible prototype.
+or network I/O. Windows and Xiaomi have independent 48-kHz audio clocks. On the
+DEVELOPMENT branch, M2b now includes one bounded output-demand correction
+authority (AAudio callback) with Q32 linear interpolation at +/-400 ppm and a
+30-ms target ring occupancy. The hardware-proven reference branch retains
+the original renderer without adaptive drift correction.
 
 ## Build from Visual Studio Developer PowerShell
 
@@ -74,6 +77,35 @@ yet localized to capture gain, network gap, or Android output gain. The
 next implementation iterations prioritize timely QUIC service during
 bursty capture and click-free AAudio start/underrun behavior, followed by
 source/sink drift adaptation and Android app lifecycle integration.
+
+## Post-baseline M2b clock adaptation (development branch, not yet phone-qualified)
+
+A single Android AAudio callback owns all playback-clock correction.
+`src/adaptive_clock.h` measures buffered source frames, smooths occupancy
+across output callbacks, and applies bounded proportional/integral correction
+by changing source sample advance by **at most +/-400 ppm** using linear
+interpolation. QUIC ACK/pacing timers and WASAPI source positions are NOT
+playback clocks. Callback ring remains 80 ms maximum. It primes with 30 ms
+and reports drift correction (ppm), true underrun events, and rebuffer events.
+After a true underrun, it resets correction and re-primes; no retroactive
+rewrite of audio that has already played.
+
+**Native renderer ABI is now v2.** New Rust receiver requires
+`df_audio_abi_version() == 2` before accessing the extended statistics.
+Redeploy BOTH the native `libdeskfuse_android_audio.so` and Android
+`deskfuse-vnext-continuous` executable together; an old shared library is
+deliberately rejected before its statistics can be read with a mismatched
+layout. Rebuild Windows `continuous-quic-lab.exe` after pulling any sender
+changes. **The working branch `reference/vnext-audio-first-audible-20261023`
+remains untouched**.
+
+The developer's subsequent brief listening impression was that pops might
+be shorter but perhaps louder or more frequent, while general music was
+still clean. This is not strong enough to identify or confirm a fix.
+Phone volume can include platform gain transitions unrelated to media
+underruns; output and capture logs must be compared before attributing
+that noise to any specific component. Retest initially at a comfortable,
+moderate phone volume.
 
 ## Scope and limits
 
