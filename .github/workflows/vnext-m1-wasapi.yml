@@ -25,6 +25,9 @@ jobs:
       - name: Qualify streaming DFWC source/QPC parser against original record layout
         shell: pwsh
         run: python vnext/qualification/test_analyze_dfpcm.py
+      - name: Assert local physical-run evidence evaluator fails closed
+        shell: pwsh
+        run: python vnext/qualification/test_evaluate_physical_audio.py
       - name: Statically parse physical qualification PowerShell (no devices contacted)
         shell: pwsh
         run: |
