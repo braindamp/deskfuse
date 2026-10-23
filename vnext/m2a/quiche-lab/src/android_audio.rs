@@ -22,9 +22,25 @@ pub struct AudioStats {
     pub reprime_events: u64,
 }
 
+// ABI v3: renderer-owned source position at last committed callback output,
+// plus the number of physical source frames released or discarded. Snapshots
+// are diagnostic until the end-to-end ownership/phase gates are met.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RenderIdentity {
+    pub last_committed_source_frame: u64,
+    pub last_fraction_q32: u32,
+    pub last_epoch: u32,
+    pub last_generation: u32,
+    pub reserved: u32,
+    pub released_source_frames: u64,
+    pub discarded_on_rebuffer_frames: u64,
+    pub concealed_output_frames: u64,
+}
+
 #[cfg(target_os = "android")]
 mod native {
-    use super::AudioStats;
+    use super::{AudioStats, RenderIdentity};
     use std::ffi::{c_char, c_int, c_void, CString};
     use std::ptr;
 
@@ -39,6 +55,10 @@ mod native {
     type AbiVersion = unsafe extern "C" fn() -> u32;
     type Open = unsafe extern "C" fn(*mut *mut c_void) -> i32;
     type Push = unsafe extern "C" fn(*mut c_void, *const i16, u32) -> i32;
+    type PushIdentified = unsafe extern "C" fn(
+        *mut c_void, *const i16, u32, u64, u32, u32, u32
+    ) -> i32;
+    type IdentityStats = unsafe extern "C" fn(*mut c_void, *mut RenderIdentity) -> i32;
     type Stats = unsafe extern "C" fn(*mut c_void, *mut AudioStats) -> i32;
     type Close = unsafe extern "C" fn(*mut c_void);
     type DiagnosticModes = unsafe extern "C" fn(*mut c_void, u32) -> i32;
@@ -47,6 +67,8 @@ mod native {
         library: *mut c_void,
         ctx: *mut c_void,
         push: Push,
+        identified_push: PushIdentified,
+        identity_stats: IdentityStats,
         stats: Stats,
         close: Close,
         configure: DiagnosticModes,
@@ -71,10 +93,13 @@ mod native {
                     symbol(b"df_audio_stats_v2\0")?,
                     symbol(b"df_audio_close\0")?,
                     symbol(b"df_audio_set_diagnostic_modes\0")?,
+                    symbol(b"df_audio_push_identified\0")?,
+                    symbol(b"df_audio_identity_stats_v3\0")?,
                 ))
             })();
 
-            let (version_fn, open_fn, push_fn, stats_fn, close_fn, modes_fn) = match functions {
+            let (version_fn, open_fn, push_fn, stats_fn, close_fn, modes_fn,
+                 identified_fn, identity_fn) = match functions {
                 Ok(v) => v,
                 Err(e) => {
                     unsafe { dlclose(library); }
@@ -83,10 +108,10 @@ mod native {
             };
             let version: AbiVersion = unsafe { std::mem::transmute(version_fn) };
             let actual_version = unsafe { version() };
-            if actual_version != 2 {
+            if actual_version != 3 {
                 unsafe { dlclose(library); }
                 return Err(format!(
-                    "Android renderer ABI mismatch: expected v2, got v{actual_version}; redeploy the AAudio .so and QUIC executable together"
+                    "Android renderer ABI mismatch: expected v3, got v{actual_version}; redeploy AAudio .so and QUIC executable together"
                 ));
             }
             let open: Open = unsafe { std::mem::transmute(open_fn) };
@@ -94,6 +119,8 @@ mod native {
             let stats: Stats = unsafe { std::mem::transmute(stats_fn) };
             let close: Close = unsafe { std::mem::transmute(close_fn) };
             let configure: DiagnosticModes = unsafe { std::mem::transmute(modes_fn) };
+            let identified_push: PushIdentified = unsafe { std::mem::transmute(identified_fn) };
+            let identity_stats: IdentityStats = unsafe { std::mem::transmute(identity_fn) };
 
             let mut ctx = ptr::null_mut();
             let code = unsafe { open(&mut ctx) };
@@ -101,7 +128,7 @@ mod native {
                 unsafe { dlclose(library); }
                 return Err(format!("AAudio output open/start failed code={code}"));
             }
-            Ok(Self { library, ctx, push, stats, close, configure })
+            Ok(Self { library, ctx, push, identified_push, identity_stats, stats, close, configure })
         }
 
         pub fn set_diagnostic_modes(&mut self, fades: bool, linear_resample: bool) -> Result<(), String> {
@@ -123,6 +150,33 @@ mod native {
                 1 => Ok(false), // bounded queue full; never overwrite played frames
                 code => Err(format!("Android AAudio queue error code={code}")),
             }
+        }
+
+        pub fn push_pcm16_identified(
+            &mut self, wire_pcm: &[u8], first_source_frame: u64,
+            epoch: u32, generation: u32, concealed: bool,
+        ) -> Result<bool, String> {
+            if wire_pcm.len() != 960 { return Err("expected exact 240-frame stereo PCM16".into()); }
+            let mut native_pcm = [0i16; 480];
+            for (i, sample) in native_pcm.iter_mut().enumerate() {
+                *sample = i16::from_le_bytes([wire_pcm[i * 2], wire_pcm[i * 2 + 1]]);
+            }
+            let code = unsafe {
+                (self.identified_push)(self.ctx, native_pcm.as_ptr(), 240,
+                    first_source_frame, epoch, generation, u32::from(concealed))
+            };
+            match code {
+                0 => Ok(true),
+                1 => Ok(false),
+                _ => Err(format!("AAudio identified PCM push failed code={code}")),
+            }
+        }
+
+        pub fn identity_snapshot(&self) -> Result<RenderIdentity, String> {
+            let mut s = RenderIdentity::default();
+            let code = unsafe { (self.identity_stats)(self.ctx, &mut s) };
+            if code == 0 { Ok(s) }
+            else { Err(format!("AAudio identity stats error={code}")) }
         }
 
         pub fn snapshot(&self) -> Result<AudioStats, String> {
@@ -158,6 +212,15 @@ impl AndroidAudio {
     }
     pub fn push_pcm16(&mut self, _bytes: &[u8]) -> Result<bool, String> {
         Err("AAudio playback requires Android".into())
+    }
+    pub fn push_pcm16_identified(
+        &mut self, _bytes: &[u8], _source_frame: u64, _epoch: u32,
+        _generation: u32, _concealed: bool
+    ) -> Result<bool, String> {
+        Err("AAudio source identity requires Android".into())
+    }
+    pub fn identity_snapshot(&self) -> Result<RenderIdentity, String> {
+        Err("AAudio source identity requires Android".into())
     }
     pub fn snapshot(&self) -> Result<AudioStats, String> {
         Err("AAudio playback requires Android".into())
