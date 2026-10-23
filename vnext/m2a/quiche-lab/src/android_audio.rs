@@ -66,7 +66,7 @@ mod native {
                     symbol(b"df_audio_abi_version\0")?,
                     symbol(b"df_audio_open\0")?,
                     symbol(b"df_audio_push\0")?,
-                    symbol(b"df_audio_stats\0")?,
+                    symbol(b"df_audio_stats_v2\0")?,
                     symbol(b"df_audio_close\0")?,
                 ))
             })();
