@@ -363,8 +363,9 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
             if at.elapsed() >= Duration::from_secs(seconds + 2) {
                 let stats = conn.stats();
                 println!(
-                    "DONE Android sink received={} first_seq={:?} last_seq={:?} missing_between={} source_missing_frames={} stale={} udp_packets={} quic_lost={} (no playback)",
-                    received, first_sequence, last_sequence, gaps, source_gap_frames, late, egress.udp_packets_sent, stats.lost
+                    "DONE Android sink received={} first_seq={:?} last_seq={:?} missing_between={} source_missing_frames={} stale={} udp_packets={} quic_lost={} mode={}",
+                    received, first_sequence, last_sequence, gaps, source_gap_frames, late, egress.udp_packets_sent, stats.lost,
+                    if audio.is_some() { "native-speaker" } else { "verify-only" }
                 );
                 if let Some(ref speaker) = audio {
                     let a = speaker.snapshot().map_err(|e| format!("AAudio stats: {e}"))?;
