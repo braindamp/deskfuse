@@ -57,7 +57,19 @@ public:
                 read_.store(rd + 1, std::memory_order_release);
                 return true;
             }
-            if (closed_.load(std::memory_order_acquire)) return false;
+#ifdef DESKFUSE_QUEUE_TEST_PROBE
+            // Deterministic host-only pause after the empty snapshot.
+            if (empty_probe_) empty_probe_(empty_probe_arg_);
+#endif
+            if (closed_.load(std::memory_order_acquire)) {
+                // Producer publishes its final write_ BEFORE release-closing.
+                // Acquire-close synchronizes with that publication. Re-read the
+                // producer cursor: the first empty snapshot might predate the
+                // final accepted block. Return only when the final cursor is
+                // empty; otherwise loop and drain the committed PCM.
+                if (write_.load(std::memory_order_acquire) == rd) return false;
+                continue;
+            }
             if (WaitForSingleObject(wake_, INFINITE) != WAIT_OBJECT_0) {
                 throw std::runtime_error("WASAPI writer event wait failed");
             }
@@ -71,6 +83,16 @@ public:
         SetEvent(wake_);
     }
 
+#ifdef DESKFUSE_QUEUE_TEST_PROBE
+    using EmptyProbe = void (*)(void*);
+    // Install only before starting the producer/consumer threads. Not
+    // present in production WASAPI builds.
+    void set_empty_probe(EmptyProbe callback, void* context) noexcept {
+        empty_probe_ = callback;
+        empty_probe_arg_ = context;
+    }
+#endif
+
     uint64_t dropped() const noexcept {
         return dropped_.load(std::memory_order_relaxed);
     }
@@ -79,5 +101,9 @@ private:
     std::atomic<uint64_t> read_{0}, write_{0}, dropped_{0};
     std::atomic<bool> closed_{false};
     HANDLE wake_;
+#ifdef DESKFUSE_QUEUE_TEST_PROBE
+    EmptyProbe empty_probe_ = nullptr;
+    void* empty_probe_arg_ = nullptr;
+#endif
 };
 } // namespace df_wasapi
