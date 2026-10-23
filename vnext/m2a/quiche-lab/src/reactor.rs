@@ -122,6 +122,11 @@ fn platform_wait(socket: &UdpSocket, want_write: bool, timeout_ms: i32) -> io::R
     use std::os::fd::AsRawFd;
     #[repr(C)]
     struct PollFd { fd: i32, events: i16, revents: i16 }
+    // poll(2) uses a 32-bit nfds_t on Darwin and Android, and
+    // unsigned long on Linux/glibc. Match the platform ABI exactly.
+    #[cfg(any(target_vendor = "apple", target_os = "android"))]
+    unsafe extern "C" { fn poll(fds: *mut PollFd, nfds: u32, timeout: i32) -> i32; }
+    #[cfg(not(any(target_vendor = "apple", target_os = "android")))]
     unsafe extern "C" { fn poll(fds: *mut PollFd, nfds: usize, timeout: i32) -> i32; }
     const POLLIN: i16 = 0x0001;
     const POLLOUT: i16 = 0x0004;
