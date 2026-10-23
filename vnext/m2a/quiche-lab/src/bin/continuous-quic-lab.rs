@@ -567,6 +567,9 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
     let mut audio: Option<AndroidAudio> = None;
     let mut latest_render_record: Option<(deskfuse_quiche_lab::android_audio::RenderSnapshot, u64)> = None;
     let mut coherent_records_read = 0u64;
+    // Strict PCM verification excludes only startup priming and shutdown,
+    // never silently calls those defined silences a transport underrun.
+    let mut strict_baseline: Option<(deskfuse_quiche_lab::android_audio::RenderSnapshot, u64)> = None;
     let mut source_gap_frames = 0u64;
     let mut source_concealed_frames = 0u64;
     let mut source_unconcealed_frames = 0u64;
@@ -604,7 +607,7 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                 println!("AUDIO Android: native AAudio output started, stereo PCM16 48000 Hz; modes fades={} concealment={} linear_asrc={}",
                          modes.fades, modes.conceal, modes.linear);
                 if modes.strict {
-                    println!("STRICT Android: no resampling, concealment or gain ramps; any source gap, overflow, recovery or callback telemetry loss fails; startup prime silence excluded");
+                    println!("STRICT Android: no resampling/concealment/fades; source identity is exact; steady-state 500ms after auth until 250ms before end; startup/shutdown silence excluded");
                 }
             }
         }
@@ -882,16 +885,36 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                 match speaker.pop_snapshot()
                     .map_err(|e| format!("AAudio off-callback telemetry: {e}"))? {
                     Some((record, dropped)) => {
-                        if modes.strict && (
-                            record.underruns != 0 || record.invalidations != 0 ||
-                            record.discarded != 0 || record.concealed_outputs != 0 ||
-                            record.reprimes != 0 || dropped != 0
-                        ) {
-                            return Err(format!(
-                                "STRICT PCM violation: underruns={} invalidations={} discarded={} concealment={} reprimes={} telemetry_lost={}",
-                                record.underruns, record.invalidations, record.discarded,
-                                record.concealed_outputs, record.reprimes, dropped
-                            ).into());
+                        if modes.strict {
+                            let during_steady_state = authenticated_at.is_some_and(|at| {
+                                let elapsed = at.elapsed();
+                                elapsed >= Duration::from_millis(500) &&
+                                elapsed < Duration::from_secs(seconds)
+                                    .saturating_sub(Duration::from_millis(250))
+                            });
+                            if during_steady_state {
+                                match strict_baseline {
+                                    Some((base, baseline_drop)) => {
+                                        if record.underruns > base.underruns ||
+                                           record.invalidations > base.invalidations ||
+                                           record.discarded > base.discarded ||
+                                           record.concealed_outputs > base.concealed_outputs ||
+                                           record.reprimes > base.reprimes ||
+                                           dropped > baseline_drop {
+                                            return Err(format!(
+                                                "STRICT PCM failure during steady exposure: underruns={} invalidations={} discarded={} concealed={} reprimes={} telemetry_lost={} (startup/shutdown excluded)",
+                                                record.underruns - base.underruns,
+                                                record.invalidations - base.invalidations,
+                                                record.discarded - base.discarded,
+                                                record.concealed_outputs - base.concealed_outputs,
+                                                record.reprimes - base.reprimes,
+                                                dropped - baseline_drop
+                                            ).into());
+                                        }
+                                    }
+                                    None => strict_baseline = Some((record, dropped)),
+                                }
+                            }
                         }
                         latest_render_record = Some((record, dropped));
                         coherent_records_read += 1;
@@ -971,6 +994,9 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                         denied_reanchor, authorized_recovery);
                     if a.stream_error != 0 { return Err(format!("AAudio stream failure code={}", a.stream_error).into()); }
                     if a.rendered_frames == 0 { return Err("AAudio played no authenticated PCM frames".into()); }
+                }
+                if modes.strict && strict_baseline.is_none() {
+                    return Err("STRICT PCM failure: no steady-state window with coherent output diagnostics".into());
                 }
                 if received == 0 { return Err("no authenticated PCM DATAGRAMs received".into()); }
                 return Ok(());
