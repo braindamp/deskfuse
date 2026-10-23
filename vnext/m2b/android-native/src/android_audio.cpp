@@ -5,6 +5,7 @@
 // This is the initial audible integration, not yet a drift-qualified renderer.
 #include <aaudio/AAudio.h>
 #include "adaptive_clock.h"
+#include "clock_qualification.h"
 
 #include <algorithm>
 #include <array>
@@ -51,7 +52,8 @@ public:
     bool primed = false;
     bool has_primed = false;
     uint32_t fade_in_remaining = kFadeFrames; // callback thread only
-    df_audio::DriftFollower follower; // experimental linear comparator
+    df_audio::DriftFollower follower; // Q32 phase and linear-interpolation comparator
+    df_audio::TimeBasedFollower output_clock; // elapsed-time controller, callback-owned
     // Bits: 0=fade, 1=linear resampling. Bit 2 concealment belongs
     // exclusively to the Rust receiver, which owns source-frame gaps.
     std::atomic<uint32_t> diagnostic_modes{3};
@@ -88,6 +90,7 @@ public:
                 self->primed = true;
                 self->fade_in_remaining = kFadeFrames;
                 self->follower.reset();
+                self->output_clock.reset();
                 if (self->has_primed) {
                     self->reprime_events.fetch_add(1, std::memory_order_relaxed);
                 }
@@ -102,10 +105,22 @@ public:
         const uint32_t modes = self->diagnostic_modes.load(std::memory_order_acquire);
         uint64_t produced = 0;
         if ((modes & 2u) != 0) {
-            // Historical elapsed-callback-dependent linear comparator only;
-            // neither controller nor interpolator qualifies as production ASRC.
-            const uint64_t step_q32 = self->follower.step(ready);
-            self->current_correction_ppm.store(self->follower.ppm, std::memory_order_relaxed);
+            // The controller integrates by OUTPUT FRAMES (elapsed sample time),
+            // uses projected post-callback occupancy, clips disturbances,
+            // limits correction slew and applies conditional anti-windup.
+            // The linear interpolation below remains only an experimental
+            // spectral comparator; it is NOT the production streaming ASRC.
+            const double commanded_ppm = self->output_clock.update(
+                static_cast<uint32_t>(requested),
+                static_cast<int64_t>(ready),
+                static_cast<int64_t>(df_audio::kTargetFrames));
+            const auto delta_q32 = static_cast<int64_t>(
+                static_cast<double>(df_audio::kOneQ32) *
+                commanded_ppm / 1'000'000.0);
+            const uint64_t step_q32 = static_cast<uint64_t>(
+                static_cast<int64_t>(df_audio::kOneQ32) + delta_q32);
+            self->current_correction_ppm.store(
+                static_cast<int32_t>(commanded_ppm), std::memory_order_relaxed);
             while (produced < requested && wr - rd >= 2) {
                 self->follower.consume_one(
                     self->ring.data(), rd,
@@ -167,6 +182,7 @@ public:
             rd = wr;
             self->primed = false;
             self->follower.reset();
+            self->output_clock.reset();
             self->current_correction_ppm.store(0, std::memory_order_relaxed);
             self->underrun_events.fetch_add(1, std::memory_order_relaxed);
         }
