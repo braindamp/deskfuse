@@ -302,7 +302,12 @@ void capture(IMMDeviceEnumerator& enumerator, const std::wstring& device_id,
                 const HRESULT get = reader->GetBuffer(&raw_data, &frames, &flags,
                                                        &device_pos, &qpc100);
                 check(get, "IAudioCaptureClient::GetBuffer");
-                if (!frames) continue;
+                if (!frames) {
+                    // Every successful GetBuffer must be paired with
+                    // ReleaseBuffer, including an empty capture fragment.
+                    check(reader->ReleaseBuffer(0), "IAudioCaptureClient::ReleaseBuffer(0)");
+                    continue;
+                }
                 for (UINT32 offset = 0; offset < frames; offset += kMaxFrames) {
                     Block b;
                     b.first_device_frame = device_pos + offset;
