@@ -111,11 +111,17 @@ def evaluate(folder: Path) -> dict:
     reasons = []
     if not HEX40.fullmatch(str(manifest["commit"])) or manifest["commit"] != pair.get("commit"):
         reasons.append("commit identity missing or mismatch")
-    if manifest["slot"] != pair.get("slot") or manifest["client_mode"] != pair.get("mode"):
+    strict = (manifest["client_mode"] == "client-playback-strict"
+              and pair.get("supports_strict") is True
+              and manifest["processing_mode"] == "strict-f0c0r0")
+    normal = (manifest["client_mode"] == pair.get("mode")
+              and (
+                  manifest["processing_mode"] == "reference-native"
+                  if pair.get("mode") == "client-playback"
+                  else bool(re.fullmatch(r"f[01]c[01]r[01]", str(manifest["processing_mode"])))
+              ))
+    if manifest["slot"] != pair.get("slot") or not (strict or normal):
         reasons.append("pair identity/mode mismatch")
-    if manifest["processing_mode"] != ("reference-native" if pair.get("mode") == "client-playback"
-                                      else manifest["processing_mode"]):
-        reasons.append("processing mode incompatible with receiver")
     if manifest["windows_exit"] != 0 or manifest["android_exit"] != 0:
         reasons.append("native process exit nonzero/unknown")
     if not (manifest["source_auth"] and manifest["sink_auth"]):
