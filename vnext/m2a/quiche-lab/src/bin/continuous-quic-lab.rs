@@ -829,13 +829,24 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                         // means PCM was omitted BEFORE packet numbering, not
                         // ordinary QUIC packet loss. Never manufacture half a
                         // signal from repeated silence concealment.
-                        if continuity_watch.observe(
-                            previous_source_sequence, h.packet_sequence, missing) {
+                        let recurring_source_hole = continuity_watch.observe(
+                            previous_source_sequence, h.packet_sequence, missing);
+                        if recurring_source_hole && playback_library.is_some() {
                             return Err(format!(
                                 "SUSTAINED SOURCE CONTINUITY FAILURE: {} consecutive source gaps despite consecutive authenticated media sequences; missing_frames={} first_source_frame={} sequence={} (AAudio stopped, investigate Windows capture/reader/drop counters)",
                                 continuity_watch.repeated_gaps(), missing,
                                 h.first_source_frame, h.packet_sequence
                             ).into());
+                        }
+                        // Verify-only / client-capture mode never opens an
+                        // AAudio stream, so it may collect the complete source
+                        // failure signature instead of stopping after 8 gaps.
+                        if recurring_source_hole && playback_library.is_none() &&
+                            continuity_watch.repeated_gaps()==ContinuityWatch::LIMIT {
+                            eprintln!(
+                                "TRACE Android VERIFY_ONLY_SOURCE_CONTINUITY_FAILURE repeated_gaps={} first_source_frame={} sequence={} (no audio output)",
+                                continuity_watch.repeated_gaps(),h.first_source_frame,h.packet_sequence
+                            );
                         }
                         if modes.strict && missing != 0 {
                             return Err(format!(
