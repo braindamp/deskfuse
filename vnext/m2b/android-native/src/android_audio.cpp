@@ -9,6 +9,7 @@
 #include <cstring>
 #include <memory>
 #include <new>
+#include <time.h>
 
 namespace {
 struct Stats {
@@ -25,6 +26,14 @@ struct Stats {
     uint64_t underrun_events;
     uint64_t reprime_events;
 };
+struct PresentationTimeV5 {
+    int64_t output_frame_position;
+    int64_t monotonic_nanoseconds;
+    int32_t aaudio_result;
+    int32_t reserved;
+};
+static_assert(sizeof(PresentationTimeV5) == 24);
+
 struct IdentityStats {
     uint64_t last_committed_source_frame;
     uint32_t last_fraction_q32;
@@ -189,6 +198,20 @@ DF_EXPORT int32_t df_audio_stats(void* ctx, void* out) noexcept {
 DF_EXPORT int32_t df_audio_stats_v2(void* ctx, void* out) noexcept {
     if (!ctx || !out) return -1;
     static_cast<Renderer*>(ctx)->stats(static_cast<Stats*>(out));
+    return 0;
+}
+// Off-callback only: Android HAL presentation timestamp, NOT a remote
+// WASAPI QPC or externally measured acoustic arrival time. The two clocks
+// cannot be subtracted without a calibrated cross-machine time relation.
+DF_EXPORT int32_t df_audio_presentation_time_v5(void* ctx, void* out) noexcept {
+    if (!ctx || !out) return -1;
+    auto* renderer = static_cast<Renderer*>(ctx);
+    auto* result = static_cast<PresentationTimeV5*>(out);
+    *result = {};
+    if (!renderer->stream) return -2;
+    result->aaudio_result = AAudioStream_getTimestamp(
+        renderer->stream, CLOCK_MONOTONIC,
+        &result->output_frame_position, &result->monotonic_nanoseconds);
     return 0;
 }
 DF_EXPORT int32_t df_audio_identity_stats_v3(void* ctx, void* out) noexcept {
