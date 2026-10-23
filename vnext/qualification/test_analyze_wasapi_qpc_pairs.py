@@ -55,6 +55,43 @@ class PairedFragmentEvidenceTests(unittest.TestCase):
             self.assertEqual(data["sender_pairs_matching_original_packet_exactly"], 0)
             self.assertEqual(data["sender_pairs_conflicting_with_original_packet"], 1)
 
+    def test_an_original_packet_can_contain_more_than_two_240_chunks(self):
+        with tempfile.TemporaryDirectory() as t:
+            path = Path(t)
+            self.sample(path)
+            csv_path = path / "windows-original-wasapi-packets.csv"
+            csv_path.write_text(
+                csv_path.read_text(encoding="utf-8").replace(
+                    "1000,480,0,", "1000,960,0,"),
+                encoding="utf-8")
+            log = path / "windows-source.stderr.txt"
+            log.write_text(
+                "TRACE Windows ADJACENT_240_QPC_PAIR "
+                "first_frame=1480 second_frame=1720 first_qpc100=1195650 "
+                "second_qpc100=1245650 first_now_qpc100=1100000 "
+                "second_now_qpc100=1105000 first_decision=Fresh { age_100ns: 0 } "
+                "second_decision=FutureTimestamp mixed_future_pairs=1\\n",
+                encoding="utf-8")
+            data = module.analyze(path)
+            self.assertEqual(data["sender_pairs_within_sampled_packet"], 1)
+            self.assertEqual(data["sender_pairs_matching_original_packet_exactly"], 1)
+            self.assertEqual(data["examples"][0]["offset_inside_original_packet"], 480)
+
+    def test_no_shared_packet_span_is_not_misreported_as_conflict(self):
+        with tempfile.TemporaryDirectory() as t:
+            path = Path(t)
+            self.sample(path)
+            log = path / "windows-source.stderr.txt"
+            log.write_text(
+                log.read_text(encoding="utf-8").replace(
+                    "first_frame=1000 second_frame=1240",
+                    "first_frame=2000 second_frame=2240"),
+                encoding="utf-8")
+            data = module.analyze(path)
+            self.assertEqual(data["sender_pairs_outside_sampled_packet_samples"], 1)
+            self.assertEqual(data["sender_pairs_within_sampled_packet"], 0)
+            self.assertEqual(data["sender_pairs_conflicting_with_original_packet"], 0)
+
     def test_incomplete_session_has_no_invented_success(self):
         with tempfile.TemporaryDirectory() as t:
             with self.assertRaises(FileNotFoundError):
