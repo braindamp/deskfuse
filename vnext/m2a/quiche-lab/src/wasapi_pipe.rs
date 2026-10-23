@@ -15,11 +15,14 @@ const FRAMES: usize = 240;
 const PCM_BYTES: usize = 960;
 const QUEUE_SLOTS: usize = 8;
 const DATA_DISCONTINUITY: u32 = 0x1;
+// v2 local DFWC header remains 40 bytes; 200ms native capture buffer.
+const MAX_PACKET_OFFSET_FRAMES: u32 = 9600;
 
 pub struct CaptureChunk {
     pub device_frame: u64,
     pub qpc_100ns: u64,
     pub flags: u32,
+    pub original_packet_offset_frames: u32,
     pub frames: usize,
     pub pcm: [u8; PCM_BYTES],
     pub enqueued_at: Instant,
@@ -28,6 +31,7 @@ pub struct CaptureChunk {
 pub struct CompleteBlock {
     pub first_device_frame: u64,
     pub first_qpc_100ns: u64,
+    pub original_packet_offset_frames: u32,
     pub pcm: [u8; PCM_BYTES],
 }
 
@@ -39,6 +43,7 @@ pub struct Assembler {
     have: usize,
     first_frame: u64,
     first_qpc: u64,
+    first_packet_offset_frames: u32,
     pcm: [u8; PCM_BYTES],
     pub discontinuities: u64,
 }
@@ -46,7 +51,8 @@ pub struct Assembler {
 impl Default for Assembler {
     fn default() -> Self {
         Self { next_frame: None, have: 0, first_frame: 0,
-               first_qpc: 0, pcm: [0; PCM_BYTES], discontinuities: 0 }
+               first_qpc: 0, first_packet_offset_frames: 0,
+               pcm: [0; PCM_BYTES], discontinuities: 0 }
     }
 }
 
@@ -68,6 +74,8 @@ impl Assembler {
                 self.first_frame = chunk.device_frame + at as u64;
                 self.first_qpc = if chunk.qpc_100ns == 0 { 0 }
                     else { chunk.qpc_100ns + (at as u64 * 10_000_000 / 48_000) };
+                self.first_packet_offset_frames =
+                    chunk.original_packet_offset_frames + at as u32;
             }
             let n = (FRAMES - self.have).min(chunk.frames - at);
             self.pcm[self.have * 4..(self.have + n) * 4]
@@ -79,6 +87,7 @@ impl Assembler {
                 assembled = Some(CompleteBlock {
                     first_device_frame: self.first_frame,
                     first_qpc_100ns: self.first_qpc,
+                    original_packet_offset_frames: self.first_packet_offset_frames,
                     pcm: self.pcm,
                 });
                 self.have = 0;
@@ -104,16 +113,24 @@ fn read_chunk(input: &mut impl Read) -> io::Result<Option<CaptureChunk>> {
     }
     let count = le32(&h[24..28]) as usize;
     let size = le32(&h[32..36]) as usize;
-    if &h[..4] != b"DFWC" || le32(&h[4..8]) != 1
-        || count == 0 || count > FRAMES || size != count * 4 || le32(&h[36..40]) != 0
+    let offset = le32(&h[36..40]);
+    let device_frame = le64(&h[8..16]);
+    let qpc = le64(&h[16..24]);
+    let offset_100ns = u64::from(offset) * 10_000_000 / 48_000;
+    if &h[..4] != b"DFWC" || le32(&h[4..8]) != 2
+        || count == 0 || count > FRAMES || size != count * 4
+        || offset > MAX_PACKET_OFFSET_FRAMES || offset % FRAMES as u32 != 0
+        || device_frame < u64::from(offset)
+        || (qpc != 0 && qpc < offset_100ns)
     {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid WASAPI pipe frame"));
     }
     let mut pcm = [0u8; PCM_BYTES];
     input.read_exact(&mut pcm[..size])?;
     Ok(Some(CaptureChunk {
-        device_frame: le64(&h[8..16]),
-        qpc_100ns: le64(&h[16..24]),
+        device_frame,
+        qpc_100ns: qpc,
+        original_packet_offset_frames: offset,
         frames: count,
         flags: le32(&h[28..32]),
         pcm,
@@ -184,4 +201,55 @@ pub fn spawn(
 /// Actual WASAPI QPC/source timestamp remains independently available.
 pub fn queue_too_old(chunk: &CaptureChunk) -> bool {
     chunk.enqueued_at.elapsed() > Duration::from_millis(60)
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn record(version: u32, first: u64, first_qpc: u64, offset: u32) -> Vec<u8> {
+        let mut data = vec![0u8; HEADER + PCM_BYTES];
+        data[..4].copy_from_slice(b"DFWC");
+        data[4..8].copy_from_slice(&version.to_le_bytes());
+        data[8..16].copy_from_slice(&first.to_le_bytes());
+        data[16..24].copy_from_slice(&first_qpc.to_le_bytes());
+        data[24..28].copy_from_slice(&240u32.to_le_bytes());
+        data[32..36].copy_from_slice(&960u32.to_le_bytes());
+        data[36..40].copy_from_slice(&offset.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn original_packet_provenance_survives_local_wire_and_assembler() {
+        let frame = 27_523_200;
+        let packet_qpc = 2_097_401u64;
+        let a = read_chunk(&mut Cursor::new(record(2, frame, packet_qpc, 0)))
+            .unwrap().unwrap();
+        let b = read_chunk(&mut Cursor::new(record(2, frame + 240, packet_qpc + 50_000, 240)))
+            .unwrap().unwrap();
+        let mut assembler = Assembler::default();
+        let first = assembler.push(&a).unwrap();
+        let second = assembler.push(&b).unwrap();
+        assert_eq!(first.first_qpc_100ns, packet_qpc);
+        assert_eq!(first.original_packet_offset_frames, 0);
+        assert_eq!(second.first_qpc_100ns, packet_qpc + 50_000);
+        assert_eq!(second.original_packet_offset_frames, 240);
+        assert_eq!(second.first_device_frame, frame + 240);
+    }
+
+    #[test]
+    fn old_or_malformed_local_capture_header_fails_closed() {
+        assert!(read_chunk(&mut Cursor::new(record(1, 240, 2_000_000, 240)))
+            .is_err()); // Mixed native binaries not silently accepted.
+        assert!(read_chunk(&mut Cursor::new(record(2, 240, 2_000_000, 480)))
+            .is_err()); // Original packet cannot predate stream origin.
+        assert!(read_chunk(&mut Cursor::new(record(2, 240, 2_000_000, 239)))
+            .is_err()); // Native fragments must be on exact 240 frame steps.
+        assert!(read_chunk(&mut Cursor::new(record(2, 9_840, 2_000_000, 9_840)))
+            .is_err()); // Offset beyond 200ms capture buffer.
+        assert!(read_chunk(&mut Cursor::new(record(2, 240, 100, 240)))
+            .is_err()); // Origin QPC underflow not allowed.
+    }
 }
