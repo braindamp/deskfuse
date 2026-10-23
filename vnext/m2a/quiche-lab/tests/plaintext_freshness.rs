@@ -148,3 +148,36 @@ fn repeated_scheduling_opportunities_purge_before_construction()->Result<()>{
     assert_eq!(track.len(),0);
     Ok(())
 }
+
+#[test]
+fn authenticated_quic_recovery_challenge_binds_nonce_context_and_fresh_anchor()->Result<()> {
+    use deskfuse_quiche_lab::fresh_anchor::{Message,REQUEST,ANCHOR};
+    use deskfuse_quiche_lab::receive_frontier::Context;
+    let (mut server,mut client)=established_pair()?;
+    let request=Message {
+        kind:REQUEST,nonce:0x1007,frame:48240,
+        context:Context{epoch:1,stream:1,format:1},
+    };
+    client.dgram_send(&request.encode())?;
+    pump(&mut client,&mut server)?;
+    let mut received=[0u8;1350];
+    let n=server.dgram_recv(&mut received)?;
+    assert_eq!(Message::decode(&received[..n]),Some(request));
+    // A post-recovery source frame observed AFTER receiving request.
+    let response=Message{kind:ANCHOR,frame:48720,..request};
+    server.dgram_send(&response.encode())?;
+    pump(&mut server,&mut client)?;
+    let n=client.dgram_recv(&mut received)?;
+    let decoded=Message::decode(&received[..n]).unwrap();
+    assert_eq!(decoded,response);
+    let matches_active=|r:Message|r.kind==ANCHOR &&
+        r.nonce==request.nonce && r.context==request.context &&
+        r.frame>=request.frame;
+    assert!(matches_active(decoded));
+    assert!(!matches_active(Message{nonce:request.nonce-1,..response}));
+    assert!(!matches_active(Message{frame:request.frame-240,..response}));
+    assert!(!matches_active(Message{
+        context:Context{format:2,..response.context},..response
+    }));
+    Ok(())
+}
