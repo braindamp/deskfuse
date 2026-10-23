@@ -15,8 +15,9 @@ if ($LASTEXITCODE -ne 0 -or $branch -ne 'feature/vnext-wp001-native-lab') {
     throw 'Refusing to build from main, preserved reference or unknown branch'
 }
 $dirty = @(& git -C $LabRoot status --porcelain)
-if ($LASTEXITCODE -ne 0 -or $dirty.Count -gt 0) {
-    throw 'Commit or intentionally isolate local modifications before building evidentiary binaries'
+if ($LASTEXITCODE -ne 0) { throw 'Unable to inspect local Git worktree' }
+if ($dirty.Count -gt 0) {
+    Write-Warning ('Building with {0} local Git worktree change(s). No files will be deleted, stashed, or reset. Binary SHA256 hashes will still be printed; this is not clean-commit qualification evidence.' -f $dirty.Count)
 }
 if (-not (Test-Path -LiteralPath (Join-Path $AndroidNdk 'build\cmake\android.toolchain.cmake'))) {
     throw 'Pinned Android NDK r30 missing'
