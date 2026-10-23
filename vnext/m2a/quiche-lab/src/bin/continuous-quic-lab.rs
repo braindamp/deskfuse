@@ -154,6 +154,7 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
     let mut expired_source_qpc = 0u64;
     let mut invalid_source_qpc = 0u64;
     let mut future_source_qpc = 0u64;
+    let mut provenance_saved_fragments = 0u64;
     let mut max_observed_source_age_100ns = 0u64;
     let mut previous_initial_qpc:Option<(u64,u64,u64,AgeDecision)> = None;
     let mut adjacent_240_qpc_pairs=0u64;
@@ -282,10 +283,28 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                             // is not a source-age bound. Fail closed on QPC
                             // timestamp errors or excessive age.
                             let qpc_now = source_age::local_qpc_100ns()?;
+                            let ordinary_age =
+                                source_age::classify(qpc_now, chunk.qpc_100ns);
                             let age = source_age::classify_wasapi(
                                 qpc_now, chunk.qpc_100ns,
                                 chunk.original_packet_offset_frames
                             );
+                            if ordinary_age == AgeDecision::FutureTimestamp &&
+                                matches!(age, AgeDecision::Fresh { .. }) {
+                                // Counts EXACTLY the native-provenanced 5ms
+                                // fragments that the former policy discarded.
+                                provenance_saved_fragments += 1;
+                                if provenance_saved_fragments<=4 ||
+                                    provenance_saved_fragments%512==0 {
+                                    eprintln!(
+                                        "TRACE Windows QPC_PROVEN_FRAGMENT_ACCEPT frame={} offset_frames={} first_frame_qpc100={} now_qpc100={} saved={}",
+                                        chunk.device_frame,
+                                        chunk.original_packet_offset_frames,
+                                        chunk.qpc_100ns,qpc_now,
+                                        provenance_saved_fragments
+                                    );
+                                }
+                            }
                             // Pure diagnostics: an adjacent QPC pair may span
                             // a single GetBuffer packet. Match with the native
                             // original-packet CSV by first_device_frame before
@@ -561,10 +580,10 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                     let stats = c.stats();
                     if capture.is_some() {
                         println!(
-                            "DONE Windows WASAPI source duration={}s real_pcm_blocks_queued={} quiche_queue_full={} source_queue_old={} qpc_expired={} qpc_invalid={} qpc_future={} qpc_max_age_100ns={} quiche_plaintext_expired={} quiche_plaintext_orphans={} quiche_plaintext_absent={} quiche_identity_high_water={} anchor_replies={} capture_discontinuities={} pre_quic_source_gaps={} pre_quic_missing_frames={} ingress_chunks={} assembled_blocks={} adjacent_240_qpc_pairs={} mixed_future_pairs={} last_wasapi_qpc_100ns={} udp_packets={} udp_would_block={} quic_dgram_sent={} quic_lost={}",
+                            "DONE Windows WASAPI source duration={}s real_pcm_blocks_queued={} quiche_queue_full={} source_queue_old={} qpc_expired={} qpc_invalid={} qpc_future={} qpc_proven_fragments={} qpc_max_age_100ns={} quiche_plaintext_expired={} quiche_plaintext_orphans={} quiche_plaintext_absent={} quiche_identity_high_water={} anchor_replies={} capture_discontinuities={} pre_quic_source_gaps={} pre_quic_missing_frames={} ingress_chunks={} assembled_blocks={} adjacent_240_qpc_pairs={} mixed_future_pairs={} last_wasapi_qpc_100ns={} udp_packets={} udp_would_block={} quic_dgram_sent={} quic_lost={}",
                             seconds, offered, not_queued, source_chunks_too_old,
                             expired_source_qpc, invalid_source_qpc, future_source_qpc,
-                            max_observed_source_age_100ns,
+                            provenance_saved_fragments,max_observed_source_age_100ns,
                             outstanding.expired, outstanding.orphaned,
                             outstanding.absent, outstanding.high_water,
                             anchor_replies_sent, assembler.discontinuities,
