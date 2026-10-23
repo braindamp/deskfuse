@@ -90,6 +90,33 @@ foreach ($remotePath in $expectedRemoteHashes.Keys) {
     }
 }
 'android_pair_sha256_verified=true' | Add-Content -LiteralPath $manifest
+
+# Preflight existing test credentials without reading, copying, or printing keys.
+# No implicit credential generation or production pairing fallbacks.
+foreach ($remoteCredential in @('df-lab-ca.pem', 'df-lab-client.pem', 'df-lab-client.key')) {
+    & adb shell ('test -r /data/local/tmp/' + $remoteCredential)
+    if ($LASTEXITCODE -ne 0) {
+        throw ('Required locally provisioned Android lab credential unavailable: ' +
+            $remoteCredential)
+    }
+}
+'android_lab_credentials_readable=true' | Add-Content -LiteralPath $manifest
+
+# Local-only environment observations for hardware-profile comparison.
+$hardware = Join-Path $folder 'device-and-power.txt'
+('android_model=' + ((& adb shell getprop ro.product.model) -join '').Trim()) |
+    Set-Content -LiteralPath $hardware -Encoding UTF8
+('android_api=' + ((& adb shell getprop ro.build.version.sdk) -join '').Trim()) |
+    Add-Content -LiteralPath $hardware
+('android_build=' + ((& adb shell getprop ro.build.fingerprint) -join '').Trim()) |
+    Add-Content -LiteralPath $hardware
+('windows_os=' + [Environment]::OSVersion.VersionString) |
+    Add-Content -LiteralPath $hardware
+(& powercfg /getactivescheme 2>&1) |
+    Out-File -LiteralPath (Join-Path $folder 'windows-power-plan.txt')
+(& adb shell dumpsys battery 2>&1) |
+    Out-File -LiteralPath (Join-Path $folder 'android-battery.txt')
+
 $serverOut = Join-Path $folder 'windows-source.stdout.txt'
 $serverErr = Join-Path $folder 'windows-source.stderr.txt'
 $clientLog = Join-Path $folder 'android-receiver.txt'
