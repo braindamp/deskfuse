@@ -20,6 +20,7 @@ constexpr int32_t kChannels = 2;
 constexpr uint32_t kBlockFrames = 240;
 constexpr uint64_t kCapacityFrames = kBlockFrames * 16; // hard cap: 80 ms
 constexpr uint64_t kPrimeFrames = kBlockFrames * 4;     // initial 20 ms
+constexpr uint32_t kFadeFrames = 96;                  // 2 ms click-reduction edge
 
 struct Stats {
     uint64_t accepted_frames;
@@ -43,6 +44,7 @@ public:
 
     // Callback-private state: only the renderer's AAudio callback touches this.
     bool primed = false;
+    uint32_t fade_in_remaining = kFadeFrames; // callback thread only
 
     std::atomic<uint64_t> accepted_frames{0};
     std::atomic<uint64_t> rendered_frames{0};
@@ -69,7 +71,10 @@ public:
             return AAUDIO_CALLBACK_RESULT_STOP;
         }
         if (!self->primed) {
-            if (ready >= kPrimeFrames) self->primed = true;
+            if (ready >= kPrimeFrames) {
+                self->primed = true;
+                self->fade_in_remaining = kFadeFrames;
+            }
             else {
                 self->silence_frames.fetch_add(requested, std::memory_order_relaxed);
                 self->callback_count.fetch_add(1, std::memory_order_relaxed);
@@ -87,6 +92,36 @@ public:
         if (take > first) {
             std::memcpy(output + first * kChannels, self->ring.data(),
                         static_cast<size_t>(take - first) * kChannels * sizeof(int16_t));
+        }
+
+        // Real-time, bounded integer fades at output START / true UNDERRUN.
+        // These avoid a hard zero-to-sample or sample-to-zero discontinuity
+        // without moving sample positions or changing the phone's media clock.
+        // In particular this is NOT a Windows/Android volume automation fix.
+        if (self->fade_in_remaining && take) {
+            const auto ramp = std::min<uint64_t>(take, self->fade_in_remaining);
+            const uint32_t begun = kFadeFrames - self->fade_in_remaining;
+            for (uint64_t frame = 0; frame < ramp; ++frame) {
+                const int32_t gain = static_cast<int32_t>(begun + frame + 1);
+                for (int ch = 0; ch < kChannels; ++ch) {
+                    const auto i = static_cast<size_t>(frame) * kChannels + ch;
+                    output[i] = static_cast<int16_t>(
+                        static_cast<int32_t>(output[i]) * gain / kFadeFrames);
+                }
+            }
+            self->fade_in_remaining -= static_cast<uint32_t>(ramp);
+        }
+        if (take < requested && take) {
+            const auto tail = std::min<uint64_t>(take, kFadeFrames);
+            const auto begin = take - tail;
+            for (uint64_t frame = 0; frame < tail; ++frame) {
+                const int32_t gain = static_cast<int32_t>(tail - frame - 1);
+                for (int ch = 0; ch < kChannels; ++ch) {
+                    const auto i = static_cast<size_t>(begin + frame) * kChannels + ch;
+                    output[i] = static_cast<int16_t>(
+                        static_cast<int32_t>(output[i]) * gain / static_cast<int32_t>(tail));
+                }
+            }
         }
 
         // Sole reader publishes release BEFORE producer reuses the slots.
