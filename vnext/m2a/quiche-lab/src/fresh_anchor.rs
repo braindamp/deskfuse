@@ -34,6 +34,11 @@ pub struct Message {
     pub context: Context,
 }
 impl Message {
+    pub fn confirms(&self, challenge: &Self) -> bool {
+        self.kind == ANCHOR && challenge.kind == REQUEST &&
+        self.nonce == challenge.nonce && self.context == challenge.context &&
+        self.frame >= challenge.frame
+    }
     pub fn encode(self) -> [u8; LEN] {
         let mut out = [0; LEN];
         out[..4].copy_from_slice(MAGIC);
@@ -87,11 +92,9 @@ mod tests {
     fn stale_nonce_and_backward_floor_are_not_valid_anchors() {
         let request = Message { kind: REQUEST,nonce:9,frame:48000,
             context:Context{epoch:1,stream:1,format:1}};
-        let check = |r:Message| r.kind==ANCHOR && r.nonce==request.nonce &&
-            r.context==request.context && r.frame>=request.frame;
-        assert!(!check(Message{kind:ANCHOR,nonce:8,..request}));
-        assert!(!check(Message{kind:ANCHOR,frame:47999,..request}));
-        assert!(!check(Message{kind:ANCHOR,context:Context{epoch:2,..request.context},..request}));
-        assert!(check(Message{kind:ANCHOR,frame:48240,..request}));
+        assert!(!Message{kind:ANCHOR,nonce:8,..request}.confirms(&request));
+        assert!(!Message{kind:ANCHOR,frame:47999,..request}.confirms(&request));
+        assert!(!Message{kind:ANCHOR,context:Context{epoch:2,..request.context},..request}.confirms(&request));
+        assert!(Message{kind:ANCHOR,frame:48240,..request}.confirms(&request));
     }
 }
