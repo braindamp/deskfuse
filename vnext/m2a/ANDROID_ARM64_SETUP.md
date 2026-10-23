@@ -1,154 +1,132 @@
-# M2a Android ARM64 build toolchain — Windows host
+# DeskFuse vNext M2a — Android ARM64 native smoke test
 
-**Target device:** Xiaomi `24117RN76E`, Android API 36, `arm64-v8a` (confirmed over authorized ADB). **Build SDK:** existing `D:\Android\Sdk` with Android platform API 35. The build platform need not equal the device API. **Pinned NDK:** r30 LTS, `30.0.16248370` (official Android LTS download listing, October 2026). Use one checked toolchain version, not an implicit `latest`.
+**Current result (Windows 10 development machine, reported 2026-10-23):**
+Native `android-arm64-smoke` cross-build **succeeded** using Rust 1.99.1,
+cargo-ndk 4.1.2, NDK r30 (`30.0.16248370`), CMake/Ninja and
+`quiche 0.30.0` / `boring-sys 5.3.0`.
+The on-device ADB execution is **not yet confirmed**.
+This is not an Android QUIC receiver or an APK.
 
-The Android NDK/rust target setup is a prerequisite only. There is **no Android receiver implementation or APK in this document**. Do not overwrite the currently working DeskFuse APK or install new virtual drivers.
+The reference phone is Xiaomi model `24117RN76E`, Android API 36,
+`arm64-v8a`, ADB-authorized. The build is for generic Android ARM64 and
+does not depend on the phone brand. The separate working DeskFuse APK/driver
+must not be modified.
 
-## Install just the NDK onto D:
+## Installed tools
 
-Use normal PowerShell (not elevated) with the already discovered SDK manager:
+- Android SDK: `D:\Android\Sdk` (platform API 35)
+- Android NDK: `D:\Android\Sdk\ndk\30.0.16248370`
+- `rustup target add aarch64-linux-android`
+- Rust Windows MSVC, `cargo-ndk`, Visual Studio 2022 developer PowerShell,
+  CMake, Ninja, LLVM/libclang, NASM
+- No Android emulator is needed: the physical phone is ADB-authorized.
+
+If the NDK needs installation in a new environment:
 
 ```powershell
 $sdk = 'D:\Android\Sdk'
-$ndkVersion = '30.0.16248370'
 $env:ANDROID_SDK_ROOT = $sdk
-& "$sdk\cmdline-tools\latest\bin\sdkmanager.bat" "--sdk_root=$sdk" --install "ndk;$ndkVersion"
+& "$sdk\cmdline-tools\latest\bin\sdkmanager.bat" "--sdk_root=$sdk" --install "ndk;30.0.16248370"
 ```
 
-Accept Google's license terms if prompted. This install can use several GB of transient/download/decompressed space on D:. It does not download an emulator or update the C: SDK. If Java is not found, install/point to an already trusted JDK instead of deleting or repointing either SDK.
+SDK Manager needs Java >=17. An SDK XML version warning is not an
+installation failure if `ndk\30.0.16248370\source.properties` exists and
+reports `Pkg.Revision = 30.0.16248370`.
 
-## Verify the compiler
+## Reproducible Windows → Android ARM64 cross-build
 
-```powershell
-$ndk = Join-Path $sdk "ndk\$ndkVersion"
-Test-Path "$ndk\source.properties"
-Get-Content "$ndk\source.properties" | Select-String 'Pkg.Revision'
-& "$ndk\toolchains\llvm\prebuilt\windows-x86_64\bin\clang.exe" --version
-& "$ndk\toolchains\llvm\prebuilt\windows-x86_64\bin\aarch64-linux-android35-clang.cmd" --version
-rustup target add aarch64-linux-android
-rustup target list --installed
-adb shell getprop ro.product.cpu.abi
-adb shell getprop ro.build.version.sdk
-```
+A previously failed native CMake configuration can retain `CMakeSystem.cmake`
+declaring `Windows` and `CMAKE_CROSSCOMPILING=FALSE`, even while its cache
+mentions Android. Consequently its compiler checks try to link `kernel32`,
+`user32` and `--major-image-version` using the Android Clang compiler.
+Creating extensionless `clang` hard links does **not** solve this root cause.
+The proper remedy is a target-specific Android NDK CMake toolchain.
 
-The `aarch64-linux-android35-clang.cmd` wrapper should exist in the NDK; 35 is the build API already installed and <= physical Android API 36. For future binaries, `minSdk` is chosen independently based on supported Android feature gates (for a 36-only lab, API 35 is fine). Do not infer permission, device or audio readiness from compiler checks.
+Use the tracked wrapper:
+[`quiche-lab/cmake/android-ndk-wrapper.cmake`](quiche-lab/cmake/android-ndk-wrapper.cmake).
+It configures `arm64-v8a`, `android-35` and `c++_shared`, then includes
+Google's NDK toolchain so the NDK selects the Windows host compiler executable.
+This is the equivalent of the working local toolchain wrapper reported by the
+developer; replacing an already-working local wrapper is unnecessary.
 
-## Storage policy
-
-The SDK/NDK resides on D:. Windows profile Cargo registry, toolchain and Android emulator files may still consume C:. Monitor free space on both drives and keep a safe headroom. Do not move/delete the working C: Android SDK or emulator as part of this lab. The isolated Cargo `target` build outputs are inside the vNext worktree on D:.
-
-## Next gates
-
-Create a real Android arm64 Rust QUIC receiver in a separate artifact/package identity; use authenticated pairing/client authorization rather than accepting arbitrary peers. Establish a test control channel and real Windows↔Android DATAGRAMs over a documented route. Measure UDP receive clock, frame identities/epochs, queue bounds, loss/late accounting and full physical network timing before enabling any Android playback or replacing the existing app.
-
-
-## Stage 1 — run the isolated ARM64 smoke executable on the device
-
-This is **not** a QUIC network receiver yet. The standalone native binary lives in `quiche-lab/src/bin/android-arm64-smoke.rs`. It checks the source-indexed packet parser and instantiates an actual quiche crypto configuration on the Android CPU. It never installs an APK, opens UDP sockets or modifies the existing DeskFuse app.
-
-Upstream quiche recommends `cargo-ndk` for Android cross-compilation; it configures the NDK linker, C/C++ dependencies and bindgen cross-target sysroot. On the Windows host, in **Visual Studio Developer PowerShell**:
+**On a new Visual Studio Developer PowerShell / Windows Terminal session:**
 
 ```powershell
 cd 'D:\Coding\DeskFuse\vnext-wp001'
 git pull --ff-only origin feature/vnext-wp001-native-lab
-rustup target add aarch64-linux-android
+cd 'vnext\m2a\quiche-lab'
 
 $env:ANDROID_SDK_ROOT = 'D:\Android\Sdk'
 $env:ANDROID_NDK_HOME = 'D:\Android\Sdk\ndk\30.0.16248370'
-if (-not (Test-Path "$env:ANDROID_NDK_HOME\source.properties")) {
-    throw 'NDK r30 not installed on D:'
-}
 
-# cargo-ndk is a build-time tool, not an Android app or phone package.
-cargo install cargo-ndk --locked
+# IMPORTANT: Build-script target-specific overrides, not global CMake settings.
+$env:CMAKE_TOOLCHAIN_FILE_aarch64_linux_android = (
+    Resolve-Path '.\cmake\android-ndk-wrapper.cmake'
+).Path
+$env:CMAKE_GENERATOR_aarch64_linux_android = 'Ninja'
 
-# IMPORTANT cargo-ndk 4.1.x: -P is the Android platform, -p selects a Cargo package.
-# Run the next command FROM vnext/m2a/quiche-lab, where Cargo.toml lives.
-cd 'D:\\Coding\\DeskFuse\\vnext-wp001\\vnext\\m2a\\quiche-lab'
+# The HYPHENATED target suffix is necessary on cargo-ndk v4.1.2:
+# cargo-ndk overwrites the underscore-suffixed bindgen setting.
+Set-Item -Path 'Env:BINDGEN_EXTRA_CLANG_ARGS_aarch64-linux-android' `
+    -Value '--target=aarch64-linux-android35'
 
-# API 35 is compatible with the tested Android API 36 phone.
-# First cross-build compiles BoringSSL for ARM64 and may take longer.
-cargo ndk -t arm64-v8a -P 35 build --bin android-arm64-smoke
+# Command line: capital -P = Android API; lowercase -p = Cargo package.
+cargo ndk -t arm64-v8a -P 35 build --bin android-arm64-smoke --locked
 ```
 
-**Only after the build succeeds**, run these direct USB ADB commands (single executable; no APK, no install):
+These variables apply to the current shell only. Reapply them in a new shell.
+The initial successful report used a separate local wrapper with the same
+five effective CMake lines, so the tracked wrapper is a source-controlled
+reproduction rather than independently CI-verified cross-build.
+
+**Only if the stale CMake target state causes a repeat failure**, clean
+the affected native package once, not the entire project:
 
 ```powershell
-$exe = 'vnext\m2a\quiche-lab\target\aarch64-linux-android\debug\android-arm64-smoke'
-if (-not (Test-Path $exe)) { throw 'ARM64 binary missing: build must pass first' }
+cargo clean --package boring-sys --target aarch64-linux-android
+cargo ndk -t arm64-v8a -P 35 build --bin android-arm64-smoke --locked
+```
+
+The project does not yet commit its local `Cargo.lock`; the developer's
+`--locked` build succeeds because a lockfile exists in that checkout. Audit
+and commit the lockfile to this isolated branch before promising reproducible
+fresh-clone `--locked` builds.
+
+## Execute the isolated native smoke test on the Android device
+
+Only after the Android ARM64 build returns success, **from the quiche-lab
+directory**:
+
+```powershell
+$exe = 'target\aarch64-linux-android\debug\android-arm64-smoke'
+if (-not (Test-Path -LiteralPath $exe)) { throw "Missing Android binary: $exe" }
 adb devices -l
 adb push $exe /data/local/tmp/deskfuse-vnext-arm64-smoke
 adb shell chmod 700 /data/local/tmp/deskfuse-vnext-arm64-smoke
 adb shell /data/local/tmp/deskfuse-vnext-arm64-smoke
 ```
 
-Expected output includes `PASS DeskFuse vNext target=android arch=aarch64 real-quiche-config=true audio-frames=240 first-source-frame=48000 bytes=1000` followed by `NO NETWORKING`. If the binary fails, preserve the exact compiler/device error before trying different API levels or toolchains. Remove this isolated test file at any time using `adb shell rm /data/local/tmp/deskfuse-vnext-arm64-smoke`; do not uninstall the existing application.
+Expected stdout:
 
-Disk note: the `cargo-ndk` host tool and Rust std target use the profile's Cargo/Rust cache, typically on C:, while cross-compiled BoringSSL and executable outputs belong to the Cargo target folder on D:. Do not run `cargo clean` during builds. First build may be several GB; check C: and D: free space.
-
-Passing this smoke check **does not** establish Windows-to-phone transport, QUIC peer identity, full connectivity, audio playback, clock synchronisation or multimedia quality. The next gate is explicitly authenticated physical-device QUIC.
-
-## Windows cross-compile recovery: avoid mixing host and Android CMake
-
-If `boring-sys` finishes compiling `libssl.a` but a later CMake compiler check tries to link Windows `-lkernel32`, `-luser32` etc., the generated CMake cache is using the Windows host instead of the Android toolchain. The NDK toolchain file is `<NDK>/build/cmake/android.toolchain.cmake`; the `cargo-ndk` wrapper exports appropriate Android target and compiler variables. Do **not** confuse `-p` (Cargo package) with `-P` (Android API level) in cargo-ndk 4.1.x.
-
-Run from the quiche-lab directory with CMake/Ninja accessible. Undo only manual compiler overrides left by earlier troubleshooting:
-
-```powershell
-cd 'D:\Coding\DeskFuse\vnext-wp001\vnext\m2a\quiche-lab'
-$env:ANDROID_SDK_ROOT = 'D:\Android\Sdk'
-$env:ANDROID_NDK_HOME = 'D:\Android\Sdk\ndk\30.0.16248370'
-$env:CMAKE_GENERATOR = 'Ninja'
-
-foreach ($name in @(
-    'CC_aarch64_linux_android','CXX_aarch64_linux_android',
-    'CFLAGS_aarch64_linux_android','CXXFLAGS_aarch64_linux_android',
-    'CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER',
-    'CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS',
-    'CMAKE_TOOLCHAIN_FILE','CMAKE_SYSTEM_NAME'
-)) { Remove-Item -Path "Env:$name" -ErrorAction SilentlyContinue }
-
-# Remove only the Android boring-sys CMake build directory from the
-# failed configure; this retains Cargo's other compiled build artifacts.
-Get-ChildItem 'target\aarch64-linux-android\debug\build' -Directory -Filter 'boring-sys-*' -ErrorAction SilentlyContinue |
-    ForEach-Object { Join-Path $_.FullName 'out\build' } |
-    Where-Object { Test-Path -LiteralPath $_ } |
-    ForEach-Object { Remove-Item -LiteralPath $_ -Recurse -Force }
-
-# Use cargo-ndk (not plain cargo build) for the complete Android target setup.
-cargo ndk -t arm64-v8a -P 35 build --bin android-arm64-smoke
+```text
+PASS DeskFuse vNext target=android arch=aarch64 real-quiche-config=true audio-frames=240 first-source-frame=48000 bytes=1000
+NO NETWORKING: smoke test only; no QUIC peer authentication or Android playback.
 ```
 
-This cleanup can rebuild native BoringSSL libraries but does not affect the Windows Rust build, the existing DeskFuse app, or the Android SDK/NDK installation. If the new CMake configure still attempts Windows libraries, inspect the new `CMakeCache.txt` for `CMAKE_TOOLCHAIN_FILE`, `ANDROID_ABI`, `ANDROID_PLATFORM`, and `CMAKE_SYSTEM_NAME` before attempting any larger cleanup. Do not globally set `CMAKE_TOOLCHAIN_FILE` for unrelated native Windows builds.
+This only verifies the executable and linked quiche config run on the phone,
+plus the PCM wire-format roundtrip. It is *not* proof of QUIC connectivity,
+mutual endpoint authentication, time sync, Wi-Fi latency, or native audio.
+It opens no UDP socket and installs no APK.
 
-## Windows cargo-ndk 4.1.2 extensionless Clang workaround (provisional)
+To remove the temporary test file (after stopping it):
+`adb shell rm /data/local/tmp/deskfuse-vnext-arm64-smoke`.
 
-The cargo-ndk v4.1.2 implementation constructs `<NDK>/toolchains/llvm/prebuilt/windows-x86_64/bin/clang` and `clang++` (without `.exe`) as target CC/CXX environment values. The boring-sys 5.3 build script forwards these values to `-DCMAKE_C_COMPILER=` and `-DCMAKE_CXX_COMPILER=`. When a second CMake configure revalidates the compiler, it can reject those extensionless paths even though `clang.exe` exists. This is **not** fixed by repeatedly removing CMake caches or switching to a Visual Studio developer shell.
+## Storage and next acceptance gate
 
-A narrow Windows/NTFS workaround is to add hard-link aliases to the *same* existing compiler files. Hard links avoid duplicate compiler storage and require no changes to Rust dependencies. They do modify two directory entries inside this dedicated D: NDK installation, so they should be treated as a temporary local workaround, not part of the standard SDK install.
+SDK/NDK and build outputs are on D:. Cargo registry/toolchain caches may be
+under the Windows profile on C:. Avoid clearing working build artifacts or
+modifying the existing C: Android Studio SDK.
 
-```powershell
-$bin = 'D:\Android\Sdk\ndk\30.0.16248370\toolchains\llvm\prebuilt\windows-x86_64\bin'
-foreach ($tool in @('clang','clang++')) {
-    $real = Join-Path $bin "$tool.exe"
-    $alias = Join-Path $bin $tool
-    if (-not (Test-Path -LiteralPath $real -PathType Leaf)) {
-        throw "Missing expected real NDK compiler: $real"
-    }
-    if (-not (Test-Path -LiteralPath $alias)) {
-        New-Item -ItemType HardLink -Path $alias -Target $real | Out-Null
-    }
-    if (-not (Test-Path -LiteralPath $alias)) { throw "Cannot create $alias" }
-}
-cd 'D:\Coding\DeskFuse\vnext-wp001\vnext\m2a\quiche-lab'
-$env:ANDROID_NDK_HOME='D:\Android\Sdk\ndk\30.0.16248370'
-$env:ANDROID_SDK_ROOT='D:\Android\Sdk'
-$env:CMAKE_GENERATOR='Ninja'
-cargo ndk -t arm64-v8a -P 35 build --bin android-arm64-smoke
-```
-
-Try without cleaning first; any successful native build intermediates remain available to Cargo. If a different error appears, capture its first CMake error and final build-script error rather than changing platform flags blindly. Never create Windows library stubs for `-lkernel32` / `-luser32`: that indicates the wrong target environment.
-
-After testing, the aliases can be removed **if they were created by this workaround** with `Remove-Item -LiteralPath "$bin\clang","$bin\clang++"`. Removing a hard link does not delete the original `clang.exe` / `clang++.exe`. Do not run the removal while a build is in progress.
-
-Source: upstream cargo-ndk `src/cargo.rs` (target_cc/target_cxx construction) and cloudflare/boring `boring-sys/build/main.rs` (CMake compiler argument forwarding). This exact combination still needs validation on the current Windows machine; the workaround is not yet a passed acceptance gate.
+Next: isolated authenticated Windows ↔ Android physical-device QUIC DATAGRAM
+transport, source-frame identity and loss/freshness tracking; no Android
+playback or production pairing claims until those gates are tested.
