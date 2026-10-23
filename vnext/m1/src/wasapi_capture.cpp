@@ -16,17 +16,17 @@
 #include <ksmedia.h>
 #include <wrl/client.h>
 
+#include "spsc_capture_queue.h"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
-#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
 #include <memory>
-#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -103,49 +103,6 @@ struct Block {
     std::array<uint8_t, kPayloadLimit> pcm{};
 };
 
-class Queue {
-public:
-    bool try_push(const Block& b) {
-        {
-            std::lock_guard<std::mutex> lock(mu_);
-            if (closed_ || count_ == kQueueSlots) {
-                ++dropped_;
-                return false;
-            }
-            slots_[(front_ + count_) % kQueueSlots] = b;
-            ++count_;
-        }
-        cv_.notify_one();
-        return true;
-    }
-    bool pop(Block& b) {
-        std::unique_lock<std::mutex> lock(mu_);
-        cv_.wait(lock, [&] { return count_ != 0 || closed_; });
-        if (!count_) return false;
-        b = slots_[front_];
-        front_ = (front_ + 1) % kQueueSlots;
-        --count_;
-        return true;
-    }
-    void finish() {
-        {
-            std::lock_guard<std::mutex> lock(mu_);
-            closed_ = true;
-        }
-        cv_.notify_all();
-    }
-    uint64_t dropped() const {
-        std::lock_guard<std::mutex> lock(mu_);
-        return dropped_;
-    }
-private:
-    mutable std::mutex mu_;
-    std::condition_variable cv_;
-    std::array<Block, kQueueSlots> slots_{};
-    size_t front_ = 0, count_ = 0;
-    uint64_t dropped_ = 0;
-    bool closed_ = false;
-};
 
 void write_all(HANDLE h, const uint8_t* data, size_t size) {
     while (size != 0) {
@@ -382,7 +339,7 @@ void capture(IMMDeviceEnumerator& enumerator, const std::wstring& device_id,
                             reinterpret_cast<void**>(reader.GetAddressOf())), "GetService capture");
 
     PacketTimingTrace packet_trace;
-    Queue queue;
+    df_wasapi::SpscCaptureQueue<Block, kQueueSlots> queue;
     std::atomic<bool> failed{false};
     std::thread writer([&] {
         try {
