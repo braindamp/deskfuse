@@ -33,11 +33,18 @@ jobs:
         run: |
           $tokens = $null
           $errorsFound = $null
-          [System.Management.Automation.Language.Parser]::ParseFile(
-            (Resolve-Path 'vnext/qualification/run-physical-audio.ps1').Path,
-            [ref]$tokens, [ref]$errorsFound
-          ) | Out-Null
-          if ($errorsFound.Count -ne 0) { throw ($errorsFound | Out-String) }
+          foreach ($script in @(
+            'vnext/qualification/run-physical-audio.ps1',
+            'vnext/qualification/mark-audio-event.ps1'
+          )) {
+            $tokens = $null
+            $errorsFound = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $script).Path,
+              [ref]$tokens, [ref]$errorsFound
+            ) | Out-Null
+            if ($errorsFound.Count -ne 0) { throw ($errorsFound | Out-String) }
+          }
       - name: Configure native C++20 Windows capture
         shell: pwsh
         run: cmake -S vnext/m1 -B vnext/m1/build -G "Visual Studio 17 2022" -A x64
