@@ -66,6 +66,17 @@ pub struct RenderSnapshot {
     pub drift_ppm: i32,
     pub reserved: u32,
 }
+// ABI v5 additive off-callback Android HAL presentation measurement.
+// It is not an acoustic mic timestamp and cannot be subtracted from Windows
+// WASAPI QPC without independently measured cross-device clock alignment.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PresentationTimeV5 {
+    pub output_frame_position: i64,
+    pub monotonic_nanoseconds: i64,
+    pub aaudio_result: i32,
+    pub reserved: i32,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Admission {
     Accepted,
@@ -98,12 +109,13 @@ mod abi_tests {
         assert_eq!(std::mem::size_of::<AudioStats>(),80);
         assert_eq!(std::mem::size_of::<RenderIdentity>(),48);
         assert_eq!(std::mem::size_of::<RenderSnapshot>(),144);
+        assert_eq!(std::mem::size_of::<PresentationTimeV5>(),24);
     }
 }
 
 #[cfg(target_os = "android")]
 mod native {
-    use super::{Admission, AudioStats, RenderIdentity, RenderSnapshot};
+    use super::{Admission, AudioStats, RenderIdentity, RenderSnapshot, PresentationTimeV5};
     use std::ffi::{c_char, c_int, c_void, CString};
     use std::ptr;
 
@@ -126,12 +138,14 @@ mod native {
     type Applied=unsafe extern "C" fn(*mut c_void)->u64;
     type Snapshot=unsafe extern "C" fn(
         *mut c_void,*mut RenderSnapshot,*mut u64)->i32;
+    type Presentation=unsafe extern "C" fn(
+        *mut c_void,*mut PresentationTimeV5)->i32;
 
     pub struct Renderer {
         library:*mut c_void, ctx:*mut c_void,
         push:PushV5, stats:Stats, identity_stats:IdentityStats,
         modes:Modes, close:Close, request:Request, applied:Applied,
-        snapshot:Snapshot,
+        snapshot:Snapshot, presentation:Presentation,
     }
     impl Renderer {
         pub fn open(path:&str)->Result<Self,String> {
@@ -164,8 +178,9 @@ mod native {
                 sym(b"df_audio_request_recovery_v4\0")?,
                 sym(b"df_audio_recovery_applied_v4\0")?,
                 sym(b"df_audio_snapshot_v4\0")?,
+                sym(b"df_audio_presentation_time_v5\0")?,
             )))();
-            let (open,close,modes,push,stats,identity_stats,request,applied,snapshot)=match funcs{
+            let (open,close,modes,push,stats,identity_stats,request,applied,snapshot,presentation)=match funcs{
                 Ok(parts)=>parts,
                 Err(e)=>{unsafe{dlclose(library)};return Err(e);}
             };
@@ -186,6 +201,7 @@ mod native {
                 request:unsafe{std::mem::transmute(request)},
                 applied:unsafe{std::mem::transmute(applied)},
                 snapshot:unsafe{std::mem::transmute(snapshot)},
+                presentation:unsafe{std::mem::transmute(presentation)},
             })
         }
         pub fn set_diagnostic_modes(&mut self,fades:bool,linear:bool)->Result<(),String>{
@@ -225,6 +241,11 @@ mod native {
                 x=>Err(format!("AAudio coherent snapshot error={x}")),
             }
         }
+        pub fn presentation_time(&self)->Result<PresentationTimeV5,String>{
+            let mut value=PresentationTimeV5::default();
+            let code=unsafe{(self.presentation)(self.ctx,&mut value)};
+            if code==0{Ok(value)}else{Err(format!("AAudio HAL timestamp interface code={code}"))}
+        }
         pub fn snapshot(&self)->Result<AudioStats,String>{
             let mut value=AudioStats::default();
             let code=unsafe{(self.stats)(self.ctx,&mut value)};
@@ -258,6 +279,9 @@ impl AndroidAudio{
     pub fn request_recovery(&mut self)->u64{0}
     pub fn recovery_applied(&self)->u64{0}
     pub fn pop_snapshot(&self)->Result<Option<(RenderSnapshot,u64)>,String>{
+        Err("Android AAudio required".into())
+    }
+    pub fn presentation_time(&self)->Result<PresentationTimeV5,String>{
         Err("Android AAudio required".into())
     }
     pub fn snapshot(&self)->Result<AudioStats,String>{Err("Android AAudio required".into())}
