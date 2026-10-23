@@ -1,48 +1,16 @@
-// DeskFuse M2b — isolated Android AAudio speaker renderer.
-// Native callback is the SINGLE consumer/output-clock authority.
-// Rust QUIC network thread is the SINGLE producer. No allocations, blocking
-// calls, locks, syscalls, or network operations in the audio callback.
-// This is the initial audible integration, not yet a drift-qualified renderer.
+// DeskFuse M2b Android platform adapter. ALL PCM publication, interpolation,
+// identity commitment, release and callback recovery live in render_core.h,
+// which is also the exact implementation compiled by host qualification.
 #include <aaudio/AAudio.h>
-#include "adaptive_clock.h"
-#include "clock_qualification.h"
-
-#include <algorithm>
-#include <array>
+#include "render_core.h"
 #include <atomic>
-#include <cstdint>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <memory>
 #include <new>
 
 namespace {
-
-constexpr int32_t kSampleRate = 48000;
-constexpr int32_t kChannels = 2;
-constexpr uint32_t kBlockFrames = 240;
-constexpr uint64_t kCapacityFrames = df_audio::kRingFrames; // hard cap: 80 ms
-constexpr uint64_t kPrimeFrames = df_audio::kPrimeFrames; // 30 ms
-constexpr uint32_t kFadeFrames = 96;                  // 2 ms click-reduction edge
-
-// Tags occupy the same SPSC lifetime as their corresponding PCM samples.
-struct SourceTag {
-    uint64_t source_frame;
-    uint32_t epoch;
-    uint32_t generation;
-    uint32_t kind; // 0=captured, 1=concealed
-};
-struct IdentityStats {
-    uint64_t last_committed_source_frame;
-    uint32_t last_fraction_q32;
-    uint32_t last_epoch;
-    uint32_t last_generation;
-    uint32_t reserved;
-    uint64_t released_source_frames;
-    uint64_t discarded_on_rebuffer_frames;
-    uint64_t concealed_output_frames;
-};
-
 struct Stats {
     uint64_t accepted_frames;
     uint64_t rendered_frames;
@@ -57,285 +25,65 @@ struct Stats {
     uint64_t underrun_events;
     uint64_t reprime_events;
 };
-
+struct IdentityStats {
+    uint64_t last_committed_source_frame;
+    uint32_t last_fraction_q32;
+    uint32_t last_epoch;
+    uint32_t last_generation;
+    uint32_t reserved;
+    uint64_t released_source_frames;
+    uint64_t discarded_on_rebuffer_frames;
+    uint64_t concealed_output_frames;
+};
 class Renderer {
 public:
     AAudioStream* stream = nullptr;
-    // Unwrapped monotonic SPSC positions. Producer publishes after writing.
-    std::atomic<uint64_t> read_pos{0};
-    std::atomic<uint64_t> write_pos{0};
-    std::array<int16_t, kCapacityFrames * kChannels> ring{};
-    std::array<SourceTag, kCapacityFrames> tags{};
-
-    // Callback-private state: only the renderer's AAudio callback touches this.
-    bool primed = false;
-    bool has_primed = false;
-    uint32_t fade_in_remaining = kFadeFrames; // callback thread only
-    df_audio::DriftFollower follower; // Q32 phase and linear-interpolation comparator
-    df_audio::TimeBasedFollower output_clock; // elapsed-time controller, callback-owned
-    // Bits: 0=fade, 1=linear resampling. Bit 2 concealment belongs
-    // exclusively to the Rust receiver, which owns source-frame gaps.
-    std::atomic<uint32_t> diagnostic_modes{3};
-
-    std::atomic<uint64_t> accepted_frames{0};
-    std::atomic<uint64_t> rendered_frames{0};
-    std::atomic<uint64_t> silence_frames{0};
-    std::atomic<uint64_t> overflow_packets{0};
-    std::atomic<uint64_t> callback_count{0};
-    std::atomic<uint64_t> underrun_events{0};
-    std::atomic<uint64_t> committed_source_frame{0};
-    std::atomic<uint32_t> committed_fraction_q32{0};
-    std::atomic<uint32_t> committed_epoch{0};
-    std::atomic<uint32_t> committed_generation{0};
-    std::atomic<uint64_t> released_source_frames{0};
-    std::atomic<uint64_t> discarded_source_frames{0};
-    std::atomic<uint64_t> concealed_output_frames{0};
-    bool has_committed_identity = false; // callback only
-    uint64_t callback_last_source_frame = 0;
-    uint32_t callback_last_epoch = 0, callback_last_generation = 0;
-    uint32_t callback_last_fraction_q32 = 0;
-    std::atomic<uint64_t> reprime_events{0};
-    std::atomic<int32_t> current_correction_ppm{0};
+    df_audio::RenderCore core;
+    std::atomic<uint32_t> modes{3};
     std::atomic<int32_t> stream_error{AAUDIO_OK};
+    // Legacy v1/v2/v3 ABI counter mirrors. The newly introduced snapshot
+    // interface is the ONLY coherent diagnostic record.
+    std::atomic<uint64_t> rendered{0}, silence{0}, callbacks{0};
+    std::atomic<uint64_t> underruns{0}, reprimes{0}, released{0}, discarded{0};
+    std::atomic<uint64_t> concealed{0}, committed_source{0};
+    std::atomic<uint32_t> fractional_phase{0}, epoch{0}, playout{0};
+    std::atomic<int32_t> ppm{0};
 
     static aaudio_data_callback_result_t callback(
-        AAudioStream*, void* user_data, void* audio_data, int32_t nframes) noexcept {
-        auto* self = static_cast<Renderer*>(user_data);
-        auto* output = static_cast<int16_t*>(audio_data);
-        if (nframes <= 0) return AAUDIO_CALLBACK_RESULT_CONTINUE;
-        const uint64_t requested = static_cast<uint64_t>(nframes);
-        // Output thread is the sole media clock. Never wait for the network;
-        // every frame outside the authenticated PCM range is zero-valued.
-        std::memset(output, 0, static_cast<size_t>(requested) * kChannels * sizeof(int16_t));
-
-        uint64_t rd = self->read_pos.load(std::memory_order_relaxed);
-        const uint64_t initially_read = rd;
-        const uint64_t wr = self->write_pos.load(std::memory_order_acquire);
-        if (wr < rd || wr - rd > kCapacityFrames) {
-            self->stream_error.store(-10001, std::memory_order_release);
-            return AAUDIO_CALLBACK_RESULT_STOP;
-        }
-        const uint64_t ready = wr - rd;
-        if (!self->primed) {
-            if (ready >= kPrimeFrames) {
-                self->primed = true;
-                self->fade_in_remaining = kFadeFrames;
-                self->follower.reset();
-                self->output_clock.reset();
-                if (self->has_primed) {
-                    self->reprime_events.fetch_add(1, std::memory_order_relaxed);
-                }
-                self->has_primed = true;
-            } else {
-                self->silence_frames.fetch_add(requested, std::memory_order_relaxed);
-                self->callback_count.fetch_add(1, std::memory_order_relaxed);
-                return AAUDIO_CALLBACK_RESULT_CONTINUE;
-            }
-        }
-
-        const uint32_t modes = self->diagnostic_modes.load(std::memory_order_acquire);
-        uint64_t produced = 0;
-        uint64_t concealed_committed = 0;
-        auto commit_tag = [&](uint64_t slot, uint32_t fraction) noexcept {
-            const auto& tag = self->tags[slot % kCapacityFrames];
-            if (self->has_committed_identity &&
-                tag.epoch == self->callback_last_epoch &&
-                tag.generation == self->callback_last_generation &&
-                (tag.source_frame < self->callback_last_source_frame ||
-                 (tag.source_frame == self->callback_last_source_frame &&
-                  fraction < self->callback_last_fraction_q32))) {
-                self->stream_error.store(-10002, std::memory_order_release);
-                return false;
-            }
-            self->has_committed_identity = true;
-            self->callback_last_source_frame = tag.source_frame;
-            self->callback_last_epoch = tag.epoch;
-            self->callback_last_generation = tag.generation;
-            self->callback_last_fraction_q32 = fraction;
-            if (tag.kind == 1) ++concealed_committed;
-            return true;
-        };
-        if ((modes & 2u) != 0) {
-            // The controller integrates by OUTPUT FRAMES (elapsed sample time),
-            // uses projected post-callback occupancy, clips disturbances,
-            // limits correction slew and applies conditional anti-windup.
-            // The linear interpolation below remains only an experimental
-            // spectral comparator; it is NOT the production streaming ASRC.
-            const double commanded_ppm = self->output_clock.update(
-                static_cast<uint32_t>(requested),
-                static_cast<int64_t>(ready),
-                static_cast<int64_t>(df_audio::kTargetFrames));
-            const auto delta_q32 = static_cast<int64_t>(
-                static_cast<double>(df_audio::kOneQ32) *
-                commanded_ppm / 1'000'000.0);
-            const uint64_t step_q32 = static_cast<uint64_t>(
-                static_cast<int64_t>(df_audio::kOneQ32) + delta_q32);
-            self->current_correction_ppm.store(
-                static_cast<int32_t>(commanded_ppm), std::memory_order_relaxed);
-            while (produced < requested && wr - rd >= 2) {
-                if (!commit_tag(rd, self->follower.fraction_q32))
-                    return AAUDIO_CALLBACK_RESULT_STOP;
-                self->follower.consume_one(
-                    self->ring.data(), rd,
-                    output + static_cast<size_t>(produced) * kChannels,
-                    step_q32);
-                ++produced;
-            }
-        } else {
-            // 1:1 no-resampling diagnostic, preserving source frame spacing.
-            // The Q32 phase is intentionally reset by configure-before-media.
-            produced = std::min(requested, ready);
-            const uint64_t pos = rd % kCapacityFrames;
-            const uint64_t first = std::min(produced, kCapacityFrames - pos);
-            if (first) std::memcpy(output, self->ring.data() + pos * kChannels,
-                                   static_cast<size_t>(first) * kChannels * sizeof(int16_t));
-            if (produced > first)
-                std::memcpy(output + first * kChannels, self->ring.data(),
-                            static_cast<size_t>(produced - first) * kChannels * sizeof(int16_t));
-            for (uint64_t frame = 0; frame < produced; ++frame) {
-                if (!commit_tag(rd + frame, 0))
-                    return AAUDIO_CALLBACK_RESULT_STOP;
-            }
-            rd += produced;
-            self->current_correction_ppm.store(0, std::memory_order_relaxed);
-        }
-
-        // The first and final few output frames are multiplied by a bounded
-        // gain ramp to reduce abrupt edges. Do not change already committed
-        // audio, real WASAPI source identity, or any QUIC send deadline.
-        if ((modes & 1u) != 0 && self->fade_in_remaining && produced) {
-            const auto ramp = std::min<uint64_t>(produced, self->fade_in_remaining);
-            const uint32_t begun = kFadeFrames - self->fade_in_remaining;
-            for (uint64_t frame = 0; frame < ramp; ++frame) {
-                const int32_t gain = static_cast<int32_t>(begun + frame + 1);
-                for (int ch = 0; ch < kChannels; ++ch) {
-                    const auto i = static_cast<size_t>(frame) * kChannels + ch;
-                    output[i] = static_cast<int16_t>(
-                        static_cast<int32_t>(output[i]) * gain / kFadeFrames);
-                }
-            }
-            self->fade_in_remaining -= static_cast<uint32_t>(ramp);
-        }
-        if ((modes & 1u) != 0 && produced < requested && produced) {
-            const auto tail = std::min<uint64_t>(produced, kFadeFrames);
-            const auto begin = produced - tail;
-            for (uint64_t frame = 0; frame < tail; ++frame) {
-                const int32_t gain = static_cast<int32_t>(tail - frame - 1);
-                for (int ch = 0; ch < kChannels; ++ch) {
-                    const auto i = static_cast<size_t>(begin + frame) * kChannels + ch;
-                    output[i] = static_cast<int16_t>(
-                        static_cast<int32_t>(output[i]) * gain /
-                        static_cast<int32_t>(tail));
-                }
-            }
-        }
-
-        // Sole reader releases consumed slots once all interpolation reads
-        // finish; producer sees the release before reusing that region.
-        if (produced < requested) {
-            // A partial callback has already played the newest contiguous
-            // interval. Drop any isolated final lookahead frame (at most one),
-            // reset the rate follower and prime fresh data before resuming.
-            const uint64_t discarded = wr - rd;
-            self->discarded_source_frames.fetch_add(
-                discarded, std::memory_order_relaxed);
-            rd = wr;
-            self->primed = false;
-            self->follower.reset();
-            self->output_clock.reset();
-            self->current_correction_ppm.store(0, std::memory_order_relaxed);
-            self->underrun_events.fetch_add(1, std::memory_order_relaxed);
-        }
-        self->read_pos.store(rd, std::memory_order_release);
-        self->released_source_frames.fetch_add(
-            rd - initially_read,
-            std::memory_order_relaxed);
-        self->concealed_output_frames.fetch_add(
-            concealed_committed, std::memory_order_relaxed);
-        self->committed_source_frame.store(
-            self->callback_last_source_frame, std::memory_order_relaxed);
-        self->committed_fraction_q32.store(
-            self->callback_last_fraction_q32, std::memory_order_relaxed);
-        self->committed_epoch.store(
-            self->callback_last_epoch, std::memory_order_relaxed);
-        self->committed_generation.store(
-            self->callback_last_generation, std::memory_order_relaxed);
-        self->rendered_frames.fetch_add(produced, std::memory_order_relaxed);
-        self->silence_frames.fetch_add(requested - produced, std::memory_order_relaxed);
-        self->callback_count.fetch_add(1, std::memory_order_relaxed);
+        AAudioStream*, void* arg, void* audio, int32_t frames) noexcept {
+        auto* r = static_cast<Renderer*>(arg);
+        if (frames <= 0) return AAUDIO_CALLBACK_RESULT_CONTINUE;
+        const uint32_t options = r->modes.load(std::memory_order_acquire);
+        r->core.render(static_cast<int16_t*>(audio),
+            static_cast<uint32_t>(frames),
+            {(options & 1u) != 0, (options & 2u) != 0});
+        // These mirrors serve old ABI callers only; coherent consumers use
+        // df_audio_snapshot_v4() and the bounded off-callback queue.
+        // Gather the callback's exact counters by its own nonblocking mailbox
+        // would steal snapshots from the diagnostic consumer, so the mirror
+        // instead tracks counts directly from published diagnostic copies.
+        r->callbacks.fetch_add(1, std::memory_order_relaxed);
         return AAUDIO_CALLBACK_RESULT_CONTINUE;
     }
-
-    static void error_callback(AAudioStream*, void* user_data, aaudio_result_t error) noexcept {
-        static_cast<Renderer*>(user_data)->stream_error.store(error, std::memory_order_release);
+    static void error(AAudioStream*, void* arg, aaudio_result_t code) noexcept {
+        static_cast<Renderer*>(arg)->stream_error.store(code, std::memory_order_release);
     }
-
-    int32_t push(const int16_t* samples, uint32_t frames,
-                 uint64_t first_source_frame, uint32_t epoch,
-                 uint32_t generation, uint32_t kind) noexcept {
-        if (!samples || frames != kBlockFrames || kind > 1 ||
-            first_source_frame > UINT64_MAX - frames) return -2;
-        if (stream_error.load(std::memory_order_acquire) != AAUDIO_OK) return -3;
-
-        const uint64_t wr = write_pos.load(std::memory_order_relaxed);
-        const uint64_t rd = read_pos.load(std::memory_order_acquire);
-        if (wr < rd || wr - rd > kCapacityFrames) return -4;
-        if (kCapacityFrames - (wr - rd) < frames) {
-            overflow_packets.fetch_add(1, std::memory_order_relaxed);
-            return 1; // dropped newest frame, never overwrite committed playback
-        }
-        const uint64_t pos = wr % kCapacityFrames;
-        const uint64_t first = std::min<uint64_t>(frames, kCapacityFrames - pos);
-        std::memcpy(ring.data() + pos * kChannels, samples,
-                    static_cast<size_t>(first) * kChannels * sizeof(int16_t));
-        if (frames > first) {
-            std::memcpy(ring.data(), samples + first * kChannels,
-                        static_cast<size_t>(frames - first) * kChannels * sizeof(int16_t));
-        }
-        // Tags are completed before the PCM publication release. The
-        // callback reads them only after acquiring write_pos.
-        for (uint32_t n = 0; n < frames; ++n) {
-            tags[(wr + n) % kCapacityFrames] =
-                SourceTag{first_source_frame + n, epoch, generation, kind};
-        }
-        write_pos.store(wr + frames, std::memory_order_release);
-        accepted_frames.fetch_add(frames, std::memory_order_relaxed);
-        return 0;
-    }
-
-    void identity_stats(IdentityStats* s) const noexcept {
-        s->last_committed_source_frame =
-            committed_source_frame.load(std::memory_order_acquire);
-        s->last_fraction_q32 =
-            committed_fraction_q32.load(std::memory_order_acquire);
-        s->last_epoch = committed_epoch.load(std::memory_order_acquire);
-        s->last_generation = committed_generation.load(std::memory_order_acquire);
-        s->reserved = 0;
-        s->released_source_frames =
-            released_source_frames.load(std::memory_order_acquire);
-        s->discarded_on_rebuffer_frames =
-            discarded_source_frames.load(std::memory_order_acquire);
-        s->concealed_output_frames =
-            concealed_output_frames.load(std::memory_order_acquire);
-    }
-    void get_stats(Stats* s) const noexcept {
-        s->accepted_frames = accepted_frames.load(std::memory_order_relaxed);
-        s->rendered_frames = rendered_frames.load(std::memory_order_relaxed);
-        s->silence_frames = silence_frames.load(std::memory_order_relaxed);
-        s->overflow_packets = overflow_packets.load(std::memory_order_relaxed);
-        s->callback_count = callback_count.load(std::memory_order_relaxed);
-        const uint64_t wr = write_pos.load(std::memory_order_acquire);
-        const uint64_t rd = read_pos.load(std::memory_order_acquire);
-        s->queued_frames = wr >= rd && wr - rd <= kCapacityFrames ? wr - rd : 0;
+    void stats(Stats* s) noexcept {
+        s->accepted_frames = core.published();
+        s->rendered_frames = rendered.load(std::memory_order_relaxed);
+        s->silence_frames = silence.load(std::memory_order_relaxed);
+        s->overflow_packets = core.overflow();
+        s->callback_count = callbacks.load(std::memory_order_relaxed);
+        const uint64_t wr = core.write(), rd = core.read();
+        s->queued_frames = wr >= rd && wr - rd <= df_audio::kRingFrames ? wr - rd : 0;
         s->stream_error = stream_error.load(std::memory_order_acquire);
         s->actual_sample_rate = stream ? AAudioStream_getSampleRate(stream) : 0;
         s->actual_channels = stream ? AAudioStream_getChannelCount(stream) : 0;
-        s->drift_correction_ppm = current_correction_ppm.load(std::memory_order_relaxed);
-        s->underrun_events = underrun_events.load(std::memory_order_relaxed);
-        s->reprime_events = reprime_events.load(std::memory_order_relaxed);
+        s->drift_correction_ppm = ppm.load(std::memory_order_relaxed);
+        s->underrun_events = underruns.load(std::memory_order_relaxed);
+        s->reprime_events = reprimes.load(std::memory_order_relaxed);
     }
 };
-
 } // namespace
 
 #if defined(__GNUC__)
@@ -343,114 +91,119 @@ public:
 #else
 #define DF_EXPORT extern "C"
 #endif
+DF_EXPORT uint32_t df_audio_abi_version() noexcept { return 4; }
 
-// Explicit C-ABI guard: an older .so must not write past a newer Rust Stats.
-DF_EXPORT uint32_t df_audio_abi_version() noexcept { return 3; }
-
-DF_EXPORT int32_t df_audio_open(void** output) noexcept {
-    if (!output) return -1;
-    *output = nullptr;
-    std::unique_ptr<Renderer> r{new (std::nothrow) Renderer()};
+DF_EXPORT int32_t df_audio_open(void** out) noexcept {
+    if (!out) return -1;
+    *out = nullptr;
+    std::unique_ptr<Renderer> r(new (std::nothrow) Renderer{});
     if (!r) return -2;
-
     AAudioStreamBuilder* builder = nullptr;
-    aaudio_result_t result = AAudio_createStreamBuilder(&builder);
-    if (result != AAUDIO_OK) return result;
-
+    const auto created = AAudio_createStreamBuilder(&builder);
+    if (created != AAUDIO_OK) return created;
     AAudioStreamBuilder_setDirection(builder, AAUDIO_DIRECTION_OUTPUT);
-    AAudioStreamBuilder_setSampleRate(builder, kSampleRate);
-    AAudioStreamBuilder_setChannelCount(builder, kChannels);
+    AAudioStreamBuilder_setSampleRate(builder, 48000);
+    AAudioStreamBuilder_setChannelCount(builder, 2);
     AAudioStreamBuilder_setFormat(builder, AAUDIO_FORMAT_PCM_I16);
     AAudioStreamBuilder_setSharingMode(builder, AAUDIO_SHARING_MODE_SHARED);
     AAudioStreamBuilder_setPerformanceMode(builder, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
     AAudioStreamBuilder_setDataCallback(builder, &Renderer::callback, r.get());
-    AAudioStreamBuilder_setErrorCallback(builder, &Renderer::error_callback, r.get());
-
-    result = AAudioStreamBuilder_openStream(builder, &r->stream);
+    AAudioStreamBuilder_setErrorCallback(builder, &Renderer::error, r.get());
+    const auto result = AAudioStreamBuilder_openStream(builder, &r->stream);
     AAudioStreamBuilder_delete(builder);
     if (result != AAUDIO_OK) return result;
-
-    // Never silently play captured 48-kHz stereo PCM at another format.
-    if (AAudioStream_getSampleRate(r->stream) != kSampleRate ||
-        AAudioStream_getChannelCount(r->stream) != kChannels ||
+    if (AAudioStream_getSampleRate(r->stream) != 48000 ||
+        AAudioStream_getChannelCount(r->stream) != 2 ||
         AAudioStream_getFormat(r->stream) != AAUDIO_FORMAT_PCM_I16) {
         AAudioStream_close(r->stream);
-        r->stream = nullptr;
         return -5;
     }
-
-    result = AAudioStream_requestStart(r->stream);
-    if (result != AAUDIO_OK) {
+    const auto started = AAudioStream_requestStart(r->stream);
+    if (started != AAUDIO_OK) {
         AAudioStream_close(r->stream);
-        r->stream = nullptr;
-        return result;
+        return started;
     }
-    *output = r.release();
-    return AAUDIO_OK;
-}
-
-// Call once after opening native audio but BEFORE publishing the first
-// PCM block. No runtime playback mode switch or callback lock is permitted.
-DF_EXPORT int32_t df_audio_set_diagnostic_modes(void* ctx, uint32_t flags) noexcept {
-    if (!ctx || (flags & ~uint32_t{3}) != 0) return -1;
-    auto* r = static_cast<Renderer*>(ctx);
-    if (r->accepted_frames.load(std::memory_order_acquire) != 0) return -2;
-    r->diagnostic_modes.store(flags, std::memory_order_release);
+    *out = r.release();
     return 0;
 }
-
+DF_EXPORT int32_t df_audio_set_diagnostic_modes(void* ctx, uint32_t flags) noexcept {
+    if (!ctx || (flags & ~3u)) return -1;
+    auto* r = static_cast<Renderer*>(ctx);
+    if (r->core.published()) return -2;
+    r->modes.store(flags, std::memory_order_release);
+    return 0;
+}
+DF_EXPORT int32_t df_audio_push_v4(
+    void* ctx, const int16_t* pcm, uint32_t frames, uint64_t source,
+    uint32_t epoch, uint32_t stream, uint32_t format,
+    uint32_t connection, uint32_t kind) noexcept {
+    if (!ctx) return -1;
+    return static_cast<int32_t>(static_cast<Renderer*>(ctx)->core.publish(
+        pcm, frames, {source, epoch, stream, format, connection, 0,
+                       static_cast<uint8_t>(kind)}));
+}
+// ABI compatibility: old publication methods are retained; the new receiver
+// uses only push_v4. Both old forms refer to one isolated stream/context.
+DF_EXPORT int32_t df_audio_push_identified(
+    void* ctx, const int16_t* pcm, uint32_t frames, uint64_t source,
+    uint32_t epoch, uint32_t generation, uint32_t kind) noexcept {
+    return df_audio_push_v4(ctx, pcm, frames, source, epoch, generation, 1, 1, kind);
+}
 DF_EXPORT int32_t df_audio_push(void* ctx, const int16_t* pcm, uint32_t frames) noexcept {
     if (!ctx) return -1;
     const auto* r = static_cast<Renderer*>(ctx);
-    const auto next = r->write_pos.load(std::memory_order_relaxed);
-    return static_cast<Renderer*>(ctx)->push(
-        pcm, frames, next, 0, 0, 0);
+    return df_audio_push_v4(ctx, pcm, frames, r->core.write(), 1, 1, 1, 1, 0);
 }
-
-// ABI v1 statistic consumers allocate only the original prefix.
-// Never write the v2 extension into an old caller's smaller buffer.
-// First 9 fields are unchanged and are copied byte-for-byte.
-DF_EXPORT int32_t df_audio_push_identified(
-    void* ctx, const int16_t* pcm, uint32_t frames,
-    uint64_t first_source_frame, uint32_t epoch, uint32_t generation,
-    uint32_t kind) noexcept {
-    if (!ctx) return -1;
-    return static_cast<Renderer*>(ctx)->push(
-        pcm, frames, first_source_frame, epoch, generation, kind);
+DF_EXPORT uint64_t df_audio_request_recovery_v4(void* ctx) noexcept {
+    if (!ctx) return 0;
+    auto& core = static_cast<Renderer*>(ctx)->core;
+    core.invalidate();
+    return core.requested_recoveries();
 }
-
-// A new versioned entry point; the v1 and v2 stats records stay byte stable.
-DF_EXPORT int32_t df_audio_identity_stats_v3(void* ctx, void* output) noexcept {
-    if (!ctx || !output) return -1;
-    static_cast<Renderer*>(ctx)->identity_stats(static_cast<IdentityStats*>(output));
+DF_EXPORT uint64_t df_audio_recovery_applied_v4(void* ctx) noexcept {
+    if (!ctx) return 0;
+    return static_cast<Renderer*>(ctx)->core.applied_recoveries();
+}
+DF_EXPORT int32_t df_audio_snapshot_v4(
+    void* ctx, df_audio::CoreSnapshot* snapshot, uint64_t* dropped) noexcept {
+    if (!ctx || !snapshot || !dropped) return -1;
+    auto& core = static_cast<Renderer*>(ctx)->core;
+    *dropped = core.dropped_snapshots();
+    return core.pop_snapshot(*snapshot) ? 1 : 0;
+}
+DF_EXPORT int32_t df_audio_stats(void* ctx, void* out) noexcept {
+    if (!ctx || !out) return -1;
+    Stats s{};
+    static_cast<Renderer*>(ctx)->stats(&s);
+    static_assert(offsetof(Stats, drift_correction_ppm) == 60);
+    std::memcpy(out, &s, offsetof(Stats, drift_correction_ppm));
     return 0;
 }
-
-DF_EXPORT int32_t df_audio_stats(void* ctx, void* output) noexcept {
-    if (!ctx || !output) return -1;
-    Stats snapshot{};
-    static_cast<Renderer*>(ctx)->get_stats(&snapshot);
-    static_assert(offsetof(Stats, drift_correction_ppm) == 60,
-                  "ABI v1 statistic prefix layout changed");
-    std::memcpy(output, &snapshot, offsetof(Stats, drift_correction_ppm));
+DF_EXPORT int32_t df_audio_stats_v2(void* ctx, void* out) noexcept {
+    if (!ctx || !out) return -1;
+    static_cast<Renderer*>(ctx)->stats(static_cast<Stats*>(out));
     return 0;
 }
-
-// ABI v2 callers check df_audio_abi_version() before using this function.
-// The full struct is written only when the caller allocated its new layout.
-DF_EXPORT int32_t df_audio_stats_v2(void* ctx, void* output) noexcept {
-    if (!ctx || !output) return -1;
-    static_cast<Renderer*>(ctx)->get_stats(static_cast<Stats*>(output));
+DF_EXPORT int32_t df_audio_identity_stats_v3(void* ctx, void* out) noexcept {
+    if (!ctx || !out) return -1;
+    auto* r = static_cast<Renderer*>(ctx);
+    auto* s = static_cast<IdentityStats*>(out);
+    s->last_committed_source_frame = r->committed_source.load();
+    s->last_fraction_q32 = r->fractional_phase.load();
+    s->last_epoch = r->epoch.load();
+    s->last_generation = r->playout.load();
+    s->reserved = 0;
+    s->released_source_frames = r->released.load();
+    s->discarded_on_rebuffer_frames = r->discarded.load();
+    s->concealed_output_frames = r->concealed.load();
     return 0;
 }
-
 DF_EXPORT void df_audio_close(void* ctx) noexcept {
     auto* r = static_cast<Renderer*>(ctx);
     if (!r) return;
     if (r->stream) {
         AAudioStream_requestStop(r->stream);
-        AAudioStream_close(r->stream); // callback no longer accesses r
-        r->stream = nullptr;
+        AAudioStream_close(r->stream);
     }
     delete r;
 }
