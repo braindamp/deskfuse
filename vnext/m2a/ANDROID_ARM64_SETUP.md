@@ -87,3 +87,36 @@ Expected output includes `PASS DeskFuse vNext target=android arch=aarch64 real-q
 Disk note: the `cargo-ndk` host tool and Rust std target use the profile's Cargo/Rust cache, typically on C:, while cross-compiled BoringSSL and executable outputs belong to the Cargo target folder on D:. Do not run `cargo clean` during builds. First build may be several GB; check C: and D: free space.
 
 Passing this smoke check **does not** establish Windows-to-phone transport, QUIC peer identity, full connectivity, audio playback, clock synchronisation or multimedia quality. The next gate is explicitly authenticated physical-device QUIC.
+
+## Windows cross-compile recovery: avoid mixing host and Android CMake
+
+If `boring-sys` finishes compiling `libssl.a` but a later CMake compiler check tries to link Windows `-lkernel32`, `-luser32` etc., the generated CMake cache is using the Windows host instead of the Android toolchain. The NDK toolchain file is `<NDK>/build/cmake/android.toolchain.cmake`; the `cargo-ndk` wrapper exports appropriate Android target and compiler variables. Do **not** confuse `-p` (Cargo package) with `-P` (Android API level) in cargo-ndk 4.1.x.
+
+Run from the quiche-lab directory with CMake/Ninja accessible. Undo only manual compiler overrides left by earlier troubleshooting:
+
+```powershell
+cd 'D:\Coding\DeskFuse\vnext-wp001\vnext\m2a\quiche-lab'
+$env:ANDROID_SDK_ROOT = 'D:\Android\Sdk'
+$env:ANDROID_NDK_HOME = 'D:\Android\Sdk\ndk\30.0.16248370'
+$env:CMAKE_GENERATOR = 'Ninja'
+
+foreach ($name in @(
+    'CC_aarch64_linux_android','CXX_aarch64_linux_android',
+    'CFLAGS_aarch64_linux_android','CXXFLAGS_aarch64_linux_android',
+    'CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER',
+    'CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS',
+    'CMAKE_TOOLCHAIN_FILE','CMAKE_SYSTEM_NAME'
+)) { Remove-Item -Path "Env:$name" -ErrorAction SilentlyContinue }
+
+# Remove only the Android boring-sys CMake build directory from the
+# failed configure; this retains Cargo's other compiled build artifacts.
+Get-ChildItem 'target\aarch64-linux-android\debug\build' -Directory -Filter 'boring-sys-*' -ErrorAction SilentlyContinue |
+    ForEach-Object { Join-Path $_.FullName 'out\build' } |
+    Where-Object { Test-Path -LiteralPath $_ } |
+    ForEach-Object { Remove-Item -LiteralPath $_ -Recurse -Force }
+
+# Use cargo-ndk (not plain cargo build) for the complete Android target setup.
+cargo ndk -t arm64-v8a -P 35 build --bin android-arm64-smoke
+```
+
+This cleanup can rebuild native BoringSSL libraries but does not affect the Windows Rust build, the existing DeskFuse app, or the Android SDK/NDK installation. If the new CMake configure still attempts Windows libraries, inspect the new `CMakeCache.txt` for `CMAKE_TOOLCHAIN_FILE`, `ANDROID_ABI`, `ANDROID_PLATFORM`, and `CMAKE_SYSTEM_NAME` before attempting any larger cleanup. Do not globally set `CMAKE_TOOLCHAIN_FILE` for unrelated native Windows builds.
