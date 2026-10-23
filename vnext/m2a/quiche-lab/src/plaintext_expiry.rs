@@ -6,7 +6,7 @@ use quiche::Connection;
 const CAPACITY: usize = 4;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Identity {
-    pub epoch: u32, pub stream: u32,
+    pub epoch: u32, pub stream: u32, pub format: u32,
     pub sequence: u32, pub source_frame: u64,
 }
 #[derive(Debug, Clone, Copy)]
@@ -22,7 +22,8 @@ impl Identity {
         if w.len() != 1000 || w[0] != 1 || w[1] != 1 { return None; }
         let u32_at = |o: usize| u32::from_be_bytes(w[o..o+4].try_into().unwrap());
         Some(Self {
-            epoch:u32_at(8), stream:u32_at(12),sequence:u32_at(20),
+            epoch:u32_at(8), stream:u32_at(12),format:u32_at(16),
+            sequence:u32_at(20),
             source_frame:u64::from_be_bytes(w[24..32].try_into().unwrap()),
         })
     }
@@ -80,10 +81,11 @@ mod tests {
         let mut w=[0u8;1000];w[0]=1;w[1]=1;
         w[8..12].copy_from_slice(&9u32.to_be_bytes());
         w[12..16].copy_from_slice(&5u32.to_be_bytes());
+        w[16..20].copy_from_slice(&3u32.to_be_bytes());
         w[20..24].copy_from_slice(&11u32.to_be_bytes());
         w[24..32].copy_from_slice(&48000u64.to_be_bytes());
         let i=Identity::from_wire(&w).unwrap();
-        assert_eq!(i.epoch,9);assert_eq!(i.stream,5);
+        assert_eq!(i.epoch,9);assert_eq!(i.stream,5);assert_eq!(i.format,3);
         assert_eq!(i.sequence,11);assert_eq!(i.source_frame,48000);
         let mut ledger=PlaintextExpiry::default();
         for n in 0..4 {ledger.accept(Identity{sequence:n,..i},100).unwrap();}
