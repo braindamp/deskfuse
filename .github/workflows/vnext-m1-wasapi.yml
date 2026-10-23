@@ -6,6 +6,7 @@ on:
       - feature/vnext-wp001-native-lab
     paths:
       - 'vnext/m1/**'
+      - 'vnext/qualification/**'
       - '.github/workflows/vnext-m1-wasapi.yml'
   workflow_dispatch:
 
@@ -18,6 +19,16 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - name: Statically parse physical qualification PowerShell (no devices contacted)
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errorsFound = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path 'vnext/qualification/run-physical-audio.ps1').Path,
+            [ref]$tokens, [ref]$errorsFound
+          ) | Out-Null
+          if ($errorsFound.Count -ne 0) { throw ($errorsFound | Out-String) }
       - name: Configure native C++20 Windows capture
         shell: pwsh
         run: cmake -S vnext/m1 -B vnext/m1/build -G "Visual Studio 17 2022" -A x64
