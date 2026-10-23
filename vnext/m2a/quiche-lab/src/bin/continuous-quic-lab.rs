@@ -546,9 +546,14 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                                             }
                                         }
                                         if !complete_concealment {
-                                            // No partial concealment may be joined
-                                            // to a future real packet. Callback
-                                            // owns the destructive flush.
+                                            // The lost packet still advances
+                                            // the authenticated irreversible
+                                            // reception frontier. Never
+                                            // re-insert this range on retry.
+                                            last_source_frame = Some(h.first_source_frame);
+                                            first_sequence.get_or_insert(h.packet_sequence);
+                                            last_sequence = Some(h.packet_sequence);
+                                            received += 1;
                                             continue;
                                         }
                                     } else {
@@ -559,9 +564,15 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                                         source_unconcealed_frames += missing;
                                         speaker.request_recovery();
                                         recover_started += 1;
-                                        // The current packet only *identifies*
-                                        // the forward source anchor. Do not
-                                        // queue it behind retired output.
+                                        // The current packet establishes a
+                                        // forward AUTHENTICATED source cursor,
+                                        // but is NOT offered into retired FIFO.
+                                        // Only subsequent future packets may
+                                        // re-anchor after callback recovery.
+                                        last_source_frame = Some(h.first_source_frame);
+                                        first_sequence.get_or_insert(h.packet_sequence);
+                                        last_sequence = Some(h.packet_sequence);
+                                        received += 1;
                                         continue;
                                     }
                                 }
