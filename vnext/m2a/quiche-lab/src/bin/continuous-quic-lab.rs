@@ -13,6 +13,7 @@ use std::io;
 use std::sync::mpsc::TryRecvError;
 use deskfuse_quiche_lab::wasapi_pipe::{self, Assembler};
 use deskfuse_quiche_lab::android_audio::AndroidAudio;
+use deskfuse_quiche_lab::source_age::{self, AgeDecision};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
@@ -121,6 +122,10 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
     let mut assembler = Assembler::default();
     let mut source_chunks_too_old = 0u64;
     let mut last_capture_qpc = 0u64;
+    let mut expired_source_qpc = 0u64;
+    let mut invalid_source_qpc = 0u64;
+    let mut future_source_qpc = 0u64;
+    let mut max_observed_source_age_100ns = 0u64;
 
     println!("READY continuous Windows source {} ; allowed phone IP {} ; mutual TLS mandatory", local, allow_ip);
     loop {
@@ -175,7 +180,56 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                                 source_chunks_too_old += 1;
                                 continue;
                             }
+                            // WASAPI capture QPC spans the *whole* native
+                            // pipe and reader queues; enqueue residency alone
+                            // is not a source-age bound. Fail closed on QPC
+                            // timestamp errors or excessive age.
+                            let qpc_now = source_age::local_qpc_100ns()?;
+                            let age = source_age::classify(qpc_now, chunk.qpc_100ns);
+                            match age {
+                                AgeDecision::Fresh { age_100ns } => {
+                                    max_observed_source_age_100ns =
+                                        max_observed_source_age_100ns.max(age_100ns);
+                                }
+                                AgeDecision::MissingTimestamp => {
+                                    invalid_source_qpc += 1;
+                                    continue;
+                                }
+                                AgeDecision::FutureTimestamp => {
+                                    future_source_qpc += 1;
+                                    continue;
+                                }
+                                AgeDecision::Expired => {
+                                    expired_source_qpc += 1;
+                                    continue;
+                                }
+                            }
                             if let Some(block) = assembler.push(&chunk) {
+                                // Re-evaluate the ORIGINAL first-frame capture
+                                // QPC immediately before application offer.
+                                // quiche may still queue this plaintext before
+                                // later sealing; that limitation is tracked.
+                                match source_age::classify(
+                                    source_age::local_qpc_100ns()?,
+                                    block.first_qpc_100ns,
+                                ) {
+                                    AgeDecision::Fresh { age_100ns } => {
+                                        max_observed_source_age_100ns =
+                                            max_observed_source_age_100ns.max(age_100ns);
+                                    }
+                                    AgeDecision::MissingTimestamp => {
+                                        invalid_source_qpc += 1;
+                                        continue;
+                                    }
+                                    AgeDecision::FutureTimestamp => {
+                                        future_source_qpc += 1;
+                                        continue;
+                                    }
+                                    AgeDecision::Expired => {
+                                        expired_source_qpc += 1;
+                                        continue;
+                                    }
+                                }
                                 if next_sequence > u64::from(u32::MAX) {
                                     return Err("captured packet sequence exhausted".into());
                                 }
@@ -242,8 +296,10 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                     let stats = c.stats();
                     if capture.is_some() {
                         println!(
-                            "DONE Windows WASAPI source duration={}s real_pcm_blocks_queued={} quiche_queue_full={} source_queue_old={} capture_discontinuities={} last_wasapi_qpc_100ns={} udp_packets={} udp_would_block={} quic_dgram_sent={} quic_lost={}",
+                            "DONE Windows WASAPI source duration={}s real_pcm_blocks_queued={} quiche_queue_full={} source_queue_old={} qpc_expired={} qpc_invalid={} qpc_future={} qpc_max_age_100ns={} capture_discontinuities={} last_wasapi_qpc_100ns={} udp_packets={} udp_would_block={} quic_dgram_sent={} quic_lost={}",
                             seconds, offered, not_queued, source_chunks_too_old,
+                            expired_source_qpc, invalid_source_qpc, future_source_qpc,
+                            max_observed_source_age_100ns,
                             assembler.discontinuities, last_capture_qpc, egress.udp_packets_sent,
                             egress.would_block_count, stats.dgram_sent, stats.lost
                         );
