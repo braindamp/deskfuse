@@ -12,6 +12,7 @@ use std::error::Error;
 use std::io;
 use std::sync::mpsc::TryRecvError;
 use deskfuse_quiche_lab::wasapi_pipe::{self, Assembler};
+use deskfuse_quiche_lab::android_audio::AndroidAudio;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
@@ -262,7 +263,7 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
     }
 }
 
-fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, synthetic: bool) -> Result<()> {
+fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, synthetic: bool, playback_library: Option<&str>) -> Result<()> {
     let mut cfg = config(ca, cert, key)?;
     let route = UdpSocket::bind("0.0.0.0:0")?;
     route.connect(remote)?;
@@ -280,6 +281,8 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
     let mut received = 0u64;
     let mut gaps = 0u64;
     let mut late = 0u64;
+    let mut audio_queue_full = 0u64;
+    let mut audio: Option<AndroidAudio> = None;
     let mut last_source_frame = None;
     let mut source_gap_frames = 0u64;
     let mut input = [0u8; 65535];
@@ -307,6 +310,11 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
             verified(&conn)?;
             authenticated_at = Some(Instant::now());
             println!("AUTH Android: verified Windows server CA chain and deskfuse-lab.local");
+            if let Some(library) = playback_library {
+                audio = Some(AndroidAudio::open(library)
+                    .map_err(|e| format!("Android speaker renderer initialization failed: {e}"))?);
+                println!("AUDIO Android: native AAudio output started, stereo PCM16 48000 Hz");
+            }
         }
         if authenticated_at.is_some() {
             for _ in 0..128 {
@@ -331,6 +339,15 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                         first_sequence.get_or_insert(h.packet_sequence);
                         last_sequence = Some(h.packet_sequence);
                         received += 1;
+                        if let Some(ref mut speaker) = audio {
+                            // PCM is verified, authenticated, and source-monotonic
+                            // BEFORE publication to the AAudio callback ring.
+                            let samples = &datagram[HEADER_BYTES..n];
+                            if !speaker.push_pcm16(samples)
+                                .map_err(|e| format!("Android audio renderer: {e}"))? {
+                                audio_queue_full += 1;
+                            }
+                        }
                         if received % 200 == 0 {
                             println!("ANDROID PCM received={} last_seq={} source_frame={} missing_before={} stale={}",
                                 received, h.packet_sequence, h.first_source_frame, gaps, late);
@@ -349,6 +366,17 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                     "DONE Android sink received={} first_seq={:?} last_seq={:?} missing_between={} source_missing_frames={} stale={} udp_packets={} quic_lost={} (no playback)",
                     received, first_sequence, last_sequence, gaps, source_gap_frames, late, egress.udp_packets_sent, stats.lost
                 );
+                if let Some(ref speaker) = audio {
+                    let a = speaker.snapshot().map_err(|e| format!("AAudio stats: {e}"))?;
+                    println!(
+                        "AUDIO Android speaker accepted_frames={} rendered_frames={} silence_frames={} overflow_packets={} queue_full_from_receiver={} callbacks={} queued_frames={} stream_error={} format={}Hz/{}ch",
+                        a.accepted_frames, a.rendered_frames, a.silence_frames,
+                        a.overflow_packets, audio_queue_full, a.callback_count,
+                        a.queued_frames, a.stream_error, a.actual_sample_rate, a.actual_channels
+                    );
+                    if a.stream_error != 0 { return Err(format!("AAudio stream failure code={}", a.stream_error).into()); }
+                    if a.rendered_frames == 0 { return Err("AAudio played no authenticated PCM frames".into()); }
+                }
                 if received == 0 { return Err("no authenticated PCM DATAGRAMs received".into()); }
                 return Ok(());
             }
@@ -380,16 +408,19 @@ fn run() -> Result<()> {
             server(bind.parse()?, allow_ip.parse()?, ca, cert, key, positive_seconds(secs)?, None)
         }
         [_, mode, remote, ca, cert, key, secs] if mode == "client" => {
-            client(remote.parse()?, ca, cert, key, positive_seconds(secs)?, true)
+            client(remote.parse()?, ca, cert, key, positive_seconds(secs)?, true, None)
         }
         [_, mode, bind, allow_ip, ca, cert, key, exe, device, secs] if mode == "server-wasapi" => {
             server(bind.parse()?, allow_ip.parse()?, ca, cert, key,
                    positive_seconds(secs)?, Some((exe, device)))
         }
         [_, mode, remote, ca, cert, key, secs] if mode == "client-capture" => {
-            client(remote.parse()?, ca, cert, key, positive_seconds(secs)?, false)
+            client(remote.parse()?, ca, cert, key, positive_seconds(secs)?, false, None)
         }
-        _ => Err("usage: continuous-quic-lab server <bind:port> <allowed-ip> <ca> <server-cert> <server-key> <secs> | server-wasapi <bind:port> <allowed-ip> <ca> <server-cert> <server-key> <wasapi-capture.exe> <endpoint-id|default> <secs> | client|client-capture <windows-ip:port> <ca> <client-cert> <client-key> <secs>".into()),
+        [_, mode, remote, ca, cert, key, library, secs] if mode == "client-playback" => {
+            client(remote.parse()?, ca, cert, key, positive_seconds(secs)?, false, Some(library))
+        }
+        _ => Err("usage: continuous-quic-lab server <bind:port> <allowed-ip> <ca> <server-cert> <server-key> <secs> | server-wasapi <bind:port> <allowed-ip> <ca> <server-cert> <server-key> <wasapi-capture.exe> <endpoint-id|default> <secs> | client|client-capture <windows-ip:port> <ca> <client-cert> <client-key> <secs> | client-playback <windows-ip:port> <ca> <client-cert> <client-key> <libdeskfuse_android_audio.so> <secs>".into()),
     }
 }
 
