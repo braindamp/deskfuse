@@ -19,6 +19,12 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Qualify streaming DFWC source/QPC parser against original record layout
+        shell: pwsh
+        run: python vnext/qualification/test_analyze_dfpcm.py
       - name: Statically parse physical qualification PowerShell (no devices contacted)
         shell: pwsh
         run: |
