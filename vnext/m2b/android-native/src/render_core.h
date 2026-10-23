@@ -306,8 +306,8 @@ public:
                     for (uint32_t ch = 0; ch < kChannels; ++ch) {
                         auto& sample = out[i * kChannels + ch];
                         sample = static_cast<int16_t>(
-                            static_cast<int32_t>(sample) * (begin + i + 1) /
-                            fade_frames);
+                            static_cast<int64_t>(sample) * static_cast<int64_t>(begin + i + 1) /
+                            static_cast<int64_t>(fade_frames));
                     }
                 fade_remaining_ -= n;
             }
@@ -322,8 +322,8 @@ public:
                             auto& sample =
                                 out[(emitted - tail + i) * kChannels + ch];
                             sample = static_cast<int16_t>(
-                                static_cast<int32_t>(sample) * (tail - i - 1) /
-                                tail);
+                                static_cast<int64_t>(sample) * static_cast<int64_t>(tail - i - 1) /
+                                static_cast<int64_t>(tail));
                         }
                 }
                 ++underruns_;
