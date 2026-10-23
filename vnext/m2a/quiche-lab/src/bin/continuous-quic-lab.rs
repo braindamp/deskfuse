@@ -134,7 +134,8 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
     let mut skipped_source_blocks = 0u64;
     let mut egress = Egress::default();
     let mut outstanding = PlaintextExpiry::default();
-    let mut pending_capture_anchor: Option<AnchorMessage> = None;
+    // Request receipt in the exact same Windows-QPC clock domain as WASAPI.
+    let mut pending_capture_anchor: Option<(AnchorMessage, u64)> = None;
     let mut anchor_nonce_frontier = 0u64;
     let mut anchor_replies_sent = 0u64;
     let mut bytes = [0u8; 65535];
@@ -209,7 +210,9 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                         }
                         if req.nonce >= anchor_nonce_frontier {
                             anchor_nonce_frontier = req.nonce;
-                            pending_capture_anchor = Some(req);
+                            pending_capture_anchor = Some((
+                                req, source_age::local_qpc_100ns()?,
+                            ));
                         }
                     } else {
                         return Err("Windows rejected unknown authenticated recovery control".into());
@@ -276,8 +279,11 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                                         continue;
                                     }
                                 }
-                                if let Some(req) = pending_capture_anchor {
-                                    if block.first_device_frame >= req.frame {
+                                if let Some((req, request_qpc)) = pending_capture_anchor {
+                                    if block.first_device_frame >= req.frame &&
+                                        block.first_qpc_100ns >
+                                            request_qpc.saturating_add(
+                                                source_age::MAX_FUTURE_SKEW_100NS) {
                                         // Anchored to actual fresh post-request
                                         // WASAPI capture; the control response
                                         // travels over the same authenticated
