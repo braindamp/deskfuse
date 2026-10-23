@@ -143,6 +143,12 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
     let mut assembler = Assembler::default();
     let mut source_chunks_too_old = 0u64;
     let mut last_capture_qpc = 0u64;
+    // Observe what actually reaches the QUIC owner, before any new media
+    // packet sequence is assigned. Distinguishes pre-sequence source holes
+    // from packet loss and immutable ciphertext admission.
+    let mut next_capture_frame:Option<u64> = None;
+    let mut capture_source_gaps=0u64;
+    let mut capture_source_missing_frames=0u64;
     let mut expired_source_qpc = 0u64;
     let mut invalid_source_qpc = 0u64;
     let mut future_source_qpc = 0u64;
@@ -253,6 +259,25 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                                     continue;
                                 }
                             }
+                            if let Some(expected) = next_capture_frame {
+                                if chunk.device_frame != expected ||
+                                    chunk.flags & 1 != 0 {
+                                    capture_source_gaps += 1;
+                                    if chunk.device_frame > expected {
+                                        capture_source_missing_frames +=
+                                            chunk.device_frame - expected;
+                                    }
+                                    if capture_source_gaps<=8 || capture_source_gaps%128==0 {
+                                        eprintln!(
+                                            "TRACE Windows PRE_QUIC_SOURCE_GAP expected={} actual={} delta={} flags={} count={}",
+                                            expected,chunk.device_frame,
+                                            i128::from(chunk.device_frame)-i128::from(expected),
+                                            chunk.flags,capture_source_gaps
+                                        );
+                                    }
+                                }
+                            }
+                            next_capture_frame = chunk.device_frame.checked_add(chunk.frames as u64);
                             if let Some(block) = assembler.push(&chunk) {
                                 // Re-evaluate the ORIGINAL first-frame capture
                                 // QPC immediately before application offer.
@@ -395,13 +420,15 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                     let stats = c.stats();
                     if capture.is_some() {
                         println!(
-                            "DONE Windows WASAPI source duration={}s real_pcm_blocks_queued={} quiche_queue_full={} source_queue_old={} qpc_expired={} qpc_invalid={} qpc_future={} qpc_max_age_100ns={} quiche_plaintext_expired={} quiche_plaintext_orphans={} quiche_plaintext_absent={} quiche_identity_high_water={} anchor_replies={} capture_discontinuities={} last_wasapi_qpc_100ns={} udp_packets={} udp_would_block={} quic_dgram_sent={} quic_lost={}",
+                            "DONE Windows WASAPI source duration={}s real_pcm_blocks_queued={} quiche_queue_full={} source_queue_old={} qpc_expired={} qpc_invalid={} qpc_future={} qpc_max_age_100ns={} quiche_plaintext_expired={} quiche_plaintext_orphans={} quiche_plaintext_absent={} quiche_identity_high_water={} anchor_replies={} capture_discontinuities={} pre_quic_source_gaps={} pre_quic_missing_frames={} last_wasapi_qpc_100ns={} udp_packets={} udp_would_block={} quic_dgram_sent={} quic_lost={}",
                             seconds, offered, not_queued, source_chunks_too_old,
                             expired_source_qpc, invalid_source_qpc, future_source_qpc,
                             max_observed_source_age_100ns,
                             outstanding.expired, outstanding.orphaned,
                             outstanding.absent, outstanding.high_water,
-                            anchor_replies_sent, assembler.discontinuities, last_capture_qpc, egress.udp_packets_sent,
+                            anchor_replies_sent, assembler.discontinuities,
+                            capture_source_gaps,capture_source_missing_frames,
+                            last_capture_qpc, egress.udp_packets_sent,
                             egress.would_block_count, stats.dgram_sent, stats.lost
                         );
                     } else {
