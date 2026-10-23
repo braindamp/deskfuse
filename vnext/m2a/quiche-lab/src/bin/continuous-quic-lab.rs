@@ -433,6 +433,8 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
     let mut active_context: Option<(u32,u32,u32)> = None;
     let mut receiver_frontier: u64 = 0;
     let mut audio: Option<AndroidAudio> = None;
+    let mut latest_render_record: Option<(deskfuse_quiche_lab::android_audio::RenderSnapshot, u64)> = None;
+    let mut coherent_records_read = 0u64;
     let mut last_source_frame: Option<u64> = None;
     let mut source_gap_frames = 0u64;
     let mut source_concealed_frames = 0u64;
@@ -613,21 +615,36 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                             if let Some(ref speaker) = audio {
                                 let a = speaker.snapshot()
                                     .map_err(|e| format!("AAudio periodic diagnostics: {e}"))?;
-                                let identity = speaker.identity_snapshot()
-                                    .map_err(|e| format!("AAudio render identity: {e}"))?;
-                                println!("TRACE Android RENDER packet_source={} committed_source={} phase_q32={} epoch={} generation={} released={} rebuffer_discarded={} concealed_output={} queued_frames={} drift_ppm={} underruns={} rebuffer={} silence_frames={} queue_full={}",
-                                    h.first_source_frame, identity.last_committed_source_frame,
-                                    identity.last_fraction_q32, identity.last_epoch,
-                                    identity.last_generation, identity.released_source_frames,
-                                    identity.discarded_on_rebuffer_frames,
-                                    identity.concealed_output_frames, a.queued_frames,
-                                    a.drift_correction_ppm, a.underrun_events,
-                                    a.reprime_events, a.silence_frames, audio_queue_full);
+                                if let Some((record, dropped)) = latest_render_record {
+                                    println!("TRACE Android RENDER committed_source={} support={} phase_q32={} epoch={} stream={} format={} connection={} playout={} released={} discarded={} concealed_output={} callbacks_record={} dropped_callback_records={} queued_frames={} drift_ppm={} underruns={} rebuffer={} silence_frames={} queue_full={}",
+                                        record.last_source, record.last_support_source,
+                                        record.fraction_q32, record.epoch, record.stream, record.format,
+                                        record.connection, record.playout,
+                                        record.released, record.discarded, record.concealed_outputs,
+                                        record.callback_seq, dropped, a.queued_frames,
+                                        record.drift_ppm, record.underruns, record.reprimes,
+                                        record.silence, audio_queue_full);
+                                }
                             }
                         }
                     }
                     Err(quiche::Error::Done) => break,
                     Err(e) => return Err(format!("Android DATAGRAM receive: {e:?}").into()),
+                }
+            }
+        }
+        // Consumer of coherent callback snapshots is the QUIC owner, not
+        // the Android real-time thread. Bound draining work and retain only
+        // the most recent complete callback record for diagnostics.
+        if let Some(ref speaker) = audio {
+            for _ in 0..16 {
+                match speaker.pop_snapshot()
+                    .map_err(|e| format!("AAudio off-callback telemetry: {e}"))? {
+                    Some(record) => {
+                        latest_render_record = Some(record);
+                        coherent_records_read += 1;
+                    }
+                    None => break,
                 }
             }
         }
@@ -651,34 +668,15 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                         a.queued_frames, a.stream_error, a.actual_sample_rate, a.actual_channels,
                         a.drift_correction_ppm, a.underrun_events, a.reprime_events
                     );
-                    let identity = speaker.identity_snapshot()
-                        .map_err(|e| format!("AAudio final identity: {e}"))?;
-                    println!("AUDIO Android identity committed_source_frame={} fractional_phase_q32={} epoch={} stream_generation={} released_source_frames={} rebuffer_discarded_frames={} concealed_output_frames={}",
-                        identity.last_committed_source_frame, identity.last_fraction_q32,
-                        identity.last_epoch, identity.last_generation,
-                        identity.released_source_frames,
-                        identity.discarded_on_rebuffer_frames,
-                        identity.concealed_output_frames);
-                    println!("AUDIO Android recovery native_started={} pending={} native_stale={} refused_context={} frontier={} applied_ticket={}",
-                        recover_started, recover_pending, native_stale,
-                        denied_reanchor, receiver_frontier,
-                        speaker.recovery_applied());
-                    let mut coherent = 0u64;
-                    let mut dropped_callback_telemetry = 0u64;
-                    while let Some((record, dropped)) = speaker.pop_snapshot()
-                        .map_err(|e| format!("coherent render snapshot: {e}"))? {
-                        coherent += 1;
-                        dropped_callback_telemetry = dropped;
-                        println!("TRACE Android CALLBACK seq={} source={} support={} q32={} epoch={} stream={} format={} conn={} playout={} committed={} released={} discarded={} concealed={} underruns={} corrections_ppm={}",
+                    if let Some((record, dropped)) = latest_render_record {
+                        println!("AUDIO Android committed callback={} source={} support={} fraction_q32={} epoch={} stream={} format={} connection={} playout_generation={} committed_output={} released_source={} discarded_rebuffer={} concealed_output={} coherence_dropped={} coherence_read={}",
                             record.callback_seq, record.last_source,
                             record.last_support_source, record.fraction_q32,
-                            record.epoch, record.stream, record.format,
-                            record.connection, record.playout, record.committed_output,
-                            record.released, record.discarded, record.concealed_outputs,
-                            record.underruns, record.drift_ppm);
+                            record.epoch, record.stream, record.format, record.connection,
+                            record.playout, record.committed_output, record.released,
+                            record.discarded, record.concealed_outputs,
+                            dropped, coherent_records_read);
                     }
-                    println!("AUDIO Android coherent_callback_records={} dropped_callback_records={}",
-                             coherent, dropped_callback_telemetry);
                     if a.stream_error != 0 { return Err(format!("AAudio stream failure code={}", a.stream_error).into()); }
                     if a.rendered_frames == 0 { return Err("AAudio played no authenticated PCM frames".into()); }
                 }
