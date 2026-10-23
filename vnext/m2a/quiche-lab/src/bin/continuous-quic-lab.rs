@@ -281,9 +281,8 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                                 }
                                 if let Some((req, request_qpc)) = pending_capture_anchor {
                                     if block.first_device_frame >= req.frame &&
-                                        block.first_qpc_100ns >
-                                            request_qpc.saturating_add(
-                                                source_age::MAX_FUTURE_SKEW_100NS) {
+                                        fresh_anchor::after_request_capture_qpc(
+                                            request_qpc, block.first_qpc_100ns) {
                                         // Anchored to actual fresh post-request
                                         // WASAPI capture; the control response
                                         // travels over the same authenticated
