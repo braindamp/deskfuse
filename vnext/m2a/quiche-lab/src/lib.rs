@@ -7,6 +7,7 @@ pub mod android_audio;
 pub mod source_age;
 pub mod plaintext_expiry;
 pub mod receive_frontier;
+pub mod fresh_anchor;
 
 pub const HEADER_BYTES: usize = 40;
 pub const VERSION: u8 = 1;
