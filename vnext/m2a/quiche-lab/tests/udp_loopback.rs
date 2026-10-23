@@ -102,6 +102,20 @@ fn drive(
     Ok(progressed)
 }
 
+
+fn connection_status(stage: &str, start: Instant, client: &quiche::Connection, server: &quiche::Connection) -> String {
+    // Diagnostic only. Do not extend the 5s QUIC idle timeout or relax
+    // verification to turn an unexplained CI failure into a green build.
+    let c = client.stats();
+    let s = server.stats();
+    format!(
+        "stage={stage} elapsed_ms={} client(established={},closed={},udp_sent={},udp_recv={},dgram_sent={},dgram_recv={},lost={}) server(established={},closed={},udp_sent={},udp_recv={},dgram_sent={},dgram_recv={},lost={})",
+        start.elapsed().as_millis(),
+        client.is_established(), client.is_closed(), c.sent, c.recv, c.dgram_sent, c.dgram_recv, c.lost,
+        server.is_established(), server.is_closed(), s.sent, s.recv, s.dgram_sent, s.dgram_recv, s.lost
+    )
+}
+
 #[test]
 fn verified_quiche_datagram_over_real_udp_loopback() -> TestResult<()> {
     // Test CA/server identity are ephemeral, locally scoped and auto-deleted.
@@ -171,7 +185,7 @@ fn verified_quiche_datagram_over_real_udp_loopback() -> TestResult<()> {
     let start = Instant::now();
     while !(client.is_established() && server.is_established()) {
         if start.elapsed() > DEADLINE || client.is_closed() || server.is_closed() {
-            return Err("real UDP authenticated QUIC handshake did not establish".into());
+            return Err(format!("real UDP authenticated QUIC handshake did not establish; {}", connection_status("handshake", start, &client, &server)).into());
         }
         drive(&client_udp, &server_udp, &mut client, &mut server)?;
     }
@@ -202,7 +216,7 @@ fn verified_quiche_datagram_over_real_udp_loopback() -> TestResult<()> {
     let mut echoed = false;
     while !echoed {
         if start.elapsed() > DEADLINE || client.is_closed() || server.is_closed() {
-            return Err("real UDP QUIC DATAGRAM exchange timed out or connection closed".into());
+            return Err(format!("real UDP QUIC DATAGRAM exchange timed out or connection closed; {}", connection_status("forward_datagram", start, &client, &server)).into());
         }
         drive(&client_udp, &server_udp, &mut client, &mut server)?;
         match server.dgram_recv(&mut inbound) {
@@ -224,7 +238,7 @@ fn verified_quiche_datagram_over_real_udp_loopback() -> TestResult<()> {
     let mut returned = false;
     while !returned {
         if start.elapsed() > DEADLINE || client.is_closed() || server.is_closed() {
-            return Err("return UDP QUIC DATAGRAM timed out or connection closed".into());
+            return Err(format!("return UDP QUIC DATAGRAM timed out or connection closed; {}", connection_status("echo_datagram", start, &client, &server)).into());
         }
         drive(&client_udp, &server_udp, &mut client, &mut server)?;
         match client.dgram_recv(&mut inbound) {
