@@ -1,0 +1,81 @@
+name: vNext CP-001 Android ABI v5 pair
+
+on:
+  push:
+    branches: [feature/vnext-wp001-native-lab]
+    paths:
+      - 'vnext/m2a/quiche-lab/**'
+      - 'vnext/m2b/android-native/**'
+      - '.github/workflows/vnext-m2b-android-pair.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  arm64-pair:
+    name: Native AAudio plus complete Android Rust executable
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust 1.99.1 and Android target
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.99.1 --profile minimal --target aarch64-linux-android
+          rustup default 1.99.1
+          rustc -V
+      - name: Install Android NDK r30 and build prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build nasm clang
+          test -n "$ANDROID_HOME"
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;30.0.16248370"
+          test -f "$ANDROID_HOME/ndk/30.0.16248370/build/cmake/android.toolchain.cmake"
+      - name: Build Android ARM64 native renderer ABI v5
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S vnext/m2b/android-native -B /tmp/df-aaudio -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_HOME/ndk/30.0.16248370/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-35 -DANDROID_STL=c++_shared
+          cmake --build /tmp/df-aaudio --parallel 2
+          test -s /tmp/df-aaudio/libdeskfuse_android_audio.so
+      - name: Install pinned cargo-ndk host tool
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install cargo-ndk --version 4.1.2 --locked
+          cargo ndk --version
+      - name: Cross-compile full Android arm64 QUIC playback executable
+        shell: bash
+        env:
+          CMAKE_GENERATOR_aarch64_linux_android: Ninja
+          BINDGEN_EXTRA_CLANG_ARGS_aarch64-linux-android: --target=aarch64-linux-android35
+        run: |
+          set -euo pipefail
+          export ANDROID_SDK_ROOT="$ANDROID_HOME"
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/30.0.16248370"
+          export CMAKE_TOOLCHAIN_FILE_aarch64_linux_android="$GITHUB_WORKSPACE/vnext/m2a/quiche-lab/cmake/android-ndk-wrapper.cmake"
+          cd vnext/m2a/quiche-lab
+          cargo ndk -t arm64-v8a -P 35 build --bin continuous-quic-lab --locked
+          test -s target/aarch64-linux-android/debug/continuous-quic-lab
+      - name: Record exact verified ABI pair checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/deskfuse-abi5
+          cp /tmp/df-aaudio/libdeskfuse_android_audio.so /tmp/deskfuse-abi5/
+          cp vnext/m2a/quiche-lab/target/aarch64-linux-android/debug/continuous-quic-lab /tmp/deskfuse-abi5/
+          cp "$ANDROID_HOME/ndk/30.0.16248370/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" /tmp/deskfuse-abi5/
+          (cd /tmp/deskfuse-abi5 && sha256sum *.so continuous-quic-lab | tee SHA256SUMS)
+          echo "COMMIT=$GITHUB_SHA"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deskfuse-cp001-abi5-arm64
+          path: /tmp/deskfuse-abi5/
+          retention-days: 7
