@@ -159,6 +159,10 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
     let mut previous_initial_qpc:Option<(u64,u64,u64,AgeDecision)> = None;
     let mut adjacent_240_qpc_pairs=0u64;
     let mut mixed_future_pairs=0u64;
+    // One-shot pre-auth network diagnostics, no per-packet hot-path logging.
+    let mut logged_allowed_initial = false;
+    let mut logged_rejected_initial = false;
+    let mut logged_quic_accept = false;
 
     println!("READY continuous Windows source {} ; allowed phone IP {} ; mutual TLS mandatory", local, allow_ip);
     loop {
@@ -176,6 +180,15 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => return Err(e.into()),
             };
+            if origin.is_none() {
+                if from.ip() == allow_ip && !logged_allowed_initial {
+                    eprintln!("TRACE Windows PREAUTH_UDP_RX allowed_ip={} peer={} bytes={}", allow_ip, from, n);
+                    logged_allowed_initial = true;
+                } else if from.ip() != allow_ip && !logged_rejected_initial {
+                    eprintln!("TRACE Windows PREAUTH_UDP_FILTERED source_ip={} expected_ip={}", from.ip(), allow_ip);
+                    logged_rejected_initial = true;
+                }
+            }
             if from.ip() != allow_ip || peer.is_some_and(|p| p != from) { continue; }
             if conn.is_none() {
                 let header = match quiche::Header::from_slice(&mut bytes[..n], quiche::MAX_CONN_ID_LEN) {
@@ -184,6 +197,10 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                 };
                 conn = Some(quiche::accept(&header.dcid, None, local, from, &mut cfg)?);
                 peer = Some(from);
+                if !logged_quic_accept {
+                    eprintln!("TRACE Windows PREAUTH_QUIC_ACCEPT peer={}", from);
+                    logged_quic_accept = true;
+                }
             }
             let c = conn.as_mut().expect("connection accepted");
             match c.recv(&mut bytes[..n], quiche::RecvInfo { from, to: local }) {
@@ -756,6 +773,7 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
     let mut egress = Egress::default();
     let started_waiting = Instant::now();
     let mut authenticated_at: Option<Instant> = None;
+    let mut logged_initial_udp_tx = false;
     let mut first_sequence: Option<u32> = None;
     let mut last_sequence: Option<u32> = None;
     let mut received = 0u64;
@@ -1192,6 +1210,11 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
             }
         }
         egress.service(&udp, &mut conn, false)?;
+        if !logged_initial_udp_tx && egress.udp_packets_sent > 0 {
+            eprintln!("TRACE Android PREAUTH_UDP_TX accepted_by_kernel=1 dest={} total_packets={}",
+                      remote, egress.udp_packets_sent);
+            logged_initial_udp_tx = true;
+        }
         if let Some(at) = authenticated_at {
             if at.elapsed() >= Duration::from_secs(seconds + 2) {
                 let stats = conn.stats();
