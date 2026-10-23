@@ -27,11 +27,11 @@ $env:ANDROID_SDK_ROOT = $AndroidSdk
 $env:ANDROID_NDK_HOME = $AndroidNdk
 $wasapiSource = Join-Path $LabRoot 'vnext\m1'
 $wasapiBuild = Join-Path $wasapiSource 'build'
-if (-not (Test-Path -LiteralPath (Join-Path $wasapiBuild 'CMakeCache.txt') -PathType Leaf)) {
-    & cmake -S $wasapiSource -B $wasapiBuild -G Ninja
-    if ($LASTEXITCODE -ne 0) { throw 'Native Windows capture configure failed' }
-}
-& cmake --build $wasapiBuild --config Release --parallel 2
+# Ninja is single-config: --config Release does not override a Debug cache.
+# Reconfigure the existing isolated build tree so reported binary is Release.
+& cmake -S $wasapiSource -B $wasapiBuild -G Ninja -DCMAKE_BUILD_TYPE=Release
+if ($LASTEXITCODE -ne 0) { throw 'Native Windows capture Release configure failed' }
+& cmake --build $wasapiBuild --parallel 2
 if ($LASTEXITCODE -ne 0) { throw 'Native WASAPI capture build failed' }
 
 $nativeSource = Join-Path $LabRoot 'vnext\m2b\android-native'
@@ -40,7 +40,7 @@ $toolchain = Join-Path $AndroidNdk 'build\cmake\android.toolchain.cmake'
 $configure = @('-S',$nativeSource,'-B',$nativeBuild,'-G','Ninja',
     "-DCMAKE_TOOLCHAIN_FILE=$toolchain",
     '-DANDROID_ABI=arm64-v8a','-DANDROID_PLATFORM=android-35',
-    '-DANDROID_STL=c++_shared')
+    '-DANDROID_STL=c++_shared','-DCMAKE_BUILD_TYPE=Release')
 & cmake @configure
 if ($LASTEXITCODE -ne 0) { throw 'Android native audio configure failed' }
 & cmake --build $nativeBuild --parallel 2
@@ -76,6 +76,21 @@ foreach ($file in $files) {
     }
 }
 $sha = (& git -C $LabRoot rev-parse HEAD).Trim()
+foreach ($tree in @($wasapiBuild, $nativeBuild)) {
+    $cache = Join-Path $tree 'CMakeCache.txt'
+    $buildType = @(Select-String -LiteralPath $cache -Pattern '^CMAKE_BUILD_TYPE:STRING=Release
+foreach ($file in $files) {
+    $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
+    Write-Host ($hash + '  ' + $file)
+}
+Write-Host 'Built locally. No device or driver was changed.'
+)
+    if ($buildType.Count -ne 1) {
+        throw ('Expected single-config Release native build: ' + $cache)
+    }
+    Write-Host ('Native CMake configuration: Release (Ninja) ' + $tree)
+}
+Write-Host 'Rust Cargo configuration: debug (both Windows and Android; --locked).'
 Write-Host ('CP-001/MP-001 source commit: ' + $sha)
 foreach ($file in $files) {
     $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
