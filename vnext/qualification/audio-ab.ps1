@@ -9,6 +9,7 @@ param(
     [ValidateRange(10,60)][int]$Seconds=20,
     [ValidatePattern('^f[01]c[01]r[01]$')][string]$Mode='f1c1r1',
     [ValidateSet('Quick','Matrix','Repeat','Full')][string]$Suite='Quick',
+    [switch]$Strict,
     [ValidateRange(1,5)][int]$Rating=3,
     [ValidateSet('heard','not-heard','uncertain')][string]$Heard='uncertain',
     [string]$Notes='',
@@ -182,9 +183,15 @@ function Devices {
         if ($LASTEXITCODE -ne 0) { throw "Android lab credential missing: $f" }
     }
 }
-function Run([string]$slot,[string]$flags='f1c1r1') {
+function Run([string]$slot,[string]$flags='f1c1r1',[bool]$strictPlayback=$false) {
     $pair=CheckPair $slot
     if ($flags -notmatch '^f[01]c[01]r[01]$') { throw 'Invalid processing flags' }
+    if ($strictPlayback -and ($slot -eq 'reference' -or $pair.supports_strict -ne $true)) {
+        throw "Strict audible playback is unsupported for $slot at $($pair.commit)"
+    }
+    if ($strictPlayback -and $flags -ne 'f1c1r1') {
+        throw 'Strict uses an implicit f0c0r0; do not also specify -Mode'
+    }
     if ($pair.mode -ne 'client-playback-modes' -and $flags -ne 'f1c1r1') {
         throw "$slot has no selectable processing flags. It cannot run $flags."
     }
@@ -221,7 +228,9 @@ function Run([string]$slot,[string]$flags='f1c1r1') {
     $err=Join-Path $evidence 'windows-source.stderr.txt'
     $client=Join-Path $evidence 'android-receiver.txt'
     $args=@('server-wasapi',($WindowsIP + ':' + $port),$PhoneIP,(Join-Path $KeysDir 'ca.pem'),(Join-Path $KeysDir 'server.pem'),(Join-Path $KeysDir 'server.key'),$capture,$EndpointId,[string]$Seconds)
-    Write-Host "AUDIBLE $slot commit=$($pair.commit), receiver=$($pair.mode), processing=$(if ($pair.mode -eq 'client-playback-modes') {$flags} else {'reference-native'}), length=$Seconds sec. Set low Xiaomi volume."
+    $verb=if ($strictPlayback) { 'client-playback-strict' } else { $pair.mode }
+    $chosenMode=if ($strictPlayback) { 'strict-f0c0r0' } elseif ($pair.mode -eq 'client-playback-modes') { $flags } else { 'reference-native' }
+    Write-Host "AUDIBLE $slot commit=$($pair.commit), receiver=$verb, processing=$chosenMode, length=$Seconds sec. Set low Xiaomi volume."
     $proc=Start-Process -FilePath $sender -ArgumentList $args -RedirectStandardOutput $out -RedirectStandardError $err -WorkingDirectory $runtime -NoNewWindow -PassThru
     $clientExit=$null
     try {
@@ -234,8 +243,8 @@ function Run([string]$slot,[string]$flags='f1c1r1') {
             Start-Sleep -Milliseconds 100
         }
         if (-not $ready) { throw 'Windows READY timeout; phone not started' }
-        $flag=if ($pair.mode -eq 'client-playback-modes') { ' ' + $flags } else { '' }
-        $cmd="LD_LIBRARY_PATH=/data/local/tmp $remoteExe $($pair.mode) $WindowsIP" + ":$port /data/local/tmp/df-lab-ca.pem /data/local/tmp/df-lab-client.pem /data/local/tmp/df-lab-client.key $remoteSo$flag $Seconds"
+        $flag=if (-not $strictPlayback -and $pair.mode -eq 'client-playback-modes') { ' ' + $flags } else { '' }
+        $cmd="LD_LIBRARY_PATH=/data/local/tmp $remoteExe $verb $WindowsIP" + ":$port /data/local/tmp/df-lab-ca.pem /data/local/tmp/df-lab-client.pem /data/local/tmp/df-lab-client.key $remoteSo$flag $Seconds"
         $helper=Join-Path $LabRoot 'vnext\qualification\invoke-native-audio.ps1'
         $clientExit=& $helper -Executable $adb -Arguments @('shell',$cmd) -LogFile $client
         if ($clientExit -ne 0) { throw "Android audible receiver exit=$clientExit" }
@@ -249,8 +258,8 @@ function Run([string]$slot,[string]$flags='f1c1r1') {
         $proc.Refresh()
         $observation=[ordered]@{
             schema=1; slot=$slot; commit=$pair.commit; seconds=$Seconds
-            client_mode=$pair.mode
-            processing_mode=if ($pair.mode -eq 'client-playback-modes') { $flags } else { 'reference-native' }
+            client_mode=$verb
+            processing_mode=$chosenMode
             started_utc=$startUtc; ended_utc=[DateTime]::UtcNow.ToString('o')
             windows_exit=$proc.ExitCode; android_exit=$clientExit
             windows_ip=$WindowsIP; phone_ip=$PhoneIP
@@ -377,7 +386,7 @@ switch ($Action) {
         Prepare 'candidate' $history[$at]
         Status
     }
-    'Run' { Run $Version $Mode }
+    'Run' { Run $Version $Mode ([bool]$Strict) }
     'Suite' { RunSuite $Suite }
     'Report' { Report }
     'Rate' { Rate }
