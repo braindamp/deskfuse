@@ -155,9 +155,12 @@ function Prepare([string]$slot,[string]$sha) {
         Copy-Item -LiteralPath $built[$i] -Destination $out -Force
         $hashes[$fileNames[$i]]=(Get-FileHash -LiteralPath $out -Algorithm SHA256).Hash.ToLowerInvariant()
     }
-    $modes=Select-String -LiteralPath (Join-Path $crate 'src\bin\continuous-quic-lab.rs') -Pattern 'client-playback-modes' -Quiet
+    # Explicit mode grammar comes from the exact paired source revision.
+    $binSource=Get-Content -LiteralPath (Join-Path $crate 'src\bin\continuous-quic-lab.rs') -Raw
+    $modes=$binSource.Contains('mode == "client-playback-modes"')
+    $strict=$binSource.Contains('mode == "client-playback-strict"')
     $clientMode=if ($modes) { 'client-playback-modes' } else { 'client-playback' }
-    $data=[ordered]@{slot=$slot;commit=$sha;mode=$clientMode;hashes=$hashes;utc=[DateTime]::UtcNow.ToString('o')}
+    $data=[ordered]@{slot=$slot;commit=$sha;mode=$clientMode;supports_modes=$modes;supports_strict=$strict;hashes=$hashes;utc=[DateTime]::UtcNow.ToString('o')}
     $data | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $dst 'pair.json') -Encoding UTF8
     $null=CheckPair $slot
     Write-Host "BUILT $slot $sha  (audible mode=$clientMode)"
@@ -178,8 +181,12 @@ function Devices {
         if ($LASTEXITCODE -ne 0) { throw "Android lab credential missing: $f" }
     }
 }
-function Run([string]$slot) {
+function Run([string]$slot,[string]$flags='f1c1r1') {
     $pair=CheckPair $slot
+    if ($flags -notmatch '^f[01]c[01]r[01]$') { throw 'Invalid processing flags' }
+    if ($pair.mode -ne 'client-playback-modes' -and $flags -ne 'f1c1r1') {
+        throw "$slot has no selectable processing flags. It cannot run $flags."
+    }
     if (@(Get-NetUDPEndpoint -LocalPort $port -ErrorAction SilentlyContinue).Count -gt 0) { throw "UDP $port already occupied" }
     $rules=@(Get-NetFirewallRule -DisplayName $firewallName -ErrorAction SilentlyContinue | Where-Object { $_.Enabled -eq 'True' -and $_.Action -eq 'Allow' })
     if ($rules.Count -ne 1) { throw 'Scoped AB firewall rule missing. Run -Action Firewall once as administrator.' }
@@ -208,11 +215,12 @@ function Run([string]$slot) {
     $evidence=Join-Path $ABRoot ('runs\' + $stamp + '-' + $slot + '-' + $pair.commit.Substring(0,10))
     New-Item -ItemType Directory -Force -Path $evidence | Out-Null
     $pair | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $evidence 'pair.json') -Encoding UTF8
+    $startUtc=[DateTime]::UtcNow.ToString('o')
     $out=Join-Path $evidence 'windows-source.stdout.txt'
     $err=Join-Path $evidence 'windows-source.stderr.txt'
     $client=Join-Path $evidence 'android-receiver.txt'
     $args=@('server-wasapi',($WindowsIP + ':' + $port),$PhoneIP,(Join-Path $KeysDir 'ca.pem'),(Join-Path $KeysDir 'server.pem'),(Join-Path $KeysDir 'server.key'),$capture,$EndpointId,[string]$Seconds)
-    Write-Host "AUDIBLE $slot commit=$($pair.commit), mode=$($pair.mode), length=$Seconds sec. Set low Xiaomi volume."
+    Write-Host "AUDIBLE $slot commit=$($pair.commit), receiver=$($pair.mode), processing=$(if ($pair.mode -eq 'client-playback-modes') {$flags} else {'reference-native'}), length=$Seconds sec. Set low Xiaomi volume."
     $proc=Start-Process -FilePath $sender -ArgumentList $args -RedirectStandardOutput $out -RedirectStandardError $err -WorkingDirectory $runtime -NoNewWindow -PassThru
     $clientExit=$null
     try {
@@ -225,7 +233,7 @@ function Run([string]$slot) {
             Start-Sleep -Milliseconds 100
         }
         if (-not $ready) { throw 'Windows READY timeout; phone not started' }
-        $flag=if ($pair.mode -eq 'client-playback-modes') { ' f1c1r1' } else { '' }
+        $flag=if ($pair.mode -eq 'client-playback-modes') { ' ' + $flags } else { '' }
         $cmd="LD_LIBRARY_PATH=/data/local/tmp $remoteExe $($pair.mode) $WindowsIP" + ":$port /data/local/tmp/df-lab-ca.pem /data/local/tmp/df-lab-client.pem /data/local/tmp/df-lab-client.key $remoteSo$flag $Seconds"
         $helper=Join-Path $LabRoot 'vnext\qualification\invoke-native-audio.ps1'
         $clientExit=& $helper -Executable $adb -Arguments @('shell',$cmd) -LogFile $client
@@ -238,6 +246,15 @@ function Run([string]$slot) {
             if (-not $proc.HasExited) { $proc.Kill(); $proc.WaitForExit() }
         }
         $proc.Refresh()
+        $observation=[ordered]@{
+            schema=1; slot=$slot; commit=$pair.commit; seconds=$Seconds
+            client_mode=$pair.mode
+            processing_mode=if ($pair.mode -eq 'client-playback-modes') { $flags } else { 'reference-native' }
+            started_utc=$startUtc; ended_utc=[DateTime]::UtcNow.ToString('o')
+            windows_exit=$proc.ExitCode; android_exit=$clientExit
+            windows_ip=$WindowsIP; phone_ip=$PhoneIP
+        }
+        $observation | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $evidence 'run.json') -Encoding UTF8
         Write-Host "EVIDENCE $evidence / Windows exit=$($proc.ExitCode) / Android exit=$clientExit"
         foreach ($log in @($out,$err,$client)) {
             if (Test-Path -LiteralPath $log) {
@@ -247,6 +264,7 @@ function Run([string]$slot) {
     }
     if ($proc.ExitCode -ne 0) { throw "Windows sender failed (exit=$($proc.ExitCode))" }
     Write-Host 'Playback test completed; acoustic quality is judged by listener.'
+    return $evidence
 }
 function Status {
     Write-Host "REFERENCE=$referenceSha; DEV_TIP=$tip"
