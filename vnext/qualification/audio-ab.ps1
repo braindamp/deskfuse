@@ -60,7 +60,9 @@ function Checkout([string]$slot,[string]$sha) {
     $path=Src $slot
     if (-not (Test-Path -LiteralPath $path)) {
         New-Item -ItemType Directory -Force -Path (Split-Path -Parent $path) | Out-Null
-        & git -c gc.auto=0 -c maintenance.auto=false -C $LabRoot worktree add --detach $path $sha
+        # This function returns exactly one path. Native Git writes a checkout
+        # banner to stdout; leaking it makes Join-Path/CMake receive TWO paths.
+        & git -c gc.auto=0 -c maintenance.auto=false -C $LabRoot worktree add --detach $path $sha | Out-Null
         if ($LASTEXITCODE -ne 0) { throw 'Isolated worktree creation failed' }
     } else {
         if (-not (Test-Path -LiteralPath (Join-Path $path '.git'))) { throw "Not a Git worktree: $path" }
@@ -71,7 +73,7 @@ function Checkout([string]$slot,[string]$sha) {
         if ($LASTEXITCODE -ne 0 -or $dirty.Count -gt 0) { throw "Tracked edits in ${path}: refusing to switch" }
         if ((& git -C $path rev-parse HEAD).Trim() -ne $sha) {
             if ($slot -eq 'reference') { throw 'Reference worktree is not pinned' }
-            & git -c gc.auto=0 -c maintenance.auto=false -C $path switch --detach $sha
+            & git -c gc.auto=0 -c maintenance.auto=false -C $path switch --detach $sha | Out-Null
             if ($LASTEXITCODE -ne 0) { throw 'Candidate checkout failed' }
         }
     }
@@ -106,6 +108,9 @@ function Prepare([string]$slot,[string]$sha) {
         return
     }
     $worktree=Checkout $slot $sha
+    if ($worktree -isnot [string] -or $worktree -ine (Src $slot)) {
+        throw "Checkout must return one exact isolated worktree path for $slot"
+    }
     BuildTools
     $m1=Join-Path $worktree 'vnext\m1'
     $build1=Join-Path $m1 'build'
