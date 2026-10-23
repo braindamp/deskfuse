@@ -34,3 +34,18 @@ Cargo normally produces a `Cargo.lock`. Commit it once the first validated build
 - Even all-green status proves **in-process QUIC crypto**, not acoustic, Android, Wi-Fi, transport scheduling or mutual endpoint authentication.
 
 See `../PREREGISTERED_GATES.md` for the complete hardware feasibility gates.
+
+
+## Stage 2: real localhost UDP test
+
+The `udp_loopback.rs` integration test creates two different ephemeral `127.0.0.1` UDP sockets, verifies the server certificate and SNI in a real QUIC TLS handshake, carries 240 frames/1,000 application bytes in an encrypted QUIC DATAGRAM, and echoes the identical frame-indexed data back over another encrypted QUIC DATAGRAM. The test does not bind a public interface, install services, touch the driver, or run Android code.
+
+```powershell
+cd 'D:\Coding\DeskFuse\vnext-wp001'
+git pull --ff-only origin feature/vnext-wp001-native-lab
+cargo test --manifest-path vnext/m2a/quiche-lab/Cargo.toml verified_quiche_datagram_over_real_udp_loopback -- --nocapture
+```
+
+It exercises real local sockets but **not** network loss, clock mapping, the Xiaomi or a production QUIC reactor. Both the existing in-process integration test and the real UDP test only authenticate the *server* to the client, not mutually both peers. Client identity/pairing remains a separate explicit security gate. No certificate-verification bypass is permitted on the client.
+
+CI includes Linux, Windows, Apple Silicon macOS and Intel macOS. The roadmap is in `../../PLATFORM_VISION.md`.
