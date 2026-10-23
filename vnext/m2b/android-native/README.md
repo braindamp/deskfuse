@@ -10,7 +10,7 @@ It requests audio independently of network arrival or transport ACKs.
 Callback writes zeros on underrun, performs no allocation, sleeping, locks
 or network I/O. Windows and Xiaomi have independent 48-kHz audio clocks. On the
 DEVELOPMENT branch, M2b now includes one bounded output-demand correction
-authority (AAudio callback) with Q32 linear interpolation at +/-400 ppm and a
+authority (AAudio callback) with Q32 finite-support bandlimited resampling at +/-400 ppm and a
 30-ms target ring occupancy. The hardware-proven reference branch retains
 the original renderer without adaptive drift correction.
 
@@ -83,19 +83,24 @@ source/sink drift adaptation and Android app lifecycle integration.
 A single Android AAudio callback owns all playback-clock correction.
 `src/adaptive_clock.h` measures buffered source frames, smooths occupancy
 across output callbacks, and applies bounded proportional/integral correction
-by changing source sample advance by **at most +/-400 ppm** using linear
-interpolation. QUIC ACK/pacing timers and WASAPI source positions are NOT
+by changing source sample advance by **at most +/-400 ppm** using a persistent
+finite-support bandlimited ASRC. The old two-tap interpolator remains a host
+comparator, not the live adaptive renderer. QUIC ACK/pacing timers and WASAPI source positions are NOT
 playback clocks. Callback ring remains 80 ms maximum. It primes with 30 ms
 and reports drift correction (ppm), true underrun events, and rebuffer events.
 After a true underrun, it resets correction and re-primes; no retroactive
 rewrite of audio that has already played.
 
-**Native renderer ABI is now v5.** New Rust receiver requires
-`df_audio_abi_version() == 5` before accessing the library. PCM publication
+**Native renderer ABI is now v6.** New Rust receiver requires
+`df_audio_abi_version() == 6` before accessing the library. PCM publication
 uses `df_audio_push_guarded_v5` with the exact authenticated recovery ticket;
 autonomous recovery blocks publication until a fresh anchor authorizes that
 ticket. Lossy callback snapshots are diagnostic only. The v1/v2/v3 statistics
 layouts, v4 snapshot layout and historical entry points remain unchanged.
+The additive `df_audio_playout_state_v6` reports bounded playback headroom,
+recovery state and clipping for receiver reordering. It does not establish
+acoustic presentation time. Adaptive output uses explicitly counted I16
+saturation on filter overshoot; there is no hidden normalization or limiter.
 Redeploy BOTH the native `libdeskfuse_android_audio.so` and Android
 `deskfuse-vnext-continuous` executable together; an old shared library is
 deliberately rejected before its statistics can be read with a mismatched

@@ -6,6 +6,7 @@
 // even if many critical requests arrive before a callback.
 #include "adaptive_clock.h"
 #include "clock_qualification.h"
+#include "streaming_sinc.h"
 #include <array>
 #include <atomic>
 #include <algorithm>
@@ -75,6 +76,19 @@ enum class Admission : int32_t {
     RecoverPending = -3, Discontinuity = -4, Stale = -5
 };
 struct RenderOptions { bool fade = true, linear = true; };
+// "linear" is the historical option name/ABI bit. It now selects the
+// qualified finite-support sinc ASRC; false remains exact identity bypass.
+struct PlayoutState {
+    uint64_t queued_playable_frames = 0, current_source_frame = 0;
+    uint64_t requested_recovery = 0, applied_recovery = 0;
+    uint32_t primed = 0, last_callback_frames = 0, max_callback_frames = 0;
+    uint32_t playout_generation = 0;
+    int32_t stream_error = 0;
+    uint32_t fraction_q32 = 0, source_valid = 0;
+    int32_t xrun_count = 0; // off-callback AAudio observation, may be an error
+    uint64_t clipped_samples = 0; // saturating PCM16 conversion, both channels
+};
+static_assert(sizeof(PlayoutState) == 72);
 #ifdef DESKFUSE_TEST_PROBE
 enum class RenderProbe { BeforePublicationCommit, BeforeRecoveryTailRelease };
 #endif
@@ -200,9 +214,12 @@ private:
 public:
     void render(int16_t* out, uint32_t count, RenderOptions options) noexcept {
         if (!out || !count) return;
+        playout_sequence_.fetch_add(1, std::memory_order_acq_rel);
+        const uint32_t required_future = options.linear ?
+            std::max(StreamingSinc::future, options.fade ? fade_frames : 0u) : 0u;
         std::memset(out, 0, size_t(count) * kChannels * sizeof(int16_t));
         const uint64_t start = read_.load(std::memory_order_relaxed);
-        uint64_t rd = start;
+        uint64_t rd = render_cursor_;
         uint64_t wr = write_.load(std::memory_order_acquire);
         if (wr < rd || wr - rd > capacity) {
             invalidations_++;
@@ -224,7 +241,7 @@ public:
                 wr = write_.load(std::memory_order_acquire);
                 discarded_ += wr - rd;
                 rd = wr;
-                reset_output();
+                reset_output(wr);
                 ++invalidations_;
             } else {
                 // Never wait for an unscheduled producer in the callback.
@@ -255,13 +272,46 @@ public:
                     static_cast<double>(kOneQ32) * ppm / 1'000'000.0);
             }
             drift_ppm_ = options.linear ? static_cast<int32_t>(ppm) : 0;
-            while (emitted < count && wr - rd >= (options.linear ? 2u : 1u)) {
+            // Validate the complete immutable read span ONCE, not 128 tags
+            // per output sample. The SPSC read tail remains held throughout.
+            const uint64_t support_begin = options.linear ?
+                rd-std::min<uint64_t>(rd-history_anchor_,StreamingSinc::past) : rd;
+            const uint64_t maximum_advance = (fraction_q32_ + uint64_t(count)*step) >> 32;
+            const uint64_t support_end = std::min(wr,rd+maximum_advance+required_future+1);
+            bool support_valid = true;
+            conceal_prefix_[0] = 0;
+            if (rd < wr) {
+                const auto first = tags_[support_begin % capacity];
+                const uint32_t generation = playout_generation_.load(std::memory_order_relaxed);
+                for (uint64_t index=support_begin;index<support_end;++index) {
+                    const auto& tag = tags_[index % capacity];
+                    if (tag.playout != generation || !same_context(first,tag) ||
+                        tag.source_frame != first.source_frame+(index-support_begin))
+                        support_valid = false;
+                    conceal_prefix_[index-support_begin+1] = static_cast<uint16_t>(
+                        conceal_prefix_[index-support_begin] + (tag.concealed ? 1u : 0u));
+                }
+            }
+            auto find_concealment = [&](uint64_t from) noexcept {
+                for (uint64_t index = from; index < wr; ++index)
+                    if (tags_[index % capacity].concealed) return index;
+                return wr;
+            };
+            uint64_t next_concealed = find_concealment(rd);
+            while (emitted < count && wr - rd >= required_future + 1u) {
                 const auto& a = tags_[rd % capacity];
                 const uint64_t position = fraction_q32_;
                 const MediaIdentity* b = options.linear ?
-                    &tags_[(rd + 1) % capacity] : nullptr;
+                    &tags_[(rd + StreamingSinc::future) % capacity] : nullptr;
+                bool support_concealed = a.concealed != 0;
+                if (options.linear) {
+                    const uint64_t first = rd-std::min<uint64_t>(rd-history_anchor_,StreamingSinc::past);
+                    const uint64_t end = rd+StreamingSinc::future+1;
+                    support_concealed = rd-history_anchor_ < StreamingSinc::past ||
+                        conceal_prefix_[end-support_begin] != conceal_prefix_[first-support_begin];
+                }
                 if (a.playout != playout_generation_.load(std::memory_order_relaxed) ||
-                    (b && !adjacent(a, *b))) {
+                    !support_valid) {
                     // NEVER interpolate across a missing interval or changed
                     // epoch/format/connection/playout identity.
                     request_from_callback();
@@ -275,22 +325,46 @@ public:
                     request_from_callback();
                     break;
                 }
+                if (options.fade && last_kind_valid_ && (a.concealed != 0) != last_kind_concealed_) {
+                    if (!a.concealed) {
+                        fade_remaining_ = fade_frames;
+                        next_concealed = find_concealment(rd);
+                    }
+                }
+                last_kind_valid_ = true;
+                last_kind_concealed_ = a.concealed != 0;
+                std::array<float, kChannels> filtered{};
+                if (b) filtered = sinc_.sample_stereo(static_cast<uint32_t>(position),
+                    pcm_.data(),capacity,rd,history_anchor_);
                 for (uint32_t ch = 0; ch < kChannels; ++ch) {
                     const int16_t x = pcm_[(rd % capacity) * kChannels + ch];
                     int16_t sample = x;
                     if (b) {
-                        const int16_t y =
-                            pcm_[((rd + 1) % capacity) * kChannels + ch];
-                        sample = DriftFollower::sample(
-                            x, y, static_cast<uint32_t>(position));
+                        // Bandlimited reconstruction can overshoot arbitrary
+                        // full-scale PCM. Explicitly count and saturate each
+                        // affected channel sample; never wrap or hide gain.
+                        const long rounded = std::lround(filtered[ch]);
+                        if (rounded < -32768 || rounded > 32767) ++clipped_samples_;
+                        sample = static_cast<int16_t>(std::clamp(rounded,-32768L,32767L));
+                    }
+                    if (options.fade && a.concealed) {
+                        sample = 0; // explicit missing interval, no cached old support
+                    } else if (options.fade) {
+                        if (fade_remaining_)
+                            sample = static_cast<int16_t>(static_cast<int64_t>(sample) *
+                                (fade_frames - fade_remaining_ + 1) / fade_frames);
+                        if (next_concealed < wr && next_concealed > rd &&
+                            next_concealed - rd <= fade_frames)
+                            sample = static_cast<int16_t>(static_cast<int64_t>(sample) *
+                                static_cast<int64_t>(next_concealed - rd - 1) / fade_frames);
                     }
                     out[emitted * kChannels + ch] = sample;
                 }
-                if (a.concealed ||
-                    (b && position != 0 && b->concealed))
+                if (options.fade && !a.concealed && fade_remaining_) --fade_remaining_;
+                if (support_concealed)
                     ++concealed_outputs_;
                 last_commit_ = a;
-                last_support_ = (b && position != 0) ? *b : a;
+                last_support_ = b ? *b : a;
                 last_fraction_ = static_cast<uint32_t>(position);
                 last_commit_valid_ = true;
                 ++emitted;
@@ -298,18 +372,6 @@ public:
                 const uint64_t next = fraction_q32_ + step;
                 rd += next >> 32;
                 fraction_q32_ = static_cast<uint32_t>(next);
-            }
-            if (options.fade && emitted && fade_remaining_) {
-                const uint32_t n = std::min(emitted, fade_remaining_);
-                const uint32_t begin = fade_frames - fade_remaining_;
-                for (uint32_t i = 0; i < n; ++i)
-                    for (uint32_t ch = 0; ch < kChannels; ++ch) {
-                        auto& sample = out[i * kChannels + ch];
-                        sample = static_cast<int16_t>(
-                            static_cast<int64_t>(sample) * static_cast<int64_t>(begin + i + 1) /
-                            static_cast<int64_t>(fade_frames));
-                    }
-                fade_remaining_ -= n;
             }
             if (emitted < count) {
                 // AAudio will commit the emitted prefix and defined silence.
@@ -330,13 +392,17 @@ public:
                 request_from_callback();
             }
         }
-        // release only AFTER all two-tap support reads for committed output.
+        // Release only AFTER all finite-support reads for committed output;
+        // retain past FIR support separately from the next source centre.
         if (rd > wr) rd = wr;
-        released_ += rd - start;
+        render_cursor_ = rd;
+        const uint64_t release = recovery_owned || !options.linear ? rd :
+            (rd - history_anchor_ > StreamingSinc::past ? rd - StreamingSinc::past : history_anchor_);
+        released_ += release - start;
 #ifdef DESKFUSE_TEST_PROBE
         if (recovery_owned) probe(RenderProbe::BeforeRecoveryTailRelease);
 #endif
-        read_.store(rd, std::memory_order_release);
+        read_.store(release, std::memory_order_release);
         if (recovery_owned) {
             // Acknowledgement promises that discarded storage is reusable.
             // Keep producers excluded until BOTH tail and ticket are visible.
@@ -360,7 +426,7 @@ public:
         record.invalidations = invalidations_;
         record.last_source = last_commit_.source_frame;
         record.last_support_source = last_support_.source_frame;
-        record.earliest_needed = rd;
+        record.earliest_needed = release;
         record.published_tail = wr;
         record.fraction_q32 = last_fraction_;
         record.epoch = last_commit_.epoch;
@@ -384,6 +450,44 @@ public:
         legacy_playout_.store(last_commit_.playout, std::memory_order_release);
         legacy_ppm_.store(drift_ppm_, std::memory_order_release);
         snapshots_.publish(record);
+        // Atomic payload: bounded readers never race with plain callback data.
+        callback_cursor_.store(rd, std::memory_order_relaxed);
+        callback_primed_.store(primed_ ? 1u : 0u, std::memory_order_relaxed);
+        callback_frames_.store(count, std::memory_order_relaxed);
+        max_callback_frames_ = std::max(max_callback_frames_, count);
+        callback_max_frames_.store(max_callback_frames_, std::memory_order_relaxed);
+        callback_future_.store(required_future, std::memory_order_relaxed);
+        callback_source_.store(primed_ && rd < wr ? tags_[rd % capacity].source_frame : 0u,
+            std::memory_order_relaxed);
+        callback_source_valid_.store(primed_ && rd < wr ? 1u : 0u, std::memory_order_relaxed);
+        callback_fraction_.store(fraction_q32_, std::memory_order_relaxed);
+        callback_generation_.store(playout_generation_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        callback_clipped_.store(clipped_samples_, std::memory_order_relaxed);
+        playout_sequence_.fetch_add(1, std::memory_order_release);
+    }
+    bool playout_state(PlayoutState& out) const noexcept {
+        const uint64_t before = playout_sequence_.load(std::memory_order_acquire);
+        if (before & 1u) return false;
+        PlayoutState value{};
+        const uint64_t cursor = callback_cursor_.load(std::memory_order_relaxed);
+        const uint64_t wr = write_.load(std::memory_order_acquire);
+        const uint32_t future = callback_future_.load(std::memory_order_relaxed);
+        value.queued_playable_frames = wr >= cursor && wr - cursor <= capacity ?
+            (wr - cursor > future ? wr - cursor - future : 0) : 0;
+        value.current_source_frame = callback_source_.load(std::memory_order_relaxed);
+        value.primed = callback_primed_.load(std::memory_order_relaxed);
+        value.last_callback_frames = callback_frames_.load(std::memory_order_relaxed);
+        value.max_callback_frames = callback_max_frames_.load(std::memory_order_relaxed);
+        value.playout_generation = callback_generation_.load(std::memory_order_relaxed);
+        value.fraction_q32 = callback_fraction_.load(std::memory_order_relaxed);
+        value.source_valid = callback_source_valid_.load(std::memory_order_relaxed);
+        value.clipped_samples = callback_clipped_.load(std::memory_order_relaxed);
+        value.requested_recovery = requested_recoveries();
+        value.applied_recovery = applied_recoveries();
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (before != playout_sequence_.load(std::memory_order_acquire)) return false;
+        out = value;
+        return true;
     }
     uint64_t legacy_rendered() const noexcept { return legacy_rendered_.load(std::memory_order_acquire); }
     uint64_t legacy_silence() const noexcept { return legacy_silence_.load(std::memory_order_acquire); }
@@ -451,7 +555,7 @@ private:
     void request_from_callback() noexcept {
         recovery_ticket_.fetch_add(1, std::memory_order_acq_rel);
     }
-    void reset_output() noexcept {
+    void reset_output(uint64_t anchor) noexcept {
         primed_ = false;
         fade_remaining_ = fade_frames;
         follower_.reset();
@@ -459,6 +563,9 @@ private:
         drift_ppm_ = 0;
         playout_generation_.fetch_add(1, std::memory_order_acq_rel);
         last_commit_valid_ = false;
+        history_anchor_ = anchor;
+        render_cursor_ = anchor;
+        last_kind_valid_ = false;
     }
     alignas(64) std::array<int16_t, capacity * kChannels> pcm_{};
     std::array<MediaIdentity, capacity> tags_{};
@@ -479,6 +586,12 @@ private:
     uint32_t fade_remaining_ = fade_frames, fraction_q32_ = 0, last_fraction_ = 0;
     MediaIdentity last_commit_{}, last_support_{};
     TimeBasedFollower follower_{};
+    StreamingSinc sinc_{};
+    uint64_t render_cursor_ = 0, history_anchor_ = 0;
+    uint64_t clipped_samples_ = 0;
+    std::array<uint16_t, capacity+1> conceal_prefix_{};
+    bool last_kind_valid_ = false, last_kind_concealed_ = false;
+    uint32_t max_callback_frames_ = 0;
     uint64_t callbacks_ = 0, committed_output_ = 0, rendered_ = 0;
     uint64_t silence_ = 0, released_ = 0, discarded_ = 0;
     uint64_t concealed_outputs_ = 0, underruns_ = 0, reprimes_ = 0;
@@ -491,5 +604,10 @@ private:
     std::atomic<uint64_t> legacy_concealed_{0}, legacy_source_{0};
     std::atomic<uint32_t> legacy_phase_{0}, legacy_epoch_{0}, legacy_playout_{0};
     std::atomic<int32_t> legacy_ppm_{0};
+    std::atomic<uint64_t> playout_sequence_{0}, callback_cursor_{0}, callback_source_{0};
+    std::atomic<uint64_t> callback_clipped_{0};
+    std::atomic<uint32_t> callback_primed_{0}, callback_frames_{0}, callback_max_frames_{0};
+    std::atomic<uint32_t> callback_future_{StreamingSinc::future}, callback_source_valid_{0};
+    std::atomic<uint32_t> callback_fraction_{0}, callback_generation_{1};
 };
 } // namespace df_audio

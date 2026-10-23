@@ -40,12 +40,17 @@ pub fn retry_action(
 // A source block already buffered before receiving the challenge does
 // not establish a fresh anchor. The QPC source observation must occur
 // strictly after receipt plus the allowed WASAPI future-timestamp skew.
+// Compare the original packet anchor: its second fragment can legitimately
+// carry another 5ms of future lead and must not revive buffered pre-request PCM.
 pub fn after_request_capture_qpc(
     request_received_qpc_100ns: u64,
     captured_source_qpc_100ns: u64,
+    original_packet_offset_frames: u32,
 ) -> bool {
-    request_received_qpc_100ns != 0 &&
-    captured_source_qpc_100ns >
+    let Some(original_qpc) = crate::source_age::original_packet_qpc_100ns(
+        captured_source_qpc_100ns, original_packet_offset_frames
+    ) else { return false; };
+    request_received_qpc_100ns != 0 && original_qpc >
         request_received_qpc_100ns.saturating_add(
             crate::source_age::MAX_FUTURE_SKEW_100NS
         )
@@ -94,11 +99,25 @@ mod tests {
     #[test]
     fn buffered_old_capture_cannot_satisfy_fresh_request() {
         let receipt = 1_000_000u64;
-        assert!(!after_request_capture_qpc(receipt, 999_999));
-        assert!(!after_request_capture_qpc(receipt, receipt + 100_000));
-        assert!(after_request_capture_qpc(receipt, receipt + 100_001));
-        assert!(!after_request_capture_qpc(0, 1_000_000));
-        assert!(!after_request_capture_qpc(u64::MAX - 1, u64::MAX));
+        assert!(!after_request_capture_qpc(receipt, 999_999, 0));
+        assert!(!after_request_capture_qpc(receipt, receipt + 100_000, 0));
+        assert!(after_request_capture_qpc(receipt, receipt + 100_001, 0));
+        assert!(!after_request_capture_qpc(0, 1_000_000, 0));
+        assert!(!after_request_capture_qpc(u64::MAX - 1, u64::MAX, 0));
+    }
+    #[test]
+    fn future_provenanced_fragment_does_not_prove_post_request_capture() {
+        use crate::source_age::{classify_wasapi, AgeDecision};
+        let receipt = 2_000_000;
+        // A packet already buffered at receipt can have +9ms original lead,
+        // and its second fragment legitimately has +14ms derived lead.
+        let fragment = receipt + 140_000;
+        assert!(matches!(classify_wasapi(receipt, fragment, 240), AgeDecision::Fresh { .. }));
+        assert!(!after_request_capture_qpc(receipt, fragment, 240));
+        assert!(!after_request_capture_qpc(receipt, receipt + 150_000, 240));
+        assert!(after_request_capture_qpc(receipt, receipt + 150_001, 240));
+        assert!(!after_request_capture_qpc(receipt, 0, 240));
+        assert!(!after_request_capture_qpc(receipt, 1, 240));
     }
     #[test]
     fn retry_and_hard_timeout_are_bounded_and_loss_tolerant() {

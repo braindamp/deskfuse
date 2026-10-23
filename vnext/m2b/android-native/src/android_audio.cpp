@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cstdio>
 #include <memory>
 #include <new>
 #include <time.h>
@@ -78,8 +79,12 @@ public:
         s->silence_frames = core.legacy_silence();
         s->overflow_packets = core.overflow();
         s->callback_count = callbacks.load(std::memory_order_relaxed);
-        const uint64_t wr = core.write(), rd = core.read();
-        s->queued_frames = wr >= rd && wr - rd <= df_audio::kRingFrames ? wr - rd : 0;
+        // Legacy occupancy is an always-available conservative storage upper
+        // bound, including retained FIR history. Read tail FIRST: callback
+        // progress can only reduce this estimate while producer publication
+        // can increase it. ABI6 separately reports future playable demand.
+        const uint64_t rd = core.read(), wr = core.write();
+        s->queued_frames = wr >= rd ? std::min(wr-rd,df_audio::kRingFrames) : df_audio::kRingFrames;
         s->stream_error = stream_error.load(std::memory_order_acquire);
         s->actual_sample_rate = stream ? AAudioStream_getSampleRate(stream) : 0;
         s->actual_channels = stream ? AAudioStream_getChannelCount(stream) : 0;
@@ -95,7 +100,7 @@ public:
 #else
 #define DF_EXPORT extern "C"
 #endif
-DF_EXPORT uint32_t df_audio_abi_version() noexcept { return 5; }
+DF_EXPORT uint32_t df_audio_abi_version() noexcept { return 6; }
 
 DF_EXPORT int32_t df_audio_open(void** out) noexcept {
     if (!out) return -1;
@@ -122,6 +127,15 @@ DF_EXPORT int32_t df_audio_open(void** out) noexcept {
         AAudioStream_close(r->stream);
         return -5;
     }
+    // Lifecycle thread only: requesting LOW_LATENCY does not prove the
+    // negotiated backend/buffer. Preserve actual hardware-route evidence.
+    std::fprintf(stderr,
+        "AUDIO_BACKEND rate=%d channels=%d format=%d sharing=%d performance=%d frames_per_burst=%d buffer_frames=%d capacity_frames=%d xruns=%d\n",
+        AAudioStream_getSampleRate(r->stream),AAudioStream_getChannelCount(r->stream),
+        AAudioStream_getFormat(r->stream),AAudioStream_getSharingMode(r->stream),
+        AAudioStream_getPerformanceMode(r->stream),AAudioStream_getFramesPerBurst(r->stream),
+        AAudioStream_getBufferSizeInFrames(r->stream),AAudioStream_getBufferCapacityInFrames(r->stream),
+        AAudioStream_getXRunCount(r->stream));
     const auto started = AAudioStream_requestStart(r->stream);
     if (started != AAUDIO_OK) {
         AAudioStream_close(r->stream);
@@ -186,6 +200,17 @@ DF_EXPORT int32_t df_audio_snapshot_v4(
     auto& core = static_cast<Renderer*>(ctx)->core;
     *dropped = core.dropped_snapshots();
     return core.pop_snapshot(*snapshot) ? 1 : 0;
+}
+// Off-callback demand snapshot; no telemetry FIFO dependency. A concurrent
+// callback returns unavailable, so the owner must choose conservative timing.
+DF_EXPORT int32_t df_audio_playout_state_v6(void* ctx, void* out) noexcept {
+    if (!ctx || !out) return -1;
+    auto* r = static_cast<Renderer*>(ctx);
+    auto* state = static_cast<df_audio::PlayoutState*>(out);
+    if (!r->core.playout_state(*state)) return 0;
+    state->stream_error = r->stream_error.load(std::memory_order_acquire);
+    state->xrun_count = r->stream ? AAudioStream_getXRunCount(r->stream) : -1;
+    return 1;
 }
 DF_EXPORT int32_t df_audio_stats(void* ctx, void* out) noexcept {
     if (!ctx || !out) return -1;

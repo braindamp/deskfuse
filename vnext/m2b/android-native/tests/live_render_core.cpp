@@ -274,9 +274,10 @@ int main() {
                            authorization)==Admission::Accepted,
                        "authorized new generation primes independently");
             core.render(output.data(),240,{false,mode!=0});
-            expect(std::all_of(output.begin(),output.end(),
-                       [](int16_t value) { return value == 600; }),
-                   "no retired sample escapes in linear or identity mode");
+            const size_t padded = mode ? StreamingSinc::past * kChannels : 0;
+            expect(std::all_of(output.begin()+padded,output.end(),
+                       [](int16_t value) { return value >= 599 && value <= 601; }),
+                   "no retired sample escapes finite-support or identity mode");
             expect(core.pop_snapshot(record) && record.playout==2 &&
                    record.last_source>=2160,
                    "only the active playout generation contributes output");

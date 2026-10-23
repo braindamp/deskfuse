@@ -15,6 +15,14 @@ pub enum AgeDecision {
     FutureTimestamp,
     Expired,
 }
+
+/// Recover the first-frame QPC of the original native GetBuffer packet.
+/// Fragment provenance changes neither the source timestamp nor its age.
+pub fn original_packet_qpc_100ns(source_100ns: u64, offset_frames: u32) -> Option<u64> {
+    if source_100ns == 0 { return None; }
+    source_100ns.checked_sub(u64::from(offset_frames) * 10_000_000 / 48_000)
+        .filter(|qpc| *qpc != 0)
+}
 pub fn classify(now_100ns: u64, source_100ns: u64) -> AgeDecision {
     if source_100ns == 0 { return AgeDecision::MissingTimestamp; }
     if source_100ns > now_100ns {
@@ -46,8 +54,7 @@ pub fn classify_wasapi(
     if original_offset_frames == 0 || original_offset_frames > 240 {
         return ordinary;
     }
-    let offset_100ns = u64::from(original_offset_frames) * 10_000_000 / 48_000;
-    let Some(original_first_qpc) = source_100ns.checked_sub(offset_100ns) else {
+    let Some(original_first_qpc) = original_packet_qpc_100ns(source_100ns, original_offset_frames) else {
         return AgeDecision::MissingTimestamp;
     };
     // A fragment is eligible only if the FIRST frame of the same original

@@ -14,7 +14,8 @@ param(
     [string]$KeysDir = 'D:\DeskFuseLocalKeys\m2a-physical-lab',
     [string]$LabRoot = 'D:\Coding\DeskFuse\vnext-wp001',
     [string]$EvidenceRoot = 'D:\DeskFuseLocalData\cp001',
-    [string]$Profile = 'audio-only'
+    [string]$Profile = 'audio-only',
+    [string]$ExpectedBranch = 'feature/vnext-wp001-native-lab'
 )
 $ErrorActionPreference = 'Stop'
 if ($Strict -and $Modes -ne 'f0c0r0') { throw 'Strict PCM verification requires f0c0r0 (no DSP or fade)' }
@@ -33,7 +34,8 @@ foreach ($p in @($source, $capture, $android, $native, (Join-Path $KeysDir 'ca.p
 if (-not (Get-Command adb -ErrorAction SilentlyContinue)) { throw 'adb not on PATH' }
 $branch = (& git -C $LabRoot branch --show-current).Trim()
 $sha = (& git -C $LabRoot rev-parse HEAD).Trim()
-if ($LASTEXITCODE -ne 0 -or $branch -ne 'feature/vnext-wp001-native-lab') {
+if ($LASTEXITCODE -ne 0 -or $branch -ne $ExpectedBranch -or
+    $branch -in @('main', 'master') -or $branch.StartsWith('reference/')) {
     throw 'Only the isolated development branch is permitted'
 }
 $worktree = @(& git -C $LabRoot status --porcelain)
@@ -145,7 +147,7 @@ try {
     } else {
         [Environment]::SetEnvironmentVariable($traceEnv, $null, 'Process')
     }
-    $proc = Start-Process -FilePath $source -ArgumentList $sourceArgs -RedirectStandardOutput $serverOut -RedirectStandardError $serverErr -WorkingDirectory (Join-Path $LabRoot 'vnext\m2a\quiche-lab') -NoNewWindow -PassThru
+    $proc = Start-Process -FilePath $source -ArgumentList $sourceArgs -RedirectStandardOutput $serverOut -RedirectStandardError $serverErr -WorkingDirectory (Join-Path $LabRoot 'vnext\m2a\quiche-lab') -WindowStyle Hidden -PassThru
 } finally {
     [Environment]::SetEnvironmentVariable($traceEnv, $priorTrace, 'Process')
 }

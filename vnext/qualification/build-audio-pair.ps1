@@ -1,17 +1,19 @@
-# Build the exact CP-001/MP-001 Windows sender and ABI v5 Android pair.
+# Build the matching Windows sender and ABI v6 Android pair.
 # No ADB deployment, credentials, driver installs or existing APK changes.
 [CmdletBinding()]
 param(
     [string]$LabRoot = 'D:\Coding\DeskFuse\vnext-wp001',
     [string]$AndroidSdk = 'D:\Android\Sdk',
-    [string]$AndroidNdk = 'D:\Android\Sdk\ndk\30.0.16248370'
+    [string]$AndroidNdk = 'D:\Android\Sdk\ndk\30.0.16248370',
+    [string]$ExpectedBranch = 'feature/vnext-wp001-native-lab'
 )
 $ErrorActionPreference = 'Stop'
 if (-not (Test-Path -LiteralPath $LabRoot -PathType Container)) {
     throw 'Isolated DeskFuse vNext checkout missing'
 }
 $branch = (& git -C $LabRoot branch --show-current).Trim()
-if ($LASTEXITCODE -ne 0 -or $branch -ne 'feature/vnext-wp001-native-lab') {
+if ($LASTEXITCODE -ne 0 -or $branch -ne $ExpectedBranch -or
+    $branch -in @('main', 'master') -or $branch.StartsWith('reference/')) {
     throw 'Refusing to build from main, preserved reference or unknown branch'
 }
 $dirty = @(& git -C $LabRoot status --porcelain)

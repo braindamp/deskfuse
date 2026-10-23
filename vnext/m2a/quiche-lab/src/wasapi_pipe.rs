@@ -169,7 +169,9 @@ fn forward_chunks(
             Ok(Some(chunk)) => match sender.try_send(CaptureEvent::Chunk(chunk)) {
                 Ok(()) => {
                     if let Some(wake) = notifier {
-                        let _ = wake.send_to(&[0xA1], wake_addr);
+                        if let Err(e) = wake.send_to(&[0xA1], wake_addr) {
+                            return (reader_queue_drops, Err(format!("WASAPI source wake failed: {e}")));
+                        }
                     }
                 }
                 Err(TrySendError::Full(event)) => {
@@ -199,6 +201,11 @@ pub fn spawn(
     if !cfg!(windows) {
         return Err(io::Error::new(io::ErrorKind::Unsupported, "WASAPI is Windows-only"));
     }
+    // Readiness notification is required for event-driven PCM delivery.
+    // Qualify it BEFORE starting native capture; no silent polling fallback.
+    let notifier = UdpSocket::bind(if wake_addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" })?;
+    notifier.connect(wake_addr)?;
+    notifier.set_nonblocking(true)?;
     let mut command = Command::new(exe);
     command.arg("--out").arg("-").arg("--seconds").arg(seconds.to_string());
     if device_id != "default" {
@@ -211,9 +218,8 @@ pub fn spawn(
 
     let (sender, receiver) = mpsc::sync_channel(QUEUE_SLOTS);
     thread::spawn(move || {
-        let notifier = UdpSocket::bind("0.0.0.0:0").ok();
         let (reader_queue_drops, mut outcome) =
-            forward_chunks(&mut stdout, &sender, notifier.as_ref(), wake_addr);
+            forward_chunks(&mut stdout, &sender, Some(&notifier), wake_addr);
         // Do not kill a normally finishing process before its exit status is
         // available; terminate only when the pipe was invalid or owner exited.
         if outcome.is_err() && child.try_wait().ok().flatten().is_none() {
@@ -237,9 +243,7 @@ pub fn spawn(
         // is safe: this is no longer the WASAPI callback or PCM read hot path.
         // If the QUIC owner has exited, send() returns Disconnected.
         let _ = sender.send(CaptureEvent::Finished(outcome));
-        if let Some(wake) = notifier.as_ref() {
-            let _ = wake.send_to(&[0xA1], wake_addr);
-        }
+        let _ = notifier.send_to(&[0xA1], wake_addr);
     });
     Ok(receiver)
 }

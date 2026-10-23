@@ -1,6 +1,9 @@
 name: vNext M1 native WASAPI capture build
 
 on:
+  pull_request:
+    branches: [feature/vnext-wp001-native-lab]
+    paths: ['vnext/m1/**', 'vnext/qualification/**', '.github/workflows/vnext-m1-wasapi.yml']
   push:
     branches:
       - feature/vnext-wp001-native-lab
