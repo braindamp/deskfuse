@@ -75,7 +75,7 @@ fn block(sequence:u32)->(Identity,Vec<u8>){
     };
     let mut w=encode(&h).to_vec();
     w.extend([0u8;960]);
-    (Identity{epoch:9,stream:3,sequence,source_frame:h.first_source_frame},w)
+    (Identity{epoch:9,stream:3,format:1,sequence,source_frame:h.first_source_frame},w)
 }
 #[test]
 fn genuine_quiche_queued_plaintext_expires_before_sealing()->Result<()>{
