@@ -32,6 +32,37 @@ static void prime(RenderCore& core, uint64_t start=48000) {
     for (int i=0;i<8;++i) enqueue(core, start + i*240, 100+i);
 }
 int main() {
+    {   // Regression: signed PCM never wraps to massive spikes during
+        // either startup fade-in or underrun fade-out. The real production
+        // render core is exercised with deliberately negative source PCM.
+        for (int amplitude : {-1000, 1000, -32768, 32767}) {
+            RenderCore core;
+            for (int i=0; i<8; ++i) enqueue(core,48000+i*240,amplitude);
+            std::array<int16_t, 2000*kChannels> out{};
+            core.render(out.data(),2000,{true,false});
+            CoreSnapshot record{};
+            expect(core.pop_snapshot(record) && record.rendered==1920 &&
+                   record.silence==80,"test requires 1920 real PCM frames and actual underrun");
+            const auto faded = [amplitude](int64_t weight,int64_t divisor) {
+                return static_cast<int16_t>(
+                    static_cast<int64_t>(amplitude)*weight/divisor);
+            };
+            expect(out[0]==faded(1,96) &&
+                   out[95*kChannels]==amplitude,
+                   "fade-in must keep signed PCM and exact envelope");
+            expect(out[1824*kChannels]==faded(95,96) &&
+                   out[1919*kChannels]==0,
+                   "fade-out must keep signed PCM and end at zero");
+            for (uint32_t frame=0;frame<2000;++frame) {
+                for (uint32_t ch=0;ch<kChannels;++ch) {
+                    const int16_t sample=out[frame*kChannels+ch];
+                    expect(amplitude<0 ? (sample<=0 && sample>=amplitude)
+                                       : (sample>=0 && sample<=amplitude),
+                           "fades must not amplify PCM, invert polarity or wrap");
+                }
+            }
+        }
+    }
     {   // Same actual RenderCore used by the AAudio callback, not a model.
         RenderCore core;
         prime(core);
