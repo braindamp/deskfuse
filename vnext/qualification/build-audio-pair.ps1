@@ -24,6 +24,15 @@ if (-not (Test-Path -LiteralPath (Join-Path $AndroidNdk 'build\cmake\android.too
 $env:ANDROID_HOME = $AndroidSdk
 $env:ANDROID_SDK_ROOT = $AndroidSdk
 $env:ANDROID_NDK_HOME = $AndroidNdk
+$wasapiSource = Join-Path $LabRoot 'vnext\m1'
+$wasapiBuild = Join-Path $wasapiSource 'build'
+if (-not (Test-Path -LiteralPath (Join-Path $wasapiBuild 'CMakeCache.txt') -PathType Leaf)) {
+    & cmake -S $wasapiSource -B $wasapiBuild -G Ninja
+    if ($LASTEXITCODE -ne 0) { throw 'Native Windows capture configure failed' }
+}
+& cmake --build $wasapiBuild --config Release --parallel 2
+if ($LASTEXITCODE -ne 0) { throw 'Native WASAPI capture build failed' }
+
 $nativeSource = Join-Path $LabRoot 'vnext\m2b\android-native'
 $nativeBuild = Join-Path $nativeSource 'build-android'
 $toolchain = Join-Path $AndroidNdk 'build\cmake\android.toolchain.cmake'
