@@ -593,6 +593,11 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                 // QUIC socket open long enough for final sealed packets and
                 // receiver ACK/control work; this is NOT new PCM pacing.
                 if start.elapsed() >= run_for + Duration::from_secs(3) {
+                    // A successful session must observe native completion,
+                    // not merely the absence of further PCM or an idle socket.
+                    if capture.is_some() && source.is_some() {
+                        return Err("native WASAPI capture missing terminal completion at end of run".into());
+                    }
                     let stats = c.stats();
                     if capture.is_some() {
                         println!(
