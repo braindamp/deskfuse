@@ -960,7 +960,7 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
 
 fn positive_seconds(s: &str) -> Result<u64> {
     let n = s.parse::<u64>()?;
-    if !(1..=60).contains(&n) { return Err("duration must be 1..60 seconds in the isolated lab".into()); }
+    if !(1..=1800).contains(&n) { return Err("duration must be 1..1800 seconds for the preregistered physical workload".into()); }
     Ok(n)
 }
 
