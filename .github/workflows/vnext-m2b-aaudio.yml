@@ -18,11 +18,17 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
-      - name: Deterministic CP-001 controller qualifications (host C++20)
+      - name: Persistent libsamplerate candidate build prerequisite
         shell: bash
         run: |
           set -euo pipefail
-          cmake -S vnext/m2b/android-native/tests -B vnext/m2b/android-native/build-clock-tests -G Ninja -DCMAKE_BUILD_TYPE=Release
+          sudo apt-get update
+          sudo apt-get install -y libsamplerate0-dev
+      - name: Deterministic CP-001 controller and persistent ASRC host qualifications
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S vnext/m2b/android-native/tests -B vnext/m2b/android-native/build-clock-tests -G Ninja -DCMAKE_BUILD_TYPE=Release -DDESKFUSE_QUALIFY_LIBSAMPLERATE=ON
           cmake --build vnext/m2b/android-native/build-clock-tests --parallel 2
           ctest --test-dir vnext/m2b/android-native/build-clock-tests --output-on-failure
       - name: Install Android NDK r30 in runner SDK
