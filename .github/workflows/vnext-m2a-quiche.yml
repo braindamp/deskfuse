@@ -49,13 +49,14 @@ jobs:
           echo "macOS architecture: $(uname -m)"
           nasm -v
           cmake --version | head -n 1
-      - name: Select current Rust stable
+      # Match the validated Windows developer toolchain; do not float with 'stable'.
+      - name: Select Rust 1.99.1
         shell: bash
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          rustup toolchain install 1.99.1 --profile minimal
+          rustup default 1.99.1
           rustc --version
           cargo --version
-      - name: Test Rust codec and authenticated QUIC handshake
+      - name: Test Rust codec and authenticated QUIC handshake (locked dependencies)
         shell: bash
-        run: cargo test --manifest-path vnext/m2a/quiche-lab/Cargo.toml --verbose -- --nocapture
+        run: cargo test --locked --manifest-path vnext/m2a/quiche-lab/Cargo.toml --verbose -- --nocapture
