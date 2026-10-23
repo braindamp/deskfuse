@@ -144,6 +144,7 @@ pub fn spawn(
     let (sender, receiver) = mpsc::sync_channel(QUEUE_SLOTS);
     thread::spawn(move || {
         let notifier = UdpSocket::bind("0.0.0.0:0").ok();
+        let mut reader_queue_drops=0u64;
         loop {
             match read_chunk(&mut stdout) {
                 Ok(Some(chunk)) => match sender.try_send(chunk) {
@@ -152,7 +153,15 @@ pub fn spawn(
                             let _ = wake.send_to(&[0xA1], wake_addr);
                         }
                     }
-                    Err(TrySendError::Full(_)) => {} // bounded drop, not a capture-thread block
+                    Err(TrySendError::Full(dropped)) => {
+                        reader_queue_drops+=1;
+                        if reader_queue_drops<=8 || reader_queue_drops%128==0 {
+                            eprintln!(
+                                "TRACE Windows WASAPI_READER_QUEUE_DROP source_frame={} frames={} reader_queue_drops={}",
+                                dropped.device_frame,dropped.frames,reader_queue_drops
+                            );
+                        }
+                    } // bounded drop, never wait on capture-reader thread
                     Err(TrySendError::Disconnected(_)) => break,
                 },
                 Ok(None) => break,
@@ -162,6 +171,7 @@ pub fn spawn(
                 }
             }
         }
+        eprintln!("DONE Windows WASAPI pipe reader_queue_drops={reader_queue_drops}");
         // If the QUIC owner exits while the capture process is still alive,
         // don't orphan the native child process or leak a pipe handle.
         if child.try_wait().ok().flatten().is_none() { let _ = child.kill(); }
