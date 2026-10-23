@@ -14,6 +14,7 @@ use std::sync::mpsc::TryRecvError;
 use deskfuse_quiche_lab::wasapi_pipe::{self, Assembler};
 use deskfuse_quiche_lab::android_audio::AndroidAudio;
 use deskfuse_quiche_lab::source_age::{self, AgeDecision};
+use deskfuse_quiche_lab::plaintext_expiry::{PlaintextExpiry, Identity as OutgoingIdentity};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
@@ -103,6 +104,19 @@ fn deadline(dates: &[Option<Instant>]) -> Option<Instant> {
     dates.iter().copied().flatten().min()
 }
 
+fn source_egress(
+    egress: &mut Egress, udp: &UdpSocket, conn: &mut quiche::Connection,
+    writable: bool, outstanding: &mut PlaintextExpiry, physical_capture: bool,
+) -> Result<()> {
+    egress.service_with_hook(udp, conn, writable, |c| {
+        if physical_capture {
+            let now = source_age::local_qpc_100ns()?;
+            outstanding.purge(c, now);
+        }
+        Ok(())
+    })
+}
+
 fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, seconds: u64, capture: Option<(&str, &str)>) -> Result<()> {
     let mut cfg = config(ca, cert, key)?;
     let udp = socket(bind)?;
@@ -117,6 +131,7 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
     let mut not_queued = 0u64;
     let mut skipped_source_blocks = 0u64;
     let mut egress = Egress::default();
+    let mut outstanding = PlaintextExpiry::default();
     let mut bytes = [0u8; 65535];
     let mut source = None;
     let mut assembler = Assembler::default();
@@ -246,11 +261,29 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                                 // owner gets a chance to seal available packets.
                                 // Egress retains a paced/blocked sealed packet,
                                 // and we never overwrite it or add a send timer.
-                                egress.service(&udp, c, false)?;
+                                source_egress(&mut egress, &udp, c, false, &mut outstanding, capture.is_some())?;
+                                // A prior packet can remain in quiche's
+                                // plaintext queue across a long cwnd/pacing
+                                // stall: this original QPC check is the last
+                                // admission opportunity before queuing.
+                                match source_age::classify(
+                                    source_age::local_qpc_100ns()?,
+                                    block.first_qpc_100ns,
+                                ) {
+                                    AgeDecision::Fresh { .. } => {}
+                                    _ => {
+                                        expired_source_qpc += 1;
+                                        continue;
+                                    }
+                                }
                                 match c.dgram_send(&pcm) {
                                     Ok(()) => {
                                         offered += 1;
-                                        egress.service(&udp, c, false)?;
+                                        let id = OutgoingIdentity::from_wire(&pcm)
+                                            .ok_or("outgoing PCM header identity missing")?;
+                                        outstanding.accept(id, block.first_qpc_100ns)
+                                            .map_err(|e| format!("quiche plaintext bound violated: {e}"))?;
+                                        source_egress(&mut egress, &udp, c, false, &mut outstanding, capture.is_some())?;
                                     }
                                     Err(quiche::Error::Done) => {
                                         not_queued += 1;
@@ -296,7 +329,7 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
     
             }
             // QUIC and this kernel socket have exactly one egress owner.
-            egress.service(&udp, c, false)?;
+            source_egress(&mut egress, &udp, c, false, &mut outstanding, capture.is_some())?;
             if let Some(start) = origin {
                 // Stop source production at run_for, but leave the authenticated
                 // QUIC socket open long enough for final sealed packets and
@@ -305,10 +338,12 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                     let stats = c.stats();
                     if capture.is_some() {
                         println!(
-                            "DONE Windows WASAPI source duration={}s real_pcm_blocks_queued={} quiche_queue_full={} source_queue_old={} qpc_expired={} qpc_invalid={} qpc_future={} qpc_max_age_100ns={} capture_discontinuities={} last_wasapi_qpc_100ns={} udp_packets={} udp_would_block={} quic_dgram_sent={} quic_lost={}",
+                            "DONE Windows WASAPI source duration={}s real_pcm_blocks_queued={} quiche_queue_full={} source_queue_old={} qpc_expired={} qpc_invalid={} qpc_future={} qpc_max_age_100ns={} quiche_plaintext_expired={} quiche_plaintext_orphans={} quiche_plaintext_absent={} quiche_identity_high_water={} capture_discontinuities={} last_wasapi_qpc_100ns={} udp_packets={} udp_would_block={} quic_dgram_sent={} quic_lost={}",
                             seconds, offered, not_queued, source_chunks_too_old,
                             expired_source_qpc, invalid_source_qpc, future_source_qpc,
                             max_observed_source_age_100ns,
+                            outstanding.expired, outstanding.orphaned,
+                            outstanding.absent, outstanding.high_water,
                             assembler.discontinuities, last_capture_qpc, egress.udp_packets_sent,
                             egress.would_block_count, stats.dgram_sent, stats.lost
                         );
@@ -337,7 +372,7 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
         let ready = wait_udp(&udp, writable, wake)?;
         if ready.writable {
             if let Some(c) = conn.as_mut() {
-                egress.service(&udp, c, true)?;
+                source_egress(&mut egress, &udp, c, true, &mut outstanding, capture.is_some())?;
             }
         }
     }
