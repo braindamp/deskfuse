@@ -72,14 +72,20 @@ pub fn local_qpc_100ns() -> io::Result<u64> {
         fn QueryPerformanceCounter(counter: *mut i64) -> i32;
         fn QueryPerformanceFrequency(frequency: *mut i64) -> i32;
     }
+    // Windows QPC frequency is fixed for the running system. Query it once,
+    // not on every WASAPI block / PCM admission freshness check. QPC counter
+    // is still sampled freshly for each decision; no cached age or new clock.
+    static FREQUENCY: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    let frequency = *FREQUENCY.get_or_init(|| {
+        let mut value = 0i64;
+        if unsafe { QueryPerformanceFrequency(&mut value) } == 0 { 0 } else { value }
+    });
+    if frequency <= 0 {
+        return Err(io::Error::new(io::ErrorKind::Other, "Windows QPC frequency unavailable"));
+    }
     let mut counter = 0i64;
-    let mut frequency = 0i64;
-    let ok = unsafe {
-        QueryPerformanceFrequency(&mut frequency) != 0
-            && QueryPerformanceCounter(&mut counter) != 0
-    };
-    if !ok || frequency <= 0 || counter < 0 {
-        return Err(io::Error::new(io::ErrorKind::Other, "Windows QPC unavailable"));
+    if unsafe { QueryPerformanceCounter(&mut counter) } == 0 || counter < 0 {
+        return Err(io::Error::new(io::ErrorKind::Other, "Windows QPC counter unavailable"));
     }
     let ticks = (counter as u128) * 10_000_000u128 / (frequency as u128);
     u64::try_from(ticks).map_err(|_| {
