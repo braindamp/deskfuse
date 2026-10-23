@@ -28,6 +28,11 @@ jobs:
       - name: Assert local physical-run evidence evaluator fails closed
         shell: pwsh
         run: python vnext/qualification/test_evaluate_physical_audio.py
+      - name: Prove diagnostic stderr is not fatal but real receiver errors remain fatal in Windows PowerShell 5.1
+        shell: pwsh
+        run: |
+          & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File vnext/qualification/test-invoke-native-audio.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'Windows PowerShell 5.1 native stderr or exit-status regression failed' }
       - name: Statically parse physical qualification PowerShell (no devices contacted)
         shell: pwsh
         run: |
@@ -36,7 +41,9 @@ jobs:
           foreach ($script in @(
             'vnext/qualification/run-physical-audio.ps1',
             'vnext/qualification/mark-audio-event.ps1',
-            'vnext/qualification/build-audio-pair.ps1'
+            'vnext/qualification/build-audio-pair.ps1',
+            'vnext/qualification/invoke-native-audio.ps1',
+            'vnext/qualification/test-invoke-native-audio.ps1'
           )) {
             $tokens = $null
             $errorsFound = $null
