@@ -4,7 +4,13 @@
 Native `android-arm64-smoke` cross-build **succeeded** using Rust 1.99.1,
 cargo-ndk 4.1.2, NDK r30 (`30.0.16248370`), CMake/Ninja and
 `quiche 0.30.0` / `boring-sys 5.3.0`.
-The on-device ADB execution is **not yet confirmed**.
+**On-device ADB execution PASS reported by developer (2026-10-23):**
+the Android ARM64 binary was pushed to `/data/local/tmp/`, given executable
+permissions, and run with the matching NDK `libc++_shared.so` available via
+a command-local `LD_LIBRARY_PATH`. Its output matched the exact expected
+`PASS DeskFuse vNext target=android arch=aarch64 real-quiche-config=true
+audio-frames=240 first-source-frame=48000 bytes=1000` message.
+This is a developer-reported hardware observation, not independent CI evidence.
 This is not an Android QUIC receiver or an APK.
 
 The reference phone is Xiaomi model `24117RN76E`, Android API 36,
