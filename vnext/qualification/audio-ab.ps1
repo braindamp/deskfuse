@@ -68,7 +68,7 @@ function Checkout([string]$slot,[string]$sha) {
         $b=(& git -C $path rev-parse --path-format=absolute --git-common-dir).Trim()
         if ($LASTEXITCODE -ne 0 -or $a -ine $b) { throw "Foreign worktree: $path" }
         $dirty=@(& git -C $path status --porcelain --untracked-files=no)
-        if ($LASTEXITCODE -ne 0 -or $dirty.Count -gt 0) { throw "Tracked edits in $path: refusing to switch" }
+        if ($LASTEXITCODE -ne 0 -or $dirty.Count -gt 0) { throw "Tracked edits in ${path}: refusing to switch" }
         if ((& git -C $path rev-parse HEAD).Trim() -ne $sha) {
             if ($slot -eq 'reference') { throw 'Reference worktree is not pinned' }
             & git -c gc.auto=0 -c maintenance.auto=false -C $path switch --detach $sha
