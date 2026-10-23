@@ -159,7 +159,7 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                 }
             }
             // QUIC and this kernel socket have exactly one egress owner.
-            egress.service(&udp, c, true)?;
+            egress.service(&udp, c, false)?;
             if let Some(start) = origin {
                 if start.elapsed() >= run_for {
                     let stats = c.stats();
@@ -262,7 +262,7 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64) -> 
                 }
             }
         }
-        egress.service(&udp, &mut conn, true)?;
+        egress.service(&udp, &mut conn, false)?;
         if let Some(at) = authenticated_at {
             if at.elapsed() >= Duration::from_secs(seconds + 2) {
                 let stats = conn.stats();
