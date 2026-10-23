@@ -132,7 +132,23 @@ $clientLog = Join-Path $folder 'android-receiver.txt'
 $sourceArgs = @('server-wasapi',($WindowsIP + ':48235'),$PhoneIP,
     (Join-Path $KeysDir 'ca.pem'),(Join-Path $KeysDir 'server.pem'),
     (Join-Path $KeysDir 'server.key'),$capture,$EndpointId,([string]$Seconds))
-$proc = Start-Process -FilePath $source -ArgumentList $sourceArgs -RedirectStandardOutput $serverOut -RedirectStandardError $serverErr -WorkingDirectory (Join-Path $LabRoot 'vnext\m2a\quiche-lab') -NoNewWindow -PassThru
+# Explicit opt-in diagnostic: the Windows child inherits this local-only path,
+# then passes it to its WASAPI capture child. No PCM is written to this CSV.
+# Only trace when the receiver has no AAudio output; restore caller environment.
+$traceEnv = 'DESKFUSE_WASAPI_PACKET_TRACE'
+$priorTrace = [Environment]::GetEnvironmentVariable($traceEnv, 'Process')
+try {
+    if ($VerifyOnly) {
+        $tracePath = Join-Path $folder 'windows-original-wasapi-packets.csv'
+        [Environment]::SetEnvironmentVariable($traceEnv, $tracePath, 'Process')
+        ('wasapi_packet_trace=' + $tracePath) | Add-Content -LiteralPath $manifest
+    } else {
+        [Environment]::SetEnvironmentVariable($traceEnv, $null, 'Process')
+    }
+    $proc = Start-Process -FilePath $source -ArgumentList $sourceArgs -RedirectStandardOutput $serverOut -RedirectStandardError $serverErr -WorkingDirectory (Join-Path $LabRoot 'vnext\m2a\quiche-lab') -NoNewWindow -PassThru
+} finally {
+    [Environment]::SetEnvironmentVariable($traceEnv, $priorTrace, 'Process')
+}
 $observer = $null
 try {
     $startupDeadline = [DateTime]::UtcNow.AddSeconds(12)
