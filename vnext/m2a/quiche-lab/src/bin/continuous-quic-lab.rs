@@ -442,8 +442,9 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                                     }
                                     continue;
                                 }
+                                let admit_now_qpc = source_age::local_qpc_100ns()?;
                                 match outstanding.admit(c, &pcm, block.first_qpc_100ns,
-                                                        source_age::local_qpc_100ns()?) {
+                                                        admit_now_qpc) {
                                     Ok(QueueAdmission::Queued) => {
                                         offered += 1;
                                         if offered<=3 || offered%512==0 {
@@ -457,6 +458,15 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                                     }
                                     Ok(QueueAdmission::Expired) => {
                                         expired_source_qpc += 1;
+                                        if expired_source_qpc<=8 || expired_source_qpc%128==0 {
+                                            eprintln!(
+                                                "TRACE Windows SOURCE_FILTER_DROP stage=quiche_admit_expired reason={:?} sequence={} frame={} frames={} source_qpc100={} now_qpc100={} count={}",
+                                                source_age::classify(admit_now_qpc,block.first_qpc_100ns),
+                                                assigned_sequence,block.first_device_frame,
+                                                AUDIO_FRAMES,block.first_qpc_100ns,
+                                                admit_now_qpc,expired_source_qpc
+                                            );
+                                        }
                                     }
                                     Ok(QueueAdmission::Full) => {
                                         not_queued += 1;
