@@ -103,7 +103,16 @@ if (-not (Test-Path -LiteralPath $exe)) { throw "Missing Android binary: $exe" }
 adb devices -l
 adb push $exe /data/local/tmp/deskfuse-vnext-arm64-smoke
 adb shell chmod 700 /data/local/tmp/deskfuse-vnext-arm64-smoke
-adb shell /data/local/tmp/deskfuse-vnext-arm64-smoke
+
+# A standalone native executable does not have Gradle packaging its libc++.
+# Push exactly the C++ runtime from the NDK that built this ARM64 binary.
+$libcxx = "$env:ANDROID_NDK_HOME\toolchains\llvm\prebuilt\windows-x86_64\sysroot\usr\lib\aarch64-linux-android\libc++_shared.so"
+if (-not (Test-Path -LiteralPath $libcxx)) { throw "NDK C++ runtime missing: $libcxx" }
+adb push $libcxx /data/local/tmp/libc++_shared.so
+
+# Apply local runtime lookup for this invocation only; do not modify
+# global Android loader paths or any installed DeskFuse APK.
+adb shell 'LD_LIBRARY_PATH=/data/local/tmp /data/local/tmp/deskfuse-vnext-arm64-smoke'
 ```
 
 Expected stdout:
@@ -113,7 +122,7 @@ PASS DeskFuse vNext target=android arch=aarch64 real-quiche-config=true audio-fr
 NO NETWORKING: smoke test only; no QUIC peer authentication or Android playback.
 ```
 
-This only verifies the executable and linked quiche config run on the phone,
+If the device reports a missing `std::__ndk1::__libcpp_verbose_abort` symbol,\nthe matching NDK `libc++_shared.so` is probably not available to the\nstandalone executable. The above push and one-command `LD_LIBRARY_PATH`\nfix are necessary because there is no APK/Gradle step to package it.\nDo not replace any system libraries on the phone.\n\nThis only verifies the executable and linked quiche config run on the phone,
 plus the PCM wire-format roundtrip. It is *not* proof of QUIC connectivity,
 mutual endpoint authentication, time sync, Wi-Fi latency, or native audio.
 It opens no UDP socket and installs no APK.
