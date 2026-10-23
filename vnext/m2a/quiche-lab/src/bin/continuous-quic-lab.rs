@@ -463,8 +463,10 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                                         // output position with bounded zero-valued PCM
                                         // BEFORE the next valid source interval.
                                         const ZERO_PCM: [u8; PAYLOAD_BYTES] = [0; PAYLOAD_BYTES];
-                                        for _ in 0..(missing / AUDIO_FRAMES) {
-                                            if speaker.push_pcm16(&ZERO_PCM)
+                                        for offset in 0..(missing / AUDIO_FRAMES) {
+                                            if speaker.push_pcm16_identified(
+                                                &ZERO_PCM, expected + offset * AUDIO_FRAMES,
+                                                h.media_epoch, h.source_stream_id, true)
                                                 .map_err(|e| format!("Android missing-frame concealment: {e}"))? {
                                                 source_concealed_frames += AUDIO_FRAMES;
                                             } else {
@@ -490,7 +492,9 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                             // PCM is verified, authenticated, and source-monotonic
                             // BEFORE publication to the AAudio callback ring.
                             let samples = &datagram[HEADER_BYTES..n];
-                            if !speaker.push_pcm16(samples)
+                            if !speaker.push_pcm16_identified(
+                                samples, h.first_source_frame,
+                                h.media_epoch, h.source_stream_id, false)
                                 .map_err(|e| format!("Android audio renderer: {e}"))? {
                                 audio_queue_full += 1;
                             }
@@ -503,9 +507,16 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                             if let Some(ref speaker) = audio {
                                 let a = speaker.snapshot()
                                     .map_err(|e| format!("AAudio periodic diagnostics: {e}"))?;
-                                println!("TRACE Android RENDER source_frame={} queued_frames={} drift_ppm={} underruns={} rebuffer={} silence_frames={} queue_full={}",
-                                    h.first_source_frame, a.queued_frames, a.drift_correction_ppm,
-                                    a.underrun_events, a.reprime_events, a.silence_frames, audio_queue_full);
+                                let identity = speaker.identity_snapshot()
+                                    .map_err(|e| format!("AAudio render identity: {e}"))?;
+                                println!("TRACE Android RENDER packet_source={} committed_source={} phase_q32={} epoch={} generation={} released={} rebuffer_discarded={} concealed_output={} queued_frames={} drift_ppm={} underruns={} rebuffer={} silence_frames={} queue_full={}",
+                                    h.first_source_frame, identity.last_committed_source_frame,
+                                    identity.last_fraction_q32, identity.last_epoch,
+                                    identity.last_generation, identity.released_source_frames,
+                                    identity.discarded_on_rebuffer_frames,
+                                    identity.concealed_output_frames, a.queued_frames,
+                                    a.drift_correction_ppm, a.underrun_events,
+                                    a.reprime_events, a.silence_frames, audio_queue_full);
                             }
                         }
                     }
@@ -534,6 +545,14 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                         a.queued_frames, a.stream_error, a.actual_sample_rate, a.actual_channels,
                         a.drift_correction_ppm, a.underrun_events, a.reprime_events
                     );
+                    let identity = speaker.identity_snapshot()
+                        .map_err(|e| format!("AAudio final identity: {e}"))?;
+                    println!("AUDIO Android identity committed_source_frame={} fractional_phase_q32={} epoch={} stream_generation={} released_source_frames={} rebuffer_discarded_frames={} concealed_output_frames={}",
+                        identity.last_committed_source_frame, identity.last_fraction_q32,
+                        identity.last_epoch, identity.last_generation,
+                        identity.released_source_frames,
+                        identity.discarded_on_rebuffer_frames,
+                        identity.concealed_output_frames);
                     if a.stream_error != 0 { return Err(format!("AAudio stream failure code={}", a.stream_error).into()); }
                     if a.rendered_frames == 0 { return Err("AAudio played no authenticated PCM frames".into()); }
                 }
