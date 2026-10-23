@@ -41,6 +41,7 @@ mod native {
     type Push = unsafe extern "C" fn(*mut c_void, *const i16, u32) -> i32;
     type Stats = unsafe extern "C" fn(*mut c_void, *mut AudioStats) -> i32;
     type Close = unsafe extern "C" fn(*mut c_void);
+    type DiagnosticModes = unsafe extern "C" fn(*mut c_void, u32) -> i32;
 
     pub struct Renderer {
         library: *mut c_void,
@@ -48,6 +49,7 @@ mod native {
         push: Push,
         stats: Stats,
         close: Close,
+        configure: DiagnosticModes,
     }
 
     impl Renderer {
@@ -68,10 +70,11 @@ mod native {
                     symbol(b"df_audio_push\0")?,
                     symbol(b"df_audio_stats_v2\0")?,
                     symbol(b"df_audio_close\0")?,
+                    symbol(b"df_audio_set_diagnostic_modes\0")?,
                 ))
             })();
 
-            let (version_fn, open_fn, push_fn, stats_fn, close_fn) = match functions {
+            let (version_fn, open_fn, push_fn, stats_fn, close_fn, modes_fn) = match functions {
                 Ok(v) => v,
                 Err(e) => {
                     unsafe { dlclose(library); }
@@ -90,6 +93,7 @@ mod native {
             let push: Push = unsafe { std::mem::transmute(push_fn) };
             let stats: Stats = unsafe { std::mem::transmute(stats_fn) };
             let close: Close = unsafe { std::mem::transmute(close_fn) };
+            let configure: DiagnosticModes = unsafe { std::mem::transmute(modes_fn) };
 
             let mut ctx = ptr::null_mut();
             let code = unsafe { open(&mut ctx) };
@@ -97,7 +101,14 @@ mod native {
                 unsafe { dlclose(library); }
                 return Err(format!("AAudio output open/start failed code={code}"));
             }
-            Ok(Self { library, ctx, push, stats, close })
+            Ok(Self { library, ctx, push, stats, close, configure })
+        }
+
+        pub fn set_diagnostic_modes(&mut self, fades: bool, linear_resample: bool) -> Result<(), String> {
+            let flags = u32::from(fades) | (u32::from(linear_resample) << 1);
+            let code = unsafe { (self.configure)(self.ctx, flags) };
+            if code == 0 { Ok(()) }
+            else { Err(format!("AAudio diagnostic modes must be chosen before publishing PCM, code={code}")) }
         }
 
         pub fn push_pcm16(&mut self, wire_pcm: &[u8]) -> Result<bool, String> {
@@ -141,6 +152,9 @@ pub struct AndroidAudio;
 impl AndroidAudio {
     pub fn open(_path: &str) -> Result<Self, String> {
         Err("AAudio playback requires the Android ARM64 executable".into())
+    }
+    pub fn set_diagnostic_modes(&mut self, _fades: bool, _linear_resample: bool) -> Result<(), String> {
+        Err("AAudio diagnostic modes require Android".into())
     }
     pub fn push_pcm16(&mut self, _bytes: &[u8]) -> Result<bool, String> {
         Err("AAudio playback requires Android".into())
