@@ -12,10 +12,10 @@ mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
 
 
-def pack(first_frame, qpc, frames=240, flags=0, sample=1000):
+def pack(first_frame, qpc, frames=240, flags=0, sample=1000, version=1, packet_offset=0):
     pcm = struct.pack("<hh", sample, sample) * frames
     header = mod.HEADER.pack(
-        b"DFWC", 1, first_frame, qpc, frames, flags, len(pcm), 0
+        b"DFWC", version, first_frame, qpc, frames, flags, len(pcm), packet_offset
     )
     return header + pcm
 
@@ -62,6 +62,25 @@ class CaptureEvidenceTests(unittest.TestCase):
             self.run_bytes(b"BAD!" + pack(0, 1)[4:])
         with self.assertRaises(ValueError):
             self.run_bytes(pack(0, 1) + b"DFWC")
+
+    def test_v2_real_original_packet_fragments_preserve_frame_and_qpc_evidence(self):
+        start = pack(48000, 10_000_000, version=2, packet_offset=0)
+        later = pack(48240, 10_050_000, version=2, packet_offset=240)
+        report = self.run_bytes(start + later)
+        self.assertEqual(report["source_frames"], 480)
+        self.assertEqual(report["source_gaps"], 0)
+        self.assertEqual(report["nonmonotonic_qpc"], 0)
+        self.assertEqual(report["max_qpc_slope_error_us"], 0)
+        # Strict live sender rejects v1; the offline inspector still reads
+        # immutable reference v1 artifacts without changing them.
+        self.assertEqual(self.run_bytes(pack(48000, 10_000_000))["records"], 1)
+        for kwargs in [
+            dict(version=3), dict(version=2, packet_offset=239),
+            dict(version=2, packet_offset=240),
+            dict(version=2, packet_offset=9840),
+        ]:
+            with self.assertRaises(ValueError):
+                self.run_bytes(pack(0, 10_000_000, **kwargs))
 
     def test_full_scale_clips_are_measured_not_interpreted_as_volume(self):
         data = pack(0, 1_000_000, sample=32767)
