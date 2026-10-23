@@ -58,6 +58,50 @@ int main() {
         if (observed.load() != 12345) return 9;
     }
 
+    // Force the shutdown race: consumer observes empty, pauses before its
+    // acquire-close read; producer publishes the final record and closes.
+    // An old one-shot close check would lose that accepted final record.
+    {
+        Queue q;
+        struct Pause {
+            HANDLE observed = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            HANDLE resume = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            std::atomic<bool> first{true};
+        } pause;
+        if (!pause.observed || !pause.resume) return 11;
+        q.set_empty_probe([](void* p) {
+            auto& state = *static_cast<Pause*>(p);
+            if (!state.first.exchange(false)) return;
+            SetEvent(state.observed);
+            if (WaitForSingleObject(state.resume, 5000) != WAIT_OBJECT_0)
+                std::terminate();
+        }, &pause);
+        std::atomic<uint64_t> received{UINT64_MAX};
+        std::thread writer([&] {
+            Packet p{};
+            if (q.pop(p)) received.store(p.frame);
+        });
+        if (WaitForSingleObject(pause.observed, 5000) != WAIT_OBJECT_0) {
+            SetEvent(pause.resume);
+            q.finish();
+            writer.join();
+            CloseHandle(pause.observed);
+            CloseHandle(pause.resume);
+            return 12;
+        }
+        Packet last{};
+        last.frame = 54321;
+        const bool accepted = q.try_push(last);
+        q.finish();
+        SetEvent(pause.resume);
+        writer.join();
+        CloseHandle(pause.observed);
+        CloseHandle(pause.resume);
+        if (!accepted || received.load() != 54321 || q.dropped() != 0) return 13;
+        Packet empty{};
+        if (q.pop(empty)) return 14;
+    }
+
     // Concurrent wraparound: accepted data remains ordered and unchanged,
     // even while the producer drops entire packets during writer stalls.
     {
@@ -93,6 +137,6 @@ int main() {
         if (!valid.load() || received.load() != accepted ||
             accepted + q.dropped() != count) return 10;
     }
-    std::cout << "PASS: nonblocking capture, FIFO, exact PCM, bounded drops, close/drain, idle wake\n";
+    std::cout << "PASS: nonblocking capture, FIFO, exact PCM, bounded drops, final-block shutdown race, idle wake\n";
     return 0;
 }
