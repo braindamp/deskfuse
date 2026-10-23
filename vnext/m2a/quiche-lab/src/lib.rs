@@ -1,6 +1,8 @@
 //! DeskFuse M2a protocol wire layout. The input **must already be authenticated
 //! by the surrounding QUIC connection**; this parser does not authenticate it.
 //! No heap allocation is needed in encode/decode.
+pub mod reactor;
+
 pub const HEADER_BYTES: usize = 40;
 pub const VERSION: u8 = 1;
 pub const KIND_AUDIO: u8 = 1;
