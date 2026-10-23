@@ -77,6 +77,21 @@ class EvidenceTests(unittest.TestCase):
             self.assertTrue(any("hashes" in s for s in report["failures"]))
             self.assertTrue(any("receiver" in s for s in report["failures"]))
 
+    def test_repeated_pre_quic_missing_audio_is_not_clean_evidence(self):
+        with tempfile.TemporaryDirectory() as t:
+            folder = self.create(Path(t) / "distorted")
+            with (folder / "android-receiver.txt").open("a", encoding="utf-8") as file:
+                for sequence in range(100, 115):
+                    file.write(
+                        f"TRACE Android SOURCE_GAP epoch=1 sequence={sequence} "
+                        f"first_source_frame={100000 + (sequence-100)*480} "
+                        "gap_frames=240 elapsed_ms=16400\\n"
+                    )
+            report = evaluation.check_session(folder)
+            self.assertEqual(report["session_log_consistency"], "FAIL")
+            self.assertEqual(report["observations"]["worst_contiguous_source_gap_run"], 15)
+            self.assertTrue(any("distorted playback" in f for f in report["failures"]))
+
     def test_strict_verifier_fails_even_with_clean_output(self):
         with tempfile.TemporaryDirectory() as t:
             folder = self.create(Path(t) / "strict")
