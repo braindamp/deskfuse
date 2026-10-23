@@ -10,6 +10,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <cstddef>
 #include <cstring>
 #include <memory>
 #include <new>
@@ -262,7 +263,22 @@ DF_EXPORT int32_t df_audio_push(void* ctx, const int16_t* pcm, uint32_t frames) 
     return static_cast<Renderer*>(ctx)->push(pcm, frames);
 }
 
+// ABI v1 statistic consumers allocate only the original prefix.
+// Never write the v2 extension into an old caller's smaller buffer.
+// First 9 fields are unchanged and are copied byte-for-byte.
 DF_EXPORT int32_t df_audio_stats(void* ctx, void* output) noexcept {
+    if (!ctx || !output) return -1;
+    Stats snapshot{};
+    static_cast<Renderer*>(ctx)->get_stats(&snapshot);
+    static_assert(offsetof(Stats, drift_correction_ppm) == 60,
+                  "ABI v1 statistic prefix layout changed");
+    std::memcpy(output, &snapshot, offsetof(Stats, drift_correction_ppm));
+    return 0;
+}
+
+// ABI v2 callers check df_audio_abi_version() before using this function.
+// The full struct is written only when the caller allocated its new layout.
+DF_EXPORT int32_t df_audio_stats_v2(void* ctx, void* output) noexcept {
     if (!ctx || !output) return -1;
     static_cast<Renderer*>(ctx)->get_stats(static_cast<Stats*>(output));
     return 0;
