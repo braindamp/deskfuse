@@ -38,30 +38,34 @@ impl PlaintextExpiry {
     // This sees ONLY still-queued DATAGRAM plaintext. No access to already
     // sealed packet contents or QUIC rollback. Missing entries are reclaimed.
     pub fn purge(&mut self, conn: &mut Connection, now_qpc: u64) {
-        let mut present = [false; CAPACITY];
-        let mut expired = [false; CAPACITY];
+        let present: [std::cell::Cell<bool>; CAPACITY] =
+            std::array::from_fn(|_| std::cell::Cell::new(false));
+        let expired: [std::cell::Cell<bool>; CAPACITY] =
+            std::array::from_fn(|_| std::cell::Cell::new(false));
+        let unknown = std::cell::Cell::new(0u64);
         conn.dgram_purge_outgoing(|bytes| {
             match Identity::from_wire(bytes) {
                 Some(id) => {
                     if let Some((index, entry)) = self.entries.iter().enumerate()
                         .find(|(_, item)| item.id == id)
                     {
-                        present[index]=true;
-                        expired[index]=!matches!(classify(now_qpc,entry.source_qpc),
-                                             AgeDecision::Fresh{..});
-                        expired[index]
+                        present[index].set(true);
+                        expired[index].set(!matches!(classify(now_qpc,entry.source_qpc),
+                                             AgeDecision::Fresh{..}));
+                        expired[index].get()
                     } else {
-                        self.orphaned += 1;
+                        unknown.set(unknown.get() + 1);
                         true // Unknown/retired media is never newly sealed
                     }
                 }
                 None => false, // non-media DATAGRAMs do not count as PCM
             }
         });
+        self.orphaned += unknown.get();
         let old = std::mem::take(&mut self.entries);
         for (index, entry) in old.into_iter().enumerate() {
-            if !present[index] { self.absent += 1; }
-            else if expired[index] { self.expired += 1; }
+            if !present[index].get() { self.absent += 1; }
+            else if expired[index].get() { self.expired += 1; }
             else { self.entries.push(entry); }
         }
     }
