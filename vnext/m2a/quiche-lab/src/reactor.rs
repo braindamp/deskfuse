@@ -122,6 +122,36 @@ impl Egress {
 mod ciphertext_slot_tests {
     use super::*;
     #[test]
+    fn pending_ciphertext_prevents_any_quiche_construction_until_writable() {
+        let udp=UdpSocket::bind("127.0.0.1:0").unwrap();
+        udp.set_nonblocking(true).unwrap();
+        let local=udp.local_addr().unwrap();
+        let remote:SocketAddr="127.0.0.1:4433".parse().unwrap();
+        let mut cfg=quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+        cfg.set_application_protos(&[b"df-sealed-slot-unit"]).unwrap();
+        let cid=quiche::ConnectionId::from_ref(&[0x52;16]);
+        let mut conn=quiche::connect(None,&cid,local,remote,&mut cfg).unwrap();
+        let sealed=vec![0x64u8;1200];
+        let mut e=Egress::default();
+        e.pending=Some(Pending{bytes:sealed.clone(),to:remote,at:Instant::now()});
+        e.blocked=true;
+        let mut hooks=0;
+        for _ in 0..5 {
+            e.service_with_hook(&udp,&mut conn,false, |_|{
+                hooks+=1;Ok(())
+            }).unwrap();
+            assert_eq!(hooks,0,"no conn.send behind occupied sealed slot");
+            assert_eq!(e.pending.as_ref().unwrap().bytes,sealed);
+        }
+        e.service_with_hook(&udp,&mut conn,true, |_|{
+            hooks+=1;Ok(())
+        }).unwrap();
+        assert!(hooks>=1,
+            "plaintext freshness hook runs before next construction after sealed UDP acceptance");
+        assert!(e.udp_packets_sent>=1);
+    }
+
+    #[test]
     fn repeated_wouldblock_preserves_identical_ciphertext_and_one_slot() {
         let target:SocketAddr="127.0.0.1:443".parse().unwrap();
         let original=vec![0x4au8;1200];
