@@ -166,7 +166,10 @@ struct PacketObservation {
 struct PacketTimingTrace {
     std::wstring path;
     LARGE_INTEGER frequency{};
-    std::array<PacketObservation, 128> samples{};
+    // Fixed 160-KiB budget, sufficient for every 480-frame original
+    // GetBuffer packet during the short <=20s silent diagnostic. No
+    // allocation, lock, log write or wait on the capture thread.
+    std::array<PacketObservation, 4096> samples{};
     size_t recorded = 0;
     uint64_t eligible = 0;
 
@@ -183,10 +186,10 @@ struct PacketTimingTrace {
     void observe(UINT64 frame, UINT32 frames, UINT64 first_qpc100, DWORD flags) {
         if (path.empty() || frames < 480) return;
         ++eligible;
-        // No disk I/O, allocations or waits on WASAPI capture thread.
-        // Record both 240-frame halves of early and sampled original packets.
-        if (recorded == samples.size() ||
-            (eligible > 32 && eligible % 64 != 0)) return;
+        // No disk I/O, allocations, locks or waits on WASAPI capture
+        // thread. An exhaustive bounded trace prevents independently
+        // sampled native/sender diagnostics from missing the same packet.
+        if (recorded == samples.size()) return;
         LARGE_INTEGER now{};
         if (!QueryPerformanceCounter(&now) || now.QuadPart < 0) return;
         const uint64_t ticks = uint64_t(now.QuadPart);
