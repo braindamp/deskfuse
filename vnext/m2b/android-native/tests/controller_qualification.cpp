@@ -76,6 +76,25 @@ int main() {
     recovery.run(240, 30, 100);
     require(recovery.occupancy > 1000 && recovery.occupancy < 1800,
             "explicit re-prime recovery");
+    // +/-500ppm lies OUTSIDE the +/-400ppm actuator authority.
+    // Long-duration occupation must eventually hit the fixed-capacity
+    // recovery boundary, not be reported as indefinitely stable correction.
+    Sim too_fast, too_slow;
+    too_fast.run(240, 900, 500);
+    too_slow.run(240, 900, -500);
+    require(too_fast.overflows > 0,
+            "+500ppm must eventually expose unrecoverable ring pressure");
+    require(too_slow.underruns > 0,
+            "-500ppm must eventually expose unavoidable output underrun");
+    // Explicit recovery: discard obsolete samples, re-prime the existing
+    // 30ms target, and ensure an in-authority source again remains bounded.
+    too_fast.follower.reset();
+    too_fast.occupancy = 1440;
+    too_fast.prev_ppm = 0;
+    too_fast.run(240, 45, 100);
+    require(too_fast.occupancy > 900 && too_fast.occupancy < 2000,
+            "recover from over-authority positive drift via fresh re-prime");
+
     Sim mixed;
     for (int i = 0; i < 40000; ++i) {
         constexpr int sizes[] = {48, 96, 192, 240, 480, 960};
