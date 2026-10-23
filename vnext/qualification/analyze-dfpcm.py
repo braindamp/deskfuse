@@ -44,8 +44,21 @@ def analyze(path):
             magic, version, pos, qpc, frames, flags, payload_size, reserved = (
                 HEADER.unpack(header)
             )
-            if (magic != b"DFWC" or version != 1 or reserved != 0 or
-                    not 1 <= frames <= 240 or payload_size != frames * 4):
+            # Read-only offline evidence supports both immutable baseline
+            # v1 (reserved must be zero) and provenance-bearing v2 records.
+            # The live Rust reader accepts ONLY v2 to fail closed on mixed
+            # native binaries. 40-byte local header and PCM remain unchanged.
+            packet_offset = reserved
+            malformed_origin = (version == 2 and (
+                packet_offset > 9600 or packet_offset % 240 != 0
+                or pos < packet_offset
+                or (qpc != 0 and
+                    qpc < packet_offset * QPC_UNITS_PER_SEC // RATE)
+            ))
+            if (magic != b"DFWC" or version not in (1, 2)
+                    or (version == 1 and reserved != 0)
+                    or malformed_origin
+                    or not 1 <= frames <= 240 or payload_size != frames * 4):
                 raise ValueError(
                     f"invalid DFWC record at index={result['records']}"
                 )
