@@ -826,7 +826,7 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
         if callback_recovery_needed && anchor_pending.is_none() &&
             authenticated_at.is_some_and(|at|
                 at.elapsed() < Duration::from_secs(seconds.saturating_sub(1))) {
-            if let (Some(context), Some(ref mut speaker)) = (session_context, audio.as_mut()) {
+            if let (Some(context), Some(speaker)) = (session_context, audio.as_mut()) {
                 begin_fresh_anchor(
                     &mut anchor_pending, &mut fresh_anchor_nonce, speaker,
                     context, ingress_frontier.floor(),
