@@ -97,7 +97,7 @@ fn deadline(dates: &[Option<Instant>]) -> Option<Instant> {
     dates.iter().copied().flatten().min()
 }
 
-fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, seconds: u64) -> Result<()> {
+fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, seconds: u64, capture: Option<(&str, &str)>) -> Result<()> {
     let mut cfg = config(ca, cert, key)?;
     let udp = socket(bind)?;
     let local = udp.local_addr()?;
@@ -112,6 +112,10 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
     let mut skipped_source_blocks = 0u64;
     let mut egress = Egress::default();
     let mut bytes = [0u8; 65535];
+    let mut source = None;
+    let mut assembler = Assembler::default();
+    let mut source_chunks_too_old = 0u64;
+    let mut last_capture_qpc = 0u64;
 
     println!("READY continuous Windows source {} ; allowed phone IP {} ; mutual TLS mandatory", local, allow_ip);
     loop {
@@ -149,29 +153,68 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
             if c.is_established() && origin.is_none() {
                 verified(c)?;
                 origin = Some(Instant::now());
-                println!("AUTH Windows: Android client CA and certificate verified; starting source-clock blocks");
+                if let Some((capture_exe, endpoint)) = capture {
+                    source = Some(wasapi_pipe::spawn(capture_exe, endpoint, seconds, local)?);
+                    println!("AUTH Windows: Android client verified; native WASAPI capture process started");
+                } else {
+                    println!("AUTH Windows: Android client CA and certificate verified; starting synthetic source-clock blocks");
+                }
             }
-            if let Some(start) = origin {
-                let now = Instant::now();
-                if now.duration_since(start) < run_for {
-                    // Source timestamps are derived from the origin clock, not
-                    // network ACKs. Missed source periods are never replayed.
-                    let due = (now.duration_since(start).as_micros() / SYNTHETIC_BLOCK.as_micros()) as u64;
-                    if due >= next_sequence {
-                        skipped_source_blocks += due - next_sequence;
-                        next_sequence = due + 1;
-                        if due > u64::from(u32::MAX) { return Err("source sequence exhausted".into()); }
-                        let payload = packet(due as u32);
-                        if c.dgram_max_writable_len().unwrap_or(0) < APP_BYTES {
-                            return Err("DATAGRAM negotiation cannot carry 1000-byte PCM frame".into());
+            if let Some(ref receiver) = source {
+                // Real WASAPI events wake this QUIC owner via the local UDP socket.
+                // Never synthesize a 5-ms send tick or use ACKs as an audio clock.
+                for _ in 0..128 {
+                    match receiver.try_recv() {
+                        Ok(chunk) => {
+                            if wasapi_pipe::queue_too_old(&chunk) {
+                                source_chunks_too_old += 1;
+                                continue;
+                            }
+                            if let Some(block) = assembler.push(&chunk) {
+                                if next_sequence > u64::from(u32::MAX) {
+                                    return Err("captured packet sequence exhausted".into());
+                                }
+                                let pcm = captured_packet(next_sequence as u32, block.first_device_frame, &block.pcm);
+                                next_sequence += 1;
+                                last_capture_qpc = block.first_qpc_100ns;
+                                if c.dgram_max_writable_len().unwrap_or(0) < pcm.len() {
+                                    return Err("QUIC DATAGRAM cannot fit 1000-byte captured PCM".into());
+                                }
+                                match c.dgram_send(&pcm) {
+                                    Ok(()) => offered += 1,
+                                    Err(quiche::Error::Done) => not_queued += 1,
+                                    Err(e) => return Err(format!("captured PCM QUIC enqueue: {e:?}").into()),
+                                }
+                            }
                         }
-                        match c.dgram_send(&payload) {
-                            Ok(()) => offered += 1,
-                            Err(quiche::Error::Done) => not_queued += 1,
-                            Err(e) => return Err(format!("DATAGRAM enqueue: {e:?}").into()),
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => break,
+                    }
+                }
+            } else if capture.is_none() {
+                if let Some(start) = origin {
+                    let now = Instant::now();
+                    if now.duration_since(start) < run_for {
+                        // Source timestamps are derived from the origin clock, not
+                        // network ACKs. Missed source periods are never replayed.
+                        let due = (now.duration_since(start).as_micros() / SYNTHETIC_BLOCK.as_micros()) as u64;
+                        if due >= next_sequence {
+                            skipped_source_blocks += due - next_sequence;
+                            next_sequence = due + 1;
+                            if due > u64::from(u32::MAX) { return Err("source sequence exhausted".into()); }
+                            let payload = packet(due as u32);
+                            if c.dgram_max_writable_len().unwrap_or(0) < APP_BYTES {
+                                return Err("DATAGRAM negotiation cannot carry 1000-byte PCM frame".into());
+                            }
+                            match c.dgram_send(&payload) {
+                                Ok(()) => offered += 1,
+                                Err(quiche::Error::Done) => not_queued += 1,
+                                Err(e) => return Err(format!("DATAGRAM enqueue: {e:?}").into()),
+                            }
                         }
                     }
                 }
+    
             }
             // QUIC and this kernel socket have exactly one egress owner.
             egress.service(&udp, c, false)?;
@@ -181,20 +224,29 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                 // receiver ACK/control work; this is NOT new PCM pacing.
                 if start.elapsed() >= run_for + Duration::from_secs(3) {
                     let stats = c.stats();
+                    if capture.is_some() {
+                        println!(
+                            "DONE Windows WASAPI source duration={}s real_pcm_blocks_queued={} quiche_queue_full={} source_queue_old={} capture_discontinuities={} last_wasapi_qpc_100ns={} udp_packets={} udp_would_block={} quic_dgram_sent={} quic_lost={}",
+                            seconds, offered, not_queued, source_chunks_too_old,
+                            assembler.discontinuities, last_capture_qpc, egress.udp_packets_sent,
+                            egress.would_block_count, stats.dgram_sent, stats.lost
+                        );
+                    } else {
                     println!(
                         "DONE Windows source duration={}s offered={} quiche_queue_full={} skipped_source={} udp_packets={} udp_would_block={} quic_dgram_sent={} quic_lost={}",
                         seconds, offered, not_queued, skipped_source_blocks,
                         egress.udp_packets_sent, egress.would_block_count, stats.dgram_sent, stats.lost
                     );
+                    }
                     return Ok(());
                 }
             }
         }
 
-        let source_wake = origin.and_then(|start| {
+        let source_wake = if capture.is_some() { None } else { origin.and_then(|start| {
             if start.elapsed() >= run_for { None }
             else { start.checked_add(SYNTHETIC_BLOCK.saturating_mul(next_sequence.min(u32::MAX as u64) as u32)) }
-        });
+        }) };
         let quic_wake = conn.as_ref().and_then(|c| c.timeout_instant());
         let wake = deadline(&[
             next_deadline(quic_wake, egress.deadline(), source_wake),
