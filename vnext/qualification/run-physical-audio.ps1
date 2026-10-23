@@ -7,6 +7,7 @@ param(
     [Parameter(Mandatory=$true)][string]$AndroidNativeSo,
     [ValidatePattern('^f[01]c[01]r[01]$')][string]$Modes = 'f1c1r1',
     [switch]$Strict,
+    [switch]$VerifyOnly,
     [ValidateRange(10,1800)][int]$Seconds = 1800,
     [string]$WindowsIP = '192.168.2.107',
     [string]$PhoneIP = '192.168.2.114',
@@ -17,6 +18,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 if ($Strict -and $Modes -ne 'f0c0r0') { throw 'Strict PCM verification requires f0c0r0 (no DSP or fade)' }
+if ($Strict -and $VerifyOnly) { throw 'Choose either Strict AAudio verification or silent VerifyOnly, not both' }
 $stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
 $folder = Join-Path $EvidenceRoot ($stamp + '-' + ($Profile -replace '[^\w-]','_') + '-' + $Modes)
 New-Item -ItemType Directory -Force -Path $folder | Out-Null
@@ -51,6 +53,7 @@ $events = @(
     'profile=' + $Profile,
     'modes=' + $Modes,
     'strict_pcm=' + [bool]$Strict,
+    'verify_only_no_aaudio=' + [bool]$VerifyOnly,
     'duration_seconds=' + $Seconds,
     'endpoint_id=' + $EndpointId,
     'windows_ip=' + $WindowsIP,
@@ -174,9 +177,15 @@ try {
     # Operator performs >=15 Brave window restorations at minutes 5/20
     # when running the preregistered loaded profile; record exact times
     # in session.txt. This script does NOT claim those actions occurred.
-    $verb = if ($Strict) { 'client-playback-strict' } else { 'client-playback-modes' }
-    $modeArg = if ($Strict) { '' } else { $Modes + ' ' }
-    $cmd = 'LD_LIBRARY_PATH=/data/local/tmp /data/local/tmp/deskfuse-vnext-continuous ' + $verb + ' ' + $WindowsIP + ':48235 /data/local/tmp/df-lab-ca.pem /data/local/tmp/df-lab-client.pem /data/local/tmp/df-lab-client.key /data/local/tmp/libdeskfuse_android_audio.so ' + $modeArg + $Seconds
+    # VerifyOnly receives and validates actual authenticated source PCM
+    # but never loads the native AAudio renderer and cannot emit phone audio.
+    $verb = if ($VerifyOnly) { 'client-capture' } elseif ($Strict) { 'client-playback-strict' } else { 'client-playback-modes' }
+    $modeArg = if ($Strict -or $VerifyOnly) { '' } else { $Modes + ' ' }
+    $rendererArg = if ($VerifyOnly) { '' } else { '/data/local/tmp/libdeskfuse_android_audio.so ' }
+    $cmd = 'LD_LIBRARY_PATH=/data/local/tmp /data/local/tmp/deskfuse-vnext-continuous ' + $verb + ' ' + $WindowsIP + ':48235 /data/local/tmp/df-lab-ca.pem /data/local/tmp/df-lab-client.pem /data/local/tmp/df-lab-client.key ' + $rendererArg + $modeArg + $Seconds
+    if ($VerifyOnly) {
+        Write-Host 'VERIFY ONLY: Android validates incoming QUIC PCM but NEVER starts AAudio. No Xiaomi speaker playback.'
+    }
     # Android Rust emits normal diagnostics on stderr. Windows PowerShell
     # 5.1 must not terminate on those lines under ErrorActionPreference=Stop.
     # The helper still returns the REAL adb/remote process exit code.
@@ -204,3 +213,4 @@ try {
 }
 Write-Host ('Evidence folder: ' + $folder)
 Write-Host 'No endpoint routing or installed driver was changed.'
+if ($VerifyOnly) { Write-Host 'This is silent transport diagnosis, NOT an audible or acoustic qualification.' }
