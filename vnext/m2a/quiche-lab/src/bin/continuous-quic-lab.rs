@@ -799,12 +799,49 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
             for _ in 0..16 {
                 match speaker.pop_snapshot()
                     .map_err(|e| format!("AAudio off-callback telemetry: {e}"))? {
-                    Some(record) => {
-                        latest_render_record = Some(record);
+                    Some((record, dropped)) => {
+                        if record.invalidations > last_handled_invalidation {
+                            last_handled_invalidation = record.invalidations;
+                            if anchor_pending.is_none() &&
+                                authenticated_at.is_some_and(|at|
+                                    at.elapsed() <
+                                    Duration::from_secs(seconds.saturating_sub(1))) {
+                                if let Some(context) = session_context {
+                                    begin_fresh_anchor(
+                                        &mut anchor_pending, &mut fresh_anchor_nonce,
+                                        // The actual audio callback already
+                                        // requested recovery. A second ticket
+                                        // from the connection owner is safe:
+                                        // both coalesce into one callback flush.
+                                        &mut audio.as_mut().expect("authenticated playback"),
+                                        context, ingress_frontier.floor(),
+                                    )?;
+                                    recover_started += 1;
+                                }
+                            }
+                        }
+                        latest_render_record = Some((record, dropped));
                         coherent_records_read += 1;
                     }
                     None => break,
                 }
+            }
+        }
+        if let Some(ref mut pending) = anchor_pending {
+            let now = Instant::now();
+            if now.duration_since(pending.started) >=
+                Duration::from_millis(fresh_anchor::TIMEOUT_MS) {
+                return Err(format!(
+                    "authenticated post-recovery source anchor timed out nonce={} floor={}",
+                    pending.challenge.nonce, pending.challenge.frame
+                ).into());
+            }
+            if pending.confirmed.is_none() && now >= pending.retry_at {
+                match conn.dgram_send(&pending.challenge.encode()) {
+                    Ok(()) | Err(quiche::Error::Done) => {}
+                    Err(e) => return Err(format!("Android source anchor request: {e:?}").into()),
+                }
+                pending.retry_at = now + Duration::from_millis(fresh_anchor::RETRY_MS);
             }
         }
         egress.service(&udp, &mut conn, false)?;
@@ -836,6 +873,9 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                             record.discarded, record.concealed_outputs,
                             dropped, coherent_records_read);
                     }
+                    println!("AUDIO Android authenticated_reanchors={} outstanding_anchor={} last_receiver_frontier={}",
+                        confirmed_reanchors, anchor_pending.is_some(),
+                        ingress_frontier.floor());
                     if a.stream_error != 0 { return Err(format!("AAudio stream failure code={}", a.stream_error).into()); }
                     if a.rendered_frames == 0 { return Err("AAudio played no authenticated PCM frames".into()); }
                 }
@@ -849,7 +889,15 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
         let until = authenticated_at
             .map(|at| at + Duration::from_secs(seconds + 2))
             .unwrap_or(started_waiting + CONNECT_LIMIT);
-        let wake = next_deadline(conn.timeout_instant(), egress.deadline(), Some(until));
+        let recovery_wake = anchor_pending.as_ref().map(|pending| {
+            let timeout = pending.started + Duration::from_millis(fresh_anchor::TIMEOUT_MS);
+            if pending.confirmed.is_some() { timeout }
+            else { timeout.min(pending.retry_at) }
+        });
+        let wake = next_deadline(
+            next_deadline(conn.timeout_instant(), egress.deadline(), Some(until)),
+            recovery_wake, None
+        );
         let ready: Readiness = wait_udp(&udp, egress.needs_write_readiness(), wake)?;
         if ready.writable {
             egress.service(&udp, &mut conn, true)?;
