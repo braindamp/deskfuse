@@ -89,7 +89,8 @@ foreach ($test in $matrix) {
 $script:modeCapable=$false
 $script:played=@()
 RunSuite 'Quick'
-if (@($script:played | Where-Object { $_ -ne 'reference/f1c1r1' -and $_ -ne 'candidate/f1c1r1' }).Count -ne 0) {
+$unexpected=@($script:played | Where-Object { $_ -ne 'reference/f1c1r1' -and $_ -ne 'candidate/f1c1r1' })
+if ($unexpected.Count -ne 0) {
     throw 'Old candidate suite incorrectly requested unsupported processing flags'
 }
 Write-Host 'PASS: older candidate reverts to native audible-only comparison, never inventing supported flags'
