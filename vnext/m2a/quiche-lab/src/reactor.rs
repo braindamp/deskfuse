@@ -48,11 +48,28 @@ impl Egress {
         conn: &mut quiche::Connection,
         writable: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        self.service_with_hook(socket, conn, writable, |_| Ok(()))
+    }
+
+    /// The hook runs IMMEDIATELY before *every* quiche::Connection::send()
+    /// construction attempt. For PCM, it purges expired queued plaintext using
+    /// quiche's supported dgram_purge_outgoing. It is never called while
+    /// ciphertext is occupying the one sealed slot; subsequent code cannot
+    /// construct another packet behind blocked/sealed ciphertext.
+    pub fn service_with_hook(
+        &mut self,
+        socket: &UdpSocket,
+        conn: &mut quiche::Connection,
+        writable: bool,
+        mut before_construct: impl FnMut(&mut quiche::Connection)
+            -> Result<(), Box<dyn std::error::Error>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         if self.blocked && !writable {
             return Ok(());
         }
         for _ in 0..MAX_BURST {
             if self.pending.is_none() {
+                before_construct(conn)?;
                 let mut buf = [0u8; MAX_QUIC_UDP_BYTES];
                 let (len, info) = match conn.send(&mut buf) {
                     Ok(packet) => packet,
