@@ -417,10 +417,11 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                 if let Some(ref speaker) = audio {
                     let a = speaker.snapshot().map_err(|e| format!("AAudio stats: {e}"))?;
                     println!(
-                        "AUDIO Android speaker accepted_frames={} rendered_frames={} silence_frames={} overflow_packets={} queue_full_from_receiver={} callbacks={} queued_frames={} stream_error={} format={}Hz/{}ch",
+                        "AUDIO Android speaker accepted_frames={} rendered_frames={} silence_frames={} overflow_packets={} queue_full_from_receiver={} callbacks={} queued_frames={} stream_error={} format={}Hz/{}ch drift_ppm={} underrun_events={} reprime_events={}",
                         a.accepted_frames, a.rendered_frames, a.silence_frames,
                         a.overflow_packets, audio_queue_full, a.callback_count,
-                        a.queued_frames, a.stream_error, a.actual_sample_rate, a.actual_channels
+                        a.queued_frames, a.stream_error, a.actual_sample_rate, a.actual_channels,
+                        a.drift_correction_ppm, a.underrun_events, a.reprime_events
                     );
                     if a.stream_error != 0 { return Err(format!("AAudio stream failure code={}", a.stream_error).into()); }
                     if a.rendered_frames == 0 { return Err("AAudio played no authenticated PCM frames".into()); }
