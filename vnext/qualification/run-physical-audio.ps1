@@ -69,9 +69,108 @@ if ($LASTEXITCODE -ne 0) { throw 'Android QUIC executable push failed' }
 if ($LASTEXITCODE -ne 0) { throw 'Android AAudio native library push failed' }
 & adb shell chmod 700 /data/local/tmp/deskfuse-vnext-continuous
 if ($LASTEXITCODE -ne 0) { throw 'Android executable chmod failed' }
-& adb shell 'sha256sum /data/local/tmp/deskfuse-vnext-continuous /data/local/tmp/libdeskfuse_android_audio.so' |
-    Tee-Object -FilePath (Join-Path $folder 'android-sha256.txt')
-if ($LASTEXITCODE -ne 0) { throw 'Android remote hash verification failed' }
+$remoteHashOutput = @(& adb shell 'sha256sum /data/local/tmp/deskfuse-vnext-continuous /data/local/tmp/libdeskfuse_android_audio.so')
+if ($LASTEXITCODE -ne 0) { throw 'Android remote hash query failed' }
+$remoteHashOutput | Set-Content -LiteralPath (Join-Path $folder 'android-sha256.txt') -Encoding UTF8
+$remoteHashes = @{}
+foreach ($line in $remoteHashOutput) {
+    if ($line -notmatch '^([0-9a-fA-F]{64})\s+(/data/local/tmp/[^\s]+)
+$serverOut = Join-Path $folder 'windows-source.stdout.txt'
+$serverErr = Join-Path $folder 'windows-source.stderr.txt'
+$clientLog = Join-Path $folder 'android-receiver.txt'
+$sourceArgs = @('server-wasapi',($WindowsIP + ':48235'),$PhoneIP,
+    (Join-Path $KeysDir 'ca.pem'),(Join-Path $KeysDir 'server.pem'),
+    (Join-Path $KeysDir 'server.key'),$capture,$EndpointId,([string]$Seconds))
+$proc = Start-Process -FilePath $source -ArgumentList $sourceArgs -RedirectStandardOutput $serverOut -RedirectStandardError $serverErr -WorkingDirectory (Join-Path $LabRoot 'vnext\m2a\quiche-lab') -NoNewWindow -PassThru
+$observer = $null
+try {
+    # Require the actual QUIC listener before connecting the phone.
+    # The loop is startup orchestration, NOT an audio send/presentation timer.
+    $startupDeadline = [DateTime]::UtcNow.AddSeconds(12)
+    $ready = $false
+    while ([DateTime]::UtcNow -lt $startupDeadline) {
+        $proc.Refresh()
+        if ($proc.HasExited) {
+            throw ('Windows source exited before READY, code=' + $proc.ExitCode)
+        }
+        if ((Test-Path -LiteralPath $serverOut) -and
+            (Select-String -LiteralPath $serverOut -Pattern '^READY continuous Windows source ' -Quiet)) {
+            $ready = $true
+            break
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    if (-not $ready) { throw 'Windows source did not report READY within 12s; phone not started' }
+    'sender_ready_utc=' + (Get-Date).ToUniversalTime().ToString('o') |
+        Add-Content -LiteralPath $manifest
+
+    # A local, low-frequency observer records real PC load/Brave presence.
+    # It does not press keys, restore windows, drive audio or claim that
+    # required operator actions happened.
+    $observer = Start-Job -ArgumentList $folder, $Seconds -ScriptBlock {
+        param([string]$saveFolder, [int]$duration)
+        $outFile = Join-Path $saveFolder 'host-resource-samples.csv'
+        'utc,source_rss_bytes,source_cpu_seconds,brave_process_count,brave_rss_bytes' |
+            Set-Content -LiteralPath $outFile -Encoding UTF8
+        $end = [DateTime]::UtcNow.AddSeconds($duration + 12)
+        while ([DateTime]::UtcNow -lt $end) {
+            $sourceProcesses = @(Get-Process -Name 'continuous-quic-lab' -ErrorAction SilentlyContinue)
+            $braveProcesses = @(Get-Process -Name brave -ErrorAction SilentlyContinue)
+            $sourceRss = ($sourceProcesses | Measure-Object -Property WorkingSet64 -Sum).Sum
+            $sourceCpu = ($sourceProcesses | Measure-Object -Property CPU -Sum).Sum
+            $braveRss = ($braveProcesses | Measure-Object -Property WorkingSet64 -Sum).Sum
+            ('{0},{1},{2},{3},{4}' -f
+                [DateTime]::UtcNow.ToString('o'),
+                [long]$sourceRss, [double]$sourceCpu,
+                $braveProcesses.Count, [long]$braveRss) |
+                Add-Content -LiteralPath $outFile
+            Start-Sleep -Seconds 10
+        }
+    }
+    # Operator performs >=15 Brave window restorations at minutes 5/20
+    # when running the preregistered loaded profile; record exact times
+    # in session.txt. This script does NOT claim those actions occurred.
+    $verb = if ($Strict) { 'client-playback-strict' } else { 'client-playback-modes' }
+    $modeArg = if ($Strict) { '' } else { $Modes + ' ' }
+    $cmd = 'LD_LIBRARY_PATH=/data/local/tmp /data/local/tmp/deskfuse-vnext-continuous ' + $verb + ' ' + $WindowsIP + ':48235 /data/local/tmp/df-lab-ca.pem /data/local/tmp/df-lab-client.pem /data/local/tmp/df-lab-client.key /data/local/tmp/libdeskfuse_android_audio.so ' + $modeArg + $Seconds
+    & adb shell $cmd 2>&1 | Tee-Object -FilePath $clientLog
+    $exitCode = $LASTEXITCODE
+    ('client_exit=' + $exitCode) | Add-Content -LiteralPath $manifest
+    if ($exitCode -ne 0) { throw ('Android receiver exit=' + $exitCode) }
+} finally {
+    if ($null -ne $observer) {
+        Stop-Job -Job $observer -ErrorAction SilentlyContinue
+        Receive-Job -Job $observer -ErrorAction SilentlyContinue |
+            Out-File -LiteralPath (Join-Path $folder 'observer-errors.txt')
+        Remove-Job -Job $observer -Force -ErrorAction SilentlyContinue
+    }
+    if (-not $proc.HasExited) {
+        $proc.WaitForExit(12000) | Out-Null
+        if (-not $proc.HasExited) { $proc.Kill() }
+    }
+    $proc.Refresh()
+    ('sender_exit=' + $proc.ExitCode) | Add-Content -LiteralPath $manifest
+    ('end_utc=' + (Get-Date).ToUniversalTime().ToString('o')) | Add-Content -LiteralPath $manifest
+    ('brave_processes_at_end=' + @(Get-Process brave -ErrorAction SilentlyContinue).Count) | Add-Content -LiteralPath $manifest
+}
+Write-Host ('Evidence folder: ' + $folder)
+Write-Host 'No endpoint routing or installed driver was changed.'
+) {
+        throw ('Malformed Android sha256sum output; no playback started: ' + $line)
+    }
+    $remoteHashes[$Matches[2]] = $Matches[1].ToLowerInvariant()
+}
+$expectedRemoteHashes = @{
+    '/data/local/tmp/deskfuse-vnext-continuous' = (Get-FileHash -LiteralPath $android -Algorithm SHA256).Hash.ToLowerInvariant()
+    '/data/local/tmp/libdeskfuse_android_audio.so' = (Get-FileHash -LiteralPath $native -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+foreach ($remotePath in $expectedRemoteHashes.Keys) {
+    if (-not $remoteHashes.ContainsKey($remotePath) -or
+        $remoteHashes[$remotePath] -cne $expectedRemoteHashes[$remotePath]) {
+        throw ('Android binary SHA256 mismatch; refusing to start source for ' + $remotePath)
+    }
+}
+'android_pair_sha256_verified=true' | Add-Content -LiteralPath $manifest
 $serverOut = Join-Path $folder 'windows-source.stdout.txt'
 $serverErr = Join-Path $folder 'windows-source.stderr.txt'
 $clientLog = Join-Path $folder 'android-receiver.txt'
