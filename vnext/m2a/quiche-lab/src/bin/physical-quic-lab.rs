@@ -1,4 +1,4 @@
-//! M2a hardware gate: authenticated Windows listener and Android ARM64 client.
+//! M2a hardware gate: Windows sends indexed PCM; Android ARM64 verifies and echoes.
  //! Separate command-line lab, NOT an APK or a production network service.
  //! No audio capture or playback. Source-indexed PCM test data only.
 use deskfuse_quiche_lab::{encode, parse, Configuration, Header, HEADER_BYTES, KIND_AUDIO, VERSION};
@@ -112,10 +112,8 @@ fn client(server: SocketAddr, ca: &str, cert: &str, key: &str) -> Result<()> {
     let mut conn = quiche::connect(Some("deskfuse-lab.local"), &scid, local, server, &mut cfg)?;
 
     let start = Instant::now();
-    let mut next_to_send = 0u32;
     let mut next_to_receive = 0u32;
-    let mut sent_at = start;
-    let mut rtt_sum = Duration::ZERO;
+    let mut complete: Option<Instant> = None;
     let mut authenticated = false;
     let mut input = [0u8; 65535];
     let mut datagram = [0u8; 1500];
@@ -144,46 +142,43 @@ fn client(server: SocketAddr, ca: &str, cert: &str, key: &str) -> Result<()> {
         if conn.is_established() && !authenticated {
             tls_peer_verified(&conn)?;
             authenticated = true;
-            println!("AUTH client: server CA chain and deskfuse-lab.local identity verified");
+            println!("AUTH Android: Windows server CA chain and deskfuse-lab.local identity verified");
         }
         if authenticated {
             loop {
                 match conn.dgram_recv(&mut datagram) {
                     Ok(n) => {
-                        if next_to_receive >= next_to_send {
-                            return Err("unsolicited/replayed echo".into());
+                        if next_to_receive >= PACKETS {
+                            return Err("extra/replayed DATAGRAM from Windows".into());
                         }
                         verify_packet(&datagram[..n], next_to_receive)?;
-                        rtt_sum += sent_at.elapsed();
-                        println!("RECEIVED seq={} source_frame={} bytes={}",
+                        // Android verifies authentic incoming Windows-origin
+                        // source indexes, then sends the same plaintext as
+                        // an encrypted QUIC DATAGRAM back to the Windows peer.
+                        conn.dgram_send(&datagram[..n])?;
+                        println!("ANDROID VERIFIED seq={} source_frame={} bytes={}",
                             next_to_receive, 48_000+u64::from(next_to_receive)*240, n);
                         next_to_receive += 1;
                         progressed += 1;
+                        if next_to_receive == PACKETS {
+                            complete = Some(Instant::now());
+                        }
                     }
                     Err(quiche::Error::Done) => break,
-                    Err(e) => return Err(format!("client DATAGRAM receive failed: {e:?}").into()),
+                    Err(e) => return Err(format!("Android DATAGRAM receive failed: {e:?}").into()),
                 }
-            }
-            if next_to_receive == PACKETS {
-                println!("PASS physical UDP QUIC mTLS device client: {} source-indexed DATAGRAMs returned, mean sequential roundtrip {:.2} ms",
-                    PACKETS, rtt_sum.as_secs_f64()*1000.0/f64::from(PACKETS));
-                return Ok(());
-            }
-            if next_to_send == next_to_receive && next_to_send < PACKETS {
-                let packet = test_packet(next_to_send);
-                if conn.dgram_max_writable_len().unwrap_or(0) < packet.len() {
-                    return Err("QUIC DATAGRAM limit too small".into());
-                }
-                conn.dgram_send(&packet)?;
-                sent_at = Instant::now();
-                next_to_send += 1;
-                progressed += 1;
             }
         }
         timeout(&mut conn);
+        // Flush echo of last sample packet before exiting the isolated lab.
+        // Android success proves ingress and enqueue, not Windows echo delivery.
+        if complete.is_some_and(|t| t.elapsed() >= FINISH_GRACE) {
+            println!("PASS Android received {} source-indexed Windows QUIC DATAGRAMs and queued encrypted echoes", PACKETS);
+            return Ok(());
+        }
         if progressed == 0 { thread::sleep(Duration::from_millis(2)); }
     }
-    Err(format!("client timeout: echoed {next_to_receive}/{PACKETS}; no transport-level retransmission of DATAGRAMs").into())
+    Err(format!("Android timeout: verified {next_to_receive}/{PACKETS} Windows DATAGRAMs; no retransmission of DATAGRAM payloads").into())
 }
 
 fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str) -> Result<()> {
@@ -195,8 +190,10 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str) -
     let mut conn: Option<quiche::Connection> = None;
     let mut peer: Option<SocketAddr> = None;
     let mut authenticated = false;
-    let mut next_sequence = 0u32;
-    let mut complete: Option<Instant> = None;
+    let mut next_to_send = 0u32;
+    let mut next_to_receive = 0u32;
+    let mut sent_at = Instant::now();
+    let mut rtt_sum = Duration::ZERO;
     let start = Instant::now();
     let mut input = [0u8; 65535];
     let mut datagram = [0u8; 1500];
@@ -239,40 +236,48 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str) -
             if c.is_established() && !authenticated {
                 tls_peer_verified(c)?; // MANDATORY: server never accepts anonymous client.
                 authenticated = true;
-                println!("AUTH server: CA-validated client certificate presented");
+                println!("AUTH Windows: CA-validated Android client certificate presented");
             }
             if authenticated {
                 loop {
                     match c.dgram_recv(&mut datagram) {
                         Ok(n) => {
-                            if next_sequence >= PACKETS {
-                                return Err("extra/replayed DATAGRAM".into());
+                            if next_to_receive >= next_to_send {
+                                return Err("unsolicited/replayed Android echo".into());
                             }
-                            verify_packet(&datagram[..n], next_sequence)?;
-                            c.dgram_send(&datagram[..n])?;
-                            println!("VERIFIED seq={} source_frame={} bytes={}",
-                                next_sequence, 48_000+u64::from(next_sequence)*240, n);
-                            next_sequence += 1;
+                            verify_packet(&datagram[..n], next_to_receive)?;
+                            rtt_sum += sent_at.elapsed();
+                            println!("WINDOWS ECHO seq={} source_frame={} bytes={}",
+                                next_to_receive, 48_000+u64::from(next_to_receive)*240, n);
+                            next_to_receive += 1;
                             progressed += 1;
-                            if next_sequence == PACKETS { complete = Some(Instant::now()); }
                         }
                         Err(quiche::Error::Done) => break,
-                        Err(e) => return Err(format!("server DATAGRAM receive failed: {e:?}").into()),
+                        Err(e) => return Err(format!("Windows DATAGRAM receive failed: {e:?}").into()),
                     }
+                }
+                if next_to_receive == PACKETS {
+                    println!("PASS Windows sender: {} authenticated source-indexed DATAGRAM echoes returned, mean sequential QUIC roundtrip {:.2} ms",
+                        PACKETS, rtt_sum.as_secs_f64()*1000.0/f64::from(PACKETS));
+                    return Ok(());
+                }
+                if next_to_send == next_to_receive && next_to_send < PACKETS {
+                    let packet = test_packet(next_to_send);
+                    if c.dgram_max_writable_len().unwrap_or(0) < packet.len() {
+                        return Err("QUIC DATAGRAM limit too small".into());
+                    }
+                    c.dgram_send(&packet)?;
+                    sent_at = Instant::now();
+                    next_to_send += 1;
+                    progressed += 1;
                 }
             }
             progressed += flush(&socket, c)?;
             timeout(c);
         }
-        // Give the last encrypted echoed packet a short opportunity to leave,
-        // but do not claim receiver delivery from server-side send completion.
-        if complete.is_some_and(|t| t.elapsed() >= FINISH_GRACE) {
-            println!("PASS Windows listener: verified {} authenticated source-indexed DATAGRAMs and queued echoes", PACKETS);
-            return Ok(());
-        }
         if progressed == 0 { thread::sleep(Duration::from_millis(2)); }
     }
-    Err(format!("server timeout: verified {next_sequence}/{PACKETS} client DATAGRAMs").into())
+    Err(format!("Windows timeout: returned {next_to_receive}/{PACKETS} Android echoes; no retransmission of DATAGRAM payloads").into())
 }
 
 fn main() {
