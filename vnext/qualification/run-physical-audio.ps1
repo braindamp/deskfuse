@@ -6,6 +6,7 @@ param(
     [Parameter(Mandatory=$true)][string]$AndroidExecutable,
     [Parameter(Mandatory=$true)][string]$AndroidNativeSo,
     [ValidatePattern('^f[01]c[01]r[01]$')][string]$Modes = 'f1c1r1',
+    [switch]$Strict,
     [ValidateRange(10,1800)][int]$Seconds = 1800,
     [string]$WindowsIP = '192.168.2.107',
     [string]$PhoneIP = '192.168.2.114',
