@@ -120,3 +120,35 @@ cargo ndk -t arm64-v8a -P 35 build --bin android-arm64-smoke
 ```
 
 This cleanup can rebuild native BoringSSL libraries but does not affect the Windows Rust build, the existing DeskFuse app, or the Android SDK/NDK installation. If the new CMake configure still attempts Windows libraries, inspect the new `CMakeCache.txt` for `CMAKE_TOOLCHAIN_FILE`, `ANDROID_ABI`, `ANDROID_PLATFORM`, and `CMAKE_SYSTEM_NAME` before attempting any larger cleanup. Do not globally set `CMAKE_TOOLCHAIN_FILE` for unrelated native Windows builds.
+
+## Windows cargo-ndk 4.1.2 extensionless Clang workaround (provisional)
+
+The cargo-ndk v4.1.2 implementation constructs `<NDK>/toolchains/llvm/prebuilt/windows-x86_64/bin/clang` and `clang++` (without `.exe`) as target CC/CXX environment values. The boring-sys 5.3 build script forwards these values to `-DCMAKE_C_COMPILER=` and `-DCMAKE_CXX_COMPILER=`. When a second CMake configure revalidates the compiler, it can reject those extensionless paths even though `clang.exe` exists. This is **not** fixed by repeatedly removing CMake caches or switching to a Visual Studio developer shell.
+
+A narrow Windows/NTFS workaround is to add hard-link aliases to the *same* existing compiler files. Hard links avoid duplicate compiler storage and require no changes to Rust dependencies. They do modify two directory entries inside this dedicated D: NDK installation, so they should be treated as a temporary local workaround, not part of the standard SDK install.
+
+```powershell
+$bin = 'D:\Android\Sdk\ndk\30.0.16248370\toolchains\llvm\prebuilt\windows-x86_64\bin'
+foreach ($tool in @('clang','clang++')) {
+    $real = Join-Path $bin "$tool.exe"
+    $alias = Join-Path $bin $tool
+    if (-not (Test-Path -LiteralPath $real -PathType Leaf)) {
+        throw "Missing expected real NDK compiler: $real"
+    }
+    if (-not (Test-Path -LiteralPath $alias)) {
+        New-Item -ItemType HardLink -Path $alias -Target $real | Out-Null
+    }
+    if (-not (Test-Path -LiteralPath $alias)) { throw "Cannot create $alias" }
+}
+cd 'D:\Coding\DeskFuse\vnext-wp001\vnext\m2a\quiche-lab'
+$env:ANDROID_NDK_HOME='D:\Android\Sdk\ndk\30.0.16248370'
+$env:ANDROID_SDK_ROOT='D:\Android\Sdk'
+$env:CMAKE_GENERATOR='Ninja'
+cargo ndk -t arm64-v8a -P 35 build --bin android-arm64-smoke
+```
+
+Try without cleaning first; any successful native build intermediates remain available to Cargo. If a different error appears, capture its first CMake error and final build-script error rather than changing platform flags blindly. Never create Windows library stubs for `-lkernel32` / `-luser32`: that indicates the wrong target environment.
+
+After testing, the aliases can be removed **if they were created by this workaround** with `Remove-Item -LiteralPath "$bin\clang","$bin\clang++"`. Removing a hard link does not delete the original `clang.exe` / `clang++.exe`. Do not run the removal while a build is in progress.
+
+Source: upstream cargo-ndk `src/cargo.rs` (target_cc/target_cxx construction) and cloudflare/boring `boring-sys/build/main.rs` (CMake compiler argument forwarding). This exact combination still needs validation on the current Windows machine; the workaround is not yet a passed acceptance gate.
