@@ -102,8 +102,7 @@ mod tests {
             let accepted=f.ingest(context,seq,48000+u64::from(seq)*480,240).unwrap();
             assert_eq!(accepted.missing_frames,240);
             assert_eq!(accepted.missing_sequences,0);
-            assert_eq!(watch.observe(last,seq,accepted.missing_frames),
-                       seq==ContinuityWatch::LIMIT-1);
+            assert!(!watch.observe(last,seq,accepted.missing_frames));
         }
         assert_eq!(watch.repeated_gaps(),ContinuityWatch::LIMIT-1);
         let last=f.last_sequence();
