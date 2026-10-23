@@ -347,7 +347,7 @@ int wmain(int argc, wchar_t** argv) {
             else if (arg == L"--out" && i + 1 < argc) path = argv[++i];
             else if (arg == L"--seconds" && i + 1 < argc) {
                 const unsigned long n = std::stoul(argv[++i]);
-                if (n < 1 || n > 60) throw std::runtime_error("seconds must be 1..60");
+                if (n < 1 || n > 1800) throw std::runtime_error("seconds must be 1..1800");
                 seconds = static_cast<uint32_t>(n);
             } else {
                 throw std::runtime_error("usage: deskfuse-wasapi-capture --list | "
