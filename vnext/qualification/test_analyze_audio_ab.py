@@ -104,6 +104,23 @@ class ABAnalysisTests(unittest.TestCase):
                                         "mode": "client-playback-modes"}))
             self.assertIn("commit identity missing or mismatch", report.evaluate(folder)["reasons"])
 
+    def test_strict_audible_flag_is_explicit_and_supported(self):
+        with tempfile.TemporaryDirectory() as d:
+            folder = self.fixture(Path(d), current=True)
+            pair_path = folder / "pair.json"
+            pair = json.loads(pair_path.read_text())
+            pair["supports_strict"] = True
+            pair_path.write_text(json.dumps(pair))
+            run_path = folder / "run.json"
+            run = json.loads(run_path.read_text())
+            run["client_mode"] = "client-playback-strict"
+            run["processing_mode"] = "strict-f0c0r0"
+            run_path.write_text(json.dumps(run))
+            self.assertEqual(report.evaluate(folder)["status"], "OUTPUT_RECORDED_LISTENING_UNCONFIRMED")
+            pair["supports_strict"] = False
+            pair_path.write_text(json.dumps(pair))
+            self.assertIn("pair identity/mode mismatch", report.evaluate(folder)["reasons"])
+
     def test_aggregator_never_mixes_reference_and_candidate(self):
         with tempfile.TemporaryDirectory() as d:
             r1 = report.evaluate(self.fixture(Path(d) / "one", current=True))
