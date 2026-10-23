@@ -152,16 +152,26 @@ void put64(uint8_t* at, uint64_t v) {
 // This offset is provenance, not an audio-clock offset or a send timer.
 // A v1 reader MUST reject this wire version rather than misread the field.
 void write_block(HANDLE out, const Block& b) {
-    uint8_t header[kHeaderSize] = { 'D', 'F', 'W', 'C' };
+    if (b.frame_count == 0 || b.frame_count > kMaxFrames) {
+        throw std::runtime_error("invalid WASAPI writer frame count");
+    }
+    // The DFWC header and PCM payload form one contiguous pipe record.
+    // One WriteFile per 5-ms block avoids a second syscall and pipe wake.
+    // This runs on the writer thread, never on the WASAPI capture callback.
+    std::array<uint8_t, kHeaderSize + kPayloadLimit> record{};
+    uint8_t* header = record.data();
+    header[0] = 'D'; header[1] = 'F'; header[2] = 'W'; header[3] = 'C';
     put32(header + 4, 2);
     put64(header + 8, b.first_device_frame);
     put64(header + 16, b.qpc_100ns);
     put32(header + 24, b.frame_count);
     put32(header + 28, b.flags);
-    put32(header + 32, b.frame_count * kChannels * sizeof(int16_t));
+    const size_t pcm_bytes = static_cast<size_t>(b.frame_count) *
+                             kChannels * sizeof(int16_t);
+    put32(header + 32, static_cast<uint32_t>(pcm_bytes));
     put32(header + 36, b.original_packet_offset_frames);
-    write_all(out, header, sizeof(header));
-    write_all(out, b.pcm.data(), b.frame_count * kChannels * sizeof(int16_t));
+    std::memcpy(record.data() + kHeaderSize, b.pcm.data(), pcm_bytes);
+    write_all(out, record.data(), kHeaderSize + pcm_bytes);
 }
 
 
