@@ -795,6 +795,7 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
         // Consumer of coherent callback snapshots is the QUIC owner, not
         // the Android real-time thread. Bound draining work and retain only
         // the most recent complete callback record for diagnostics.
+        let mut callback_recovery_needed = false;
         if let Some(ref speaker) = audio {
             for _ in 0..16 {
                 match speaker.pop_snapshot()
@@ -802,29 +803,24 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                     Some((record, dropped)) => {
                         if record.invalidations > last_handled_invalidation {
                             last_handled_invalidation = record.invalidations;
-                            if anchor_pending.is_none() &&
-                                authenticated_at.is_some_and(|at|
-                                    at.elapsed() <
-                                    Duration::from_secs(seconds.saturating_sub(1))) {
-                                if let Some(context) = session_context {
-                                    begin_fresh_anchor(
-                                        &mut anchor_pending, &mut fresh_anchor_nonce,
-                                        // The actual audio callback already
-                                        // requested recovery. A second ticket
-                                        // from the connection owner is safe:
-                                        // both coalesce into one callback flush.
-                                        &mut audio.as_mut().expect("authenticated playback"),
-                                        context, ingress_frontier.floor(),
-                                    )?;
-                                    recover_started += 1;
-                                }
-                            }
+                            callback_recovery_needed = true;
                         }
                         latest_render_record = Some((record, dropped));
                         coherent_records_read += 1;
                     }
                     None => break,
                 }
+            }
+        }
+        if callback_recovery_needed && anchor_pending.is_none() &&
+            authenticated_at.is_some_and(|at|
+                at.elapsed() < Duration::from_secs(seconds.saturating_sub(1))) {
+            if let (Some(context), Some(ref mut speaker)) = (session_context, audio.as_mut()) {
+                begin_fresh_anchor(
+                    &mut anchor_pending, &mut fresh_anchor_nonce, speaker,
+                    context, ingress_frontier.floor(),
+                )?;
+                recover_started += 1;
             }
         }
         if let Some(ref mut pending) = anchor_pending {
