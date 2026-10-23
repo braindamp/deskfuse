@@ -51,6 +51,30 @@ Expected: AUTH at both peers; AUDIO Android native AAudio output started;
 later rendered_frames > 0. Nonzero output frames alone do not establish
 audibility; verify actual audible music and phone output route/volume.
 
+## First physical audible playback — developer observation (2026-10-23)
+
+**PASS: real Windows audio was heard from the Xiaomi handset over authenticated
+QUIC, using Windows WASAPI capture and the native Android AAudio sink.**
+Audio otherwise sounded clean; a small crackle/pop was heard during volume
+adjustments. This is developer-reported physical hardware evidence, not a
+latency, stress, or production-quality acceptance claim.
+
+For the 10-second capture / receiver observation:
+- Windows WASAPI: 480,480 frames acquired; bounded writer drops 0.
+- Windows: 1,958 PCM DATAGRAMs queued; QUIC DATAGRAM queue full 44 times.
+- Android: 1,957 PCM DATAGRAMs received; 45 missing sequence positions
+  (= 10,800 source frames). One offered DATAGRAM was not received.
+- Android AAudio: 469,680 PCM source frames accepted and rendered; 89,040
+  zero-output frames (including session boundary priming/drain), 0 native
+  ring overflows, 0 renderer errors. No measured acoustic latency yet.
+
+The source packet counters separate the 44 sender-side queue misses from
+the one additional missing receiver packet. The volume-change pop is not
+yet localized to capture gain, network gap, or Android output gain. The
+next implementation iterations prioritize timely QUIC service during
+bursty capture and click-free AAudio start/underrun behavior, followed by
+source/sink drift adaptation and Android app lifecycle integration.
+
 ## Scope and limits
 
 The C++ native ARM64 library build was verified in GitHub CI. Real hardware
