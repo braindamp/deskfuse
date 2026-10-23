@@ -15,7 +15,7 @@ use deskfuse_quiche_lab::wasapi_pipe::{self, Assembler};
 use deskfuse_quiche_lab::android_audio::{Admission, AndroidAudio};
 use deskfuse_quiche_lab::source_age::{self, AgeDecision};
 use deskfuse_quiche_lab::plaintext_expiry::{PlaintextExpiry, QueueAdmission};
-use deskfuse_quiche_lab::receive_frontier::{ReceiveFrontier, Context as SourceContext, Reject as SourceReject};
+use deskfuse_quiche_lab::receive_frontier::{ReceiveFrontier, ContinuityWatch, Context as SourceContext, Reject as SourceReject};
 use deskfuse_quiche_lab::fresh_anchor::{self, Message as AnchorMessage};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
@@ -570,6 +570,7 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
     // Strict PCM verification excludes only startup priming and shutdown,
     // never silently calls those defined silences a transport underrun.
     let mut strict_baseline: Option<(deskfuse_quiche_lab::android_audio::RenderSnapshot, u64)> = None;
+    let mut continuity_watch = ContinuityWatch::default();
     let mut source_gap_frames = 0u64;
     let mut source_concealed_frames = 0u64;
     let mut source_unconcealed_frames = 0u64;
@@ -679,6 +680,7 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                         // retired stream epoch or a previously committed
                         // source-frame interval. This irreversible frontier
                         // outlives every local AAudio re-prime.
+                        let previous_source_sequence = ingress_frontier.last_sequence();
                         let accepted = match ingress_frontier.ingest(
                             SourceContext {
                                 epoch: h.media_epoch,
@@ -711,6 +713,18 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                         source_gap_frames += accepted.missing_frames;
                         let expected = accepted.expected_source;
                         let missing = accepted.missing_frames;
+                        // A contiguous media sequence with missing source frames
+                        // means PCM was omitted BEFORE packet numbering, not
+                        // ordinary QUIC packet loss. Never manufacture half a
+                        // signal from repeated silence concealment.
+                        if continuity_watch.observe(
+                            previous_source_sequence, h.packet_sequence, missing) {
+                            return Err(format!(
+                                "SUSTAINED SOURCE CONTINUITY FAILURE: {} consecutive source gaps despite consecutive authenticated media sequences; missing_frames={} first_source_frame={} sequence={} (AAudio stopped, investigate Windows capture/reader/drop counters)",
+                                continuity_watch.repeated_gaps(), missing,
+                                h.first_source_frame, h.packet_sequence
+                            ).into());
+                        }
                         if modes.strict && missing != 0 {
                             return Err(format!(
                                 "STRICT PCM violation: authenticated source gap frames={} at={} (no concealment or skip permitted)",
