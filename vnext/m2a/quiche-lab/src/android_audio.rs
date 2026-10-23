@@ -16,6 +16,10 @@ pub struct AudioStats {
     pub stream_error: i32,
     pub actual_sample_rate: i32,
     pub actual_channels: i32,
+    // ABI version 2. Never read these from an old renderer shared library.
+    pub drift_correction_ppm: i32,
+    pub underrun_events: u64,
+    pub reprime_events: u64,
 }
 
 #[cfg(target_os = "android")]
@@ -32,6 +36,7 @@ mod native {
         fn dlclose(handle: *mut c_void) -> c_int;
     }
 
+    type AbiVersion = unsafe extern "C" fn() -> u32;
     type Open = unsafe extern "C" fn(*mut *mut c_void) -> i32;
     type Push = unsafe extern "C" fn(*mut c_void, *const i16, u32) -> i32;
     type Stats = unsafe extern "C" fn(*mut c_void, *mut AudioStats) -> i32;
@@ -58,6 +63,7 @@ mod native {
                     else { Ok(ptr) }
                 };
                 Ok::<_, String>((
+                    symbol(b"df_audio_abi_version\0")?,
                     symbol(b"df_audio_open\0")?,
                     symbol(b"df_audio_push\0")?,
                     symbol(b"df_audio_stats\0")?,
@@ -65,13 +71,21 @@ mod native {
                 ))
             })();
 
-            let (open_fn, push_fn, stats_fn, close_fn) = match functions {
+            let (version_fn, open_fn, push_fn, stats_fn, close_fn) = match functions {
                 Ok(v) => v,
                 Err(e) => {
                     unsafe { dlclose(library); }
                     return Err(e);
                 }
             };
+            let version: AbiVersion = unsafe { std::mem::transmute(version_fn) };
+            let actual_version = unsafe { version() };
+            if actual_version != 2 {
+                unsafe { dlclose(library); }
+                return Err(format!(
+                    "Android renderer ABI mismatch: expected v2, got v{actual_version}; redeploy the AAudio .so and QUIC executable together"
+                ));
+            }
             let open: Open = unsafe { std::mem::transmute(open_fn) };
             let push: Push = unsafe { std::mem::transmute(push_fn) };
             let stats: Stats = unsafe { std::mem::transmute(stats_fn) };
