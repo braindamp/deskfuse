@@ -41,13 +41,8 @@ public:
     df_audio::RenderCore core;
     std::atomic<uint32_t> modes{3};
     std::atomic<int32_t> stream_error{AAUDIO_OK};
-    // Legacy v1/v2/v3 ABI counter mirrors. The newly introduced snapshot
-    // interface is the ONLY coherent diagnostic record.
-    std::atomic<uint64_t> rendered{0}, silence{0}, callbacks{0};
-    std::atomic<uint64_t> underruns{0}, reprimes{0}, released{0}, discarded{0};
-    std::atomic<uint64_t> concealed{0}, committed_source{0};
-    std::atomic<uint32_t> fractional_phase{0}, epoch{0}, playout{0};
-    std::atomic<int32_t> ppm{0};
+    // v1/v2/v3 records remain ABI-stable; v4 is the coherent record.
+    std::atomic<uint64_t> callbacks{0};
 
     static aaudio_data_callback_result_t callback(
         AAudioStream*, void* arg, void* audio, int32_t frames) noexcept {
@@ -70,8 +65,8 @@ public:
     }
     void stats(Stats* s) noexcept {
         s->accepted_frames = core.published();
-        s->rendered_frames = rendered.load(std::memory_order_relaxed);
-        s->silence_frames = silence.load(std::memory_order_relaxed);
+        s->rendered_frames = core.legacy_rendered();
+        s->silence_frames = core.legacy_silence();
         s->overflow_packets = core.overflow();
         s->callback_count = callbacks.load(std::memory_order_relaxed);
         const uint64_t wr = core.write(), rd = core.read();
@@ -79,9 +74,9 @@ public:
         s->stream_error = stream_error.load(std::memory_order_acquire);
         s->actual_sample_rate = stream ? AAudioStream_getSampleRate(stream) : 0;
         s->actual_channels = stream ? AAudioStream_getChannelCount(stream) : 0;
-        s->drift_correction_ppm = ppm.load(std::memory_order_relaxed);
-        s->underrun_events = underruns.load(std::memory_order_relaxed);
-        s->reprime_events = reprimes.load(std::memory_order_relaxed);
+        s->drift_correction_ppm = core.legacy_ppm();
+        s->underrun_events = core.legacy_underruns();
+        s->reprime_events = core.legacy_reprimes();
     }
 };
 } // namespace
@@ -188,14 +183,14 @@ DF_EXPORT int32_t df_audio_identity_stats_v3(void* ctx, void* out) noexcept {
     if (!ctx || !out) return -1;
     auto* r = static_cast<Renderer*>(ctx);
     auto* s = static_cast<IdentityStats*>(out);
-    s->last_committed_source_frame = r->committed_source.load();
-    s->last_fraction_q32 = r->fractional_phase.load();
-    s->last_epoch = r->epoch.load();
-    s->last_generation = r->playout.load();
+    s->last_committed_source_frame = r->core.legacy_source();
+    s->last_fraction_q32 = r->core.legacy_phase();
+    s->last_epoch = r->core.legacy_epoch();
+    s->last_generation = r->core.legacy_playout();
     s->reserved = 0;
-    s->released_source_frames = r->released.load();
-    s->discarded_on_rebuffer_frames = r->discarded.load();
-    s->concealed_output_frames = r->concealed.load();
+    s->released_source_frames = r->core.legacy_released();
+    s->discarded_on_rebuffer_frames = r->core.legacy_discarded();
+    s->concealed_output_frames = r->core.legacy_concealed();
     return 0;
 }
 DF_EXPORT void df_audio_close(void* ctx) noexcept {
