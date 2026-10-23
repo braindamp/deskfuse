@@ -39,34 +39,34 @@ struct MailSlot {
 };
 class SnapshotMailbox {
 public:
-    // Callback-owned publisher; reader NEVER inspects a slot while writing.
+    // SPSC FIFOs cannot scan for "any ready" slot: slot reuse could return
+    // newer callback N+1 before older callback N. Both positions are
+    // thread-owned and advance only after a successfully published record.
     void publish(const CoreSnapshot& value) noexcept {
-        for (auto& slot : slots_) {
-            uint32_t expected = 0;
-            if (!slot.state.compare_exchange_strong(expected, 1,
-                    std::memory_order_acq_rel)) continue;
-            slot.value = value;
-            slot.state.store(2, std::memory_order_release);
+        auto& slot = slots_[next_write_ % slots_.size()];
+        if (slot.state.load(std::memory_order_acquire) != 0) {
+            dropped_.fetch_add(1, std::memory_order_relaxed);
             return;
         }
-        dropped_.fetch_add(1, std::memory_order_relaxed);
+        slot.value = value;
+        slot.state.store(2, std::memory_order_release);
+        ++next_write_;
     }
     bool pop(CoreSnapshot& result) noexcept {
-        for (auto& slot : slots_) {
-            uint32_t expected = 2;
-            if (!slot.state.compare_exchange_strong(expected, 3,
-                    std::memory_order_acq_rel)) continue;
-            result = slot.value;
-            slot.state.store(0, std::memory_order_release);
-            return true;
-        }
-        return false;
+        auto& slot = slots_[next_read_ % slots_.size()];
+        if (slot.state.load(std::memory_order_acquire) != 2) return false;
+        result = slot.value;
+        slot.state.store(0, std::memory_order_release);
+        ++next_read_;
+        return true;
     }
     uint64_t dropped() const noexcept {
         return dropped_.load(std::memory_order_relaxed);
     }
 private:
     std::array<MailSlot, 8> slots_{};
+    uint64_t next_write_ = 0; // callback-owned
+    uint64_t next_read_ = 0;  // off-callback telemetry-consumer-owned
     std::atomic<uint64_t> dropped_{0};
 };
 
