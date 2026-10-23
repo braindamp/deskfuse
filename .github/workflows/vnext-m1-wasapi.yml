@@ -35,7 +35,8 @@ jobs:
           $errorsFound = $null
           foreach ($script in @(
             'vnext/qualification/run-physical-audio.ps1',
-            'vnext/qualification/mark-audio-event.ps1'
+            'vnext/qualification/mark-audio-event.ps1',
+            'vnext/qualification/build-audio-pair.ps1'
           )) {
             $tokens = $null
             $errorsFound = $null
