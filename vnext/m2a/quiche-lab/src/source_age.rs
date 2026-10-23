@@ -77,6 +77,26 @@ mod tests {
         assert_eq!(max_source_age(), Duration::from_millis(60));
     }
     #[test]
+    fn two_240_frame_halves_can_straddle_existing_future_cutoff() {
+        // Reproduces the physical Windows failure hypothesis without
+        // changing any production eligibility, source clock or queue bounds.
+        // Both samples are associated with ONE synthetic original WASAPI
+        // GetBuffer packet; its second 240-frame half is 5 ms later.
+        let now = 2_000_000u64;
+        let first = now + 95_650; // +9.565 ms: currently admitted
+        let second = first + 240 * 10_000_000 / 48_000; // +14.565 ms
+        assert_eq!(second - first, 50_000);
+        assert_eq!(classify(now, first), AgeDecision::Fresh { age_100ns: 0 });
+        assert_eq!(classify(now, second), AgeDecision::FutureTimestamp);
+        // A different QPC observation for the second half is possible,
+        // but ordinary ~0.5-ms processing cannot bridge this cutoff.
+        assert_eq!(classify(now + 5_000, second), AgeDecision::FutureTimestamp);
+        // Preserve the hard 60-ms past-age limit during this diagnosis.
+        assert_eq!(classify(now, now - MAX_SOURCE_AGE_100NS - 1),
+                   AgeDecision::Expired);
+        assert_eq!(classify(now, 0), AgeDecision::MissingTimestamp);
+    }
+    #[test]
     fn no_silent_wraparound() {
         assert_eq!(classify(10, u64::MAX), AgeDecision::FutureTimestamp);
         assert_eq!(classify(u64::MAX, 1), AgeDecision::Expired);
