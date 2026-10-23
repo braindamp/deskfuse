@@ -9,6 +9,7 @@
 #define NOMINMAX
 #include <windows.h>
 #include <audioclient.h>
+#include <avrt.h>
 #include <mmdeviceapi.h>
 #include <functiondiscoverykeys_devpkey.h>
 #include <propvarutil.h>
@@ -52,6 +53,28 @@ class ComApartment {
 public:
     ComApartment() { check(CoInitializeEx(nullptr, COINIT_MULTITHREADED), "CoInitializeEx"); }
     ~ComApartment() { CoUninitialize(); }
+};
+
+// Best-effort MMCSS Audio registration for this exact event-driven capture
+// thread. The pipe writer remains ordinary priority; slow I/O must never
+// inherit real-time scheduling. Lack of MMCSS cannot prevent audible output.
+class AudioMmcssTask {
+public:
+    AudioMmcssTask() {
+        DWORD task_index = 0;
+        task_ = AvSetMmThreadCharacteristicsW(L"Audio", &task_index);
+        if (!task_) {
+            std::cerr << "WARN WASAPI MMCSS registration unavailable; "
+                      << "ordinary thread priority error=" << GetLastError() << "\n";
+        }
+    }
+    ~AudioMmcssTask() {
+        if (task_) AvRevertMmThreadCharacteristics(task_);
+    }
+    AudioMmcssTask(const AudioMmcssTask&) = delete;
+    AudioMmcssTask& operator=(const AudioMmcssTask&) = delete;
+private:
+    HANDLE task_ = nullptr;
 };
 
 class Handle {
@@ -377,6 +400,7 @@ void capture(IMMDeviceEnumerator& enumerator, const std::wstring& device_id,
     const auto start = std::chrono::steady_clock::now();
     std::cerr << "WASAPI capturing selected render endpoint, 48k stereo PCM16; "
               << "queue_slots=" << kQueueSlots << " duration=" << seconds << "s\n";
+    AudioMmcssTask mmcss;
     HRESULT start_result = audio->Start();
     if (FAILED(start_result)) {
         queue.finish();
