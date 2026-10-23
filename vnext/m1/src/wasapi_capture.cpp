@@ -158,6 +158,77 @@ void write_block(HANDLE out, const Block& b) {
     write_all(out, b.pcm.data(), b.frame_count * kChannels * sizeof(int16_t));
 }
 
+
+struct PacketObservation {
+    uint64_t source_frame = 0, packet_qpc100 = 0, local_qpc100 = 0;
+    uint32_t frames = 0, flags = 0;
+};
+struct PacketTimingTrace {
+    std::wstring path;
+    LARGE_INTEGER frequency{};
+    std::array<PacketObservation, 128> samples{};
+    size_t recorded = 0;
+    uint64_t eligible = 0;
+
+    PacketTimingTrace() {
+        wchar_t value[2048]{};
+        DWORD n = GetEnvironmentVariableW(L"DESKFUSE_WASAPI_PACKET_TRACE",
+                                           value, DWORD(std::size(value)));
+        if (!n) return;
+        if (n >= std::size(value)) throw std::runtime_error("packet trace path too long");
+        path.assign(value, value + n);
+        if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0)
+            throw std::runtime_error("packet trace QPC frequency unavailable");
+    }
+    void observe(UINT64 frame, UINT32 frames, UINT64 first_qpc100, DWORD flags) {
+        if (path.empty() || frames < 480) return;
+        ++eligible;
+        // No disk I/O, allocations or waits on WASAPI capture thread.
+        // Record both 240-frame halves of early and sampled original packets.
+        if (recorded == samples.size() ||
+            (eligible > 32 && eligible % 64 != 0)) return;
+        LARGE_INTEGER now{};
+        if (!QueryPerformanceCounter(&now) || now.QuadPart < 0) return;
+        const uint64_t ticks = uint64_t(now.QuadPart);
+        const uint64_t hz = uint64_t(frequency.QuadPart);
+        const uint64_t current = ticks / hz * 10'000'000ULL +
+                                 (ticks % hz) * 10'000'000ULL / hz;
+        samples[recorded++] = {frame, first_qpc100, current, frames, flags};
+    }
+    void save() const {
+        if (path.empty()) return;
+        Handle file(CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
+                                nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr));
+        if (file.get() == INVALID_HANDLE_VALUE)
+            throw std::runtime_error("cannot create original-packet timing CSV");
+        const std::string header =
+            "first_frame,packet_frames,flags,packet_qpc100,local_getbuffer_qpc100,"
+            "first_fragment_frame,first_fragment_qpc100,"
+            "second_fragment_frame,second_fragment_qpc100,"
+            "first_future_100ns,second_future_100ns\n";
+        write_all(file.get(), reinterpret_cast<const uint8_t*>(header.data()), header.size());
+        for (size_t i = 0; i < recorded; ++i) {
+            const auto& p = samples[i];
+            const uint64_t later = p.packet_qpc100 == 0 ? 0 :
+                                   p.packet_qpc100 + 240ULL * 10'000'000ULL / kSampleRate;
+            const auto first_future = int64_t(p.packet_qpc100) - int64_t(p.local_qpc100);
+            const auto second_future = int64_t(later) - int64_t(p.local_qpc100);
+            const std::string row =
+                std::to_string(p.source_frame) + "," +
+                std::to_string(p.frames) + "," + std::to_string(p.flags) + "," +
+                std::to_string(p.packet_qpc100) + "," +
+                std::to_string(p.local_qpc100) + "," +
+                std::to_string(p.source_frame) + "," +
+                std::to_string(p.packet_qpc100) + "," +
+                std::to_string(p.source_frame + 240) + "," +
+                std::to_string(later) + "," +
+                std::to_string(first_future) + "," +
+                std::to_string(second_future) + "\n";
+            write_all(file.get(), reinterpret_cast<const uint8_t*>(row.data()), row.size());
+        }
+    }
+};
+
 bool supported_mix(const WAVEFORMATEX& wf, bool& is_float) {
     if (wf.nSamplesPerSec != kSampleRate || wf.nChannels != kChannels) return false;
     const bool extensible = wf.wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
@@ -265,6 +336,7 @@ void capture(IMMDeviceEnumerator& enumerator, const std::wstring& device_id,
     check(audio->GetService(__uuidof(IAudioCaptureClient),
                             reinterpret_cast<void**>(reader.GetAddressOf())), "GetService capture");
 
+    PacketTimingTrace packet_trace;
     Queue queue;
     std::atomic<bool> failed{false};
     std::thread writer([&] {
@@ -312,6 +384,8 @@ void capture(IMMDeviceEnumerator& enumerator, const std::wstring& device_id,
                     check(reader->ReleaseBuffer(0), "IAudioCaptureClient::ReleaseBuffer(0)");
                     continue;
                 }
+                packet_trace.observe(device_pos, frames,
+                    (flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR) ? 0 : qpc100, flags);
                 for (UINT32 offset = 0; offset < frames; offset += kMaxFrames) {
                     Block b;
                     b.first_device_frame = device_pos + offset;
@@ -345,11 +419,16 @@ void capture(IMMDeviceEnumerator& enumerator, const std::wstring& device_id,
         std::cerr << "EARLY WASAPI capture source_frames_observed=" << observed
                   << " dropped_blocks_bounded_writer=" << queue.dropped()
                   << " writer_failed=" << failed.load() << "\n";
+        try { packet_trace.save(); }
+        catch (const std::exception& e) {
+            std::cerr << "FAIL WASAPI original-packet trace: " << e.what() << "\n";
+        }
         throw;
     }
     check(audio->Stop(), "IAudioClient::Stop");
     queue.finish();
     writer.join();
+    packet_trace.save();
     if (failed.load()) throw std::runtime_error("binary output writer failed");
     std::cerr << "DONE WASAPI capture source_frames_observed=" << observed
               << " dropped_blocks_bounded_writer=" << queue.dropped() << "\n";
