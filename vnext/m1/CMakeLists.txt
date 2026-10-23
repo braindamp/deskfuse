@@ -1,0 +1,14 @@
+cmake_minimum_required(VERSION 3.24)
+project(DeskFuseM1Wasapi LANGUAGES CXX)
+
+if(NOT WIN32)
+  message(FATAL_ERROR "M1 WASAPI capture is a Windows-only platform adapter")
+endif()
+
+add_executable(deskfuse-wasapi-capture src/wasapi_capture.cpp)
+target_compile_features(deskfuse-wasapi-capture PRIVATE cxx_std_20)
+target_compile_definitions(deskfuse-wasapi-capture PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_link_libraries(deskfuse-wasapi-capture PRIVATE ole32 uuid propsys avrt)
+if(MSVC)
+  target_compile_options(deskfuse-wasapi-capture PRIVATE /W4 /permissive- /EHsc)
+endif()
