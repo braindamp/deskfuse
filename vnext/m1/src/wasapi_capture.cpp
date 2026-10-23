@@ -63,6 +63,10 @@ public:
     Handle(const Handle&) = delete;
     Handle& operator=(const Handle&) = delete;
     [[nodiscard]] HANDLE get() const { return value_; }
+    void reset(HANDLE v) {
+        if (value_ && value_ != INVALID_HANDLE_VALUE) CloseHandle(value_);
+        value_ = v;
+    }
 private:
     HANDLE value_;
 };
@@ -366,7 +370,7 @@ int wmain(int argc, wchar_t** argv) {
             if (out == INVALID_HANDLE_VALUE) {
                 throw std::runtime_error("refusing overwrite or cannot create capture file");
             }
-            file = Handle(out);
+            file.reset(out);
         }
         if (!out || out == INVALID_HANDLE_VALUE) throw std::runtime_error("invalid output handle");
         capture(*enumerator.Get(), device_id, out, seconds);
