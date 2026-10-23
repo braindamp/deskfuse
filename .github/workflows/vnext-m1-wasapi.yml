@@ -1,0 +1,26 @@
+name: vNext M1 native WASAPI capture build
+
+on:
+  push:
+    branches:
+      - feature/vnext-wp001-native-lab
+    paths:
+      - 'vnext/m1/**'
+      - '.github/workflows/vnext-m1-wasapi.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-capture:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure native C++20 Windows capture
+        shell: pwsh
+        run: cmake -S vnext/m1 -B vnext/m1/build -G "Visual Studio 17 2022" -A x64
+      - name: Build endpoint-selectable WASAPI adapter
+        shell: pwsh
+        run: cmake --build vnext/m1/build --config Release --parallel 2
