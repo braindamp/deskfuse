@@ -608,6 +608,14 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                                 // post-request capture anchor.
                                 continue;
                             }
+                            // Advance the irreversible source frontier
+                            // to the server's *post-request* fresh observation.
+                            // Old dropped playback intervals must never be
+                            // synthesized back into the newly primed ring.
+                            ingress_frontier.accept_fresh_anchor(
+                                pending.confirmed.expect("fresh and applied above")
+                            ).map_err(|e|
+                                format!("recovery anchor rolled source frontier backward: {e:?}"))?;
                             anchor_pending = None;
                             confirmed_reanchors += 1;
                         }
