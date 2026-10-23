@@ -51,7 +51,10 @@ public:
     bool primed = false;
     bool has_primed = false;
     uint32_t fade_in_remaining = kFadeFrames; // callback thread only
-    df_audio::DriftFollower follower; // AAudio callback exclusively owns drift correction
+    df_audio::DriftFollower follower; // experimental linear comparator
+    // Bits: 0=fade, 1=linear resampling. Bit 2 concealment belongs
+    // exclusively to the Rust receiver, which owns source-frame gaps.
+    std::atomic<uint32_t> diagnostic_modes{3};
 
     std::atomic<uint64_t> accepted_frames{0};
     std::atomic<uint64_t> rendered_frames{0};
@@ -96,24 +99,39 @@ public:
             }
         }
 
-        // Occupancy-based drift adaptation is deliberately gentle, bounded to
-        // +/-400 ppm, and integrates only on the Android output callback.
-        // AAudio's real output demand defines requested, NOT sender pacing.
-        const uint64_t step_q32 = self->follower.step(ready);
-        self->current_correction_ppm.store(self->follower.ppm, std::memory_order_relaxed);
-
+        const uint32_t modes = self->diagnostic_modes.load(std::memory_order_acquire);
         uint64_t produced = 0;
-        while (produced < requested && wr - rd >= 2) {
-            self->follower.consume_one(
-                self->ring.data(), rd,
-                output + static_cast<size_t>(produced) * kChannels, step_q32);
-            ++produced;
+        if ((modes & 2u) != 0) {
+            // Historical elapsed-callback-dependent linear comparator only;
+            // neither controller nor interpolator qualifies as production ASRC.
+            const uint64_t step_q32 = self->follower.step(ready);
+            self->current_correction_ppm.store(self->follower.ppm, std::memory_order_relaxed);
+            while (produced < requested && wr - rd >= 2) {
+                self->follower.consume_one(
+                    self->ring.data(), rd,
+                    output + static_cast<size_t>(produced) * kChannels,
+                    step_q32);
+                ++produced;
+            }
+        } else {
+            // 1:1 no-resampling diagnostic, preserving source frame spacing.
+            // The Q32 phase is intentionally reset by configure-before-media.
+            produced = std::min(requested, ready);
+            const uint64_t pos = rd % kCapacityFrames;
+            const uint64_t first = std::min(produced, kCapacityFrames - pos);
+            if (first) std::memcpy(output, self->ring.data() + pos * kChannels,
+                                   static_cast<size_t>(first) * kChannels * sizeof(int16_t));
+            if (produced > first)
+                std::memcpy(output + first * kChannels, self->ring.data(),
+                            static_cast<size_t>(produced - first) * kChannels * sizeof(int16_t));
+            rd += produced;
+            self->current_correction_ppm.store(0, std::memory_order_relaxed);
         }
 
         // The first and final few output frames are multiplied by a bounded
         // gain ramp to reduce abrupt edges. Do not change already committed
         // audio, real WASAPI source identity, or any QUIC send deadline.
-        if (self->fade_in_remaining && produced) {
+        if ((modes & 1u) != 0 && self->fade_in_remaining && produced) {
             const auto ramp = std::min<uint64_t>(produced, self->fade_in_remaining);
             const uint32_t begun = kFadeFrames - self->fade_in_remaining;
             for (uint64_t frame = 0; frame < ramp; ++frame) {
@@ -126,7 +144,7 @@ public:
             }
             self->fade_in_remaining -= static_cast<uint32_t>(ramp);
         }
-        if (produced < requested && produced) {
+        if ((modes & 1u) != 0 && produced < requested && produced) {
             const auto tail = std::min<uint64_t>(produced, kFadeFrames);
             const auto begin = produced - tail;
             for (uint64_t frame = 0; frame < tail; ++frame) {
@@ -256,6 +274,16 @@ DF_EXPORT int32_t df_audio_open(void** output) noexcept {
     }
     *output = r.release();
     return AAUDIO_OK;
+}
+
+// Call once after opening native audio but BEFORE publishing the first
+// PCM block. No runtime playback mode switch or callback lock is permitted.
+DF_EXPORT int32_t df_audio_set_diagnostic_modes(void* ctx, uint32_t flags) noexcept {
+    if (!ctx || (flags & ~uint32_t{3}) != 0) return -1;
+    auto* r = static_cast<Renderer*>(ctx);
+    if (r->accepted_frames.load(std::memory_order_acquire) != 0) return -2;
+    r->diagnostic_modes.store(flags, std::memory_order_release);
+    return 0;
 }
 
 DF_EXPORT int32_t df_audio_push(void* ctx, const int16_t* pcm, uint32_t frames) noexcept {
