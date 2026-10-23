@@ -56,10 +56,8 @@ def check_session(folder: Path) -> dict:
         failures.append("Missing session artifacts: " + ", ".join(missing))
     if kv.get("android_pair_sha256_verified") != "true":
         failures.append("Android executable/native library deployment hashes not verified")
-    if not SHA256.fullmatch(kv.get("git_commit", "")):
-        # Git commit SHA is hexadecimal, but it is 40 hex chars (not SHA256).
-        if not re.fullmatch(r"[0-9a-f]{40}", kv.get("git_commit", "")):
-            failures.append("Missing exact source commit")
+    if not re.fullmatch(r"[0-9a-f]{40}", kv.get("git_commit", "")):
+        failures.append("Missing exact 40-character source commit")
     hashes = [line for line in manifest.splitlines() if line.startswith("sha256=")]
     if len(hashes) != 4 or any(not SHA256.fullmatch(line[7:71]) for line in hashes):
         failures.append("Expected exactly four local binary SHA256 entries")
@@ -73,7 +71,11 @@ def check_session(folder: Path) -> dict:
         failures.append("Authenticated Windows peer not observed")
     if line_with_prefix(phone, "AUTH Android:") is None:
         failures.append("Authenticated Android server not observed")
-    capture = line_with_prefix(windows, "DONE WASAPI capture ")
+    # Native WASAPI emits its lifecycle counters on the child stderr,
+    # inherited by the Rust QUIC source. Never report a false missing capture
+    # merely because the Rust parent redirects stdout separately.
+    capture = (line_with_prefix(err, "DONE WASAPI capture ") or
+               line_with_prefix(windows, "DONE WASAPI capture "))
     sender = line_with_prefix(windows, "DONE Windows WASAPI source ")
     received = line_with_prefix(phone, "DONE Android sink ")
     speaker = line_with_prefix(phone, "AUDIO Android speaker ")
