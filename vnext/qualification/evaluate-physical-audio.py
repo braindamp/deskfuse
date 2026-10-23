@@ -17,6 +17,28 @@ from pathlib import Path
 
 METRIC = re.compile(r"\b([a-zA-Z_][a-zA-Z_0-9]*)=([^\s]+)")
 SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
+SOURCE_GAP = re.compile(
+    r"TRACE Android SOURCE_GAP .*?sequence=(\d+) first_source_frame=(\d+) gap_frames=(\d+)"
+)
+
+def worst_repeated_presequence_source_holes(text: str) -> int:
+    # Contiguous QUIC media sequences combined with repeated source-position
+    # jumps identify upstream PCM omissions, not UDP packet loss.
+    count = worst = 0
+    previous = None
+    for match in SOURCE_GAP.finditer(text):
+        seq, frame, missing = (int(value) for value in match.groups())
+        current = (seq, frame, missing)
+        if (previous is not None and seq == previous[0] + 1
+                and frame == previous[1] + 480 and missing == 240
+                and previous[2] == 240):
+            count += 1
+        else:
+            count = 1 if missing == 240 else 0
+        worst = max(worst, count)
+        previous = current
+    return worst
+
 REQUIRED = {
     "windows-source.stdout.txt",
     "windows-source.stderr.txt",
@@ -128,6 +150,12 @@ def check_session(folder: Path) -> dict:
         failures.append("Android did not confirm native speaker playback mode")
     if "STRICT PCM failure" in phone or "STRICT PCM violation" in phone:
         failures.append("Strict PCM verifier reported failure")
+    repeated_source_holes = worst_repeated_presequence_source_holes(phone)
+    if repeated_source_holes >= 8 or "SUSTAINED SOURCE CONTINUITY FAILURE" in phone:
+        failures.append(
+            "Sustained source-frame holes with contiguous authenticated packet sequences: "
+            "unacceptable distorted playback; investigate Windows pre-QUIC drops"
+        )
     if "panicked at" in phone or "panicked at" in windows or "panicked at" in err:
         failures.append("Runtime panic in audio session")
     duration = integer(kv, "duration_seconds")
@@ -159,6 +187,9 @@ def check_session(folder: Path) -> dict:
         "physical_acceptance": "OPEN",
         "operator_observations": events,
         "observations": {
+            "worst_contiguous_source_gap_run": repeated_source_holes,
+            "windows_pre_quic_source_gaps": integer(sender_fields,"pre_quic_source_gaps"),
+            "windows_pre_quic_missing_frames": integer(sender_fields,"pre_quic_missing_frames"),
             "windows_source_frames": integer(capture_fields, "source_frames_observed"),
             "windows_writer_drops": integer(capture_fields, "dropped_blocks_bounded_writer"),
             "windows_quic_queue_full": integer(sender_fields, "quiche_queue_full"),
