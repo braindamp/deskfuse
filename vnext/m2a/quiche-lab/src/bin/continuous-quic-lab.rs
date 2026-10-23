@@ -21,6 +21,10 @@ const ALPN: &[u8] = b"df-continuous-m2a-1";
 const AUDIO_FRAMES: u64 = 240;
 const PAYLOAD_BYTES: usize = 960;
 const APP_BYTES: usize = 1000;
+// Only short, precisely aligned source gaps are concealed by silence.
+// A longer gap is explicitly recorded; never queue hundreds of milliseconds
+// of obsolete zeros into the phone's fixed 80-ms output ring.
+const MAX_CONCEALMENT_FRAMES: u64 = 480; // two 5-ms DATAGRAMs
 const CONNECT_LIMIT: Duration = Duration::from_secs(30);
 
 fn config(ca: &str, cert: &str, key: &str) -> Result<quiche::Config> {
@@ -296,6 +300,8 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
     let mut audio: Option<AndroidAudio> = None;
     let mut last_source_frame = None;
     let mut source_gap_frames = 0u64;
+    let mut source_concealed_frames = 0u64;
+    let mut source_unconcealed_frames = 0u64;
     let mut input = [0u8; 65535];
     let mut datagram = [0u8; 1500];
 
@@ -341,10 +347,38 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                             gaps += u64::from(h.packet_sequence - last - 1);
                         }
                         if let Some(previous) = last_source_frame {
-                            if h.first_source_frame < previous + AUDIO_FRAMES {
-                                return Err("nonmonotonic or overlapping authenticated WASAPI source frames".into());
+                            let expected = previous.checked_add(AUDIO_FRAMES)
+                                .ok_or("Android source-frame index exhausted")?;
+                            if h.first_source_frame < expected {
+                                return Err("nonmonotonic or overlapping authenticated source frames".into());
                             }
-                            source_gap_frames += h.first_source_frame - (previous + AUDIO_FRAMES);
+                            let missing = h.first_source_frame - expected;
+                            source_gap_frames += missing;
+                            if missing != 0 {
+                                if let Some(ref mut speaker) = audio {
+                                    if missing <= MAX_CONCEALMENT_FRAMES && missing % AUDIO_FRAMES == 0 {
+                                        // A genuine 5- or 10-ms media hole. Preserve
+                                        // output position with bounded zero-valued PCM
+                                        // BEFORE the next valid source interval.
+                                        const ZERO_PCM: [u8; PAYLOAD_BYTES] = [0; PAYLOAD_BYTES];
+                                        for _ in 0..(missing / AUDIO_FRAMES) {
+                                            if speaker.push_pcm16(&ZERO_PCM)
+                                                .map_err(|e| format!("Android missing-frame concealment: {e}"))? {
+                                                source_concealed_frames += AUDIO_FRAMES;
+                                            } else {
+                                                audio_queue_full += 1;
+                                                source_unconcealed_frames += AUDIO_FRAMES;
+                                            }
+                                        }
+                                    } else {
+                                        // A long gap cannot be backfilled by increasing
+                                        // latency beyond the fixed phone ring capacity.
+                                        // Account for it; later renderer generation and
+                                        // drift recovery will handle this explicitly.
+                                        source_unconcealed_frames += missing;
+                                    }
+                                }
+                            }
                         }
                         last_source_frame = Some(h.first_source_frame);
                         first_sequence.get_or_insert(h.packet_sequence);
@@ -374,8 +408,10 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
             if at.elapsed() >= Duration::from_secs(seconds + 2) {
                 let stats = conn.stats();
                 println!(
-                    "DONE Android sink received={} first_seq={:?} last_seq={:?} missing_between={} source_missing_frames={} stale={} udp_packets={} quic_lost={} mode={}",
-                    received, first_sequence, last_sequence, gaps, source_gap_frames, late, egress.udp_packets_sent, stats.lost,
+                    "DONE Android sink received={} first_seq={:?} last_seq={:?} missing_between={} source_missing_frames={} concealed_frames={} unfilled_frames={} stale={} udp_packets={} quic_lost={} mode={}",
+                    received, first_sequence, last_sequence, gaps, source_gap_frames,
+                    source_concealed_frames, source_unconcealed_frames,
+                    late, egress.udp_packets_sent, stats.lost,
                     if audio.is_some() { "native-speaker" } else { "verify-only" }
                 );
                 if let Some(ref speaker) = audio {
