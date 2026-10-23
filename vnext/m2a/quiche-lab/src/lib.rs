@@ -3,6 +3,7 @@
 //! No heap allocation is needed in encode/decode.
 pub mod reactor;
 pub mod wasapi_pipe;
+pub mod android_audio;
 
 pub const HEADER_BYTES: usize = 40;
 pub const VERSION: u8 = 1;
