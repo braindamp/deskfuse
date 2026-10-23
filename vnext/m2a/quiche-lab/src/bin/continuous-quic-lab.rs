@@ -155,6 +155,9 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
     let mut invalid_source_qpc = 0u64;
     let mut future_source_qpc = 0u64;
     let mut max_observed_source_age_100ns = 0u64;
+    let mut previous_initial_qpc:Option<(u64,u64,u64,AgeDecision)> = None;
+    let mut adjacent_240_qpc_pairs=0u64;
+    let mut mixed_future_pairs=0u64;
 
     println!("READY continuous Windows source {} ; allowed phone IP {} ; mutual TLS mandatory", local, allow_ip);
     loop {
@@ -263,6 +266,7 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                                 );
                             }
                             if wasapi_pipe::queue_too_old(&chunk) {
+                                previous_initial_qpc=None;
                                 source_chunks_too_old += 1;
                                 if source_chunks_too_old<=8 || source_chunks_too_old%128==0 {
                                     eprintln!(
@@ -279,6 +283,33 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                             // timestamp errors or excessive age.
                             let qpc_now = source_age::local_qpc_100ns()?;
                             let age = source_age::classify(qpc_now, chunk.qpc_100ns);
+                            // Pure diagnostics: an adjacent QPC pair may span
+                            // a single GetBuffer packet. Match with the native
+                            // original-packet CSV by first_device_frame before
+                            // concluding both halves share an original packet.
+                            // No waiting, reordering, filtering or PCM copies.
+                            if let Some((prev_frame,prev_qpc,prev_now,prev_age))=previous_initial_qpc {
+                                if prev_frame.checked_add(AUDIO_FRAMES)==Some(chunk.device_frame)
+                                    && prev_qpc.checked_add(50_000)==Some(chunk.qpc_100ns) {
+                                    adjacent_240_qpc_pairs+=1;
+                                    let mixed=matches!(prev_age,AgeDecision::Fresh { .. })
+                                        && matches!(age,AgeDecision::FutureTimestamp);
+                                    if mixed {
+                                        mixed_future_pairs+=1;
+                                        if mixed_future_pairs<=12 || mixed_future_pairs%128==0 {
+                                            eprintln!(
+                                                "TRACE Windows ADJACENT_240_QPC_PAIR first_frame={} second_frame={} first_qpc100={} second_qpc100={} first_now_qpc100={} second_now_qpc100={} first_decision={:?} second_decision={:?} mixed_future_pairs={}",
+                                                prev_frame,chunk.device_frame,
+                                                prev_qpc,chunk.qpc_100ns,prev_now,qpc_now,
+                                                prev_age,age,mixed_future_pairs
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            previous_initial_qpc=Some((
+                                chunk.device_frame,chunk.qpc_100ns,qpc_now,age
+                            ));
                             match age {
                                 AgeDecision::Fresh { age_100ns } => {
                                     max_observed_source_age_100ns =
@@ -522,7 +553,7 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                     let stats = c.stats();
                     if capture.is_some() {
                         println!(
-                            "DONE Windows WASAPI source duration={}s real_pcm_blocks_queued={} quiche_queue_full={} source_queue_old={} qpc_expired={} qpc_invalid={} qpc_future={} qpc_max_age_100ns={} quiche_plaintext_expired={} quiche_plaintext_orphans={} quiche_plaintext_absent={} quiche_identity_high_water={} anchor_replies={} capture_discontinuities={} pre_quic_source_gaps={} pre_quic_missing_frames={} ingress_chunks={} assembled_blocks={} last_wasapi_qpc_100ns={} udp_packets={} udp_would_block={} quic_dgram_sent={} quic_lost={}",
+                            "DONE Windows WASAPI source duration={}s real_pcm_blocks_queued={} quiche_queue_full={} source_queue_old={} qpc_expired={} qpc_invalid={} qpc_future={} qpc_max_age_100ns={} quiche_plaintext_expired={} quiche_plaintext_orphans={} quiche_plaintext_absent={} quiche_identity_high_water={} anchor_replies={} capture_discontinuities={} pre_quic_source_gaps={} pre_quic_missing_frames={} ingress_chunks={} assembled_blocks={} adjacent_240_qpc_pairs={} mixed_future_pairs={} last_wasapi_qpc_100ns={} udp_packets={} udp_would_block={} quic_dgram_sent={} quic_lost={}",
                             seconds, offered, not_queued, source_chunks_too_old,
                             expired_source_qpc, invalid_source_qpc, future_source_qpc,
                             max_observed_source_age_100ns,
@@ -530,7 +561,8 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                             outstanding.absent, outstanding.high_water,
                             anchor_replies_sent, assembler.discontinuities,
                             capture_source_gaps,capture_source_missing_frames,
-                            ingress_chunks,assembled_blocks,last_capture_qpc, egress.udp_packets_sent,
+                            ingress_chunks,assembled_blocks,adjacent_240_qpc_pairs,
+                            mixed_future_pairs,last_capture_qpc, egress.udp_packets_sent,
                             egress.would_block_count, stats.dgram_sent, stats.lost
                         );
                     } else {
