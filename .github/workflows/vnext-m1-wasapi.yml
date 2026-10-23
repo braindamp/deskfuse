@@ -72,3 +72,6 @@ jobs:
       - name: Build endpoint-selectable WASAPI adapter
         shell: pwsh
         run: cmake --build vnext/m1/build --config Release --parallel 2
+      - name: Verify real-time WASAPI capture queue without an audio device
+        shell: pwsh
+        run: ctest --test-dir vnext/m1/build -C Release --output-on-failure
