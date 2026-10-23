@@ -250,7 +250,7 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
         let quic_wake = conn.as_ref().and_then(|c| c.timeout_instant());
         let wake = deadline(&[
             next_deadline(quic_wake, egress.deadline(), source_wake),
-            if origin.is_none() { Some(end_waiting) } else { origin.and_then(|x| x.checked_add(run_for)) },
+            if origin.is_none() { Some(end_waiting) } else { origin.and_then(|x| x.checked_add(run_for + Duration::from_secs(3))) },
         ]);
         let writable = egress.needs_write_readiness();
         let ready = wait_udp(&udp, writable, wake)?;
@@ -262,7 +262,7 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
     }
 }
 
-fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64) -> Result<()> {
+fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, synthetic: bool) -> Result<()> {
     let mut cfg = config(ca, cert, key)?;
     let route = UdpSocket::bind("0.0.0.0:0")?;
     route.connect(remote)?;
@@ -280,6 +280,8 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64) -> 
     let mut received = 0u64;
     let mut gaps = 0u64;
     let mut late = 0u64;
+    let mut last_source_frame = None;
+    let mut source_gap_frames = 0u64;
     let mut input = [0u8; 65535];
     let mut datagram = [0u8; 1500];
 
@@ -312,13 +314,20 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64) -> 
                     Ok(n) => {
                         let (h, _) = parse(&datagram[..n], &Configuration::default())
                             .map_err(|e| format!("Android rejected PCM header: {e:?}"))?;
-                        if n != APP_BYTES || datagram[..n] != packet(h.packet_sequence) {
-                            return Err("Android rejected PCM source-frame or payload identity".into());
+                        if n != APP_BYTES || (synthetic && datagram[..n] != packet(h.packet_sequence)) {
+                            return Err("Android rejected PCM source-frame or synthetic payload identity".into());
                         }
                         if let Some(last) = last_sequence {
                             if h.packet_sequence <= last { late += 1; continue; }
                             gaps += u64::from(h.packet_sequence - last - 1);
                         }
+                        if let Some(previous) = last_source_frame {
+                            if h.first_source_frame < previous + AUDIO_FRAMES {
+                                return Err("nonmonotonic or overlapping authenticated WASAPI source frames".into());
+                            }
+                            source_gap_frames += h.first_source_frame - (previous + AUDIO_FRAMES);
+                        }
+                        last_source_frame = Some(h.first_source_frame);
                         first_sequence.get_or_insert(h.packet_sequence);
                         last_sequence = Some(h.packet_sequence);
                         received += 1;
@@ -337,8 +346,8 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64) -> 
             if at.elapsed() >= Duration::from_secs(seconds + 2) {
                 let stats = conn.stats();
                 println!(
-                    "DONE Android sink received={} first_seq={:?} last_seq={:?} missing_between={} stale={} udp_packets={} quic_lost={} (no playback)",
-                    received, first_sequence, last_sequence, gaps, late, egress.udp_packets_sent, stats.lost
+                    "DONE Android sink received={} first_seq={:?} last_seq={:?} missing_between={} source_missing_frames={} stale={} udp_packets={} quic_lost={} (no playback)",
+                    received, first_sequence, last_sequence, gaps, source_gap_frames, late, egress.udp_packets_sent, stats.lost
                 );
                 if received == 0 { return Err("no authenticated PCM DATAGRAMs received".into()); }
                 return Ok(());
@@ -368,12 +377,19 @@ fn run() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     match args.as_slice() {
         [_, mode, bind, allow_ip, ca, cert, key, secs] if mode == "server" => {
-            server(bind.parse()?, allow_ip.parse()?, ca, cert, key, positive_seconds(secs)?)
+            server(bind.parse()?, allow_ip.parse()?, ca, cert, key, positive_seconds(secs)?, None)
         }
         [_, mode, remote, ca, cert, key, secs] if mode == "client" => {
-            client(remote.parse()?, ca, cert, key, positive_seconds(secs)?)
+            client(remote.parse()?, ca, cert, key, positive_seconds(secs)?, true)
         }
-        _ => Err("usage: continuous-quic-lab server <bind-ip:port> <allowed-phone-ip> <ca.pem> <server.pem> <server.key> <seconds> | client <windows-ip:port> <ca.pem> <client.pem> <client.key> <seconds>".into()),
+        [_, mode, bind, allow_ip, ca, cert, key, exe, device, secs] if mode == "server-wasapi" => {
+            server(bind.parse()?, allow_ip.parse()?, ca, cert, key,
+                   positive_seconds(secs)?, Some((exe, device)))
+        }
+        [_, mode, remote, ca, cert, key, secs] if mode == "client-capture" => {
+            client(remote.parse()?, ca, cert, key, positive_seconds(secs)?, false)
+        }
+        _ => Err("usage: continuous-quic-lab server <bind:port> <allowed-ip> <ca> <server-cert> <server-key> <secs> | server-wasapi <bind:port> <allowed-ip> <ca> <server-cert> <server-key> <wasapi-capture.exe> <endpoint-id|default> <secs> | client|client-capture <windows-ip:port> <ca> <client-cert> <client-key> <secs>".into()),
     }
 }
 
