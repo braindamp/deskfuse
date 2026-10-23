@@ -1,4 +1,25 @@
+# Native build artifacts (do not upload binaries or local build metadata).
 /target/
-/*.key
-/*.pem
-/*.crt
+
+# Never commit local TLS private/public identity materials or pairing secrets.
+# GitHub is public. These patterns include nested test-credential directories.
+**/*.key
+**/*.pem
+**/*.crt
+**/*.cer
+**/*.der
+**/*.p12
+**/*.pfx
+**/*.jks
+**/*.keystore
+**/*.p8
+**/*.env
+**/.env
+**/.env.*
+!.env.example
+**/secrets/
+**/.secrets/
+**/credentials/
+**/private-identities/
+
+# Debug/test secrets must be created outside the Git worktree whenever possible.
