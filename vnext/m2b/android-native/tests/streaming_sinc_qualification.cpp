@@ -20,6 +20,63 @@ static void publish(RenderCore& core, uint64_t source, int amplitude, bool conce
                 static_cast<uint8_t>(concealed)})==Admission::Accepted,"PCM admission");
 }
 static int qualify() {
+    for(uint32_t demand:{48u,240u,480u,960u,1280u}) {
+        RenderCore core;
+        uint64_t source=0;
+        for(uint32_t b=0;b<6;++b,source+=240)publish(core,source,1000);
+        std::array<int16_t,1280*kChannels> out{};
+        core.render(out.data(),demand,{false,true});
+        PlayoutState state{};
+        require(core.playout_state(state) && !state.primed &&
+            core.legacy_rendered()==0 && core.legacy_underruns()==0,
+            "1440 PREcallback frames do not establish POSTcallback target");
+        while(source<demand+kTargetFrames) {
+            publish(core,source,1000);
+            source+=240;
+        }
+        core.render(out.data(),demand,{false,true});
+        require(core.playout_state(state) && state.primed &&
+            state.queued_playable_frames+StreamingSinc::future>=kTargetFrames &&
+            core.legacy_underruns()==0,
+            "first callback leaves controller source-inventory target");
+        // Re-prime uses exactly the same condition and cannot resurrect the
+        // smaller historical startup reserve after an authenticated reset.
+        core.invalidate();
+        core.render(out.data(),demand,{false,true});
+        source+=240;
+        const uint64_t anchor=source;
+        for(uint32_t b=0;b<6;++b,source+=240)publish(core,source,1000);
+        core.render(out.data(),demand,{false,true});
+        require(core.playout_state(state) && !state.primed,
+            "re-prime does not repeat the undersized initial reserve");
+        while(source-anchor<demand+kTargetFrames) {
+            publish(core,source,1000);
+            source+=240;
+        }
+        core.render(out.data(),demand,{false,true});
+        require(core.playout_state(state) && state.primed &&
+            state.queued_playable_frames+StreamingSinc::future>=kTargetFrames &&
+            core.legacy_underruns()==0,"re-prime matches output-demand target");
+    }
+    {   // A legacy backend can request a second 20ms chunk immediately.
+        // The former 30ms PREcallback start left <10ms for that next pull.
+        RenderCore core;
+        for(uint64_t b=0;b<10;++b)publish(core,b*240,1000);
+        std::array<int16_t,960*kChannels> out{};
+        core.render(out.data(),960,{true,true});
+        core.render(out.data(),960,{true,true});
+        require(core.legacy_rendered()==1920 && core.legacy_silence()==0 &&
+            core.legacy_underruns()==0,"two consecutive20ms output pulls survive startup");
+    }
+    {   // Unsupported demand cannot grow the ring or fake the target.
+        RenderCore core;
+        for(uint64_t b=0;b<16;++b)publish(core,b*240,1000);
+        std::array<int16_t,2400*kChannels> out{};
+        core.render(out.data(),2400,{false,true});
+        PlayoutState state{};
+        require(core.playout_state(state) && !state.primed && core.read()==0 &&
+            core.write()==RenderCore::capacity,"impossible target remains bounded/unprimed");
+    }
     StreamingSinc sinc;
     double max_passband_db=0, max_phase_error=0, max_stopband=0;
     for (uint32_t phase=0;phase<64;++phase) {

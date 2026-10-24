@@ -1126,8 +1126,10 @@ impl ClientMedia {
                     presentation.aaudio_result);
                 if let Some(playout)=speaker.playout_state()
                     .map_err(|e|format!("AAudio periodic playout state: {e}"))? {
-                    println!("TRACE Android RECONSTRUCTION clipped_samples={} xrun_count={}",
-                        playout.clipped_samples,playout.xrun_count);
+                    println!("TRACE Android RECONSTRUCTION clipped_samples={} xrun_count={} last_callback_frames={} max_callback_frames={} playable_frames={} primed={}",
+                        playout.clipped_samples,playout.xrun_count,
+                        playout.last_callback_frames,playout.max_callback_frames,
+                        playout.queued_playable_frames,playout.primed);
                 }
                 if let Some((record, dropped)) = self.latest_render_record {
                     println!("TRACE Android RENDER committed_source={} support={} phase_q32={} epoch={} stream={} format={} connection={} playout={} released={} discarded={} concealed_output={} callbacks_record={} dropped_callback_records={} queued_frames={} drift_ppm={} underruns={} rebuffer={} silence_frames={} queue_full={}",

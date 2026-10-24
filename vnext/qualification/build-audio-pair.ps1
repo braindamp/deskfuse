@@ -5,7 +5,8 @@ param(
     [string]$LabRoot = 'D:\Coding\DeskFuse\vnext-wp001',
     [string]$AndroidSdk = 'D:\Android\Sdk',
     [string]$AndroidNdk = 'D:\Android\Sdk\ndk\30.0.16248370',
-    [string]$ExpectedBranch = 'feature/vnext-wp001-native-lab'
+    [string]$ExpectedBranch = 'feature/vnext-wp001-native-lab',
+    [ValidateSet('release','debug')][string]$RustProfile = 'release'
 )
 $ErrorActionPreference = 'Stop'
 if (-not (Test-Path -LiteralPath $LabRoot -PathType Container)) {
@@ -59,16 +60,24 @@ Set-Item -Path 'Env:BINDGEN_EXTRA_CLANG_ARGS_aarch64-linux-android' -Value '--ta
 
 Push-Location -LiteralPath $crate
 try {
-    & cargo build --locked --bin continuous-quic-lab
+    # Cargo resolves CARGO_TARGET_DIR (including relative paths) and any
+    # configured target-dir from this exact crate working directory.
+    $metadataText = @(& cargo metadata --locked --no-deps --format-version 1)
+    if ($LASTEXITCODE -ne 0) { throw 'Unable to resolve Cargo target directory' }
+    $cargoTarget = ($metadataText -join [Environment]::NewLine | ConvertFrom-Json).target_directory
+    if ([string]::IsNullOrWhiteSpace($cargoTarget)) { throw 'Cargo returned no target directory' }
+    $profileArgs = @()
+    if ($RustProfile -eq 'release') { $profileArgs = @('--release') }
+    & cargo build --locked --bin continuous-quic-lab --target-dir $cargoTarget @profileArgs
     if ($LASTEXITCODE -ne 0) { throw 'Windows Rust source build failed' }
-    & cargo ndk -t arm64-v8a -P 35 build --bin continuous-quic-lab --locked
+    & cargo ndk -t arm64-v8a -P 35 build --bin continuous-quic-lab --locked --target-dir $cargoTarget @profileArgs
     if ($LASTEXITCODE -ne 0) { throw 'Android ARM64 Rust transport build failed' }
 }
 finally { Pop-Location }
 
 $files = @(
-    (Join-Path $crate 'target\debug\continuous-quic-lab.exe'),
-    (Join-Path $crate 'target\aarch64-linux-android\debug\continuous-quic-lab'),
+    (Join-Path $cargoTarget ($RustProfile + '\continuous-quic-lab.exe')),
+    (Join-Path $cargoTarget ('aarch64-linux-android\' + $RustProfile + '\continuous-quic-lab')),
     (Join-Path $nativeBuild 'libdeskfuse_android_audio.so'),
     (Join-Path $LabRoot 'vnext\m1\build\deskfuse-wasapi-capture.exe')
 )
@@ -86,10 +95,21 @@ foreach ($tree in @($wasapiBuild, $nativeBuild)) {
     }
     Write-Host ('Native CMake configuration: Release (Ninja) ' + $tree)
 }
-Write-Host 'Rust Cargo configuration: debug (both Windows and Android; --locked).'
+Write-Host ('Rust Cargo configuration: ' + $RustProfile + ' (both Windows and Android; --locked).')
+Write-Host ('Cargo target directory: ' + $cargoTarget)
 Write-Host ('CP-001/MP-001 source commit: ' + $sha)
-foreach ($file in $files) {
+$receiptArtifacts = @()
+for ($i = 0; $i -lt $files.Count; ++$i) {
+    $file = $files[$i]
     $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
     Write-Host ($hash + '  ' + $file)
+    $profile = if ($i -lt 2) { $RustProfile } else { 'release' }
+    $receiptArtifacts += [pscustomobject]@{path=(Resolve-Path -LiteralPath $file).Path; sha256=$hash; profile=$profile}
 }
+$receiptPath = Join-Path $wasapiBuild 'audio-pair-build.json'
+[pscustomobject]@{
+    schema=1; source_commit=$sha; built_utc=(Get-Date).ToUniversalTime().ToString('o')
+    cargo_target_directory=$cargoTarget; artifacts=$receiptArtifacts
+} | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $receiptPath -Encoding UTF8
+Write-Host ('Hash-bound local build receipt: ' + $receiptPath)
 Write-Host 'Built locally. No device or driver was changed.'

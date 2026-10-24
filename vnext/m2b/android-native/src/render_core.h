@@ -251,8 +251,19 @@ public:
         }
         uint32_t emitted = 0;
         const uint64_t ready = wr - rd;
+        // The follower's target is inventory AFTER this callback's demand,
+        // not before it. Starting at just 1440 makes a 960-frame first pull
+        // leave only 480 source frames, a deficit the slow drift loop cannot
+        // repair promptly. No extra queue: prime to that SAME controller
+        // operating point, allowing the retained FIR history to fit too.
+        const uint64_t priming_threshold = options.linear ?
+            uint64_t(count) + kTargetFrames : prime;
+        const bool priming_fits = !options.linear ||
+            priming_threshold <= capacity-StreamingSinc::past;
         if (!primed_ && !recovery_deferred) {
-            if (ready >= prime) {
+            // Identity bypass keeps its historical fixed prebuffer; it has
+            // no occupancy controller whose operating point must be matched.
+            if (priming_fits && ready >= priming_threshold) {
                 primed_ = true;
                 if (ever_primed_) ++reprimes_;
                 ever_primed_ = true;

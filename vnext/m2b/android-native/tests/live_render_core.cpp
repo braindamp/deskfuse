@@ -269,7 +269,7 @@ int main() {
             const uint64_t authorization = core.applied_recoveries();
             expect(core.publish_guarded(fresh.data(),240,tag(2160),0)==
                    Admission::RecoverPending,"retired authorization cannot reanchor PCM");
-            for (uint32_t i=0;i<6;++i)
+            for (uint32_t i=0;i<7;++i)
                 expect(core.publish_guarded(fresh.data(),240,tag(2160+i*240),
                            authorization)==Admission::Accepted,
                        "authorized new generation primes independently");
