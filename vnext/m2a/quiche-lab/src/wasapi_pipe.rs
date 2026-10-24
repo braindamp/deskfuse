@@ -3,7 +3,8 @@
 //! Only the Windows process owns WASAPI/COM. Rust owns QUIC. Every source
 //! chunk includes device sample index and WASAPI QPC anchor. The binary
 //! pipe is local only, never a trust or authentication boundary.
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
+use crate::deferred_trace::{Event, Ledger};
 use std::net::{SocketAddr, UdpSocket};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
@@ -33,7 +34,18 @@ pub struct CaptureChunk {
 // masquerade as an ordinary end-of-stream.
 pub enum CaptureEvent {
     Chunk(CaptureChunk),
-    Finished(Result<(), String>),
+    Finished { outcome: Result<(), String>, summary: Box<ReaderSummary> },
+}
+
+pub struct ReaderSummary { pub drops:u64, trace:Ledger }
+impl Default for ReaderSummary {
+    fn default()->Self {Self {drops:0,trace:Ledger::new(8)}}
+}
+impl ReaderSummary {
+    pub fn flush(&self,out:&mut impl Write)->io::Result<()> {
+        self.trace.flush(out,17)?;
+        writeln!(out,"DONE Windows WASAPI pipe reader_queue_drops={}",self.drops)
+    }
 }
 
 pub struct CompleteBlock {
@@ -162,35 +174,31 @@ fn read_chunk(input: &mut impl Read) -> io::Result<Option<CaptureChunk>> {
 fn forward_chunks(
     input: &mut impl Read, sender: &SyncSender<CaptureEvent>,
     notifier: Option<&UdpSocket>, wake_addr: SocketAddr
-) -> (u64, Result<(), String>) {
-    let mut reader_queue_drops = 0u64;
+) -> (ReaderSummary, Result<(), String>) {
+    let mut summary = ReaderSummary::default();
     loop {
         match read_chunk(input) {
             Ok(Some(chunk)) => match sender.try_send(CaptureEvent::Chunk(chunk)) {
                 Ok(()) => {
                     if let Some(wake) = notifier {
                         if let Err(e) = wake.send_to(&[0xA1], wake_addr) {
-                            return (reader_queue_drops, Err(format!("WASAPI source wake failed: {e}")));
+                            return (summary, Err(format!("WASAPI source wake failed: {e}")));
                         }
                     }
                 }
                 Err(TrySendError::Full(event)) => {
-                    reader_queue_drops += 1;
-                    if reader_queue_drops <= 8 || reader_queue_drops % 128 == 0 {
-                        if let CaptureEvent::Chunk(dropped) = event {
-                            eprintln!(
-                                "TRACE Windows WASAPI_READER_QUEUE_DROP source_frame={} frames={} reader_queue_drops={}",
-                                dropped.device_frame, dropped.frames, reader_queue_drops
-                            );
-                        }
+                    summary.drops += 1;
+                    if let CaptureEvent::Chunk(dropped) = event {
+                        summary.trace.record(Event::ReaderDrop {frame:dropped.device_frame,
+                            frames:dropped.frames as u64,count:summary.drops});
                     }
                 } // bounded drop; never wait to send PCM from reader thread
                 Err(TrySendError::Disconnected(_)) => {
-                    return (reader_queue_drops, Err("WASAPI consumer disconnected".into()));
+                    return (summary, Err("WASAPI consumer disconnected".into()));
                 }
             },
-            Ok(None) => return (reader_queue_drops, Ok(())),
-            Err(e) => return (reader_queue_drops, Err(format!("WASAPI pipe error: {e}"))),
+            Ok(None) => return (summary, Ok(())),
+            Err(e) => return (summary, Err(format!("WASAPI pipe error: {e}"))),
         }
     }
 }
@@ -218,7 +226,7 @@ pub fn spawn(
 
     let (sender, receiver) = mpsc::sync_channel(QUEUE_SLOTS);
     thread::spawn(move || {
-        let (reader_queue_drops, mut outcome) =
+        let (summary, mut outcome) =
             forward_chunks(&mut stdout, &sender, Some(&notifier), wake_addr);
         // Do not kill a normally finishing process before its exit status is
         // available; terminate only when the pipe was invalid or owner exited.
@@ -235,17 +243,20 @@ pub fn spawn(
             }
             _ => {}
         }
-        eprintln!("DONE Windows WASAPI pipe reader_queue_drops={reader_queue_drops}");
-        if let Err(ref reason) = outcome {
-            eprintln!("FAIL Windows WASAPI capture source: {reason}");
-        }
-        // A terminal event is ordered after any queued chunks. Blocking here
-        // is safe: this is no longer the WASAPI callback or PCM read hot path.
-        // If the QUIC owner has exited, send() returns Disconnected.
-        let _ = sender.send(CaptureEvent::Finished(outcome));
-        let _ = notifier.send_to(&[0xA1], wake_addr);
+        // Ordered terminal delivery happens after child cleanup and BEFORE
+        // any diagnostic output. No writer exists on this reader path.
+        deliver_terminal(&sender, summary, outcome, Some(&notifier), wake_addr);
     });
     Ok(receiver)
+}
+
+fn deliver_terminal(sender:&SyncSender<CaptureEvent>, summary:ReaderSummary,
+                    outcome:Result<(),String>, notifier:Option<&UdpSocket>,
+                    wake_addr:SocketAddr) {
+    // Allocation and a potentially blocking terminal send are permitted only
+    // after PCM forwarding/child cleanup. No diagnostic sink is involved.
+    let _ = sender.send(CaptureEvent::Finished { outcome, summary:Box::new(summary) });
+    if let Some(notifier)=notifier {let _=notifier.send_to(&[0xA1],wake_addr);}
 }
 
 /// The read-thread timestamp is a conservative *queue residency* bound only.
@@ -306,11 +317,11 @@ mod tests {
         wire.extend(record(1, 480, 2_050_000, 240));
         let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
         let (drops, outcome) = forward_chunks(&mut Cursor::new(wire), &tx, None, addr);
-        assert_eq!(drops, 0);
+        assert_eq!(drops.drops, 0);
         assert!(outcome.unwrap_err().contains("invalid WASAPI pipe frame"));
         match rx.try_recv().unwrap() {
             CaptureEvent::Chunk(chunk) => assert_eq!(chunk.device_frame, 240),
-            CaptureEvent::Finished(_) => panic!("terminal before accepted PCM"),
+            CaptureEvent::Finished { .. } => panic!("terminal before accepted PCM"),
         }
         assert!(rx.try_recv().is_err()); // incompatible PCM never forwarded
     }
@@ -327,5 +338,49 @@ mod tests {
             .is_err()); // Offset beyond 200ms capture buffer.
         assert!(read_chunk(&mut Cursor::new(record(2, 240, 100, 240)))
             .is_err()); // Origin QPC underflow not allowed.
+    }
+
+    #[test]
+    fn full_reader_queue_accounts_source_ranges_and_delivers_terminal_after_pcm() {
+        let mut wire=Vec::new();
+        for n in 0..25u64 {wire.extend(record(2,48_000+n*240,2_000_000+n*50_000,0));}
+        let (tx,rx)=mpsc::sync_channel(QUEUE_SLOTS);
+        let addr="127.0.0.1:9".parse().unwrap();
+        // No output sink exists in forwarding, even while the queue is full.
+        let (summary,outcome)=forward_chunks(&mut Cursor::new(wire),&tx,None,addr);
+        assert_eq!(summary.drops,17);
+        assert!(outcome.is_ok());
+        let terminal=thread::spawn(move||deliver_terminal(&tx,summary,outcome,None,addr));
+        for n in 0..8u64 {
+            match rx.recv().unwrap() {
+                CaptureEvent::Chunk(c)=>assert_eq!(c.device_frame,48_000+n*240),
+                _=>panic!("terminal overtook PCM"),
+            }
+        }
+        let CaptureEvent::Finished{outcome,summary}=rx.recv().unwrap() else {panic!("terminal missing")};
+        assert!(outcome.is_ok());
+        terminal.join().unwrap();
+        // Formatting happens only here, after actual terminal delivery.
+        let mut text=Vec::new();summary.flush(&mut text).unwrap();
+        let text=String::from_utf8(text).unwrap();
+        assert!(text.contains("source_frame=49920 frames=240 reader_queue_drops=1"));
+        assert!(text.contains("source_frame=53760 frames=240 reader_queue_drops=17"));
+        assert!(text.contains("total=17 retained=16 omitted=1"));
+        assert!(!text.contains("source_frame=51840 frames=240 reader_queue_drops=9"));
+        assert!(text.contains("DONE Windows WASAPI pipe reader_queue_drops=17"));
+    }
+
+    #[test]
+    fn malformed_source_error_is_delivered_with_summary_after_prior_pcm() {
+        let mut wire=record(2,48_000,2_000_000,0);
+        wire.extend(record(1,48_240,2_050_000,0));
+        let (tx,rx)=mpsc::sync_channel(QUEUE_SLOTS);
+        let addr="127.0.0.1:9".parse().unwrap();
+        let (summary,outcome)=forward_chunks(&mut Cursor::new(wire),&tx,None,addr);
+        deliver_terminal(&tx,summary,outcome,None,addr);
+        assert!(matches!(rx.recv().unwrap(),CaptureEvent::Chunk(_)));
+        let CaptureEvent::Finished{outcome,summary}=rx.recv().unwrap() else {panic!("terminal missing")};
+        assert_eq!(summary.drops,0);
+        assert!(outcome.unwrap_err().contains("invalid WASAPI pipe frame"));
     }
 }

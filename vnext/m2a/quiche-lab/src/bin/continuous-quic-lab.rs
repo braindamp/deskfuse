@@ -16,6 +16,7 @@ use deskfuse_quiche_lab::android_audio::{Admission, AndroidAudio};
 use deskfuse_quiche_lab::source_age::{self, AgeDecision};
 use deskfuse_quiche_lab::plaintext_expiry::{PlaintextExpiry, QueueAdmission};
 use deskfuse_quiche_lab::receive_frontier::{ReceiveFrontier, ContinuityWatch, Context as SourceContext, Reject as SourceReject};
+use deskfuse_quiche_lab::deferred_trace::{WindowsTrace, Event as TraceEvent, FilterStage};
 use deskfuse_quiche_lab::fresh_anchor::{self, Message as AnchorMessage};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
@@ -165,6 +166,9 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
     let mut logged_quic_accept = false;
 
     println!("READY continuous Windows source {} ; allowed phone IP {} ; mutual TLS mandatory", local, allow_ip);
+    let mut trace = WindowsTrace::default();
+    let mut reader_summary: Option<Box<wasapi_pipe::ReaderSummary>> = None;
+    let result = (|| -> Result<()> {
     loop {
         let now = Instant::now();
         if origin.is_none() && now >= end_waiting { return Err("no authenticated Android client within connection deadline".into()); }
@@ -214,8 +218,8 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                 verified(c)?;
                 origin = Some(Instant::now());
                 if let Some((capture_exe, endpoint)) = capture {
+                    println!("AUTH Windows: Android client verified; starting native WASAPI capture");
                     source = Some(wasapi_pipe::spawn(capture_exe, endpoint, seconds, local)?);
-                    println!("AUTH Windows: Android client verified; native WASAPI capture process started");
                 } else {
                     println!("AUTH Windows: Android client CA and certificate verified; starting synthetic source-clock blocks");
                 }
@@ -266,34 +270,15 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                                         capture_source_missing_frames +=
                                             chunk.device_frame - expected;
                                     }
-                                    if capture_source_gaps<=8 || capture_source_gaps%128==0 {
-                                        eprintln!(
-                                            "TRACE Windows SOURCE_INGRESS_GAP expected={} actual={} delta={} frames={} flags={} source_qpc100={} count={}",
-                                            expected,chunk.device_frame,
-                                            i128::from(chunk.device_frame)-i128::from(expected),
-                                            chunk.frames,chunk.flags,chunk.qpc_100ns,capture_source_gaps
-                                        );
-                                    }
+                                    trace.record(TraceEvent::Gap { expected: expected, actual: chunk.device_frame, frames: (chunk.frames) as u64, flags: chunk.flags, qpc: chunk.qpc_100ns, count: capture_source_gaps });
                                 }
                             }
                             next_capture_frame = chunk.device_frame.checked_add(chunk.frames as u64);
-                            if ingress_chunks<=3 || ingress_chunks%512==0 {
-                                eprintln!(
-                                    "TRACE Windows SOURCE_INGRESS ordinal={} frame={} frames={} flags={} qpc100={} original_packet_offset_frames={}",
-                                    ingress_chunks,chunk.device_frame,chunk.frames,
-                                    chunk.flags,chunk.qpc_100ns,chunk.original_packet_offset_frames
-                                );
-                            }
+                            trace.record(TraceEvent::Ingress { ordinal: ingress_chunks, frame: chunk.device_frame, frames: (chunk.frames) as u64, flags: chunk.flags, qpc: chunk.qpc_100ns, offset: chunk.original_packet_offset_frames });
                             if wasapi_pipe::queue_too_old(&chunk) {
                                 previous_initial_qpc=None;
                                 source_chunks_too_old += 1;
-                                if source_chunks_too_old<=8 || source_chunks_too_old%128==0 {
-                                    eprintln!(
-                                        "TRACE Windows SOURCE_FILTER_DROP stage=reader_residency frame={} frames={} source_qpc100={} now_qpc100={} count={}",
-                                        chunk.device_frame,chunk.frames,chunk.qpc_100ns,
-                                        source_age::local_qpc_100ns()?,source_chunks_too_old
-                                    );
-                                }
+                                trace.record(TraceEvent::Filter { stage: FilterStage::ReaderResidency, frame: chunk.device_frame, frames: (chunk.frames) as u64, qpc: chunk.qpc_100ns, now: source_age::local_qpc_100ns()?, count: source_chunks_too_old, reason: AgeDecision::Expired, sequence: None });
                                 continue;
                             }
                             // WASAPI capture QPC spans the *whole* native
@@ -312,16 +297,7 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                                 // Counts EXACTLY the native-provenanced 5ms
                                 // fragments that the former policy discarded.
                                 provenance_saved_fragments += 1;
-                                if provenance_saved_fragments<=4 ||
-                                    provenance_saved_fragments%512==0 {
-                                    eprintln!(
-                                        "TRACE Windows QPC_PROVEN_FRAGMENT_ACCEPT frame={} offset_frames={} first_frame_qpc100={} now_qpc100={} saved={}",
-                                        chunk.device_frame,
-                                        chunk.original_packet_offset_frames,
-                                        chunk.qpc_100ns,qpc_now,
-                                        provenance_saved_fragments
-                                    );
-                                }
+                                trace.record(TraceEvent::Proven { frame: chunk.device_frame, offset: chunk.original_packet_offset_frames, qpc: chunk.qpc_100ns, now: qpc_now, saved: provenance_saved_fragments });
                             }
                             // Pure diagnostics: an adjacent QPC pair may span
                             // a single GetBuffer packet. Match with the native
@@ -336,14 +312,7 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                                         && matches!(age,AgeDecision::FutureTimestamp);
                                     if mixed {
                                         mixed_future_pairs+=1;
-                                        if mixed_future_pairs<=12 || mixed_future_pairs%128==0 {
-                                            eprintln!(
-                                                "TRACE Windows ADJACENT_240_QPC_PAIR first_frame={} second_frame={} first_qpc100={} second_qpc100={} first_now_qpc100={} second_now_qpc100={} first_decision={:?} second_decision={:?} mixed_future_pairs={}",
-                                                prev_frame,chunk.device_frame,
-                                                prev_qpc,chunk.qpc_100ns,prev_now,qpc_now,
-                                                prev_age,age,mixed_future_pairs
-                                            );
-                                        }
+                                        trace.record(TraceEvent::Pair { first: prev_frame, second: chunk.device_frame, first_qpc: prev_qpc, second_qpc: chunk.qpc_100ns, first_now: prev_now, second_now: qpc_now, first_age: prev_age, second_age: age, count: mixed_future_pairs });
                                     }
                                 }
                             }
@@ -357,35 +326,17 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                                 }
                                 AgeDecision::MissingTimestamp => {
                                     invalid_source_qpc += 1;
-                                    if invalid_source_qpc<=8 || invalid_source_qpc%128==0 {
-                                        eprintln!(
-                                            "TRACE Windows SOURCE_FILTER_DROP stage=initial_qpc_missingtimestamp frame={} frames={} source_qpc100={} now_qpc100={} count={}",
-                                            chunk.device_frame,chunk.frames,chunk.qpc_100ns,
-                                            qpc_now,invalid_source_qpc
-                                        );
-                                    }
+                                    trace.record(TraceEvent::Filter { stage: FilterStage::InitialMissing, frame: chunk.device_frame, frames: (chunk.frames) as u64, qpc: chunk.qpc_100ns, now: qpc_now, count: invalid_source_qpc, reason: AgeDecision::MissingTimestamp, sequence: None });
                                     continue;
                                 }
                                 AgeDecision::FutureTimestamp => {
                                     future_source_qpc += 1;
-                                    if future_source_qpc<=8 || future_source_qpc%128==0 {
-                                        eprintln!(
-                                            "TRACE Windows SOURCE_FILTER_DROP stage=initial_qpc_futuretimestamp frame={} frames={} source_qpc100={} now_qpc100={} count={}",
-                                            chunk.device_frame,chunk.frames,chunk.qpc_100ns,
-                                            qpc_now,future_source_qpc
-                                        );
-                                    }
+                                    trace.record(TraceEvent::Filter { stage: FilterStage::InitialFuture, frame: chunk.device_frame, frames: (chunk.frames) as u64, qpc: chunk.qpc_100ns, now: qpc_now, count: future_source_qpc, reason: AgeDecision::FutureTimestamp, sequence: None });
                                     continue;
                                 }
                                 AgeDecision::Expired => {
                                     expired_source_qpc += 1;
-                                    if expired_source_qpc<=8 || expired_source_qpc%128==0 {
-                                        eprintln!(
-                                            "TRACE Windows SOURCE_FILTER_DROP stage=initial_qpc_expired frame={} frames={} source_qpc100={} now_qpc100={} count={}",
-                                            chunk.device_frame,chunk.frames,chunk.qpc_100ns,
-                                            qpc_now,expired_source_qpc
-                                        );
-                                    }
+                                    trace.record(TraceEvent::Filter { stage: FilterStage::InitialExpired, frame: chunk.device_frame, frames: (chunk.frames) as u64, qpc: chunk.qpc_100ns, now: qpc_now, count: expired_source_qpc, reason: AgeDecision::Expired, sequence: None });
                                     continue;
                                 }
                             }
@@ -395,13 +346,7 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                                 // quiche may still queue this plaintext before
                                 // later sealing; that limitation is tracked.
                                 assembled_blocks += 1;
-                                if assembled_blocks<=3 || assembled_blocks%512==0 {
-                                    eprintln!(
-                                        "TRACE Windows ASSEMBLED_PCM ordinal={} frame={} frames={} source_qpc100={} original_packet_offset_frames={}",
-                                        assembled_blocks,block.first_device_frame,AUDIO_FRAMES,
-                                        block.first_qpc_100ns,block.original_packet_offset_frames
-                                    );
-                                }
+                                trace.record(TraceEvent::Assembled { ordinal: assembled_blocks, frame: block.first_device_frame, frames: (AUDIO_FRAMES) as u64, qpc: block.first_qpc_100ns, offset: block.original_packet_offset_frames });
                                 let assembled_now_qpc=source_age::local_qpc_100ns()?;
                                 match source_age::classify_wasapi(
                                     assembled_now_qpc,
@@ -414,35 +359,17 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                                     }
                                     AgeDecision::MissingTimestamp => {
                                         invalid_source_qpc += 1;
-                                        if invalid_source_qpc<=8 || invalid_source_qpc%128==0 {
-                                            eprintln!(
-                                                "TRACE Windows SOURCE_FILTER_DROP stage=assembled_qpc_missingtimestamp frame={} frames={} source_qpc100={} now_qpc100={} count={}",
-                                                block.first_device_frame,AUDIO_FRAMES,
-                                                block.first_qpc_100ns,assembled_now_qpc,invalid_source_qpc
-                                            );
-                                        }
+                                        trace.record(TraceEvent::Filter { stage: FilterStage::AssembledMissing, frame: block.first_device_frame, frames: (AUDIO_FRAMES) as u64, qpc: block.first_qpc_100ns, now: assembled_now_qpc, count: invalid_source_qpc, reason: AgeDecision::MissingTimestamp, sequence: None });
                                         continue;
                                     }
                                     AgeDecision::FutureTimestamp => {
                                         future_source_qpc += 1;
-                                        if future_source_qpc<=8 || future_source_qpc%128==0 {
-                                            eprintln!(
-                                                "TRACE Windows SOURCE_FILTER_DROP stage=assembled_qpc_futuretimestamp frame={} frames={} source_qpc100={} now_qpc100={} count={}",
-                                                block.first_device_frame,AUDIO_FRAMES,
-                                                block.first_qpc_100ns,assembled_now_qpc,future_source_qpc
-                                            );
-                                        }
+                                        trace.record(TraceEvent::Filter { stage: FilterStage::AssembledFuture, frame: block.first_device_frame, frames: (AUDIO_FRAMES) as u64, qpc: block.first_qpc_100ns, now: assembled_now_qpc, count: future_source_qpc, reason: AgeDecision::FutureTimestamp, sequence: None });
                                         continue;
                                     }
                                     AgeDecision::Expired => {
                                         expired_source_qpc += 1;
-                                        if expired_source_qpc<=8 || expired_source_qpc%128==0 {
-                                            eprintln!(
-                                                "TRACE Windows SOURCE_FILTER_DROP stage=assembled_qpc_expired frame={} frames={} source_qpc100={} now_qpc100={} count={}",
-                                                block.first_device_frame,AUDIO_FRAMES,
-                                                block.first_qpc_100ns,assembled_now_qpc,expired_source_qpc
-                                            );
-                                        }
+                                        trace.record(TraceEvent::Filter { stage: FilterStage::AssembledExpired, frame: block.first_device_frame, frames: (AUDIO_FRAMES) as u64, qpc: block.first_qpc_100ns, now: assembled_now_qpc, count: expired_source_qpc, reason: AgeDecision::Expired, sequence: None });
                                         continue;
                                     }
                                 }
@@ -474,13 +401,7 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                                     return Err("captured packet sequence exhausted".into());
                                 }
                                 let assigned_sequence=next_sequence as u32;
-                                if next_sequence<3 || next_sequence%512==0 {
-                                    eprintln!(
-                                        "TRACE Windows SEQUENCE_ASSIGNED sequence={} frame={} frames={} source_qpc100={}",
-                                        assigned_sequence,block.first_device_frame,AUDIO_FRAMES,
-                                        block.first_qpc_100ns
-                                    );
-                                }
+                                trace.record(TraceEvent::Sequence { sequence: assigned_sequence, frame: block.first_device_frame, frames: (AUDIO_FRAMES) as u64, qpc: block.first_qpc_100ns });
                                 let pcm = captured_packet(assigned_sequence, block.first_device_frame, &block.pcm);
                                 next_sequence += 1;
                                 last_capture_qpc = block.first_qpc_100ns;
@@ -506,14 +427,7 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                                 );
                                 if !matches!(offer_age,AgeDecision::Fresh { .. }) {
                                     expired_source_qpc += 1;
-                                    if expired_source_qpc<=8 || expired_source_qpc%128==0 {
-                                        eprintln!(
-                                            "TRACE Windows SOURCE_FILTER_DROP stage=after_sequence_qpc reason={:?} sequence={} frame={} frames={} source_qpc100={} now_qpc100={} count={}",
-                                            offer_age,assigned_sequence,block.first_device_frame,
-                                            AUDIO_FRAMES,block.first_qpc_100ns,
-                                            offer_qpc_now,expired_source_qpc
-                                        );
-                                    }
+                                    trace.record(TraceEvent::Filter { stage: FilterStage::AfterSequence, reason: offer_age, sequence: Some(assigned_sequence), frame: block.first_device_frame, frames: (AUDIO_FRAMES) as u64, qpc: block.first_qpc_100ns, now: offer_qpc_now, count: expired_source_qpc });
                                     continue;
                                 }
                                 let admit_now_qpc = source_age::local_qpc_100ns()?;
@@ -523,44 +437,26 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                                 ) {
                                     Ok(QueueAdmission::Queued) => {
                                         offered += 1;
-                                        if offered<=3 || offered%512==0 {
-                                            eprintln!(
-                                                "TRACE Windows QUIC_ADMITTED sequence={} frame={} source_qpc100={} count={}",
-                                                assigned_sequence,block.first_device_frame,
-                                                block.first_qpc_100ns,offered
-                                            );
-                                        }
+                                        trace.record(TraceEvent::Admitted { sequence: assigned_sequence, frame: block.first_device_frame, qpc: block.first_qpc_100ns, count: offered });
                                         source_egress(&mut egress, &udp, c, false, &mut outstanding, capture.is_some())?;
                                     }
                                     Ok(QueueAdmission::Expired) => {
                                         expired_source_qpc += 1;
-                                        if expired_source_qpc<=8 || expired_source_qpc%128==0 {
-                                            eprintln!(
-                                                "TRACE Windows SOURCE_FILTER_DROP stage=quiche_admit_expired reason={:?} sequence={} frame={} frames={} source_qpc100={} now_qpc100={} count={}",
-                                                source_age::classify_wasapi(admit_now_qpc,block.first_qpc_100ns,
-                                                    block.original_packet_offset_frames),
-                                                assigned_sequence,block.first_device_frame,
-                                                AUDIO_FRAMES,block.first_qpc_100ns,
-                                                admit_now_qpc,expired_source_qpc
-                                            );
-                                        }
+                                        trace.record(TraceEvent::Filter { stage: FilterStage::AdmitExpired, reason: source_age::classify_wasapi(admit_now_qpc,block.first_qpc_100ns,
+                                                    block.original_packet_offset_frames), sequence: Some(assigned_sequence), frame: block.first_device_frame, frames: (AUDIO_FRAMES) as u64, qpc: block.first_qpc_100ns, now: admit_now_qpc, count: expired_source_qpc });
                                     }
                                     Ok(QueueAdmission::Full) => {
                                         not_queued += 1;
                                         // Source frame is the cross-machine key;
                                         // clocks are NOT assumed synchronized.
-                                        if not_queued <= 4 || not_queued % 16 == 0 {
-                                            eprintln!("TRACE Windows QUIC_QUEUE_DROP sequence={} source_frame={} qpc100={} count={} age_max_100ns={}",
-                                                assigned_sequence,block.first_device_frame,
-                                                block.first_qpc_100ns,not_queued,
-                                                max_observed_source_age_100ns);
-                                        }
+                                        trace.record(TraceEvent::QueueDrop { sequence: assigned_sequence, frame: block.first_device_frame, qpc: block.first_qpc_100ns, count: not_queued, age_max: max_observed_source_age_100ns });
                                     }
                                     Err(e) => return Err(format!("captured PCM QUIC enqueue: {e:?}").into()),
                                 }
                             }
                         }
-                        Ok(CaptureEvent::Finished(outcome)) => {
+                        Ok(CaptureEvent::Finished { outcome, summary }) => {
+                            reader_summary = Some(summary);
                             if let Err(reason) = outcome {
                                 return Err(format!("native WASAPI source failed: {reason}").into());
                             }
@@ -670,6 +566,25 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
             }
         }
     }
+    })();
+    // The reactor is quiescent. No diagnostic writer is reachable from the
+    // live owner/reader paths above. Dropping an unfinished source does not
+    // synchronously join its child; report missing summary honestly.
+    let incomplete_reader = source.is_some() && reader_summary.is_none();
+    drop(source.take());
+    let flush_result = (|| -> io::Result<()> {
+        let mut out = io::stderr().lock();
+        trace.flush(&mut out)?;
+        if let Some(summary) = reader_summary { summary.flush(&mut out)?; }
+        else if incomplete_reader {
+            use std::io::Write;
+            writeln!(out,"TRACE Windows reader_summary_unavailable=true native_cleanup_confirmed=false")?;
+        }
+        Ok(())
+    })();
+    // Never replace the original media/transport failure with a log error.
+    result?;
+    flush_result.map_err(|e| format!("deferred diagnostic output failed: {e}").into())
 }
 
 #[derive(Copy, Clone)]
