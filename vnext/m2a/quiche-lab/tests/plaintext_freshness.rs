@@ -14,7 +14,8 @@ type Result<T> = std::result::Result<T,Box<dyn Error>>;
 const ALPN:&[u8]=b"df-inmemory-mp001-1";
 const MTU:usize=1350;
 fn config(path:&Path,server:bool)->Result<quiche::Config>{
-    let mut c=quiche::Config::new(quiche::PROTOCOL_VERSION)?;
+    let mut c=quiche::Config::new(quiche::PROTOCOL_VERSION)
+        .map_err(|e| format!("fixture TLS configuration initialization: {e:?}"))?;
     c.set_application_protos(&[ALPN])?;
     c.set_max_recv_udp_payload_size(MTU);
     c.set_max_send_udp_payload_size(MTU);
@@ -25,11 +26,14 @@ fn config(path:&Path,server:bool)->Result<quiche::Config>{
     c.set_initial_max_streams_bidi(1);
     c.enable_dgram(true,4,4);
     c.verify_peer(true);
-    c.load_verify_locations_from_file(path.join("ca.pem").to_str().unwrap())?;
+    c.load_verify_locations_from_file(path.join("ca.pem").to_str().unwrap())
+        .map_err(|e| format!("fixture CA loading: {e:?}"))?;
     c.load_cert_chain_from_pem_file(
-        path.join(if server{"server.pem"}else{"client.pem"}).to_str().unwrap())?;
+        path.join(if server{"server.pem"}else{"client.pem"}).to_str().unwrap())
+        .map_err(|e| format!("fixture certificate loading (server={server}): {e:?}"))?;
     c.load_priv_key_from_pem_file(
-        path.join(if server{"server.key"}else{"client.key"}).to_str().unwrap())?;
+        path.join(if server{"server.key"}else{"client.key"}).to_str().unwrap())
+        .map_err(|e| format!("fixture private-key loading (server={server}): {e:?}"))?;
     Ok(c)
 }
 fn pump(src:&mut quiche::Connection,dst:&mut quiche::Connection)->Result<usize>{
@@ -41,7 +45,9 @@ fn pump(src:&mut quiche::Connection,dst:&mut quiche::Connection)->Result<usize>{
             Err(quiche::Error::Done)=>break,
             Err(e)=>return Err(format!("in-memory seal error: {e:?}").into()),
         };
-        dst.recv(&mut buf[..n],quiche::RecvInfo{from:info.from,to:info.to})?;
+        dst.recv(&mut buf[..n],quiche::RecvInfo{from:info.from,to:info.to})
+            .map_err(|e| format!("fixture QUIC receive: {e:?}; local={:?}; peer={:?}",
+                                dst.local_error(), dst.peer_error()))?;
         n_packets+=1;
     }
     Ok(n_packets)
@@ -79,6 +85,35 @@ fn block(sequence:u32)->(Identity,Vec<u8>){
     let mut w=encode(&h).to_vec();
     w.extend([0u8;960]);
     (Identity{epoch:9,stream:3,format:1,sequence,source_frame:h.first_source_frame},w)
+}
+#[test]
+fn receive_fifo_loses_burst_without_interleaving_but_draining_each_udp_preserves_pcm()->Result<()>{
+    // Real mutually authenticated quiche, not a mock queue. Every audio
+    // DATAGRAM fits in its own UDP packet. The fixture delivers a kernel-like
+    // burst immediately; no network or wall-clock sleeps are involved.
+    for interleave in [false,true] {
+        let (mut sender,mut receiver)=established_pair()?;
+        let mut received=Vec::new();
+        for sequence in 0..6 {
+            let (_,bytes)=block(sequence);
+            sender.dgram_send(&bytes)?;
+            pump(&mut sender,&mut receiver)?;
+            if interleave {
+                let mut datagram=[0u8;1000];
+                while let Ok(n)=receiver.dgram_recv(&mut datagram) {
+                    received.push(Identity::from_wire(&datagram[..n]).unwrap().sequence);
+                }
+            }
+            pump(&mut receiver,&mut sender)?;
+        }
+        let mut datagram=[0u8;1000];
+        while let Ok(n)=receiver.dgram_recv(&mut datagram) {
+            received.push(Identity::from_wire(&datagram[..n]).unwrap().sequence);
+        }
+        assert_eq!(received,if interleave {vec![0,1,2,3,4,5]}else{vec![2,3,4,5]},
+                   "receive FIFO capacity remains four; drain after each UDP receive");
+    }
+    Ok(())
 }
 #[test]
 fn genuine_quiche_queued_plaintext_expires_before_sealing()->Result<()>{

@@ -3,10 +3,13 @@
 // which is also the exact implementation compiled by host qualification.
 #include <aaudio/AAudio.h>
 #include "render_core.h"
+#include "output_config.h"
+#include "timing_sample.h"
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cstdio>
 #include <memory>
 #include <new>
 #include <time.h>
@@ -44,9 +47,11 @@ struct IdentityStats {
     uint64_t discarded_on_rebuffer_frames;
     uint64_t concealed_output_frames;
 };
+std::atomic<uint64_t> next_output_generation{1};
 class Renderer {
 public:
     AAudioStream* stream = nullptr;
+    uint64_t output_generation = 0; // immutable for this stream lifetime
     df_audio::RenderCore core;
     std::atomic<uint32_t> modes{3};
     std::atomic<int32_t> stream_error{AAUDIO_OK};
@@ -78,8 +83,12 @@ public:
         s->silence_frames = core.legacy_silence();
         s->overflow_packets = core.overflow();
         s->callback_count = callbacks.load(std::memory_order_relaxed);
-        const uint64_t wr = core.write(), rd = core.read();
-        s->queued_frames = wr >= rd && wr - rd <= df_audio::kRingFrames ? wr - rd : 0;
+        // Legacy occupancy is an always-available conservative storage upper
+        // bound, including retained FIR history. Read tail FIRST: callback
+        // progress can only reduce this estimate while producer publication
+        // can increase it. ABI6 separately reports future playable demand.
+        const uint64_t rd = core.read(), wr = core.write();
+        s->queued_frames = wr >= rd ? std::min(wr-rd,df_audio::kRingFrames) : df_audio::kRingFrames;
         s->stream_error = stream_error.load(std::memory_order_acquire);
         s->actual_sample_rate = stream ? AAudioStream_getSampleRate(stream) : 0;
         s->actual_channels = stream ? AAudioStream_getChannelCount(stream) : 0;
@@ -95,9 +104,9 @@ public:
 #else
 #define DF_EXPORT extern "C"
 #endif
-DF_EXPORT uint32_t df_audio_abi_version() noexcept { return 5; }
+DF_EXPORT uint32_t df_audio_abi_version() noexcept { return 7; }
 
-DF_EXPORT int32_t df_audio_open(void** out) noexcept {
+static int32_t open_audio(void** out, uint32_t buffer_bursts) noexcept {
     if (!out) return -1;
     *out = nullptr;
     std::unique_ptr<Renderer> r(new (std::nothrow) Renderer{});
@@ -122,13 +131,43 @@ DF_EXPORT int32_t df_audio_open(void** out) noexcept {
         AAudioStream_close(r->stream);
         return -5;
     }
+    const int32_t requested = df_audio::requested_buffer_frames(
+        buffer_bursts, AAudioStream_getFramesPerBurst(r->stream));
+    if (requested < 0) { AAudioStream_close(r->stream); return -6; }
+    const int32_t set_result = requested == 0 ?
+        AAudioStream_getBufferSizeInFrames(r->stream) :
+        AAudioStream_setBufferSizeInFrames(r->stream, requested);
+    if (set_result < 0) {
+        std::fprintf(stderr, "AUDIO_BUFFER request_bursts=%u requested_frames=%d setter_error=%d\n",
+            buffer_bursts, requested, set_result);
+        AAudioStream_close(r->stream);
+        return set_result;
+    }
+    // Lifecycle thread only: requesting LOW_LATENCY does not prove the
+    // negotiated backend/buffer. Preserve actual hardware-route evidence.
+    std::fprintf(stderr,
+        "AUDIO_BACKEND rate=%d channels=%d format=%d sharing=%d performance=%d frames_per_burst=%d buffer_frames=%d capacity_frames=%d xruns=%d requested_bursts=%u requested_frames=%d setter_result=%d\n",
+        AAudioStream_getSampleRate(r->stream),AAudioStream_getChannelCount(r->stream),
+        AAudioStream_getFormat(r->stream),AAudioStream_getSharingMode(r->stream),
+        AAudioStream_getPerformanceMode(r->stream),AAudioStream_getFramesPerBurst(r->stream),
+        AAudioStream_getBufferSizeInFrames(r->stream),AAudioStream_getBufferCapacityInFrames(r->stream),
+        AAudioStream_getXRunCount(r->stream), buffer_bursts, requested, set_result);
     const auto started = AAudioStream_requestStart(r->stream);
     if (started != AAUDIO_OK) {
         AAudioStream_close(r->stream);
         return started;
     }
+    r->output_generation = next_output_generation.fetch_add(1, std::memory_order_relaxed);
     *out = r.release();
     return 0;
+}
+DF_EXPORT int32_t df_audio_open(void** out) noexcept { return open_audio(out, 0); }
+DF_EXPORT int32_t df_audio_open_config_v7(
+    const df_audio::OutputConfigV7* config, void** out) noexcept {
+    if (!out) return -1;
+    *out = nullptr;
+    if (!config || !df_audio::valid_output_config(*config)) return -6;
+    return open_audio(out, config->buffer_bursts);
 }
 DF_EXPORT int32_t df_audio_set_diagnostic_modes(void* ctx, uint32_t flags) noexcept {
     if (!ctx || (flags & ~3u)) return -1;
@@ -187,6 +226,17 @@ DF_EXPORT int32_t df_audio_snapshot_v4(
     *dropped = core.dropped_snapshots();
     return core.pop_snapshot(*snapshot) ? 1 : 0;
 }
+// Off-callback demand snapshot; no telemetry FIFO dependency. A concurrent
+// callback returns unavailable, so the owner must choose conservative timing.
+DF_EXPORT int32_t df_audio_playout_state_v6(void* ctx, void* out) noexcept {
+    if (!ctx || !out) return -1;
+    auto* r = static_cast<Renderer*>(ctx);
+    auto* state = static_cast<df_audio::PlayoutState*>(out);
+    if (!r->core.playout_state(*state)) return 0;
+    state->stream_error = r->stream_error.load(std::memory_order_acquire);
+    state->xrun_count = r->stream ? AAudioStream_getXRunCount(r->stream) : -1;
+    return 1;
+}
 DF_EXPORT int32_t df_audio_stats(void* ctx, void* out) noexcept {
     if (!ctx || !out) return -1;
     Stats s{};
@@ -213,6 +263,34 @@ DF_EXPORT int32_t df_audio_presentation_time_v5(void* ctx, void* out) noexcept {
         renderer->stream, CLOCK_MONOTONIC,
         &result->output_frame_position, &result->monotonic_nanoseconds);
     return 0;
+}
+// Owner/lifecycle thread only. No explicit wait, allocation or callback changes.
+DF_EXPORT int32_t df_audio_timing_sample_v7(
+    void* ctx, df_audio::TimingSampleV7* out) noexcept {
+    if (!ctx || !out || out->size != sizeof(*out) || out->version != 7 || out->reserved != 0)
+        return -1;
+    auto* r = static_cast<Renderer*>(ctx);
+    if (!r->stream) return -2;
+    *out = {};
+    out->output_generation = r->output_generation;
+    timespec before{}, after{};
+    const int before_result = clock_gettime(CLOCK_MONOTONIC, &before);
+    out->state_before = AAudioStream_getState(r->stream);
+    out->written_before = AAudioStream_getFramesWritten(r->stream);
+    out->timestamp_result = AAudioStream_getTimestamp(r->stream, CLOCK_MONOTONIC,
+        &out->timestamp_frame, &out->timestamp_ns);
+    out->written_after = AAudioStream_getFramesWritten(r->stream);
+    out->state_after = AAudioStream_getState(r->stream);
+    out->sample_rate = AAudioStream_getSampleRate(r->stream);
+    out->xrun_count = AAudioStream_getXRunCount(r->stream);
+    out->buffer_frames = AAudioStream_getBufferSizeInFrames(r->stream);
+    out->capacity_frames = AAudioStream_getBufferCapacityInFrames(r->stream);
+    out->device_id = AAudioStream_getDeviceId(r->stream);
+    const int after_result = clock_gettime(CLOCK_MONOTONIC, &after);
+    out->clock_result = before_result != 0 ? -1 : (after_result != 0 ? -2 : 0);
+    if (before_result == 0) out->before_ns = int64_t(before.tv_sec)*1000000000 + before.tv_nsec;
+    if (after_result == 0) out->after_ns = int64_t(after.tv_sec)*1000000000 + after.tv_nsec;
+    return 0; // Timestamp/clock failures stay explicit data, not fatal audio errors.
 }
 DF_EXPORT int32_t df_audio_identity_stats_v3(void* ctx, void* out) noexcept {
     if (!ctx || !out) return -1;

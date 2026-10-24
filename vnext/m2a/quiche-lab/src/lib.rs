@@ -1,6 +1,7 @@
 //! DeskFuse M2a protocol wire layout. The input **must already be authenticated
 //! by the surrounding QUIC connection**; this parser does not authenticate it.
 //! No heap allocation is needed in encode/decode.
+pub mod deferred_trace;
 pub mod reactor;
 pub mod wasapi_pipe;
 pub mod android_audio;
@@ -8,6 +9,7 @@ pub mod source_age;
 pub mod plaintext_expiry;
 pub mod receive_frontier;
 pub mod fresh_anchor;
+pub mod reorder;
 
 pub const HEADER_BYTES: usize = 40;
 pub const VERSION: u8 = 1;

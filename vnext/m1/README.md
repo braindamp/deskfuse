@@ -49,13 +49,13 @@ interleaved PCM16 stereo frames:
 | Offset | Field |
 | --- | --- |
 | 0 | ASCII `DFWC` (4 bytes) |
-| 4 | u32 version = 1 |
+| 4 | u32 version = 2 |
 | 8 | u64 first capture-device source frame |
 | 16 | u64 WASAPI QPC timestamp in 100-ns units; zero when invalid |
 | 24 | u32 frame count |
 | 28 | u32 WASAPI capture flags |
 | 32 | u32 PCM bytes = frames * 4 |
-| 36 | u32 reserved = 0 |
+| 36 | u32 offset of this fragment within the original WASAPI packet (frames) |
 | 40 | little-endian PCM16 interleaved stereo data |
 
 The Rust-side `vnext/m2a/quiche-lab/src/wasapi_pipe.rs` reads these records
@@ -72,7 +72,8 @@ New `continuous-quic-lab` modes:
   <client-key> <seconds>`
 
 The Android receiver verifies authenticated packet format, sequence, source
-frame identity and bounded payload, **but does not yet render audio**. Unlike
+frame identity and bounded payload. `client-capture` is silent verification;
+`client-playback-modes` uses the native AAudio renderer. Unlike
 the deterministic synthetic fixture, its actual PCM content cannot be
 recomputed from a sequence number.
 
@@ -81,9 +82,8 @@ recomputed from a sequence number.
 This first adapter is intended to establish *actual captured Windows audio
 entering the authenticated transport*. It is not the final capture/transport
 contract: the production path still needs a unified native ownership adapter,
-bounded source-QPC freshness checks before encryption, documented
-epoch/generation changes, supported source-rate/channel conversion policy,
-capture-domain timestamp uncertainty, operational reconnects, native Android
-Oboe/AAudio rendering, output-demand clock recovery, and physical load
-qualification. No synthetic 5-ms clock or QUIC ACK clock belongs in
+supported source-rate/channel conversion policy, capture-domain timestamp
+uncertainty, operational reconnect qualification and sustained physical load
+qualification. Source-QPC admission, native AAudio rendering and output-demand
+clock correction now exist, but are not full product qualification. No synthetic 5-ms clock or QUIC ACK clock belongs in
 production. See `vnext/m2a/PREREGISTERED_GATES.md`.

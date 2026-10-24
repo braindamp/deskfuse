@@ -1,4 +1,4 @@
-# M2b Android native AAudio speaker — first audible vNext slice
+# M2b Android native AAudio speaker â€” first audible vNext slice
 
 This is an ISOLATED native renderer (Android API 26+), NOT an installed
 DeskFuse APK change. AAudio uses the phone's default output route.
@@ -10,8 +10,9 @@ It requests audio independently of network arrival or transport ACKs.
 Callback writes zeros on underrun, performs no allocation, sleeping, locks
 or network I/O. Windows and Xiaomi have independent 48-kHz audio clocks. On the
 DEVELOPMENT branch, M2b now includes one bounded output-demand correction
-authority (AAudio callback) with Q32 linear interpolation at +/-400 ppm and a
-30-ms target ring occupancy. The hardware-proven reference branch retains
+authority (AAudio callback) with Q32 finite-support bandlimited resampling at +/-400 ppm and a
+30-ms projected post-callback source inventory. Startup waits for callback
+demand plus that target; this is not a fixed 30-ms end-to-end latency. The hardware-proven reference branch retains
 the original renderer without adaptive drift correction.
 
 ## Build from Visual Studio Developer PowerShell
@@ -54,7 +55,7 @@ Expected: AUTH at both peers; AUDIO Android native AAudio output started;
 later rendered_frames > 0. Nonzero output frames alone do not establish
 audibility; verify actual audible music and phone output route/volume.
 
-## First physical audible playback — developer observation (2026-10-23)
+## First physical audible playback â€” developer observation (2026-10-23)
 
 **PASS: real Windows audio was heard from the Xiaomi handset over authenticated
 QUIC, using Windows WASAPI capture and the native Android AAudio sink.**
@@ -83,19 +84,24 @@ source/sink drift adaptation and Android app lifecycle integration.
 A single Android AAudio callback owns all playback-clock correction.
 `src/adaptive_clock.h` measures buffered source frames, smooths occupancy
 across output callbacks, and applies bounded proportional/integral correction
-by changing source sample advance by **at most +/-400 ppm** using linear
-interpolation. QUIC ACK/pacing timers and WASAPI source positions are NOT
+by changing source sample advance by **at most +/-400 ppm** using a persistent
+finite-support bandlimited ASRC. The old two-tap interpolator remains a host
+comparator, not the live adaptive renderer. QUIC ACK/pacing timers and WASAPI source positions are NOT
 playback clocks. Callback ring remains 80 ms maximum. It primes with 30 ms
 and reports drift correction (ppm), true underrun events, and rebuffer events.
 After a true underrun, it resets correction and re-primes; no retroactive
 rewrite of audio that has already played.
 
-**Native renderer ABI is now v5.** New Rust receiver requires
-`df_audio_abi_version() == 5` before accessing the library. PCM publication
+**Native renderer ABI is now v6.** New Rust receiver requires
+`df_audio_abi_version() == 6` before accessing the library. PCM publication
 uses `df_audio_push_guarded_v5` with the exact authenticated recovery ticket;
 autonomous recovery blocks publication until a fresh anchor authorizes that
 ticket. Lossy callback snapshots are diagnostic only. The v1/v2/v3 statistics
 layouts, v4 snapshot layout and historical entry points remain unchanged.
+The additive `df_audio_playout_state_v6` reports bounded playback headroom,
+recovery state and clipping for receiver reordering. It does not establish
+acoustic presentation time. Adaptive output uses explicitly counted I16
+saturation on filter overshoot; there is no hidden normalization or limiter.
 Redeploy BOTH the native `libdeskfuse_android_audio.so` and Android
 `deskfuse-vnext-continuous` executable together; an old shared library is
 deliberately rejected before its statistics can be read with a mismatched
@@ -123,3 +129,31 @@ qualified. An AAudio failure from an ADB shell process may require an
 isolated app-host integration; do not bypass Android security or patch the
 existing installed APK. No credentials, private keys, recorded audio or
 phone identifiers should be committed to the public repo.
+
+## ABI 7 output buffer experiment
+
+The matching Rust/native pair requires ABI 7 and loads
+`df_audio_open_config_v7`. Historical statistics layouts/symbols are unchanged;
+mixed pairs fail before structure access. `df_audio_open` retains the default
+configuration for direct native callers.
+
+The qualification runner accepts `-AndroidBufferBursts 0` (platform default),
+`3`, or `2`. This changes only AAudio usable buffering before start; PCM format,
+shared mode, native inventory target, resampling and fades stay unchanged.
+`AUDIO_BACKEND` records requested bursts/frames, setter result and actual
+buffer size/capacity. A request is not proof of acceptance or acoustic latency.
+The default remains platform-selected until matched physical comparison.
+
+The newer pair additionally requires the additive `df_audio_timing_sample_v7`
+symbol. Its size/version-checked 104-byte record brackets the HAL timestamp and
+frames-written counters with Android monotonic observations, actual state,
+buffer size, device, and stream generation. Older ABI7 libraries missing this
+capability fail symbol lookup before opening. The historical v5 timestamp record
+remains unchanged. Sampling replaces the existing once-per-200-packets trace;
+the callback and audio controls are unchanged.
+
+Run `python vnext/qualification/analyze-android-presentation.py RUN_FOLDER`
+to inspect nominal-rate system queue estimates. Unavailable/stale/backward or
+implausible measurements are rejected explicitly. The reported sampling range
+does not cover clock-rate error or unreported downstream DSP/speaker delay;
+it does not measure end-to-end or acoustic latency.

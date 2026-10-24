@@ -3,7 +3,8 @@
 // authority. This bounded controller adjusts source samples consumed per
 // output frame, NOT QUIC pacing, WASAPI source timestamps, or AAudio rate.
 //
-// A causal linear interpolator consumes Q32 source-frame positions.
+// Historical two-tap comparator below; live rendering instead uses
+// TimeBasedFollower + StreamingSinc with explicit Q32 source positions.
 // No heap allocation, I/O, locking, or system calls are performed here.
 // One instance is accessed only on AAudio's data callback thread.
 
