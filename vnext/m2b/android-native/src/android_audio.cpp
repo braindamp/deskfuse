@@ -4,6 +4,7 @@
 #include <aaudio/AAudio.h>
 #include "render_core.h"
 #include "output_config.h"
+#include "timing_sample.h"
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -46,9 +47,11 @@ struct IdentityStats {
     uint64_t discarded_on_rebuffer_frames;
     uint64_t concealed_output_frames;
 };
+std::atomic<uint64_t> next_output_generation{1};
 class Renderer {
 public:
     AAudioStream* stream = nullptr;
+    uint64_t output_generation = 0; // immutable for this stream lifetime
     df_audio::RenderCore core;
     std::atomic<uint32_t> modes{3};
     std::atomic<int32_t> stream_error{AAUDIO_OK};
@@ -154,6 +157,7 @@ static int32_t open_audio(void** out, uint32_t buffer_bursts) noexcept {
         AAudioStream_close(r->stream);
         return started;
     }
+    r->output_generation = next_output_generation.fetch_add(1, std::memory_order_relaxed);
     *out = r.release();
     return 0;
 }
@@ -259,6 +263,34 @@ DF_EXPORT int32_t df_audio_presentation_time_v5(void* ctx, void* out) noexcept {
         renderer->stream, CLOCK_MONOTONIC,
         &result->output_frame_position, &result->monotonic_nanoseconds);
     return 0;
+}
+// Owner/lifecycle thread only. No explicit wait, allocation or callback changes.
+DF_EXPORT int32_t df_audio_timing_sample_v7(
+    void* ctx, df_audio::TimingSampleV7* out) noexcept {
+    if (!ctx || !out || out->size != sizeof(*out) || out->version != 7 || out->reserved != 0)
+        return -1;
+    auto* r = static_cast<Renderer*>(ctx);
+    if (!r->stream) return -2;
+    *out = {};
+    out->output_generation = r->output_generation;
+    timespec before{}, after{};
+    const int before_result = clock_gettime(CLOCK_MONOTONIC, &before);
+    out->state_before = AAudioStream_getState(r->stream);
+    out->written_before = AAudioStream_getFramesWritten(r->stream);
+    out->timestamp_result = AAudioStream_getTimestamp(r->stream, CLOCK_MONOTONIC,
+        &out->timestamp_frame, &out->timestamp_ns);
+    out->written_after = AAudioStream_getFramesWritten(r->stream);
+    out->state_after = AAudioStream_getState(r->stream);
+    out->sample_rate = AAudioStream_getSampleRate(r->stream);
+    out->xrun_count = AAudioStream_getXRunCount(r->stream);
+    out->buffer_frames = AAudioStream_getBufferSizeInFrames(r->stream);
+    out->capacity_frames = AAudioStream_getBufferCapacityInFrames(r->stream);
+    out->device_id = AAudioStream_getDeviceId(r->stream);
+    const int after_result = clock_gettime(CLOCK_MONOTONIC, &after);
+    out->clock_result = before_result != 0 ? -1 : (after_result != 0 ? -2 : 0);
+    if (before_result == 0) out->before_ns = int64_t(before.tv_sec)*1000000000 + before.tv_nsec;
+    if (after_result == 0) out->after_ns = int64_t(after.tv_sec)*1000000000 + after.tv_nsec;
+    return 0; // Timestamp/clock failures stay explicit data, not fatal audio errors.
 }
 DF_EXPORT int32_t df_audio_identity_stats_v3(void* ctx, void* out) noexcept {
     if (!ctx || !out) return -1;

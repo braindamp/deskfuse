@@ -143,3 +143,17 @@ shared mode, native inventory target, resampling and fades stay unchanged.
 `AUDIO_BACKEND` records requested bursts/frames, setter result and actual
 buffer size/capacity. A request is not proof of acceptance or acoustic latency.
 The default remains platform-selected until matched physical comparison.
+
+The newer pair additionally requires the additive `df_audio_timing_sample_v7`
+symbol. Its size/version-checked 104-byte record brackets the HAL timestamp and
+frames-written counters with Android monotonic observations, actual state,
+buffer size, device, and stream generation. Older ABI7 libraries missing this
+capability fail symbol lookup before opening. The historical v5 timestamp record
+remains unchanged. Sampling replaces the existing once-per-200-packets trace;
+the callback and audio controls are unchanged.
+
+Run `python vnext/qualification/analyze-android-presentation.py RUN_FOLDER`
+to inspect nominal-rate system queue estimates. Unavailable/stale/backward or
+implausible measurements are rejected explicitly. The reported sampling range
+does not cover clock-rate error or unreported downstream DSP/speaker delay;
+it does not measure end-to-end or acoustic latency.

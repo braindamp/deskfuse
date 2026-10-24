@@ -1,4 +1,5 @@
 #include "output_config.h"
+#include "timing_sample.h"
 #include <stdexcept>
 #include <initializer_list>
 static void expect(bool value) {if (!value) throw std::runtime_error("invalid output policy validation");}

@@ -1035,12 +1035,13 @@ impl ClientMedia {
             if let Some(ref speaker) = self.audio {
                 let a = speaker.snapshot()
                     .map_err(|e| format!("AAudio periodic diagnostics: {e}"))?;
-                let presentation = speaker.presentation_time()
-                    .map_err(|e| format!("AAudio off-callback presentation time: {e}"))?;
-                println!("TRACE Android OUTPUT_HAL frame={} monotonic_ns={} timestamp_result={} (not acoustic latency)",
-                    presentation.output_frame_position,
-                    presentation.monotonic_nanoseconds,
-                    presentation.aaudio_result);
+                let t = speaker.timing_sample()
+                    .map_err(|e| format!("AAudio off-callback timing sample: {e}"))?;
+                println!("TRACE Android OUTPUT_HAL frame={} monotonic_ns={} timestamp_result={} generation={} before_ns={} after_ns={} written_before={} written_after={} clock_result={} rate={} state_before={} state_after={} xruns={} buffer_frames={} capacity_frames={} device={} (system estimate only; not acoustic latency)",
+                    t.timestamp_frame,t.timestamp_ns,t.timestamp_result,t.output_generation,
+                    t.before_ns,t.after_ns,t.written_before,t.written_after,t.clock_result,
+                    t.sample_rate,t.state_before,t.state_after,t.xrun_count,t.buffer_frames,
+                    t.capacity_frames,t.device_id);
                 if let Some(playout)=speaker.playout_state()
                     .map_err(|e|format!("AAudio periodic playout state: {e}"))? {
                     println!("TRACE Android RECONSTRUCTION clipped_samples={} xrun_count={} last_callback_frames={} max_callback_frames={} playable_frames={} primed={}",

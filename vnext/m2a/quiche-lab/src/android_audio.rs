@@ -94,6 +94,19 @@ pub struct PlayoutState {
     pub xrun_count: i32,
     pub clipped_samples: u64,
 }
+// Additive v7 timing capability; old v5 timestamp layout is unchanged.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TimingSampleV7 {
+    pub size:u32, pub version:u32, pub output_generation:u64,
+    pub before_ns:i64, pub after_ns:i64,
+    pub written_before:i64, pub written_after:i64,
+    pub timestamp_frame:i64, pub timestamp_ns:i64,
+    pub clock_result:i32, pub timestamp_result:i32,
+    pub sample_rate:i32, pub state_before:i32, pub state_after:i32,
+    pub xrun_count:i32, pub buffer_frames:i32, pub capacity_frames:i32,
+    pub device_id:i32, pub reserved:i32,
+}
 // V7 adds pre-start buffer policy; all historical stats layouts stay fixed.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -135,6 +148,9 @@ mod abi_tests {
     }
     #[test]
     fn historical_struct_prefixes_and_new_coherent_record_size_remain_exact() {
+        assert_eq!(std::mem::size_of::<TimingSampleV7>(),104);
+        assert_eq!(std::mem::offset_of!(TimingSampleV7,timestamp_frame),48);
+        assert_eq!(std::mem::offset_of!(TimingSampleV7,clock_result),64);
         assert_eq!(std::mem::size_of::<OutputConfigV7>(),16);
         assert_eq!(std::mem::offset_of!(OutputConfigV7,buffer_bursts),8);
         assert!(OutputConfigV7::new(1).is_err());
@@ -149,7 +165,7 @@ mod abi_tests {
 
 #[cfg(target_os = "android")]
 mod native {
-    use super::{OutputConfigV7, Admission, AudioStats, RenderIdentity, RenderSnapshot, PresentationTimeV5, PlayoutState};
+    use super::{TimingSampleV7, OutputConfigV7, Admission, AudioStats, RenderIdentity, RenderSnapshot, PresentationTimeV5, PlayoutState};
     use std::ffi::{c_char, c_int, c_void, CString};
     use std::ptr;
 
@@ -174,13 +190,14 @@ mod native {
         *mut c_void,*mut RenderSnapshot,*mut u64)->i32;
     type Presentation=unsafe extern "C" fn(
         *mut c_void,*mut PresentationTimeV5)->i32;
+    type Timing=unsafe extern "C" fn(*mut c_void,*mut TimingSampleV7)->i32;
     type Playout=unsafe extern "C" fn(*mut c_void,*mut PlayoutState)->i32;
 
     pub struct Renderer {
         library:*mut c_void, ctx:*mut c_void,
         push:PushV5, stats:Stats, identity_stats:IdentityStats,
         modes:Modes, close:Close, request:Request, applied:Applied,
-        snapshot:Snapshot, presentation:Presentation, playout:Playout,
+        snapshot:Snapshot, presentation:Presentation, playout:Playout, timing:Timing,
     }
     impl Renderer {
         pub fn open(path:&str)->Result<Self,String> {Self::open_with_buffer(path,0)}
@@ -217,8 +234,9 @@ mod native {
                 sym(b"df_audio_snapshot_v4\0")?,
                 sym(b"df_audio_presentation_time_v5\0")?,
                 sym(b"df_audio_playout_state_v6\0")?,
+                sym(b"df_audio_timing_sample_v7\0")?,
             )))();
-            let (open,close,modes,push,stats,identity_stats,request,applied,snapshot,presentation,playout)=match funcs{
+            let (open,close,modes,push,stats,identity_stats,request,applied,snapshot,presentation,playout,timing)=match funcs{
                 Ok(parts)=>parts,
                 Err(e)=>{unsafe{dlclose(library)};return Err(e);}
             };
@@ -241,6 +259,7 @@ mod native {
                 snapshot:unsafe{std::mem::transmute(snapshot)},
                 presentation:unsafe{std::mem::transmute(presentation)},
                 playout:unsafe{std::mem::transmute(playout)},
+                timing:unsafe{std::mem::transmute(timing)},
             })
         }
         pub fn set_diagnostic_modes(&mut self,fades:bool,linear:bool)->Result<(),String>{
@@ -279,6 +298,11 @@ mod native {
                 0=>Ok(None),
                 x=>Err(format!("AAudio coherent snapshot error={x}")),
             }
+        }
+        pub fn timing_sample(&self)->Result<TimingSampleV7,String>{
+            let mut value=TimingSampleV7 {size:104,version:7,..TimingSampleV7::default()};
+            let code=unsafe{(self.timing)(self.ctx,&mut value)};
+            if code==0 {Ok(value)} else {Err(format!("AAudio timing interface code={code}"))}
         }
         pub fn presentation_time(&self)->Result<PresentationTimeV5,String>{
             let mut value=PresentationTimeV5::default();
@@ -327,6 +351,9 @@ impl AndroidAudio{
     pub fn request_recovery(&mut self)->u64{0}
     pub fn recovery_applied(&self)->u64{0}
     pub fn pop_snapshot(&self)->Result<Option<(RenderSnapshot,u64)>,String>{
+        Err("Android AAudio required".into())
+    }
+    pub fn timing_sample(&self)->Result<TimingSampleV7,String>{
         Err("Android AAudio required".into())
     }
     pub fn presentation_time(&self)->Result<PresentationTimeV5,String>{
