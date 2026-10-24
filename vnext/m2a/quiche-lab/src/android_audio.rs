@@ -77,6 +77,23 @@ pub struct PresentationTimeV5 {
     pub aaudio_result: i32,
     pub reserved: i32,
 }
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PlayoutState {
+    pub queued_playable_frames: u64,
+    pub current_source_frame: u64,
+    pub requested_recovery: u64,
+    pub applied_recovery: u64,
+    pub primed: u32,
+    pub last_callback_frames: u32,
+    pub max_callback_frames: u32,
+    pub playout_generation: u32,
+    pub stream_error: i32,
+    pub fraction_q32: u32,
+    pub source_valid: u32,
+    pub xrun_count: i32,
+    pub clipped_samples: u64,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Admission {
     Accepted,
@@ -85,11 +102,11 @@ pub enum Admission {
     Discontinuity,
     Stale,
 }
-pub fn validate_abi_v5(actual: u32) -> Result<(), String> {
-    if actual == 5 { Ok(()) }
+pub fn validate_abi_v6(actual: u32) -> Result<(), String> {
+    if actual == 6 { Ok(()) }
     else {
         Err(format!(
-            "AAudio ABI mismatch expected v5, got v{actual}: redeploy both Android binaries"
+            "AAudio ABI mismatch expected v6, got v{actual}: redeploy both Android binaries"
         ))
     }
 }
@@ -99,10 +116,10 @@ mod abi_tests {
     use super::*;
     #[test]
     fn reject_mismatched_library_versions_before_struct_io() {
-        for version in [0, 1, 2, 3, 4, 6, u32::MAX] {
-            assert!(validate_abi_v5(version).is_err());
+        for version in [0, 1, 2, 3, 4, 5, 7, u32::MAX] {
+            assert!(validate_abi_v6(version).is_err());
         }
-        assert!(validate_abi_v5(5).is_ok());
+        assert!(validate_abi_v6(6).is_ok());
     }
     #[test]
     fn historical_struct_prefixes_and_new_coherent_record_size_remain_exact() {
@@ -110,12 +127,13 @@ mod abi_tests {
         assert_eq!(std::mem::size_of::<RenderIdentity>(),48);
         assert_eq!(std::mem::size_of::<RenderSnapshot>(),144);
         assert_eq!(std::mem::size_of::<PresentationTimeV5>(),24);
+        assert_eq!(std::mem::size_of::<PlayoutState>(),72);
     }
 }
 
 #[cfg(target_os = "android")]
 mod native {
-    use super::{Admission, AudioStats, RenderIdentity, RenderSnapshot, PresentationTimeV5};
+    use super::{Admission, AudioStats, RenderIdentity, RenderSnapshot, PresentationTimeV5, PlayoutState};
     use std::ffi::{c_char, c_int, c_void, CString};
     use std::ptr;
 
@@ -140,12 +158,13 @@ mod native {
         *mut c_void,*mut RenderSnapshot,*mut u64)->i32;
     type Presentation=unsafe extern "C" fn(
         *mut c_void,*mut PresentationTimeV5)->i32;
+    type Playout=unsafe extern "C" fn(*mut c_void,*mut PlayoutState)->i32;
 
     pub struct Renderer {
         library:*mut c_void, ctx:*mut c_void,
         push:PushV5, stats:Stats, identity_stats:IdentityStats,
         modes:Modes, close:Close, request:Request, applied:Applied,
-        snapshot:Snapshot, presentation:Presentation,
+        snapshot:Snapshot, presentation:Presentation, playout:Playout,
     }
     impl Renderer {
         pub fn open(path:&str)->Result<Self,String> {
@@ -164,7 +183,7 @@ mod native {
                 Err(e)=>{unsafe{dlclose(library)};return Err(e);}
             };
             let actual=unsafe{abi()};
-            if let Err(error)=super::validate_abi_v5(actual) {
+            if let Err(error)=super::validate_abi_v6(actual) {
                 unsafe{dlclose(library)};
                 return Err(error);
             }
@@ -179,8 +198,9 @@ mod native {
                 sym(b"df_audio_recovery_applied_v4\0")?,
                 sym(b"df_audio_snapshot_v4\0")?,
                 sym(b"df_audio_presentation_time_v5\0")?,
+                sym(b"df_audio_playout_state_v6\0")?,
             )))();
-            let (open,close,modes,push,stats,identity_stats,request,applied,snapshot,presentation)=match funcs{
+            let (open,close,modes,push,stats,identity_stats,request,applied,snapshot,presentation,playout)=match funcs{
                 Ok(parts)=>parts,
                 Err(e)=>{unsafe{dlclose(library)};return Err(e);}
             };
@@ -202,6 +222,7 @@ mod native {
                 applied:unsafe{std::mem::transmute(applied)},
                 snapshot:unsafe{std::mem::transmute(snapshot)},
                 presentation:unsafe{std::mem::transmute(presentation)},
+                playout:unsafe{std::mem::transmute(playout)},
             })
         }
         pub fn set_diagnostic_modes(&mut self,fades:bool,linear:bool)->Result<(),String>{
@@ -246,6 +267,14 @@ mod native {
             let code=unsafe{(self.presentation)(self.ctx,&mut value)};
             if code==0{Ok(value)}else{Err(format!("AAudio HAL timestamp interface code={code}"))}
         }
+        pub fn playout_state(&self)->Result<Option<PlayoutState>,String>{
+            let mut value=PlayoutState::default();
+            match unsafe{(self.playout)(self.ctx,&mut value)} {
+                1=>Ok(Some(value)),
+                0=>Ok(None),
+                x=>Err(format!("AAudio playout state error={x}")),
+            }
+        }
         pub fn snapshot(&self)->Result<AudioStats,String>{
             let mut value=AudioStats::default();
             let code=unsafe{(self.stats)(self.ctx,&mut value)};
@@ -282,6 +311,9 @@ impl AndroidAudio{
         Err("Android AAudio required".into())
     }
     pub fn presentation_time(&self)->Result<PresentationTimeV5,String>{
+        Err("Android AAudio required".into())
+    }
+    pub fn playout_state(&self)->Result<Option<PlayoutState>,String>{
         Err("Android AAudio required".into())
     }
     pub fn snapshot(&self)->Result<AudioStats,String>{Err("Android AAudio required".into())}

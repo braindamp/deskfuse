@@ -25,6 +25,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
@@ -141,8 +142,12 @@ private:
     uint64_t count_ = 0;
 };
 
-void write_all(HANDLE h, const uint8_t* data, size_t size) {
+void write_all(HANDLE h, const uint8_t* data, size_t size,
+               const std::atomic<bool>* cancelled = nullptr) {
     while (size != 0) {
+        if (cancelled && cancelled->load(std::memory_order_acquire)) {
+            throw std::runtime_error("capture output cancelled during shutdown");
+        }
         DWORD written = 0;
         const DWORD request = static_cast<DWORD>(std::min<size_t>(size, 65536));
         if (!WriteFile(h, data, request, &written, nullptr) || written == 0) {
@@ -168,7 +173,8 @@ void put64(uint8_t* at, uint64_t v) {
 //         original_GetBuffer_packet_offset_frames[4].
 // This offset is provenance, not an audio-clock offset or a send timer.
 // A v1 reader MUST reject this wire version rather than misread the field.
-void write_block(HANDLE out, const Block& b) {
+void write_block(HANDLE out, const Block& b,
+                 const std::atomic<bool>* cancelled = nullptr) {
     if (b.frame_count == 0 || b.frame_count > kMaxFrames) {
         throw std::runtime_error("invalid WASAPI writer frame count");
     }
@@ -188,8 +194,58 @@ void write_block(HANDLE out, const Block& b) {
     put32(header + 32, static_cast<uint32_t>(pcm_bytes));
     put32(header + 36, b.original_packet_offset_frames);
     std::memcpy(record.data() + kHeaderSize, b.pcm.data(), pcm_bytes);
-    write_all(out, record.data(), kHeaderSize + pcm_bytes);
+    write_all(out, record.data(), kHeaderSize + pcm_bytes, cancelled);
 }
+
+// Owns the writer until completion, including when WASAPI Start/Stop fails.
+// Only shutdown waits: normal capture never waits for this thread or pipe I/O.
+// Permit a short final drain, then cancel synchronous I/O. Retrying cancellation
+// closes the race where the writer starts WriteFile just after our first cancel.
+// This is cooperative OS cancellation, not a scheduling-time guarantee.
+class CaptureWriter {
+public:
+    using Queue = df_wasapi::SpscCaptureQueue<Block, kQueueSlots>;
+    CaptureWriter(Queue& queue, HANDLE out) : queue_(queue), thread_([this, out] {
+        try {
+            Block b;
+            while (!cancelled_.load(std::memory_order_acquire) && queue_.pop(b)) {
+                write_block(out, b, &cancelled_);
+            }
+        } catch (...) {
+            error_ = std::current_exception();
+            failed_.store(true, std::memory_order_release);
+        }
+    }) {}
+    ~CaptureWriter() { finish(); }
+    CaptureWriter(const CaptureWriter&) = delete;
+    CaptureWriter& operator=(const CaptureWriter&) = delete;
+
+    bool failed() const noexcept { return failed_.load(std::memory_order_acquire); }
+    bool cancelled() const noexcept { return cancelled_.load(std::memory_order_acquire); }
+    void finish() noexcept {
+        if (!thread_.joinable()) return;
+        queue_.finish();
+        const HANDLE thread = thread_.native_handle();
+        if (WaitForSingleObject(thread, 250) != WAIT_OBJECT_0) {
+            cancelled_.store(true, std::memory_order_release);
+            do {
+                // ERROR_NOT_FOUND is harmless if no synchronous I/O was pending.
+                CancelSynchronousIo(thread);
+            } while (WaitForSingleObject(thread, 10) != WAIT_OBJECT_0);
+        }
+        thread_.join();
+    }
+    void check_result() const {
+        // Called only after finish/join, which synchronizes error_ ownership.
+        if (error_) std::rethrow_exception(error_);
+        if (cancelled()) throw std::runtime_error("capture output drain exceeded shutdown limit");
+    }
+private:
+    Queue& queue_;
+    std::atomic<bool> cancelled_{false}, failed_{false};
+    std::exception_ptr error_;
+    std::thread thread_;
+};
 
 
 struct PacketObservation {
@@ -377,19 +433,7 @@ void capture(IMMDeviceEnumerator& enumerator, const std::wstring& device_id,
 
     PacketTimingTrace packet_trace;
     df_wasapi::SpscCaptureQueue<Block, kQueueSlots> queue;
-    std::atomic<bool> failed{false};
-    std::thread writer([&] {
-        try {
-            Block b;
-            while (queue.pop(b)) write_block(out, b);
-        } catch (const std::exception& e) {
-            std::cerr << "FAIL WASAPI writer: " << e.what() << "\n";
-            failed.store(true);
-        } catch (...) {
-            std::cerr << "FAIL WASAPI writer: unexpected exception\n";
-            failed.store(true);
-        }
-    });
+    CaptureWriter writer(queue, out);
     NativeDropLedger native_drops;
     uint64_t observed = 0;
     const auto start = std::chrono::steady_clock::now();
@@ -398,13 +442,12 @@ void capture(IMMDeviceEnumerator& enumerator, const std::wstring& device_id,
     AudioMmcssTask mmcss;
     HRESULT start_result = audio->Start();
     if (FAILED(start_result)) {
-        queue.finish();
-        writer.join();
+        writer.finish();
         check(start_result, "IAudioClient::Start");
     }
     try {
         while (std::chrono::steady_clock::now() - start < std::chrono::seconds(seconds)) {
-            if (failed.load()) throw std::runtime_error("binary output writer failed");
+            if (writer.failed()) throw std::runtime_error("binary output writer failed");
             const DWORD status = WaitForSingleObject(ready.get(), 250);
             if (status == WAIT_FAILED) throw std::runtime_error("WaitForSingleObject failed");
             if (status != WAIT_OBJECT_0) continue; // idle audio is not synthetic silence
@@ -449,30 +492,32 @@ void capture(IMMDeviceEnumerator& enumerator, const std::wstring& device_id,
         }
     } catch (...) {
         audio->Stop();
-        queue.finish();
-        writer.join();
+        writer.finish();
         native_drops.report();
         std::cerr << "EARLY WASAPI capture source_frames_observed=" << observed
                   << " dropped_blocks_bounded_writer=" << queue.dropped()
-                  << " writer_failed=" << failed.load() << "\n";
+                  << " writer_failed=" << writer.failed() << "\n";
+        try { writer.check_result(); }
+        catch (const std::exception& e) { std::cerr << "FAIL WASAPI writer: " << e.what() << "\n"; }
         try { packet_trace.save(); }
         catch (const std::exception& e) {
             std::cerr << "FAIL WASAPI original-packet trace: " << e.what() << "\n";
         }
         throw;
     }
-    check(audio->Stop(), "IAudioClient::Stop");
-    queue.finish();
-    writer.join();
+    const HRESULT stop_result = audio->Stop();
+    writer.finish();
+    check(stop_result, "IAudioClient::Stop");
     native_drops.report();
     packet_trace.save();
-    if (failed.load()) throw std::runtime_error("binary output writer failed");
+    writer.check_result();
     std::cerr << "DONE WASAPI capture source_frames_observed=" << observed
               << " dropped_blocks_bounded_writer=" << queue.dropped() << "\n";
 }
 
 } // namespace
 
+#ifndef DESKFUSE_CAPTURE_LIFECYCLE_TEST
 int wmain(int argc, wchar_t** argv) {
     try {
         bool list = false;
@@ -520,3 +565,4 @@ int wmain(int argc, wchar_t** argv) {
         return 1;
     }
 }
+#endif

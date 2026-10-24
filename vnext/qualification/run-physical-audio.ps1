@@ -14,7 +14,9 @@ param(
     [string]$KeysDir = 'D:\DeskFuseLocalKeys\m2a-physical-lab',
     [string]$LabRoot = 'D:\Coding\DeskFuse\vnext-wp001',
     [string]$EvidenceRoot = 'D:\DeskFuseLocalData\cp001',
-    [string]$Profile = 'audio-only'
+    [string]$Profile = 'audio-only',
+    [string]$ExpectedBranch = 'feature/vnext-wp001-native-lab',
+    [string]$WindowsExecutable
 )
 $ErrorActionPreference = 'Stop'
 if ($Strict -and $Modes -ne 'f0c0r0') { throw 'Strict PCM verification requires f0c0r0 (no DSP or fade)' }
@@ -23,17 +25,32 @@ $stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
 $folder = Join-Path $EvidenceRoot ($stamp + '-' + ($Profile -replace '[^\w-]','_') + '-' + $Modes)
 New-Item -ItemType Directory -Force -Path $folder | Out-Null
 $manifest = Join-Path $folder 'session.txt'
-$source = Join-Path $LabRoot 'vnext\m2a\quiche-lab\target\debug\continuous-quic-lab.exe'
+$crate = Join-Path $LabRoot 'vnext\m2a\quiche-lab'
+$cargoTarget = Join-Path $crate 'target'
+if (-not [string]::IsNullOrWhiteSpace($env:CARGO_TARGET_DIR)) {
+    $cargoTarget = if ([IO.Path]::IsPathRooted($env:CARGO_TARGET_DIR)) {
+        [IO.Path]::GetFullPath($env:CARGO_TARGET_DIR)
+    } else {
+        [IO.Path]::GetFullPath((Join-Path $crate $env:CARGO_TARGET_DIR))
+    }
+}
+# Explicit paths support custom/configured Cargo target directories. Default
+# to Release and never silently substitute a prior debug executable.
+$source = if ([string]::IsNullOrWhiteSpace($WindowsExecutable)) {
+    Join-Path $cargoTarget 'release\continuous-quic-lab.exe'
+} else { $WindowsExecutable }
 $capture = Join-Path $LabRoot 'vnext\m1\build\deskfuse-wasapi-capture.exe'
 $native = (Resolve-Path -LiteralPath $AndroidNativeSo).Path
 $android = (Resolve-Path -LiteralPath $AndroidExecutable).Path
 foreach ($p in @($source, $capture, $android, $native, (Join-Path $KeysDir 'ca.pem'), (Join-Path $KeysDir 'server.pem'), (Join-Path $KeysDir 'server.key'))) {
     if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { throw "Required local input missing: $p" }
 }
+$source = (Resolve-Path -LiteralPath $source).Path
 if (-not (Get-Command adb -ErrorAction SilentlyContinue)) { throw 'adb not on PATH' }
 $branch = (& git -C $LabRoot branch --show-current).Trim()
 $sha = (& git -C $LabRoot rev-parse HEAD).Trim()
-if ($LASTEXITCODE -ne 0 -or $branch -ne 'feature/vnext-wp001-native-lab') {
+if ($LASTEXITCODE -ne 0 -or $branch -ne $ExpectedBranch -or
+    $branch -in @('main', 'master') -or $branch.StartsWith('reference/')) {
     throw 'Only the isolated development branch is permitted'
 }
 $worktree = @(& git -C $LabRoot status --porcelain)
@@ -69,6 +86,33 @@ $hashes = @($capture,$source,$native,$android) | ForEach-Object {
     $hash = Get-FileHash -LiteralPath $_ -Algorithm SHA256
     'sha256=' + $hash.Hash.ToLowerInvariant() + ' file=' + $_
 }
+# A filename containing "release" is not proof of its build configuration.
+# Match the selected artifacts against the build script's hash-bound receipt.
+$receipt = $null
+$receiptPath = Join-Path $LabRoot 'vnext\m1\build\audio-pair-build.json'
+if (Test-Path -LiteralPath $receiptPath -PathType Leaf) {
+    try { $receipt = Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json }
+    catch { Write-Warning 'Local build receipt is unreadable; build profiles remain unverified.' }
+}
+$selectedArtifacts = [ordered]@{windows_rust=$source; android_rust=$android; android_native=$native; windows_capture=$capture}
+foreach ($kind in $selectedArtifacts.Keys) {
+    $selected = (Resolve-Path -LiteralPath $selectedArtifacts[$kind]).Path
+    $selectedHash = (Get-FileHash -LiteralPath $selected -Algorithm SHA256).Hash.ToLowerInvariant()
+    $verifiedProfile = 'unverified'
+    if ($null -ne $receipt -and $receipt.schema -eq 1) {
+        foreach ($artifact in $receipt.artifacts) {
+            if ($artifact.path -ieq $selected -and $artifact.sha256 -ieq $selectedHash -and
+                $artifact.profile -in @('release','debug')) {
+                $verifiedProfile = $artifact.profile
+            }
+        }
+    }
+    $events += ($kind + '_build_profile=' + $verifiedProfile)
+}
+if ($null -ne $receipt) {
+    $events += ('build_receipt_source_commit=' + $receipt.source_commit)
+}
+$events += ('build_receipt=' + $receiptPath)
 $events + $hashes | Set-Content -LiteralPath $manifest -Encoding UTF8
 & adb push $android /data/local/tmp/deskfuse-vnext-continuous |
     Tee-Object -FilePath (Join-Path $folder 'adb-push-executable.txt')
@@ -145,7 +189,7 @@ try {
     } else {
         [Environment]::SetEnvironmentVariable($traceEnv, $null, 'Process')
     }
-    $proc = Start-Process -FilePath $source -ArgumentList $sourceArgs -RedirectStandardOutput $serverOut -RedirectStandardError $serverErr -WorkingDirectory (Join-Path $LabRoot 'vnext\m2a\quiche-lab') -NoNewWindow -PassThru
+    $proc = Start-Process -FilePath $source -ArgumentList $sourceArgs -RedirectStandardOutput $serverOut -RedirectStandardError $serverErr -WorkingDirectory (Join-Path $LabRoot 'vnext\m2a\quiche-lab') -WindowStyle Hidden -PassThru
 } finally {
     [Environment]::SetEnvironmentVariable($traceEnv, $priorTrace, 'Process')
 }
