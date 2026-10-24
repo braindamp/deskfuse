@@ -1,4 +1,4 @@
-# Build the matching Windows sender and ABI v6 Android pair.
+# Build the matching Windows sender and ABI v7 Android pair.
 # No ADB deployment, credentials, driver installs or existing APK changes.
 [CmdletBinding()]
 param(

@@ -3,6 +3,7 @@
 // which is also the exact implementation compiled by host qualification.
 #include <aaudio/AAudio.h>
 #include "render_core.h"
+#include "output_config.h"
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -100,9 +101,9 @@ public:
 #else
 #define DF_EXPORT extern "C"
 #endif
-DF_EXPORT uint32_t df_audio_abi_version() noexcept { return 6; }
+DF_EXPORT uint32_t df_audio_abi_version() noexcept { return 7; }
 
-DF_EXPORT int32_t df_audio_open(void** out) noexcept {
+static int32_t open_audio(void** out, uint32_t buffer_bursts) noexcept {
     if (!out) return -1;
     *out = nullptr;
     std::unique_ptr<Renderer> r(new (std::nothrow) Renderer{});
@@ -127,15 +128,27 @@ DF_EXPORT int32_t df_audio_open(void** out) noexcept {
         AAudioStream_close(r->stream);
         return -5;
     }
+    const int32_t requested = df_audio::requested_buffer_frames(
+        buffer_bursts, AAudioStream_getFramesPerBurst(r->stream));
+    if (requested < 0) { AAudioStream_close(r->stream); return -6; }
+    const int32_t set_result = requested == 0 ?
+        AAudioStream_getBufferSizeInFrames(r->stream) :
+        AAudioStream_setBufferSizeInFrames(r->stream, requested);
+    if (set_result < 0) {
+        std::fprintf(stderr, "AUDIO_BUFFER request_bursts=%u requested_frames=%d setter_error=%d\n",
+            buffer_bursts, requested, set_result);
+        AAudioStream_close(r->stream);
+        return set_result;
+    }
     // Lifecycle thread only: requesting LOW_LATENCY does not prove the
     // negotiated backend/buffer. Preserve actual hardware-route evidence.
     std::fprintf(stderr,
-        "AUDIO_BACKEND rate=%d channels=%d format=%d sharing=%d performance=%d frames_per_burst=%d buffer_frames=%d capacity_frames=%d xruns=%d\n",
+        "AUDIO_BACKEND rate=%d channels=%d format=%d sharing=%d performance=%d frames_per_burst=%d buffer_frames=%d capacity_frames=%d xruns=%d requested_bursts=%u requested_frames=%d setter_result=%d\n",
         AAudioStream_getSampleRate(r->stream),AAudioStream_getChannelCount(r->stream),
         AAudioStream_getFormat(r->stream),AAudioStream_getSharingMode(r->stream),
         AAudioStream_getPerformanceMode(r->stream),AAudioStream_getFramesPerBurst(r->stream),
         AAudioStream_getBufferSizeInFrames(r->stream),AAudioStream_getBufferCapacityInFrames(r->stream),
-        AAudioStream_getXRunCount(r->stream));
+        AAudioStream_getXRunCount(r->stream), buffer_bursts, requested, set_result);
     const auto started = AAudioStream_requestStart(r->stream);
     if (started != AAUDIO_OK) {
         AAudioStream_close(r->stream);
@@ -143,6 +156,14 @@ DF_EXPORT int32_t df_audio_open(void** out) noexcept {
     }
     *out = r.release();
     return 0;
+}
+DF_EXPORT int32_t df_audio_open(void** out) noexcept { return open_audio(out, 0); }
+DF_EXPORT int32_t df_audio_open_config_v7(
+    const df_audio::OutputConfigV7* config, void** out) noexcept {
+    if (!out) return -1;
+    *out = nullptr;
+    if (!config || !df_audio::valid_output_config(*config)) return -6;
+    return open_audio(out, config->buffer_bursts);
 }
 DF_EXPORT int32_t df_audio_set_diagnostic_modes(void* ctx, uint32_t flags) noexcept {
     if (!ctx || (flags & ~3u)) return -1;

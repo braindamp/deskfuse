@@ -1,4 +1,4 @@
-# M2b Android native AAudio speaker — first audible vNext slice
+# M2b Android native AAudio speaker â€” first audible vNext slice
 
 This is an ISOLATED native renderer (Android API 26+), NOT an installed
 DeskFuse APK change. AAudio uses the phone's default output route.
@@ -11,7 +11,8 @@ Callback writes zeros on underrun, performs no allocation, sleeping, locks
 or network I/O. Windows and Xiaomi have independent 48-kHz audio clocks. On the
 DEVELOPMENT branch, M2b now includes one bounded output-demand correction
 authority (AAudio callback) with Q32 finite-support bandlimited resampling at +/-400 ppm and a
-30-ms target ring occupancy. The hardware-proven reference branch retains
+30-ms projected post-callback source inventory. Startup waits for callback
+demand plus that target; this is not a fixed 30-ms end-to-end latency. The hardware-proven reference branch retains
 the original renderer without adaptive drift correction.
 
 ## Build from Visual Studio Developer PowerShell
@@ -54,7 +55,7 @@ Expected: AUTH at both peers; AUDIO Android native AAudio output started;
 later rendered_frames > 0. Nonzero output frames alone do not establish
 audibility; verify actual audible music and phone output route/volume.
 
-## First physical audible playback — developer observation (2026-10-23)
+## First physical audible playback â€” developer observation (2026-10-23)
 
 **PASS: real Windows audio was heard from the Xiaomi handset over authenticated
 QUIC, using Windows WASAPI capture and the native Android AAudio sink.**
@@ -128,3 +129,17 @@ qualified. An AAudio failure from an ADB shell process may require an
 isolated app-host integration; do not bypass Android security or patch the
 existing installed APK. No credentials, private keys, recorded audio or
 phone identifiers should be committed to the public repo.
+
+## ABI 7 output buffer experiment
+
+The matching Rust/native pair requires ABI 7 and loads
+`df_audio_open_config_v7`. Historical statistics layouts/symbols are unchanged;
+mixed pairs fail before structure access. `df_audio_open` retains the default
+configuration for direct native callers.
+
+The qualification runner accepts `-AndroidBufferBursts 0` (platform default),
+`3`, or `2`. This changes only AAudio usable buffering before start; PCM format,
+shared mode, native inventory target, resampling and fades stay unchanged.
+`AUDIO_BACKEND` records requested bursts/frames, setter result and actual
+buffer size/capacity. A request is not proof of acceptance or acoustic latency.
+The default remains platform-selected until matched physical comparison.

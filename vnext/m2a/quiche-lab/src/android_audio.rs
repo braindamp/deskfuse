@@ -94,6 +94,18 @@ pub struct PlayoutState {
     pub xrun_count: i32,
     pub clipped_samples: u64,
 }
+// V7 adds pre-start buffer policy; all historical stats layouts stay fixed.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct OutputConfigV7 {
+    pub size:u32, pub version:u32, pub buffer_bursts:u32, pub reserved:u32,
+}
+impl OutputConfigV7 {
+    pub fn new(buffer_bursts:u32)->Result<Self,String> {
+        if !matches!(buffer_bursts,0|2|3) {return Err("buffer bursts must be 0, 2 or 3".into())}
+        Ok(Self {size:16,version:7,buffer_bursts,reserved:0})
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Admission {
     Accepted,
@@ -102,11 +114,11 @@ pub enum Admission {
     Discontinuity,
     Stale,
 }
-pub fn validate_abi_v6(actual: u32) -> Result<(), String> {
-    if actual == 6 { Ok(()) }
+pub fn validate_abi_v7(actual: u32) -> Result<(), String> {
+    if actual == 7 { Ok(()) }
     else {
         Err(format!(
-            "AAudio ABI mismatch expected v6, got v{actual}: redeploy both Android binaries"
+            "AAudio ABI mismatch expected v7, got v{actual}: redeploy both Android binaries"
         ))
     }
 }
@@ -116,13 +128,17 @@ mod abi_tests {
     use super::*;
     #[test]
     fn reject_mismatched_library_versions_before_struct_io() {
-        for version in [0, 1, 2, 3, 4, 5, 7, u32::MAX] {
-            assert!(validate_abi_v6(version).is_err());
+        for version in [0, 1, 2, 3, 4, 5, 6, 8, u32::MAX] {
+            assert!(validate_abi_v7(version).is_err());
         }
-        assert!(validate_abi_v6(6).is_ok());
+        assert!(validate_abi_v7(7).is_ok());
     }
     #[test]
     fn historical_struct_prefixes_and_new_coherent_record_size_remain_exact() {
+        assert_eq!(std::mem::size_of::<OutputConfigV7>(),16);
+        assert_eq!(std::mem::offset_of!(OutputConfigV7,buffer_bursts),8);
+        assert!(OutputConfigV7::new(1).is_err());
+        for policy in [0,2,3] {assert_eq!(OutputConfigV7::new(policy).unwrap().buffer_bursts,policy);}
         assert_eq!(std::mem::size_of::<AudioStats>(),80);
         assert_eq!(std::mem::size_of::<RenderIdentity>(),48);
         assert_eq!(std::mem::size_of::<RenderSnapshot>(),144);
@@ -133,7 +149,7 @@ mod abi_tests {
 
 #[cfg(target_os = "android")]
 mod native {
-    use super::{Admission, AudioStats, RenderIdentity, RenderSnapshot, PresentationTimeV5, PlayoutState};
+    use super::{OutputConfigV7, Admission, AudioStats, RenderIdentity, RenderSnapshot, PresentationTimeV5, PlayoutState};
     use std::ffi::{c_char, c_int, c_void, CString};
     use std::ptr;
 
@@ -145,7 +161,7 @@ mod native {
         fn dlclose(handle:*mut c_void) -> c_int;
     }
     type Abi=unsafe extern "C" fn() -> u32;
-    type Open=unsafe extern "C" fn(*mut *mut c_void)->i32;
+    type Open=unsafe extern "C" fn(*const OutputConfigV7,*mut *mut c_void)->i32;
     type Close=unsafe extern "C" fn(*mut c_void);
     type Modes=unsafe extern "C" fn(*mut c_void,u32)->i32;
     type PushV5=unsafe extern "C" fn(
@@ -167,7 +183,9 @@ mod native {
         snapshot:Snapshot, presentation:Presentation, playout:Playout,
     }
     impl Renderer {
-        pub fn open(path:&str)->Result<Self,String> {
+        pub fn open(path:&str)->Result<Self,String> {Self::open_with_buffer(path,0)}
+        pub fn open_with_buffer(path:&str,buffer_bursts:u32)->Result<Self,String> {
+            let output_config=OutputConfigV7::new(buffer_bursts)?;
             let path_c=CString::new(path).map_err(|_|"invalid library path")?;
             let library=unsafe{dlopen(path_c.as_ptr(),RTLD_NOW)};
             if library.is_null() {return Err(format!("cannot load Android audio library: {path}"));}
@@ -183,12 +201,12 @@ mod native {
                 Err(e)=>{unsafe{dlclose(library)};return Err(e);}
             };
             let actual=unsafe{abi()};
-            if let Err(error)=super::validate_abi_v6(actual) {
+            if let Err(error)=super::validate_abi_v7(actual) {
                 unsafe{dlclose(library)};
                 return Err(error);
             }
             let funcs=(||Ok::<_,String>((
-                sym(b"df_audio_open\0")?,
+                sym(b"df_audio_open_config_v7\0")?,
                 sym(b"df_audio_close\0")?,
                 sym(b"df_audio_set_diagnostic_modes\0")?,
                 sym(b"df_audio_push_guarded_v5\0")?,
@@ -206,7 +224,7 @@ mod native {
             };
             let open:Open=unsafe{std::mem::transmute(open)};
             let mut ctx=ptr::null_mut();
-            let code=unsafe{open(&mut ctx)};
+            let code=unsafe{open(&output_config,&mut ctx)};
             if code!=0||ctx.is_null(){
                 unsafe{dlclose(library)};
                 return Err(format!("AAudio open error={code}"));
@@ -297,6 +315,7 @@ pub struct AndroidAudio;
 #[cfg(not(target_os="android"))]
 impl AndroidAudio{
     pub fn open(_p:&str)->Result<Self,String>{Err("Android AAudio required".into())}
+    pub fn open_with_buffer(_p:&str,_b:u32)->Result<Self,String>{Err("Android AAudio required".into())}
     pub fn set_diagnostic_modes(&mut self,_f:bool,_r:bool)->Result<(),String>{
         Err("Android AAudio required".into())
     }

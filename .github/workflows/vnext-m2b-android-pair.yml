@@ -1,4 +1,4 @@
-name: vNext CP-001 Android ABI v6 pair
+name: vNext CP-001 Android ABI v7 pair
 
 on:
   pull_request:
@@ -39,7 +39,7 @@ jobs:
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;30.0.16248370"
           test -f "$ANDROID_HOME/ndk/30.0.16248370/build/cmake/android.toolchain.cmake"
-      - name: Build Android ARM64 native renderer ABI v6
+      - name: Build Android ARM64 native renderer ABI v7
         shell: bash
         run: |
           set -euo pipefail
@@ -54,7 +54,7 @@ jobs:
           set -euo pipefail
           nm="$ANDROID_HOME/ndk/30.0.16248370/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
           "$nm" -D /tmp/df-aaudio/libdeskfuse_android_audio.so > /tmp/df-aaudio/exported-symbols.txt
-          for symbol in df_audio_abi_version df_audio_push_guarded_v5 df_audio_stats df_audio_stats_v2 df_audio_snapshot_v4 df_audio_presentation_time_v5 df_audio_playout_state_v6 df_audio_close; do
+          for symbol in df_audio_abi_version df_audio_push_guarded_v5 df_audio_stats df_audio_stats_v2 df_audio_snapshot_v4 df_audio_presentation_time_v5 df_audio_open_config_v7 df_audio_playout_state_v6 df_audio_close; do
             grep -Eq "[[:space:]]$symbol$" /tmp/df-aaudio/exported-symbols.txt ||
               { echo "Missing native ABI symbol $symbol"; exit 1; }
           done
@@ -81,14 +81,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p /tmp/deskfuse-abi6
-          cp /tmp/df-aaudio/libdeskfuse_android_audio.so /tmp/deskfuse-abi6/
-          cp vnext/m2a/quiche-lab/target/aarch64-linux-android/debug/continuous-quic-lab /tmp/deskfuse-abi6/
-          cp "$ANDROID_HOME/ndk/30.0.16248370/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" /tmp/deskfuse-abi6/
-          (cd /tmp/deskfuse-abi6 && sha256sum *.so continuous-quic-lab | tee SHA256SUMS)
+          mkdir -p /tmp/deskfuse-abi7
+          cp /tmp/df-aaudio/libdeskfuse_android_audio.so /tmp/deskfuse-abi7/
+          cp vnext/m2a/quiche-lab/target/aarch64-linux-android/debug/continuous-quic-lab /tmp/deskfuse-abi7/
+          cp "$ANDROID_HOME/ndk/30.0.16248370/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" /tmp/deskfuse-abi7/
+          (cd /tmp/deskfuse-abi7 && sha256sum *.so continuous-quic-lab | tee SHA256SUMS)
           echo "COMMIT=$GITHUB_SHA"
       - uses: actions/upload-artifact@v4
         with:
-          name: deskfuse-cp001-abi6-arm64
-          path: /tmp/deskfuse-abi6/
+          name: deskfuse-cp001-abi7-arm64
+          path: /tmp/deskfuse-abi7/
           retention-days: 7

@@ -16,10 +16,12 @@ param(
     [string]$EvidenceRoot = 'D:\DeskFuseLocalData\cp001',
     [string]$Profile = 'audio-only',
     [string]$ExpectedBranch = 'feature/vnext-wp001-native-lab',
-    [string]$WindowsExecutable
+    [string]$WindowsExecutable,
+    [ValidateSet(0,2,3)][int]$AndroidBufferBursts = 0
 )
 $ErrorActionPreference = 'Stop'
 if ($Strict -and $Modes -ne 'f0c0r0') { throw 'Strict PCM verification requires f0c0r0 (no DSP or fade)' }
+if ($AndroidBufferBursts -ne 0 -and ($Strict -or $VerifyOnly)) { throw 'Buffer experiment requires adaptive speaker playback' }
 if ($Strict -and $VerifyOnly) { throw 'Choose either Strict AAudio verification or silent VerifyOnly, not both' }
 $stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
 $folder = Join-Path $EvidenceRoot ($stamp + '-' + ($Profile -replace '[^\w-]','_') + '-' + $Modes)
@@ -69,6 +71,7 @@ $events = @(
     'git_worktree_change_count=' + $worktree.Count,
     'profile=' + $Profile,
     'modes=' + $Modes,
+    'android_requested_buffer_bursts=' + $AndroidBufferBursts,
     'strict_pcm=' + [bool]$Strict,
     'verify_only_no_aaudio=' + [bool]$VerifyOnly,
     'duration_seconds=' + $Seconds,
@@ -241,6 +244,7 @@ try {
     # but never loads the native AAudio renderer and cannot emit phone audio.
     $verb = if ($VerifyOnly) { 'client-capture' } elseif ($Strict) { 'client-playback-strict' } else { 'client-playback-modes' }
     $modeArg = if ($Strict -or $VerifyOnly) { '' } else { $Modes + ' ' }
+    if ($AndroidBufferBursts -ne 0) { $verb='client-playback-buffer'; $modeArg=$Modes + ' ' + $AndroidBufferBursts + ' ' }
     $rendererArg = if ($VerifyOnly) { '' } else { '/data/local/tmp/libdeskfuse_android_audio.so ' }
     $cmd = 'LD_LIBRARY_PATH=/data/local/tmp /data/local/tmp/deskfuse-vnext-continuous ' + $verb + ' ' + $WindowsIP + ':48235 /data/local/tmp/df-lab-ca.pem /data/local/tmp/df-lab-client.pem /data/local/tmp/df-lab-client.key ' + $rendererArg + $modeArg + $Seconds
     if ($VerifyOnly) {
