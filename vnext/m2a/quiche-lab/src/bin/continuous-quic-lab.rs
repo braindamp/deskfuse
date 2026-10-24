@@ -16,7 +16,8 @@ use deskfuse_quiche_lab::android_audio::{Admission, AndroidAudio};
 use deskfuse_quiche_lab::source_age::{self, AgeDecision};
 use deskfuse_quiche_lab::plaintext_expiry::{PlaintextExpiry, QueueAdmission};
 use deskfuse_quiche_lab::receive_frontier::{ReceiveFrontier, ContinuityWatch, Context as SourceContext, Reject as SourceReject};
-use deskfuse_quiche_lab::deferred_trace::{WindowsTrace, Event as TraceEvent, FilterStage};
+use deskfuse_quiche_lab::deferred_trace::{WindowsTrace, Event as TraceEvent, FilterStage, AndroidTrace, AndroidFault, AndroidPeriodic};
+use deskfuse_quiche_lab::android_audio::{AudioStats, PlayoutState};
 use deskfuse_quiche_lab::fresh_anchor::{self, Message as AnchorMessage};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
@@ -653,6 +654,7 @@ fn begin_fresh_anchor(
     renderer: &mut AndroidAudio,
     context: SourceContext,
     rejection_frontier: u64,
+    diagnostics: &mut AndroidTrace,
 ) -> Result<()> {
     if pending.is_none() {
         let nonce = *next_nonce;
@@ -672,8 +674,7 @@ fn begin_fresh_anchor(
             retry_at: now,
             confirmed: None,
         });
-        eprintln!("TRACE Android ANCHOR_REQUEST nonce={} floor={}",
-            nonce, rejection_frontier);
+        diagnostics.fault(AndroidFault::AnchorRequest {nonce,floor:rejection_frontier});
     }
     Ok(())
 }
@@ -692,6 +693,7 @@ struct ClientMedia {
     session_context:Option<SourceContext>, anchor_pending:Option<PendingAnchor>,
     fresh_anchor_nonce:u64, authorized_recovery:u64, confirmed_reanchors:u64,
     audio:Option<AndroidAudio>,
+    diagnostics:AndroidTrace,
     latest_render_record:Option<(deskfuse_quiche_lab::android_audio::RenderSnapshot,u64)>,
     coherent_records_read:u64,
     strict_baseline:Option<(deskfuse_quiche_lab::android_audio::RenderSnapshot,u64)>,
@@ -733,7 +735,8 @@ impl ClientMedia {
             if let Some(speaker)=self.audio.as_mut() {
                 begin_fresh_anchor(&mut self.anchor_pending,&mut self.fresh_anchor_nonce,
                     speaker,SourceContext{epoch:h.media_epoch,stream:h.source_stream_id,
-                                         format:h.format_config_id},self.ingress_frontier.floor())?;
+                                         format:h.format_config_id},self.ingress_frontier.floor(),
+                    &mut self.diagnostics)?;
                 self.recover_started+=1;
             }
             self.reorder.clear();
@@ -802,6 +805,7 @@ impl ClientMedia {
                         SourceContext { epoch:h.media_epoch, stream:h.source_stream_id,
                                         format:h.format_config_id },
                         self.ingress_frontier.floor(),
+                        &mut self.diagnostics,
                     )?;
                     self.recover_started += 1;
                 }
@@ -888,10 +892,8 @@ impl ClientMedia {
         // failure signature instead of stopping after 8 gaps.
         if recurring_source_hole && playback_library.is_none() &&
             self.continuity_watch.repeated_gaps()==ContinuityWatch::LIMIT {
-            eprintln!(
-                "TRACE Android VERIFY_ONLY_SOURCE_CONTINUITY_FAILURE repeated_gaps={} first_source_frame={} sequence={} (no audio output)",
-                self.continuity_watch.repeated_gaps(),h.first_source_frame,h.packet_sequence
-            );
+            self.diagnostics.fault(AndroidFault::VerifyContinuity {
+                repeated:self.continuity_watch.repeated_gaps(),source:h.first_source_frame,sequence:h.packet_sequence});
         }
         if modes.strict && missing != 0 {
             return Err(format!(
@@ -900,10 +902,9 @@ impl ClientMedia {
             ).into());
         }
         if missing != 0 {
-                eprintln!("TRACE Android SOURCE_GAP epoch={} sequence={} first_source_frame={} gap_frames={} elapsed_ms={}",
-                    h.media_epoch, h.packet_sequence, h.first_source_frame,
-                    missing,
-                    authenticated_at.map(|t| t.elapsed().as_millis()).unwrap_or(0));
+                self.diagnostics.fault(AndroidFault::Gap {epoch:h.media_epoch,sequence:h.packet_sequence,
+                    source:h.first_source_frame,frames:missing,
+                    elapsed_ms:authenticated_at.map(|t|t.elapsed().as_millis()).unwrap_or(0)});
                 if let Some(ref mut speaker) = self.audio {
                     if modes.conceal && missing <= MAX_CONCEALMENT_FRAMES && missing % AUDIO_FRAMES == 0 {
                         // A genuine 5- or 10-ms media hole. Preserve
@@ -935,6 +936,7 @@ impl ClientMedia {
                                             format:h.format_config_id,
                                         },
                                         self.ingress_frontier.floor(),
+                                        &mut self.diagnostics,
                                     )?;
                                     self.recover_started += 1;
                                     break;
@@ -966,6 +968,7 @@ impl ClientMedia {
                                 format:h.format_config_id,
                             },
                             self.ingress_frontier.floor(),
+                            &mut self.diagnostics,
                         )?;
                         self.recover_started += 1;
                         // The current packet establishes a
@@ -1006,6 +1009,7 @@ impl ClientMedia {
                             format:h.format_config_id,
                         },
                         self.ingress_frontier.floor(),
+                        &mut self.diagnostics,
                     )?;
                 }
                 Admission::RecoverPending => {
@@ -1019,6 +1023,7 @@ impl ClientMedia {
                             format:h.format_config_id,
                         },
                         self.ingress_frontier.floor(),
+                        &mut self.diagnostics,
                     )?;
                 }
                 Admission::Stale => {
@@ -1028,38 +1033,25 @@ impl ClientMedia {
             }
         }
         if self.received % 200 == 0 {
-            println!("ANDROID PCM received={} last_seq={} source_frame={} missing_before={} stale={} elapsed_ms={}",
-                self.received, h.packet_sequence, h.first_source_frame,
-                self.gaps, self.late,
-                authenticated_at.map(|t| t.elapsed().as_millis()).unwrap_or(0));
-            if let Some(ref speaker) = self.audio {
-                let a = speaker.snapshot()
-                    .map_err(|e| format!("AAudio periodic diagnostics: {e}"))?;
-                let t = speaker.timing_sample()
-                    .map_err(|e| format!("AAudio off-callback timing sample: {e}"))?;
-                println!("TRACE Android OUTPUT_HAL frame={} monotonic_ns={} timestamp_result={} generation={} before_ns={} after_ns={} written_before={} written_after={} clock_result={} rate={} state_before={} state_after={} xruns={} buffer_frames={} capacity_frames={} device={} (system estimate only; not acoustic latency)",
-                    t.timestamp_frame,t.timestamp_ns,t.timestamp_result,t.output_generation,
-                    t.before_ns,t.after_ns,t.written_before,t.written_after,t.clock_result,
-                    t.sample_rate,t.state_before,t.state_after,t.xrun_count,t.buffer_frames,
-                    t.capacity_frames,t.device_id);
-                if let Some(playout)=speaker.playout_state()
-                    .map_err(|e|format!("AAudio periodic playout state: {e}"))? {
-                    println!("TRACE Android RECONSTRUCTION clipped_samples={} xrun_count={} last_callback_frames={} max_callback_frames={} playable_frames={} primed={}",
-                        playout.clipped_samples,playout.xrun_count,
-                        playout.last_callback_frames,playout.max_callback_frames,
-                        playout.queued_playable_frames,playout.primed);
+            let mut sample=AndroidPeriodic {
+                received:self.received,sequence:h.packet_sequence,source:h.first_source_frame,
+                missing:self.gaps,stale:self.late,queue_full:self.audio_queue_full,
+                elapsed_ms:authenticated_at.map(|t|t.elapsed().as_millis()).unwrap_or(0),
+                ..AndroidPeriodic::default()
+            };
+            // Keep getter order/cadence unchanged; retain partial status if a
+            // getter fails, then propagate that failure exactly as before.
+            let observed=(|| -> Result<()> {
+                if let Some(ref speaker)=self.audio {
+                    sample.audio=Some(speaker.snapshot().map_err(|e|format!("AAudio periodic diagnostics: {e}"))?);
+                    sample.timing=Some(speaker.timing_sample().map_err(|e|format!("AAudio off-callback timing sample: {e}"))?);
+                    sample.playout=speaker.playout_state().map_err(|e|format!("AAudio periodic playout state: {e}"))?;
+                    sample.render=self.latest_render_record;
                 }
-                if let Some((record, dropped)) = self.latest_render_record {
-                    println!("TRACE Android RENDER committed_source={} support={} phase_q32={} epoch={} stream={} format={} connection={} playout={} released={} discarded={} concealed_output={} callbacks_record={} dropped_callback_records={} queued_frames={} drift_ppm={} underruns={} rebuffer={} silence_frames={} queue_full={}",
-                        record.last_source, record.last_support_source,
-                        record.fraction_q32, record.epoch, record.stream, record.format,
-                        record.connection, record.playout,
-                        record.released, record.discarded, record.concealed_outputs,
-                        record.callback_seq, dropped, a.queued_frames,
-                        record.drift_ppm, record.underruns, record.reprimes,
-                        record.silence, self.audio_queue_full);
-                }
-            }
+                Ok(())
+            })();
+            self.diagnostics.periodic(sample);
+            observed?;
         }
         Ok(())
     }
@@ -1068,6 +1060,9 @@ impl ClientMedia {
 fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, synthetic: bool, playback_library: Option<&str>, modes: PlayModes) -> Result<()> {
     let mut cfg = config(ca, cert, key)?;
     let mut state=ClientMedia {fresh_anchor_nonce:1,..ClientMedia::default()};
+    let mut transport_final:Option<(u64,usize)>=None;
+    let mut native_final:Option<(AudioStats,Option<PlayoutState>)>=None;
+    let result=(|| -> Result<()> {
     // Prepare the fixed-format native renderer and its immutable sinc table
     // before the handshake can cause Windows to start sending PCM. The
     // callback emits defined silence until authenticated media is admitted.
@@ -1094,9 +1089,9 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
     let mut logged_initial_udp_tx = false;
     let mut input = [0u8; 65535];
     let mut datagram = [0u8; 1500];
-    let mut foreign_udp_packets = 0u64;
 
     println!("CONNECT continuous Android sink {} -> {} ; mutual TLS mandatory", local, remote);
+    let loop_result=(|| -> Result<()> {
     loop {
         service_timeout(&mut conn);
         if conn.is_closed() { return Err("Android QUIC connection closed before receiving complete observation window".into()); }
@@ -1118,10 +1113,7 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                 Ok(_) => {
                     // Unauthenticated foreign traffic cannot terminate music.
                     // QUIC still authenticates every accepted peer packet.
-                    foreign_udp_packets = foreign_udp_packets.saturating_add(1);
-                    if foreign_udp_packets <= 4 || foreign_udp_packets % 1024 == 0 {
-                        eprintln!("TRACE Android FOREIGN_UDP_IGNORED count={foreign_udp_packets}");
-                    }
+                    state.diagnostics.foreign_udp_packets=state.diagnostics.foreign_udp_packets.saturating_add(1);
                     true
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => false,
@@ -1130,17 +1122,10 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
             if conn.is_established() && authenticated_at.is_none() {
                 verified(&conn)?;
                 authenticated_at = Some(Instant::now());
-                println!("AUTH Android: verified Windows server CA chain and deskfuse-lab.local");
-                if state.audio.is_some() {
-                    // linear_asrc is the historical parser token for r1;
-                    // backend names the actual reconstruction implementation.
-                    println!("AUDIO Android: authenticated PCM enabled, stereo PCM16 48000 Hz; modes fades={} concealment={} linear_asrc={} backend={}",
-                             modes.fades, modes.conceal, modes.linear,
-                             if modes.linear {"bandlimited-sinc128"} else {"identity"});
-                    if modes.strict {
-                        println!("STRICT Android: no resampling/concealment/fades; source identity is exact; steady-state 500ms after auth until 250ms before end; startup/shutdown silence excluded");
-                    }
-                }
+                state.diagnostics.authenticated=true;
+                state.diagnostics.playback=state.audio.is_some();
+                state.diagnostics.fades=modes.fades;state.diagnostics.conceal=modes.conceal;
+                state.diagnostics.resample=modes.linear;state.diagnostics.strict=modes.strict;
             }
             if authenticated_at.is_some() {
                 for _ in 0..128 {
@@ -1156,8 +1141,7 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                                 }
                                 if let Some(ref mut pending) = state.anchor_pending {
                                     if pending.confirm(reply, Instant::now())? {
-                                        eprintln!("TRACE Android ANCHOR_CONFIRMED nonce={} source={}",
-                                            reply.nonce, reply.frame);
+                                        state.diagnostics.fault(AndroidFault::AnchorConfirmed {nonce:reply.nonce,source:reply.frame});
                                     } // retired challenge responses are never fresh.
                                 }
                                 continue;
@@ -1234,6 +1218,7 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                     begin_fresh_anchor(
                         &mut state.anchor_pending, &mut state.fresh_anchor_nonce, speaker,
                         context, state.ingress_frontier.floor(),
+                        &mut state.diagnostics,
                     )?;
                     state.recover_started += 1;
                     state.reorder.clear();
@@ -1262,50 +1247,15 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
         }
         egress.service(&udp, &mut conn, false)?;
         if !logged_initial_udp_tx && egress.udp_packets_sent > 0 {
-            eprintln!("TRACE Android PREAUTH_UDP_TX accepted_by_kernel=1 dest={} total_packets={}",
-                      remote, egress.udp_packets_sent);
+            state.diagnostics.first_udp_tx=Some(egress.udp_packets_sent);
             logged_initial_udp_tx = true;
         }
         if let Some(at) = authenticated_at {
             if at.elapsed() >= Duration::from_secs(seconds + 2) {
-                let stats = conn.stats();
-                println!(
-                    "DONE Android sink received={} first_seq={:?} last_seq={:?} missing_between={} source_missing_frames={} concealed_frames={} unfilled_frames={} stale={} udp_packets={} quic_lost={} reorder_full={} reorder_duplicates={} reorder_budget_drops={} mode={}",
-                    state.received, state.first_sequence, state.last_sequence, state.gaps, state.source_gap_frames,
-                    state.source_concealed_frames, state.source_unconcealed_frames,
-                    state.late, egress.udp_packets_sent, stats.lost,
-                    state.reorder.full_drops,state.reorder.duplicates,state.reorder.budget_drops,
-                    if state.audio.is_some() { "native-speaker" } else { "verify-only" }
-                );
-                if let Some(ref speaker) = state.audio {
-                    let a = speaker.snapshot().map_err(|e| format!("AAudio stats: {e}"))?;
-                    if let Some(playout)=speaker.playout_state()
-                        .map_err(|e|format!("AAudio final playout state: {e}"))? {
-                        println!("AUDIO Android reconstruction clipped_samples={} xrun_count={}",
-                            playout.clipped_samples,playout.xrun_count);
-                    }
-                    println!(
-                        "AUDIO Android speaker accepted_frames={} rendered_frames={} silence_frames={} overflow_packets={} queue_full_from_receiver={} callbacks={} queued_frames={} stream_error={} format={}Hz/{}ch drift_ppm={} underrun_events={} reprime_events={}",
-                        a.accepted_frames, a.rendered_frames, a.silence_frames,
-                        a.overflow_packets, state.audio_queue_full, a.callback_count,
-                        a.queued_frames, a.stream_error, a.actual_sample_rate, a.actual_channels,
-                        a.drift_correction_ppm, a.underrun_events, a.reprime_events
-                    );
-                    if let Some((record, dropped)) = state.latest_render_record {
-                        println!("AUDIO Android committed callback={} source={} support={} fraction_q32={} epoch={} stream={} format={} connection={} playout_generation={} committed_output={} released_source={} discarded_rebuffer={} concealed_output={} coherence_dropped={} coherence_read={}",
-                            record.callback_seq, record.last_source,
-                            record.last_support_source, record.fraction_q32,
-                            record.epoch, record.stream, record.format, record.connection,
-                            record.playout, record.committed_output, record.released,
-                            record.discarded, record.concealed_outputs,
-                            dropped, state.coherent_records_read);
-                    }
-                    println!("AUDIO Android authenticated_reanchors={} outstanding_anchor={} last_receiver_frontier={}",
-                        state.confirmed_reanchors, state.anchor_pending.is_some(),
-                        state.ingress_frontier.floor());
-                    println!("AUDIO Android recovery_started={} recovery_pending_drops={} native_stale={} denied_contexts={} authorized_ticket={}",
-                        state.recover_started, state.recover_pending, state.native_stale,
-                        state.denied_reanchor, state.authorized_recovery);
+                if let Some(ref speaker)=state.audio {
+                    let a=speaker.snapshot().map_err(|e|format!("AAudio stats: {e}"))?;
+                    let playout=speaker.playout_state().map_err(|e|format!("AAudio final playout state: {e}"))?;
+                    native_final=Some((a,playout));
                     if a.stream_error != 0 { return Err(format!("AAudio stream failure code={}", a.stream_error).into()); }
                     if a.rendered_frames == 0 { return Err("AAudio played no authenticated PCM frames".into()); }
                 }
@@ -1342,11 +1292,102 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
             egress.service(&udp, &mut conn, true)?;
         }
     }
+    })();
+    // This owner is quiescent, even on a returned protocol error.
+    let stats=conn.stats();transport_final=Some((egress.udp_packets_sent,stats.lost));
+    loop_result
+    })();
+    let mut native_status_error=None;
+    if native_final.is_none() {
+        if let Some(ref speaker)=state.audio {
+            match speaker.snapshot() {
+                Ok(a)=>{
+                    match speaker.playout_state() {
+                        Ok(p)=>native_final=Some((a,p)),
+                        Err(e)=>{native_final=Some((a,None));native_status_error=Some(e);}
+                    }
+                }
+                Err(e)=>native_status_error=Some(e),
+            }
+        }
+    }
+    let complete=result.is_ok();
+    let audio=state.audio.take();
+    finish_client(result,||drop(audio),|| {
+        use std::io::Write;
+        let mut out=io::stdout().lock();
+        state.diagnostics.flush(&mut out,remote)?;
+        write_client_summary(&mut out,&state,transport_final,native_final,
+            playback_library.is_some(),complete,native_status_error.as_deref())?;
+        out.flush()
+    })
+}
+
+// Production finish path: externally backpressured output is reachable only
+// after audio shutdown. Reporting must never replace an earlier media error.
+fn finish_client(result:Result<()>,close:impl FnOnce(),write:impl FnOnce()->io::Result<()>)->Result<()> {
+    close();
+    let written=write();
+    result?;
+    written.map_err(|e|format!("Android deferred diagnostic output failed: {e}").into())
+}
+fn write_client_summary(out:&mut impl io::Write,state:&ClientMedia,
+    transport:Option<(u64,usize)>,native:Option<(AudioStats,Option<PlayoutState>)>,
+    playback:bool,complete:bool,status_error:Option<&str>)->io::Result<()> {
+    let prefix=if complete {"DONE"}else{"PARTIAL"};
+    if let Some((udp,lost))=transport {
+        writeln!(out,"{prefix} Android sink received={} first_seq={:?} last_seq={:?} missing_between={} source_missing_frames={} concealed_frames={} unfilled_frames={} stale={} udp_packets={} quic_lost={} reorder_full={} reorder_duplicates={} reorder_budget_drops={} mode={}",
+            state.received,state.first_sequence,state.last_sequence,state.gaps,state.source_gap_frames,
+            state.source_concealed_frames,state.source_unconcealed_frames,state.late,udp,lost,
+            state.reorder.full_drops,state.reorder.duplicates,state.reorder.budget_drops,
+            if playback{"native-speaker"}else{"verify-only"})?;
+    } else {writeln!(out,"TRACE Android transport_summary_unavailable=true")?;}
+    if let Some((a,playout))=native {
+        if let Some(p)=playout {
+            writeln!(out,"AUDIO Android reconstruction clipped_samples={} xrun_count={}",p.clipped_samples,p.xrun_count)?;
+        }
+        writeln!(out,"AUDIO Android speaker accepted_frames={} rendered_frames={} silence_frames={} overflow_packets={} queue_full_from_receiver={} callbacks={} queued_frames={} stream_error={} format={}Hz/{}ch drift_ppm={} underrun_events={} reprime_events={}",
+            a.accepted_frames,a.rendered_frames,a.silence_frames,a.overflow_packets,state.audio_queue_full,
+            a.callback_count,a.queued_frames,a.stream_error,a.actual_sample_rate,a.actual_channels,
+            a.drift_correction_ppm,a.underrun_events,a.reprime_events)?;
+    } else if playback {writeln!(out,"TRACE Android native_stats_unavailable=true")?;}
+    if let Some((r,dropped))=state.latest_render_record {
+        writeln!(out,"AUDIO Android committed callback={} source={} support={} fraction_q32={} epoch={} stream={} format={} connection={} playout_generation={} committed_output={} released_source={} discarded_rebuffer={} concealed_output={} coherence_dropped={} coherence_read={}",
+            r.callback_seq,r.last_source,r.last_support_source,r.fraction_q32,r.epoch,r.stream,r.format,
+            r.connection,r.playout,r.committed_output,r.released,r.discarded,r.concealed_outputs,dropped,state.coherent_records_read)?;
+    }
+    if playback {
+        writeln!(out,"AUDIO Android authenticated_reanchors={} outstanding_anchor={} last_receiver_frontier={}",state.confirmed_reanchors,state.anchor_pending.is_some(),state.ingress_frontier.floor())?;
+        writeln!(out,"AUDIO Android recovery_started={} recovery_pending_drops={} native_stale={} denied_contexts={} authorized_ticket={}",state.recover_started,state.recover_pending,state.native_stale,state.denied_reanchor,state.authorized_recovery)?;
+    }
+    if let Some(error)=status_error {writeln!(out,"TRACE Android secondary_native_status_error={error:?}")?;}
+    writeln!(out,"TRACE Android session_complete={complete}")
 }
 
 #[cfg(test)]
 mod client_staging_tests {
     use super::*;
+    #[test]
+    fn production_finish_closes_before_output_and_preserves_primary_error() {
+        use std::cell::Cell;
+        use std::io::Write;
+        struct FailedWriter<'a>(&'a Cell<bool>);
+        impl Write for FailedWriter<'_> {
+            fn write(&mut self,_:&[u8])->io::Result<usize> {
+                assert!(self.0.get(),"writer invoked before audio closed");
+                Err(io::Error::from(io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self)->io::Result<()>{Ok(())}
+        }
+        for fail_media in [false,true] {
+            let closed=Cell::new(false);
+            let result=if fail_media{Err("original media failure".into())}else{Ok(())};
+            let error=finish_client(result,||closed.set(true),||FailedWriter(&closed).write_all(b"report")).unwrap_err();
+            assert!(closed.get());
+            if fail_media {assert_eq!(error.to_string(),"original media failure")}
+            else {assert!(error.to_string().contains("Android deferred diagnostic output failed"))}
+        }
+    }
     fn deliver(state:&mut ClientMedia,sequence:u32)->Result<()> {
         let wire=captured_packet(sequence,48_000+u64::from(sequence)*AUDIO_FRAMES,&[0;960]);
         let (header,_)=parse(&wire,&Configuration::default()).unwrap();

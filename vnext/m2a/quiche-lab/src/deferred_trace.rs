@@ -226,9 +226,123 @@ impl WindowsTrace {
 // No hidden heap storage: full owner diagnostics must remain below 40 KiB.
 const _: () = assert!(std::mem::size_of::<WindowsTrace>() <= 40 * 1024);
 
+// Android uses the same first/latest retention policy, with typed periodic
+// storage so large snapshots are not replicated in every fault category.
+use crate::android_audio::{AudioStats, PlayoutState, RenderSnapshot, TimingSampleV7};
+#[derive(Clone, Copy, Default)]
+pub struct AndroidPeriodic {
+    pub received:u64, pub sequence:u32, pub source:u64,
+    pub missing:u64, pub stale:u64, pub elapsed_ms:u128, pub queue_full:u64,
+    pub audio:Option<AudioStats>, pub timing:Option<TimingSampleV7>,
+    pub playout:Option<PlayoutState>, pub render:Option<(RenderSnapshot,u64)>,
+}
+#[derive(Clone, Copy)]
+pub enum AndroidFault {
+    Gap{epoch:u32,sequence:u32,source:u64,frames:u64,elapsed_ms:u128},
+    AnchorRequest{nonce:u64,floor:u64},
+    AnchorConfirmed{nonce:u64,source:u64},
+    VerifyContinuity{repeated:u32,source:u64,sequence:u32},
+}
+struct AndroidSamples<T:Copy,const N:usize> {
+    first:[Option<T>;N], recent:[Option<T>;N], total:u64, next:usize, recent_count:usize,
+}
+impl<T:Copy,const N:usize> Default for AndroidSamples<T,N> {
+    fn default()->Self {Self{first:[None;N],recent:[None;N],total:0,next:0,recent_count:0}}
+}
+impl<T:Copy,const N:usize> AndroidSamples<T,N> {
+    fn record(&mut self,value:T) {
+        if self.total<N as u64 {self.first[self.total as usize]=Some(value)}
+        else {
+            self.recent[self.next]=Some(value);self.next=(self.next+1)%N;
+            self.recent_count=(self.recent_count+1).min(N);
+        }
+        self.total=self.total.saturating_add(1);
+    }
+    fn flush(&self,out:&mut impl Write,category:&str,mut write:impl FnMut(&mut dyn Write,T)->io::Result<()>)->io::Result<()> {
+        if self.total==0 {return Ok(())}
+        let first=self.total.min(N as u64) as usize;
+        let retained=first+self.recent_count;
+        writeln!(out,"TRACE Android DEFERRED category={category} total={} retained={retained} omitted={} (diagnostic samples; counters remain authoritative)",self.total,self.total-retained as u64)?;
+        for value in self.first[..first].iter().flatten(){write(out,*value)?}
+        let start=if self.recent_count==N {self.next}else{0};
+        for i in 0..self.recent_count {if let Some(value)=self.recent[(start+i)%N]{write(out,value)?}}
+        Ok(())
+    }
+}
+#[derive(Default)]
+pub struct AndroidTrace {
+    periodic:AndroidSamples<AndroidPeriodic,3>,
+    faults:[AndroidSamples<AndroidFault,8>;4],
+    pub authenticated:bool, pub playback:bool, pub strict:bool,
+    pub fades:bool, pub conceal:bool, pub resample:bool,
+    pub first_udp_tx:Option<u64>, pub foreign_udp_packets:u64,
+}
+impl AndroidTrace {
+    pub fn periodic(&mut self,value:AndroidPeriodic){self.periodic.record(value)}
+    pub fn fault(&mut self,value:AndroidFault){
+        let category=match value {AndroidFault::Gap{..}=>0,AndroidFault::AnchorRequest{..}=>1,
+            AndroidFault::AnchorConfirmed{..}=>2,AndroidFault::VerifyContinuity{..}=>3};
+        self.faults[category].record(value);
+    }
+    pub fn flush(&self,out:&mut impl Write,remote:std::net::SocketAddr)->io::Result<()> {
+        writeln!(out,"TRACE Android diagnostics_deferred=true audio_closed_before_output=true")?;
+        if let Some(total)=self.first_udp_tx {
+            writeln!(out,"TRACE Android PREAUTH_UDP_TX accepted_by_kernel=1 dest={remote} total_packets={total}")?;
+        }
+        if self.authenticated {
+            writeln!(out,"AUTH Android: verified Windows server CA chain and deskfuse-lab.local")?;
+            if self.playback {
+                writeln!(out,"AUDIO Android: authenticated PCM enabled, stereo PCM16 48000 Hz; modes fades={} concealment={} linear_asrc={} backend={}",self.fades,self.conceal,self.resample,if self.resample{"bandlimited-sinc128"}else{"identity"})?;
+                if self.strict {writeln!(out,"STRICT Android: no resampling/concealment/fades; source identity is exact; steady-state 500ms after auth until 250ms before end; startup/shutdown silence excluded")?;}
+            }
+        }
+        self.periodic.flush(out,"periodic",|out,p| {
+            writeln!(out,"ANDROID PCM received={} last_seq={} source_frame={} missing_before={} stale={} elapsed_ms={}",p.received,p.sequence,p.source,p.missing,p.stale,p.elapsed_ms)?;
+            if let Some(t)=p.timing {
+                writeln!(out,"TRACE Android OUTPUT_HAL frame={} monotonic_ns={} timestamp_result={} generation={} before_ns={} after_ns={} written_before={} written_after={} clock_result={} rate={} state_before={} state_after={} xruns={} buffer_frames={} capacity_frames={} device={} (system estimate only; not acoustic latency)",t.timestamp_frame,t.timestamp_ns,t.timestamp_result,t.output_generation,t.before_ns,t.after_ns,t.written_before,t.written_after,t.clock_result,t.sample_rate,t.state_before,t.state_after,t.xrun_count,t.buffer_frames,t.capacity_frames,t.device_id)?;
+            }
+            if let Some(s)=p.playout {
+                writeln!(out,"TRACE Android RECONSTRUCTION clipped_samples={} xrun_count={} last_callback_frames={} max_callback_frames={} playable_frames={} primed={}",s.clipped_samples,s.xrun_count,s.last_callback_frames,s.max_callback_frames,s.queued_playable_frames,s.primed)?;
+            }
+            if let (Some(a),Some((s,dropped)))=(p.audio,p.render) {
+                writeln!(out,"TRACE Android RENDER committed_source={} support={} phase_q32={} epoch={} stream={} format={} connection={} playout={} released={} discarded={} concealed_output={} callbacks_record={} dropped_callback_records={} queued_frames={} drift_ppm={} underruns={} rebuffer={} silence_frames={} queue_full={}",s.last_source,s.last_support_source,s.fraction_q32,s.epoch,s.stream,s.format,s.connection,s.playout,s.released,s.discarded,s.concealed_outputs,s.callback_seq,dropped,a.queued_frames,s.drift_ppm,s.underruns,s.reprimes,s.silence,p.queue_full)?;
+            }
+            Ok(())
+        })?;
+        for (i,samples) in self.faults.iter().enumerate() {
+            samples.flush(out,["source_gap","anchor_request","anchor_confirmed","verify_continuity"][i],|out,event| match event {
+                AndroidFault::Gap{epoch,sequence,source,frames,elapsed_ms}=>writeln!(out,"TRACE Android SOURCE_GAP epoch={epoch} sequence={sequence} first_source_frame={source} gap_frames={frames} elapsed_ms={elapsed_ms}"),
+                AndroidFault::AnchorRequest{nonce,floor}=>writeln!(out,"TRACE Android ANCHOR_REQUEST nonce={nonce} floor={floor}"),
+                AndroidFault::AnchorConfirmed{nonce,source}=>writeln!(out,"TRACE Android ANCHOR_CONFIRMED nonce={nonce} source={source}"),
+                AndroidFault::VerifyContinuity{repeated,source,sequence}=>writeln!(out,"TRACE Android VERIFY_ONLY_SOURCE_CONTINUITY_FAILURE repeated_gaps={repeated} first_source_frame={source} sequence={sequence} (no audio output)"),
+            })?;
+        }
+        writeln!(out,"TRACE Android FOREIGN_UDP_IGNORED count={}",self.foreign_udp_packets)
+    }
+}
+const _: () = assert!(std::mem::size_of::<AndroidTrace>() <= 32 * 1024);
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn android_samples_preserve_first_latest_totals_and_optional_status() {
+        let mut trace=AndroidTrace::default();
+        for n in 0..100 {
+            trace.periodic(AndroidPeriodic {received:n,sequence:n as u32,..Default::default()});
+            trace.fault(AndroidFault::AnchorRequest{nonce:n,floor:n*240});
+        }
+        let mut out=Vec::new();trace.flush(&mut out,"127.0.0.1:9".parse().unwrap()).unwrap();
+        let text=String::from_utf8(out).unwrap();
+        assert!(text.contains("category=periodic total=100 retained=6 omitted=94"));
+        assert!(text.contains("category=anchor_request total=100 retained=16 omitted=84"));
+        let retained:Vec<u64>=text.lines().filter(|s|s.starts_with("ANDROID PCM "))
+            .map(|s|s.split("received=").nth(1).unwrap().split_whitespace().next().unwrap().parse().unwrap()).collect();
+        assert_eq!(retained,vec![0,1,2,97,98,99]);
+        assert!(!text.contains("OUTPUT_HAL"));
+        assert!(!text.contains("RECONSTRUCTION"));
+        assert!(std::mem::size_of::<AndroidTrace>()<=32*1024);
+    }
     struct ForbiddenSink;
     impl Write for ForbiddenSink {
         fn write(&mut self, _: &[u8]) -> io::Result<usize> {
