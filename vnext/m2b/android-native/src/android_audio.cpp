@@ -51,7 +51,8 @@ struct IdentityStats {
 std::atomic<uint64_t> next_output_generation{1};
 class Renderer {
 public:
-    explicit Renderer(uint32_t reserve) noexcept : core(reserve) {}
+    explicit Renderer(uint32_t reserve) noexcept : configured_reserve(reserve), core(reserve) {}
+    const uint32_t configured_reserve;
     AAudioStream* stream = nullptr;
     uint64_t output_generation = 0; // immutable for this stream lifetime
     df_audio::RenderCore core;
@@ -372,4 +373,19 @@ DF_EXPORT void df_audio_close(void* ctx) noexcept {
         AAudioStream_close(r->stream);
     }
     delete r;
+}
+
+// Additive observation API; historical renderer ABI layouts remain unchanged.
+struct OutputStateV1 { uint32_t size,version; int32_t sharing,performance,frames_per_burst,usage,format,reserve_frames; };
+static_assert(sizeof(OutputStateV1)==32);
+DF_EXPORT int32_t df_audio_output_state_v1(void* ctx,OutputStateV1* out) noexcept {
+    if (!ctx || !out || out->size!=sizeof(OutputStateV1) || out->version!=1) return -1;
+    auto* r=static_cast<Renderer*>(ctx);
+    out->sharing=AAudioStream_getSharingMode(r->stream);
+    out->performance=AAudioStream_getPerformanceMode(r->stream);
+    out->frames_per_burst=AAudioStream_getFramesPerBurst(r->stream);
+    out->usage=AAudioStream_getUsage(r->stream);
+    out->format=AAudioStream_getFormat(r->stream);
+    out->reserve_frames=static_cast<int32_t>(r->configured_reserve);
+    return 0;
 }

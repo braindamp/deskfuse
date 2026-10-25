@@ -22,6 +22,7 @@ param(
     [string]$LabRoot = 'D:\Coding\DeskFuse\vnext-wp001',
     [string]$EvidenceRoot = 'D:\DeskFuseLocalData\cp001',
     [string]$Profile = 'audio-only',
+    [ValidatePattern('^[0-9a-f]{32}$')][string]$RunId = ([guid]::NewGuid().ToString('N')),
     [string]$ExpectedBranch = 'feature/vnext-wp001-native-lab',
     [string]$WindowsExecutable,
     [ValidateSet(0,2,3)][int]$AndroidBufferBursts = 0,
@@ -36,10 +37,10 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 if ($PSCmdlet.ParameterSetName -eq 'Product') {
-    if ($Strict -or $VerifyOnly -or $Modes -ne 'f1c1r1' -or $AndroidBufferBursts -ne 0 -or $AndroidSharingPolicy -ne 0 -or $AndroidUsagePolicy -ne 0 -or $NativeReserveFrames -ne 1440 -or $MeasureCallbacks) {
-        throw 'Product source comparison uses unchanged Android reference settings only'
+    if ($Strict -or $VerifyOnly -or $MeasureCallbacks) {
+        throw 'Product playback does not support standalone verification/callback measurement flags'
     }
-    & $PythonExecutable (Join-Path $PSScriptRoot '../../tools/audio-lab/product_runner.py') --config $ProductConfig --backend $WindowsSourceBackend --engine-period $WindowsEnginePeriod --capture-policy $WindowsCapturePolicy --seconds $Seconds --profile $Profile
+    & $PythonExecutable (Join-Path $PSScriptRoot '../../tools/audio-lab/product_runner.py') --config $ProductConfig --backend $WindowsSourceBackend --engine-period $WindowsEnginePeriod --capture-policy $WindowsCapturePolicy --seconds $Seconds --profile $Profile --run-id $RunId --bursts $AndroidBufferBursts --modes $Modes --sharing $AndroidSharingPolicy --usage $AndroidUsagePolicy --reserve $NativeReserveFrames
     exit $LASTEXITCODE
 }
 $dedicatedSource = $PSCmdlet.ParameterSetName -eq 'DeskFuse'
@@ -49,6 +50,7 @@ if ($Strict -and $VerifyOnly) { throw 'Choose either Strict AAudio verification 
 $stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
 $folder = Join-Path $EvidenceRoot ($stamp + '-' + ($Profile -replace '[^\w-]','_') + '-' + $Modes)
 New-Item -ItemType Directory -Force -Path $folder | Out-Null
+Set-Content -LiteralPath (Join-Path $folder 'run-id.txt') -Value $RunId -Encoding ASCII
 $manifest = Join-Path $folder 'session.txt'
 $crate = Join-Path $LabRoot 'vnext\m2a\quiche-lab'
 $cargoTarget = Join-Path $crate 'target'

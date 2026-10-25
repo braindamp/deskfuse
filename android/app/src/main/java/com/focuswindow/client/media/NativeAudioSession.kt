@@ -14,6 +14,12 @@ import javax.security.auth.x500.X500Principal
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
+import kotlinx.serialization.json.Json
 import org.json.JSONObject
 
 @Keep
@@ -22,6 +28,8 @@ internal object NativeAudioBridge {
     external fun run(config: String, library: String): Int
     external fun prepare(library: String): Boolean
     external fun stop()
+    external fun labVersion(library: String): Int
+    external fun observe(owner: String, library: String): String?
 }
 
 private object NativeAudioOwners {
@@ -34,6 +42,30 @@ private object NativeAudioOwners {
 /** Control bootstrap only. PCM stays in the existing native QUIC/AAudio core. */
 class NativeAudioSession(private val context: Context) {
     private var grant: String? = null
+    private var observations: Job? = null
+    private var observationSequence = 0L
+    private var lastSample = 0L
+    private val observationGate = Any()
+    private val observationDispatch = Mutex()
+    suspend fun reportObservation(expectedGrant: String, requestId: String? = null, report: suspend (ClientMessage.NativeAudioObservation) -> Unit) {
+        observationDispatch.withLock {
+            if (!acceptsVolume(expectedGrant)) return@withLock
+            observation(requestId)?.let { if (acceptsVolume(expectedGrant)) report(it) }
+        }
+    }
+    private val library get() = File(context.applicationInfo.nativeLibraryDir, "libdeskfuse_quiche_lab.so").absolutePath
+    val labVersion: Int get() = if (available) NativeAudioBridge.labVersion(library) else 0
+    private fun observation(requestId: String? = null): ClientMessage.NativeAudioObservation? = synchronized(observationGate) {
+        val owner = authorization ?: return@synchronized null
+        if (!isCurrent() || requestId != null && !Regex("^[0-9a-f]{32}$").matches(requestId)) return@synchronized null
+        val text = NativeAudioBridge.observe(owner, library) ?: return@synchronized null
+        val objectValue = JSONObject(text)
+        val sample = objectValue.getLong("sample_seq")
+        if (requestId == null && sample <= lastSample) return@synchronized null
+        lastSample = sample
+        ClientMessage.NativeAudioObservation(owner, ++observationSequence, requestId,
+            Json.parseToJsonElement(text) as kotlinx.serialization.json.JsonObject)
+    }
     @Volatile private var authorization: String? = null
     private var key: KeyPair? = null
     private val owners = NativeAudioOwners.coordinator
@@ -46,10 +78,12 @@ class NativeAudioSession(private val context: Context) {
     fun acceptsVolume(grant: String): Boolean = grant == authorization && isCurrent()
     fun isCurrent(): Boolean = generation == startedGeneration && owners.isCurrent(lease)
     fun stop() {
+        observations?.cancel(); observations = null
         generation++; val previous = lease; lease = null; grant = null; authorization = null; key = null
         if (previous != null) owners.requestRetire(previous)
     }
     suspend fun retire() {
+        observations?.cancel(); observations = null
         generation++; val previous = lease; lease = null; grant = null; authorization = null; key = null
         if (previous != null) owners.retire(previous)
     }
@@ -71,9 +105,12 @@ class NativeAudioSession(private val context: Context) {
         grant = message.grant; authorization = message.grant; key = pair
         return ClientMessage.NativeAudioCsr(message.grant, pem("CERTIFICATE REQUEST", csr))
     }
-    suspend fun start(message: ServerMessage.NativeAudioGrant, host: String, finished: (Int) -> Unit) {
+    suspend fun start(message: ServerMessage.NativeAudioGrant, host: String, scope: CoroutineScope, report: suspend (ClientMessage.NativeAudioObservation) -> Unit, finished: (Int) -> Unit) {
         require(message.version == 2 && message.grant == grant && message.port in 1..65535 &&
             message.expiresUnixMs > System.currentTimeMillis())
+        message.lab?.validate()
+        require(message.lab == null || labVersion == 1)
+        synchronized(observationGate) { observationSequence = 0; lastSample = 0 }
         val pair = key ?: error("No session key")
         val selected = lease ?: error("No current native ownership")
         key = null; grant = null // one-use, bound to this authenticated control connection
@@ -97,10 +134,22 @@ class NativeAudioSession(private val context: Context) {
                     .put("remote", "$host:${message.port}").put("ca", ca).put("cert", cert).put("key", privateKey)
                     .put("peerDer", peer.absolutePath).put("seconds", remaining)
                     .put("library", File(context.applicationInfo.nativeLibraryDir, "libdeskfuse_android_audio.so").absolutePath)
+                message.lab?.let { policy ->
+                    config.put("lab", JSONObject().put("version",policy.version).put("buffer_bursts",policy.buffer_bursts)
+                        .put("sharing_policy",policy.sharing_policy).put("usage_policy",policy.usage_policy)
+                        .put("reserve_frames",policy.reserve_frames).put("modes",policy.modes))
+                        .put("observationId",message.grant)
+                }
                 NativeAudioBridge.run(config.toString(),
                     File(context.applicationInfo.nativeLibraryDir, "libdeskfuse_quiche_lab.so").absolutePath)
             } finally { directory.deleteRecursively() }
-        }, finished = { result -> if (generation == ownerGeneration && owners.isCurrent(selected)) finished(result) })
+        }, finished = { result -> if (generation == ownerGeneration && owners.isCurrent(selected)) { observations?.cancel(); finished(result) } })
+        if (message.lab != null) observations = scope.launch(Dispatchers.Default) {
+            while (generation == ownerGeneration && owners.isCurrent(selected)) {
+                delay(500)
+                reportObservation(message.grant, report = report)
+            }
+        }
     }
     private fun pem(kind: String, bytes: ByteArray): String = "-----BEGIN $kind-----\n" +
         Base64.encodeToString(bytes, Base64.NO_WRAP).chunked(64).joinToString("\n") + "\n-----END $kind-----\n"

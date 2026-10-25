@@ -147,4 +147,5 @@ public sealed record HostServices(
     IPhoneSpeakerProvider? PhoneSpeakers = null,
     Func<string, IReadOnlyList<string>, int, IHostAudioCapture?>? CreateEndpointAudioCapture = null,
     Func<NativeAudioLaunch, CancellationToken, Task<INativeAudioProcess>>? CreateNativeAudio = null,
-    Func<string,INativeEndpointVolume>? ObserveNativeEndpointVolume = null);
+    Func<string,INativeEndpointVolume>? ObserveNativeEndpointVolume = null,
+    NativeAudioLab? AudioLab = null);

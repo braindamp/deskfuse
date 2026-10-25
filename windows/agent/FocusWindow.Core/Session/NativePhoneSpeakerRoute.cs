@@ -27,6 +27,34 @@ internal sealed class NativePhoneSpeakerRoute(PhoneConnection conn, HostServices
     private X509Certificate2? _issuer;
     private INativeAudioProcess? _process;
     private int _used;
+    private readonly NativeObservationFence _observationFence=new();
+    private readonly object _observationGate=new();
+    private string? _requestId;
+    private TaskCompletionSource<bool>? _requestedObservation;
+    public void Observe(ClientNativeAudioObservation message) {
+        lock(_observationGate) {
+            if (message.Grant!=_grant || _controlStop.IsCancellationRequested) return;
+            bool requested=message.RequestId is not null && message.RequestId==_requestId;
+            if (message.RequestId is not null&&!requested) return;
+            if (!_observationFence.Accept(message.Sequence,message.Snapshot,requested))return;
+            services.AudioLab?.Report(new JsonObject { ["version"]=1,["run_id"]=services.AudioLab.RunId,
+                ["sequence"]=message.Sequence,["end_snapshot"]=requested,["snapshot"]=message.Snapshot.DeepClone() });
+            if (requested) _requestedObservation?.TrySetResult(true);
+        }
+    }
+    private async Task<bool> RequestObservationAsync(CancellationToken ct) {
+        Task<bool> result;
+        lock(_observationGate) {
+            if(_controlStop.IsCancellationRequested || _process is null)return false;
+            _requestId=Guid.NewGuid().ToString("N");_requestedObservation=new(TaskCreationOptions.RunContinuationsAsynchronously);
+            result=_requestedObservation.Task;
+            conn.SendControl(new JsonObject {["type"]="native_audio_observation_request",["grant"]=_grant,["requestId"]=_requestId});
+        }
+        try {return await result.WaitAsync(TimeSpan.FromMilliseconds(800),ct).ConfigureAwait(false);}
+        catch(TimeoutException){return false;}
+        catch(OperationCanceledException){return false;}
+        finally {lock(_observationGate){_requestId=null;_requestedObservation=null;}}
+    }
     private int _begun;
     private readonly SemaphoreSlim _serial=new(1,1);
     private readonly object _stopGate=new();
@@ -96,7 +124,9 @@ internal sealed class NativePhoneSpeakerRoute(PhoneConnection conn, HostServices
         conn.SendControl(new JsonObject { ["type"]="native_audio_grant", ["version"]=2, ["grant"]=_grant,
             ["port"]=_process.Port, ["caPem"]=_issuer.ExportCertificatePem(),
             ["clientPem"]=clientCert.ExportCertificatePem(), ["serverDer"]=Convert.ToBase64String(serverCert.RawData),
-            ["expiresUnixMs"]=now.AddMinutes(30).ToUnixTimeMilliseconds() });
+            ["expiresUnixMs"]=now.AddMinutes(30).ToUnixTimeMilliseconds(),
+            ["lab"]=services.AudioLab?.Policy.ToJson(), ["runId"]=services.AudioLab?.RunId });
+        services.AudioLab?.Bind(RequestObservationAsync);
         _volumeTask=ObserveVolumeAsync(_process,_controlStop.Token);
     }
     private async Task ObserveVolumeAsync(INativeAudioProcess process,CancellationToken ct)
@@ -146,6 +176,7 @@ internal sealed class NativePhoneSpeakerRoute(PhoneConnection conn, HostServices
     {
         await _serial.WaitAsync().ConfigureAwait(false);
         try {
+            services.AudioLab?.Unbind(RequestObservationAsync);
             _controlStop.Cancel();
             if (_volumeTask is not null) await _volumeTask.ConfigureAwait(false);
             if (_process is not null) await _process.DisposeAsync().ConfigureAwait(false);

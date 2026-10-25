@@ -1,3 +1,4 @@
+#![recursion_limit="256"]
 //! DeskFuse M2a protocol wire layout. The input **must already be authenticated
 //! by the surrounding QUIC connection**; this parser does not authenticate it.
 //! No heap allocation is needed in encode/decode.
@@ -6,6 +7,7 @@ pub mod reactor;
 pub mod wasapi_pipe;
 pub mod endpoint_lease;
 pub mod session_control;
+pub mod lab_observation;
 #[cfg(windows)]
 pub mod committed_source;
 #[cfg(target_os="android")]
@@ -236,4 +238,17 @@ mod tests {
         b[3] = 1;
         assert_eq!(parse(&b, &Configuration::default()), Err(ParseError::UnsupportedFlags));
     }
+}
+
+/// Read-only copy on JNI/control thread. No renderer queue is touched here.
+#[cfg(target_os="android")]
+#[no_mangle]
+pub unsafe extern "C" fn deskfuse_native_audio_observation_v1(owner:*const std::ffi::c_char,out:*mut u8,capacity:u32)->i32 {
+    std::panic::catch_unwind(|| {
+        if owner.is_null() || out.is_null() || capacity<2 || capacity>8192{return -1}
+        let Ok(id)=std::ffi::CStr::from_ptr(owner).to_str() else{return -1};
+        let Some(bytes)=lab_observation::json(id) else{return 0};
+        if bytes.len()+1>capacity as usize{return -1}
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(),out,bytes.len());*out.add(bytes.len())=0;bytes.len() as i32
+    }).unwrap_or(-1)
 }

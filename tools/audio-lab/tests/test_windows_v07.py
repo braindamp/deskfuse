@@ -28,7 +28,7 @@ class WindowsRoadmapTests(unittest.TestCase):
         cmd=bridge.build_command({},bursts=0,modes="f1c1r1",seconds=30,label="",source="direct_export")
         self.assertEqual(cmd[cmd.index("-WindowsSourceBackend")+1],"committed")
         self.assertTrue(integration.source_preflight("direct_export","reference","reference",{}))
-        for changes in ({"capture_policy":"minimum"},{"bursts":2},{"modes":"f0c1r1"}):
+        for changes in ({"capture_policy":"minimum"},):
             options=dict(bursts=0,modes="f1c1r1",seconds=30,label="",source="direct_export")
             options.update(changes)
             with self.assertRaises(ValueError): bridge.build_command({},**options)

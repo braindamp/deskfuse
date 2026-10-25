@@ -72,9 +72,9 @@ const controls = [
     minLabel:'5 ms · fast', maxLabel:'50 ms · resilient' },
   { id:'hardwarePolicy', cat:'ANDROID OUTPUT', name:'AAudio buffer policy', type:'options',
     values:[['platform','Platform default (0)'],['bursts2','2 bursts · candidate'],['bursts3','3 bursts'],['bursts4','4 bursts'],['bursts6','6 bursts']],
-    description:'Reference request is platform default (0). A test reported 4,104 frames of granted capacity; capacity is NOT end-to-end delay. Burst modes are hypothetical here.', status:dev },
+    description:'Reference request is platform default (0). A test reported 4,104 frames of granted capacity; capacity is NOT end-to-end delay. Only 0/2/3 bursts can be staged for an explicit physical test using the bridge.', status:dev },
   { id:'nativeReserveFrames', cat:'ANDROID RENDERER', name:'Native post-callback reserve', type:'range',unit:'frames',min:240,max:2880,step:240,
-    description:'Reported reference is 1,440 frames / 30 ms. Proposed tuning must preserve callback and re-prime safety; this is distinct from AAudio granted buffer capacity.',status:future,
+    description:'Reported reference is 1,440 frames / 30 ms. Only 1440/1200/960/720/480 can be staged for an explicit physical test; this is distinct from AAudio granted buffer capacity.',status:future,
     minLabel:'240 frames · 5 ms',maxLabel:'2,880 frames · 60 ms' },
   { id:'adaptiveBuffer', cat:'BUFFER ENGINE', name:'Adaptive buffering', type:'options', values:[['off','Off'],['low','Low'],['medium','Medium'],['high','High']],
     description:'Proposed automatic policy for varying jitter. Not part of the reported reference; do not confuse this with deployed auto-buffer logic.', status:future },
@@ -406,15 +406,20 @@ function setupFocusSelect(){const all=[...controls,...advanced.flatMap(g=>g.item
   $('#focus-factor').innerHTML=options.map(c=>`<option value="${htmlSafe(c.id)}">${htmlSafe(c.name)}</option>`).join('');
   $('#focus-factor').value='nativeReserveFrames';}
 function newTest(){
+  if(window.deskfusePhysicalRunPending?.()){toast("Wait for the active physical run to finish before saving its observations.");return;}
   const number=$('#test-measured').value.trim();const measured=number===''?null:Number(number);
   if(measured!==null&&(!Number.isFinite(measured)||measured<0||measured>2000)){toast('Measured delay must be between 0 and 2,000 ms, or blank.');return;}
-  const changed=changedKeys(state);
+  const physical=window.deskfusePhysicalRun?.()??null;
+  const reference={buffer_bursts:0,modes:"f1c1r1",sharing_policy:0,usage_policy:0,reserve_frames:1440,engine_period:"reference",capture_policy:"reference"};
+  const executed=physical?.session;
+  const changed=executed?Object.keys(reference).filter(k=>executed[k]!==reference[k]):changedKeys(state);
   const record={id:Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,7),
     at:new Date().toISOString(),label:$('#test-label').value.trim().slice(0,100)||`Session ${testRecords.length+1}`,
     route:$('#test-route').value.trim().slice(0,90),delay:$('#test-delay').value,
     continuity:$('#test-continuity').value,quality:$('#test-quality').value,
     measuredDelayMs:measured,notes:$('#test-notes').value.trim().slice(0,2500),
-    focus:$('#focus-factor').value,changedKeys:changed,settings:{...state}};
+    focus:$('#focus-factor').value,changedKeys:changed,settings:executed?{...executed}:{...state},
+    physical_run:physical,modeledSettings:{...state}};
   testRecords.unshift(record);if(testRecords.length>100)testRecords.length=100;
   renderTestRecords();persistWorkspace();$('#test-label').value='';$('#test-notes').value='';$('#test-measured').value='';
   toast(changed.length===1?'Controlled one-factor listening test saved.':'Listening test saved with change count indicated.');
@@ -426,7 +431,7 @@ function renderTestRecords(){
   box.innerHTML=testRecords.map((r)=>`<article class="test-item">
     <div class="test-item-top"><strong>${htmlSafe(r.label)}</strong><span class="test-count-badge ${r.changedKeys.length===1?'isolated':''}">${r.changedKeys.length===1?'ONE-FACTOR':`${r.changedKeys.length} FACTORS`}</span></div>
     <div class="test-item-meta"><span>${htmlSafe(r.at.slice(0,16).replace('T',' '))} UTC</span><span>${htmlSafe(r.route)}</span></div>
-    <p class="test-changes">${r.changedKeys.length?r.changedKeys.map(k=>`${htmlSafe(k)}: ${htmlSafe(r.settings[k])}`).join(' · '):'Reference state · no changes'}</p>
+    <p class="test-changes">${r.physical_run?`Physical run ${htmlSafe(r.physical_run.run_id)} · ${htmlSafe(r.physical_run.session.source)} · `:"Model only · "}${r.changedKeys.length?r.changedKeys.map(k=>`${htmlSafe(k)}: ${htmlSafe(r.settings[k])}`).join(' · '):'Reference state · no changes'}</p>
     <div class="test-item-scores"><span>DELAY ${htmlSafe(r.delay)}</span><span>CONTINUITY ${htmlSafe(r.continuity)}</span><span>QUALITY ${htmlSafe(r.quality)}</span>${r.measuredDelayMs!==null?`<span>MEASURED ${htmlSafe(r.measuredDelayMs)} ms</span>`:''}</div>
     ${r.notes?`<p class="test-note">${htmlSafe(r.notes)}</p>`:''}
     <button type="button" class="test-load button-secondary" data-test-load="${htmlSafe(r.id)}">↶ LOAD SETTINGS</button>
@@ -456,7 +461,9 @@ function safeSettings(src){
 function restoreWorkspace(data){
  if(!data||data.schema!=='deskfuse-audio-lab-v0.3'||!data.settings||!Array.isArray(data.tests||[]))throw Error('Unsupported lab document.');
  state=safeSettings(data.settings);
- testRecords=(data.tests||[]).filter(isRecord).slice(0,100).map(r=>({...r,settings:safeSettings(r.settings),changedKeys:changedKeys(safeSettings(r.settings))}));
+ testRecords=(data.tests||[]).filter(isRecord).slice(0,100).map(r=>(r.physical_run&&/^[0-9a-f]{32}$/.test(r.physical_run.run_id)&&r.physical_run.session?
+   {...r,settings:{...r.physical_run.session},changedKeys:Array.isArray(r.changedKeys)?r.changedKeys.filter(k=>["buffer_bursts","modes","sharing_policy","usage_policy","reserve_frames","engine_period","capture_policy"].includes(k)):[]}:
+   {...r,settings:safeSettings(r.settings),changedKeys:changedKeys(safeSettings(r.settings))}));
  snapshots={a:data.snapshots?.a?safeSettings(data.snapshots.a):null,b:data.snapshots?.b?safeSettings(data.snapshots.b):null};
  currentPreset=(data.profile in presetData)?data.profile:'custom';
  renderControls();renderAdvanced();renderPresetState();updateReadouts();renderTestRecords();renderSnapshots();
@@ -506,7 +513,7 @@ function boot(){
     if(event.target.closest('#isolate-factor'))isolateFactor();
     if(event.target.closest('#revert-factor'))revertFocus();
     const load=event.target.closest('[data-test-load]');
-    if(load){const found=testRecords.find(x=>x.id===load.dataset.testLoad);if(found){state=safeSettings(found.settings);currentPreset='custom';renderControls();renderAdvanced();renderPresetState();updateReadouts();persistWorkspace();toast('Saved test settings loaded.');}}
+    if(load){const found=testRecords.find(x=>x.id===load.dataset.testLoad);if(found){state=safeSettings(found.modeledSettings||found.settings);currentPreset='custom';renderControls();renderAdvanced();renderPresetState();updateReadouts();persistWorkspace();toast('Saved test settings loaded.');}}
     if(event.target.closest('#clear-notebook')){if(confirm('Delete all local listening-test records? Export a backup first if needed.')){testRecords=[];renderTestRecords();persistWorkspace();toast('Local test records cleared.');}}
     if(event.target.closest('#menu-button')){
       const open=$('#sidebar').classList.toggle('open');$('#menu-button').setAttribute('aria-expanded',String(open));

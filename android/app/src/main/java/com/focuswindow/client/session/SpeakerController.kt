@@ -122,6 +122,7 @@ class SpeakerController(
                             profile = current,
                             capabilities = listOf("speakers"),
                             nativeAudioVersion = if (nativeAudio?.available == true) 2 else 0,
+                            nativeAudioLabVersion = nativeAudio?.labVersion ?: 0,
                         )
                     )
                     if (!recovering) {
@@ -224,9 +225,15 @@ class SpeakerController(
                         check(applied) { "Native volume/mute could not be applied." }
                     }
                 }
+                is ServerMessage.NativeAudioObservationRequest -> {
+                    val native = nativeAudio ?: error("Native receiver unavailable")
+                    native.reportObservation(message.grant, message.requestId) { transport.send(it) }
+                }
                 is ServerMessage.NativeAudioGrant -> {
                     val native = nativeAudio ?: error("Native receiver unavailable")
-                    native.start(message, payload?.host ?: error("No authenticated host")) {
+                    native.start(message, payload?.host ?: error("No authenticated host"), scope, { observation ->
+                        if (native.acceptsVolume(observation.grant)) transport.send(observation)
+                    }) {
                         scope.launch {
                             // Check at final dispatch, after any controller/session replacement.
                             if (native.isCurrent()) endConnection("Native audio session ended.", retry = true)

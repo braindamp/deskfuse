@@ -204,7 +204,10 @@ internal static class Program
         if (allowMicrophone)
             log.Warn("Development microphone bridge ENABLED for one explicitly selected Windows playback endpoint. " +
                 "Use a virtual audio cable only; a physical endpoint would play the phone microphone aloud.");
-        using var lab = args.Contains("--audio-lab") ? new AudioLabRun(Int(args,"--audio-lab-seconds",30),ct) : null;
+        using var lab = args.Contains("--audio-lab") ? new AudioLabRun(Int(args,"--audio-lab-seconds",30),ct,
+            Opt(args,"--audio-lab-run-id")??Guid.NewGuid().ToString("N"),new NativeOutputPolicy(
+                Int(args,"--audio-lab-bursts",0),Int(args,"--audio-lab-sharing",0),Int(args,"--audio-lab-usage",0),
+                Int(args,"--audio-lab-reserve",1440),Opt(args,"--audio-lab-modes")??"f1c1r1")) : null;
         if (lab is not null && (Opt(args,"--native-audio-exe") is null || Opt(args,"--native-capture-exe") is null ||
             args.Contains("--legacy-qr") || args.Contains("--auto-approve") || args.Contains("--single-session") || args.Contains("--new-pairing")))
             throw new ArgumentException("Audio Lab requires the enrolled native path without approval/pairing overrides.");
@@ -234,6 +237,7 @@ internal static class Program
             CreateEndpointAudioCapture: (endpointId, layouts, maxBytes) =>
                 new WindowsLoopbackAudioCapture(endpointId, layouts, maxBytes),
             PhoneSpeakers: new BrokerPhoneSpeakerProvider(brokerClient),
+            AudioLab: lab?.Control,
             ObserveNativeEndpointVolume: endpoint => new NativeEndpointVolume(endpoint),
             CreateNativeAudio: Opt(args, "--native-audio-exe") is string nativeExe &&
                 Opt(args, "--native-capture-exe") is string captureExe

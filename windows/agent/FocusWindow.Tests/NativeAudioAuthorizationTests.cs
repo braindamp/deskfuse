@@ -82,6 +82,41 @@ public sealed class NativeAudioAuthorizationTests
         Assert.Equal("New",Assert.Single(peers.Online).Label);
         Assert.Equal(old.Peer.Endpoints.Speakers,current.Peer.Endpoints.Speakers);
     }
+    [Fact]
+    public async Task Lab_policy_and_observations_use_the_existing_authenticated_grant_and_final_request() {
+        using var timeout=new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        await using var peer=await ConnectedPeer.CreateAsync(timeout.Token);peer.Host.StartPumps();
+        var observed=new List<JsonObject>();
+        var lab=new NativeAudioLab(new string('a',32),new NativeOutputPolicy(ReserveFrames:960),observed.Add);
+        var owner=new Owner();
+        var services=new HostServices(()=>null!,()=>null!,()=>null!,new AutoApprove(),null!,
+            CreateNativeAudio:(_,_)=>Task.FromResult<INativeAudioProcess>(owner),AudioLab:lab);
+        await using var route=new NativePhoneSpeakerRoute(peer.Host,services,"00112233445566778899aabbccddeeff",timeout.Token);
+        route.Begin();var challenge=JsonNode.Parse((await peer.ReadAsync(timeout.Token)).Plain)!;
+        var grant=challenge["grant"]!.GetValue<string>();
+        using var key=ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        var csr=new CertificateRequest("CN=Phone",key,HashAlgorithmName.SHA256).CreateSigningRequestPem();
+        await route.AuthorizeAsync(new(grant,csr));
+        var issued=JsonNode.Parse((await peer.ReadAsync(timeout.Token)).Plain)!;
+        Assert.Equal(960,issued["lab"]!["reserve_frames"]!.GetValue<int>());
+        Assert.Equal(lab.RunId,issued["runId"]!.GetValue<string>());
+        JsonObject sample=JsonNode.Parse("""{"version":1,"owner_generation":1,"sample_seq":1,"accepted_frames":240,"rendered_frames":120,"underrun_events":0,"reprime_events":0,"received_packets":1,"sample_rate":48000,"channels":2}""")!.AsObject();
+        route.Observe(new("wrong-grant",1,null,sample));Assert.Empty(observed);
+        route.Observe(new(grant,1,null,sample));Assert.Single(observed);
+        Assert.Equal(lab.RunId,observed[0]["run_id"]!.GetValue<string>());
+        var final=lab.RequestFinalAsync(timeout.Token);
+        var request=JsonNode.Parse((await peer.ReadAsync(timeout.Token)).Plain)!;
+        Assert.Equal("native_audio_observation_request",request["type"]!.GetValue<string>());
+        var requestId=request["requestId"]!.GetValue<string>();
+        route.Observe(new(grant,2,"wrong-request",sample));Assert.False(final.IsCompleted);
+        route.Observe(new(grant,2,requestId,sample));Assert.True(await final);
+        Assert.Equal(2,observed.Count);Assert.True(observed[1]["end_snapshot"]!.GetValue<bool>());
+        Assert.False(await lab.RequestFinalAsync(timeout.Token)); // bounded missing end response
+        await route.DisposeAsync();
+        route.Observe(new(grant,3,null,sample));Assert.Equal(2,observed.Count);
+        Assert.False(await lab.RequestFinalAsync(timeout.Token));
+    }
+
     private sealed class FakeVolume : INativeEndpointVolume {
         public float VolumeLevel=0.6f;
         public float Volume=>VolumeLevel;

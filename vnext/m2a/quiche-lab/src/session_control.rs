@@ -16,6 +16,7 @@ impl Session {
         STOP.store(false,Ordering::Release);
         #[cfg(target_os="android")]
         if STOP.load(Ordering::Acquire) {ACTIVE.store(false,Ordering::Release);return Err(io::Error::from(io::ErrorKind::Interrupted))}
+        crate::lab_observation::reset();
         MEDIA_READY.store(false,Ordering::Release);
         *PIN.lock().unwrap()=Some(pin); Ok(Self)
     }

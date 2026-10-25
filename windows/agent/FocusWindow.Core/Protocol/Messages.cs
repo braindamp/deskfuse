@@ -27,7 +27,7 @@ public static class Wire
 /// <summary>Client -> host messages (ClientMessage in Protocol.kt).</summary>
 public abstract record ClientMessage;
 public sealed record ClientHello(int ProtocolVersion, string ClientVersion, PhoneProfile Profile,
-    string Role = "display", IReadOnlyList<string>? Capabilities = null, int NativeAudioVersion = 0) : ClientMessage;
+    string Role = "display", IReadOnlyList<string>? Capabilities = null, int NativeAudioVersion = 0, int NativeAudioLabVersion = 0) : ClientMessage;
 public sealed record ClientProfile(PhoneProfile Profile) : ClientMessage;
 public sealed record ClientDensity(string Preset) : ClientMessage;           // logical | native | one_to_one
 public sealed record ClientRefresh(int Hz) : ClientMessage;
@@ -52,6 +52,7 @@ public sealed record ClientMicrophone(string Action) : ClientMessage;
 public sealed record ClientAudioVolume(int Level) : ClientMessage;
 public sealed record ClientNativeAudio(string Grant, string CsrPem) : ClientMessage;
 public sealed record ClientNativeAudioVolume(string Grant,long Sequence,int Level,bool Applied) : ClientMessage;
+public sealed record ClientNativeAudioObservation(string Grant,long Sequence,string? RequestId,JsonObject Snapshot) : ClientMessage;
 public sealed record ClientBye(string Reason) : ClientMessage;
 public sealed record ClientUnknown(string Type) : ClientMessage;
 public static class ClientMessageParser
@@ -88,7 +89,7 @@ public static class ClientMessageParser
                     root["protocolVersion"]?.GetValue<int>() ?? 0,
                     root["clientVersion"]?.GetValue<string>() ?? "?",
                     PhoneProfile.Parse(root["profile"]!.AsObject()), "accessory",
-                    ParseCapabilities(root), root["nativeAudioVersion"]?.GetValue<int>() ?? 0),
+                    ParseCapabilities(root), root["nativeAudioVersion"]?.GetValue<int>() ?? 0,root["nativeAudioLabVersion"]?.GetValue<int>() ?? 0),
                 "profile" => new ClientProfile(PhoneProfile.Parse(root["profile"]!.AsObject())),
                 "density" => new ClientDensity(root["preset"]!.GetValue<string>()),
                 "refresh" => new ClientRefresh(root["hz"]!.GetValue<int>()),
@@ -104,6 +105,9 @@ public static class ClientMessageParser
                     Math.Clamp(root["maxPcmBytes"]?.GetValue<int>() ?? 3840, 384, 32768)),
                 "native_audio_volume_applied" => new ClientNativeAudioVolume(root["grant"]?.GetValue<string>() ?? "",
                     root["sequence"]?.GetValue<long>() ?? 0,root["level"]?.GetValue<int>() ?? -1,root["applied"]?.GetValue<bool>() ?? false),
+                "native_audio_observation" when utf8.Length<=8192 => new ClientNativeAudioObservation(
+                    root["grant"]?.GetValue<string>()??"",root["sequence"]?.GetValue<long>()??0,
+                    root["requestId"]?.GetValue<string>(),root["snapshot"]?.AsObject()??new JsonObject()),
                 "native_audio_csr" => new ClientNativeAudio(root["grant"]?.GetValue<string>() ?? "",
                     root["csrPem"]?.GetValue<string>() ?? ""),
                 "microphone" => new ClientMicrophone(root["action"]?.GetValue<string>() ?? ""),

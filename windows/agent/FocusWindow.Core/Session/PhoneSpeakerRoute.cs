@@ -24,6 +24,7 @@ internal sealed class PhoneSpeakerRoute(
     public Task NativeCompletion => _native?.Completion ?? Task.Delay(Timeout.Infinite, _ct);
     public Task AuthorizeNativeAsync(ClientNativeAudio message) =>
         _native?.AuthorizeAsync(message) ?? Task.FromException(new InvalidOperationException("Native audio not negotiated."));
+    public void ObserveNative(ClientNativeAudioObservation message)=>_native?.Observe(message);
     public Task ApplyNativeVolumeAsync(ClientNativeAudioVolume message) =>
         _native?.ApplyVolumeAsync(message) ?? Task.FromException(new InvalidOperationException("Native route missing."));
     private IHostAudioCapture? _capture;

@@ -22,6 +22,10 @@ pub struct AudioStats {
     pub reprime_events: u64,
 }
 
+#[repr(C)]
+#[derive(Debug,Default,Clone,Copy)]
+pub struct OutputStateV1 {pub size:u32,pub version:u32,pub sharing:i32,pub performance:i32,pub frames_per_burst:i32,pub usage:i32,pub format:i32,pub reserve_frames:i32}
+
 // ABI v3: renderer-owned source position at last committed callback output,
 // plus the number of physical source frames released or discarded. Snapshots
 // are diagnostic until the end-to-end ownership/phase gates are met.
@@ -242,6 +246,7 @@ mod native {
         modes:Modes, close:Close, request:Request, applied:Applied,
         snapshot:Snapshot, presentation:Presentation, playout:Playout, timing:Timing, unsupported:Unsupported,
         callback_metrics:CallbackMetrics,
+        output:Option<super::OutputStateV1>,
     }
     impl Renderer {
         pub fn open(path:&str)->Result<Self,String> {Self::open_with_buffer(path,0)}
@@ -295,8 +300,13 @@ mod native {
                 unsafe{dlclose(library)};
                 return Err(format!("AAudio open error={code}"));
             }
+            let output=sym(b"df_audio_output_state_v1\0").ok().and_then(|p|{
+                let get:unsafe extern "C" fn(*mut c_void,*mut super::OutputStateV1)->i32=unsafe{std::mem::transmute(p)};
+                let mut value=super::OutputStateV1{size:32,version:1,..Default::default()};
+                if unsafe{get(ctx,&mut value)}==0 {Some(value)}else{None}
+            });
             Ok(Self{
-                library,ctx,
+                library,ctx,output,
                 close:unsafe{std::mem::transmute(close)},
                 modes:unsafe{std::mem::transmute(modes)},
                 push:unsafe{std::mem::transmute(push)},
@@ -349,6 +359,7 @@ mod native {
                 x=>Err(format!("AAudio coherent snapshot error={x}")),
             }
         }
+        pub fn output_state(&self)->Option<super::OutputStateV1>{self.output}
         pub fn timing_sample(&self)->Result<TimingSampleV7,String>{
             let mut value=TimingSampleV7 {size:104,version:7,..TimingSampleV7::default()};
             let code=unsafe{(self.timing)(self.ctx,&mut value)};
@@ -395,6 +406,7 @@ pub use native::Renderer as AndroidAudio;
 pub struct AndroidAudio;
 #[cfg(not(target_os="android"))]
 impl AndroidAudio{
+    pub fn output_state(&self)->Option<OutputStateV1>{None}
     pub fn open(_p:&str)->Result<Self,String>{Err("Android AAudio required".into())}
     pub fn open_with_buffer(_p:&str,_b:u32)->Result<Self,String>{Err("Android AAudio required".into())}
     pub fn open_with_config(_p:&str,_c:OutputConfigV8)->Result<Self,String>{Err("Android AAudio required".into())}

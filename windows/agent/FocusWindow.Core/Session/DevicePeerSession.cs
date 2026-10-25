@@ -66,6 +66,10 @@ internal sealed class DevicePeerSession(
             return;
         }
 
+        if (services.AudioLab is not null && !services.AudioLab.Policy.SupportedBy(hello.NativeAudioLabVersion)) {
+            conn.SendControl(ServerMessages.Stage("speakers","This receiver does not support the requested Lab output policy.",fatal:true));return;
+        }
+        var peerServices=hello.NativeAudioLabVersion==1?services:services with {AudioLab=null};
         using var lease = await peers.AttachAsync(
             hello.Profile.DeviceId, hello.Profile.DeviceLabel, shutdown, requested).ConfigureAwait(false);
         log.Info("Authenticated accessory peer joined: " + lease.Peer.DeviceId);
@@ -73,7 +77,7 @@ internal sealed class DevicePeerSession(
         // The phone's Windows playback endpoint. It is provisioned only when
         // the phone asked for the speakers capability, and it stays active
         // for as long as this peer is connected.
-        await using var speakers = new PhoneSpeakerRoute(conn, services, lease.Peer.Endpoints.Speakers,
+        await using var speakers = new PhoneSpeakerRoute(conn, peerServices, lease.Peer.Endpoints.Speakers,
             lease.Peer.Label, log);
         var active = await speakers.ProvisionAsync(requested, lease.Cancellation).ConfigureAwait(false);
 
@@ -120,6 +124,7 @@ internal sealed class DevicePeerSession(
         await foreach (var msg in conn.Messages.ReadAllAsync(ct).ConfigureAwait(false))
         {
             if (msg is ClientBye) return;
+            if (msg is ClientNativeAudioObservation observation) {speakers.ObserveNative(observation);continue;}
             if (msg is ClientNativeAudioVolume applied) {
                 await speakers.ApplyNativeVolumeAsync(applied).ConfigureAwait(false);continue;
             }

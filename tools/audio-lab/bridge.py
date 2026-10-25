@@ -22,6 +22,8 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
+import copy
 from urllib.parse import urlsplit
 from integration import (broker_preflight, receipt_preflight, receipt_path, checkout_head,
                          source_preflight, source_comparison, product_artifacts)
@@ -49,18 +51,58 @@ OBSERVED_METRICS = (
 OBSERVED_SET = frozenset(OBSERVED_METRICS)
 
 
-def parse_observed_lines(contents: str) -> dict:
-    # The runner retains stdout/stderr on disk; report observed counters only.
-    # 'AUDIO_BACKEND' records requests and capability, not speaker latency.
-    found = {}
+def parse_observed_lines(contents: str, run_id: str | None = None) -> dict:
+    # Fixed trusted-native prefixes; never turn unrelated control logs into evidence.
+    found = {}; namespaces = {}
+    prefixes = (("TRACE Android OUTPUT_HAL", "android_hal"), ("TRACE Android RENDER", "android_render"),
+        ("TRACE Android RECONSTRUCTION", "android_reconstruction"), ("AUDIO Android reconstruction", "android_reconstruction"),
+        ("AUDIO Android speaker", "android_audio"), ("AUDIO_CONFIG", "android_config"),
+        ("AUDIO_BACKEND", "android_config"), ("WASAPI_CONFIG", "windows_config"),
+        ("DIRECT_CONFIG", "windows_config"), ("DIRECT_TOTALS", "windows_source"),
+        ("DIRECT_GEOMETRY", "windows_geometry"), ("NATIVE_PCM", "windows_source"),
+        ("DONE committed source", "windows_source"), ("DONE Windows WASAPI", "windows_source"),
+        ("DONE Android sink", "android_sink"))
     for line in contents.splitlines():
-        if not line.startswith(("TRACE Android RECONSTRUCTION", "AUDIO Android speaker",
-                                "AUDIO_BACKEND", "WASAPI_CONFIG", "DIRECT_CONFIG", "DIRECT_TOTALS", "DIRECT_GEOMETRY", "NATIVE_PCM", "DONE committed source", "DONE Windows WASAPI", "DONE Android sink")):
+        if line.startswith(("LAB_ANDROID ", "LAB_TRIAL_RESULT ")):
+            try:
+                value = json.loads(line.split(" ", 1)[1])
+                if not isinstance(value, dict) or value.get("version") != 1 or not run_id or value.get("run_id") != run_id: continue
+                if line.startswith("LAB_ANDROID "):
+                    snap = value.get("snapshot")
+                    if not isinstance(snap, dict) or len(snap)>60: continue
+                    if any(not isinstance(v,(int,float,bool,type(None))) for v in snap.values()): continue
+                    prev = found.get("android_observation")
+                    if prev and value.get("sequence",0) <= prev.get("sequence",0): continue
+                    found["android_observation"] = value
+                    if value.get("end_snapshot") is True: found["android_final_observation"] = value
+                else: found["trial_result"] = value
+            except (ValueError, TypeError): pass
             continue
-        for key, value in re.findall(r"\b([a-z][a-z0-9_]*)=(-?[0-9]+)\b", line):
-            if key in OBSERVED_SET:
-                found[key] = int(value)
+        group = next((name for prefix,name in prefixes if line.startswith(prefix)), None)
+        if not group: continue
+        record = namespaces.setdefault(group,{})
+        for key,value in re.findall(r"\b([a-z][a-z0-9_]*)=(-?[0-9]+)\b",line):
+            number = int(value)
+            record[key] = number
+            if key in OBSERVED_SET: found[key] = number  # historical readouts
+    found["measurements"] = namespaces
+    # Authenticated product observations take precedence over historical log aliases.
+    if "android_observation" in found:
+        for key,value in found["android_observation"]["snapshot"].items():
+            if key in OBSERVED_SET: found[key] = value
     return found
+
+
+def merge_observed(target, update):
+    groups = target.setdefault("measurements",{})
+    for name,values in update.pop("measurements",{}).items(): groups.setdefault(name,{}).update(values)
+    previous=target.get("android_observation")
+    current=update.get("android_observation")
+    if previous and current and current.get("sequence",0)<=previous.get("sequence",0): update.pop("android_observation",None)
+    target.update(update)
+    if "android_observation" in target:
+        for key,value in target["android_observation"]["snapshot"].items():
+            if key in OBSERVED_SET: target[key]=value
 
 
 def tail_file(path: Path, limit: int = 100_000) -> str:
@@ -150,28 +192,30 @@ def check_setup(cfg: dict, *, verify_hashes: bool = False, source: str = "mm1") 
 
 def build_command(cfg: dict, *, bursts: int, modes: str, seconds: int, label: str,
                   source: str = "mm1", engine_period: str = "reference",
-                  capture_policy: str = "reference") -> list[str]:
+                  capture_policy: str = "reference", sharing: int = 0, usage: int = 0, reserve: int = 1440, run_id: str | None = None) -> list[str]:
     if source not in ("mm1", "deskfuse", "direct_export") or engine_period not in ("reference", "minimum") or capture_policy not in ("reference", "minimum"):
         raise ValueError("Unsupported Windows source or period policy")
     if source != "mm1" and cfg.get("deskfuse_peer_id"):
         raise ValueError("Manual peer identity is not authorized; use product enrollment")
     if source == "mm1" and engine_period == "minimum":
         raise ValueError("Minimum engine period requires the DeskFuse running-driver gate, not MM-1")
-    if source != "mm1" and (bursts != 0 or modes != "f1c1r1"):
-        raise ValueError("Product source comparisons require unchanged Android reference settings")
     if source == "direct_export" and capture_policy != "reference":
         raise ValueError("WASAPI allocation does not apply to committed PCM")
+    if type(sharing) is not int or sharing not in (0,1) or type(usage) is not int or usage not in (0,1) or type(reserve) is not int or reserve not in (1440,1200,960,720,480):
+        raise ValueError("Unsupported native output policy")
+    if run_id is None: run_id = uuid.uuid4().hex
+    if not re.fullmatch(r"[0-9a-f]{32}",run_id): raise ValueError("Invalid run ID")
     if bursts not in (0, 2, 3) or not MODES.fullmatch(modes) or seconds not in ALLOWED_SECONDS:
         raise ValueError("Unsupported startup parameters")
     if not PROFILE.fullmatch(label):
         raise ValueError("Use up to 35 ASCII letters, digits, underscores or hyphens for labels")
     # One-factor protocol: safe initial reference is buffer 0 + f1c1r1.
     # Other matrix choices remain a model, not executable settings.
-    modified = int(bursts != 0) + sum(modes[i] != "1" for i in (1, 3, 5)) + int(engine_period != "reference") + int(capture_policy != "reference")
+    modified = int(sharing != 0) + int(usage != 0) + int(reserve != 1440) + int(bursts != 0) + sum(modes[i] != "1" for i in (1, 3, 5)) + int(engine_period != "reference") + int(capture_policy != "reference")
     if modified > 1:
         raise ValueError("Only one difference from the listening reference is allowed per physical test")
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    profile = "audiolab-" + stamp + ("-" + label if label else "") + f"-{source}-{engine_period}-{capture_policy}-b{bursts}-{modes}"
+    profile = "audiolab-" + run_id + "-" + stamp + ("-" + label if label else "") + f"-{source}-{engine_period}-{capture_policy}-b{bursts}-{modes}"
     repo = cfg_path(cfg, "repo_root")
     if source != "mm1":
         return ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
@@ -179,7 +223,9 @@ def build_command(cfg: dict, *, bursts: int, modes: str, seconds: int, label: st
                 "-ProductConfig",str(CONFIG_FILENAME),"-PythonExecutable",sys.executable,
                 "-WindowsSourceBackend","committed" if source=="direct_export" else "loopback",
                 "-WindowsEnginePeriod",engine_period,"-WindowsCapturePolicy",capture_policy,
-                "-Seconds",str(seconds),"-Profile",profile]
+                "-Seconds",str(seconds),"-Profile",profile,"-RunId",run_id,
+                "-Modes",modes,"-AndroidBufferBursts",str(bursts),"-AndroidSharingPolicy",str(sharing),
+                "-AndroidUsagePolicy",str(usage),"-NativeReserveFrames",str(reserve)]
     endpoint=cfg.get("endpoint_id")
     if not isinstance(endpoint,str) or not endpoint.startswith("{0.0.0.00000000}."):
         raise ValueError("Explicit MM-1 endpoint required; no default-device fallback")
@@ -198,7 +244,8 @@ def build_command(cfg: dict, *, bursts: int, modes: str, seconds: int, label: st
            "-EvidenceRoot", str(cfg_path(cfg, "evidence_root")),
            "-KeysDir", str(cfg_path(cfg, "keys_dir")),
            "-Modes", modes, "-AndroidBufferBursts", str(bursts),
-           "-Seconds", str(seconds), "-Profile", profile]
+           "-Seconds", str(seconds), "-Profile", profile,"-RunId",run_id,
+           "-AndroidSharingPolicy",str(sharing),"-AndroidUsagePolicy",str(usage),"-NativeReserveFrames",str(reserve)]
     if cfg.get("windows_ip"):
         cmd.extend(["-WindowsIP", cfg["windows_ip"]])
     if cfg.get("phone_ip"):
@@ -218,21 +265,45 @@ class Runner:
         self.last_profile = None
         self.last_evidence = None
         self.started_meta = None
+        self.started_mono = None
+        self.finished_mono = None
+        self.launch_failed = False
+        self.run_id = None
+        self.active = False
+        self.observed = {}
+        self.receipt = None
+        self.history = deque(maxlen=20)
 
-    def _collect(self, proc):
+    def _collect(self, proc, run_id):
         try:
             for line in proc.stdout:
                 line = line.strip()
                 with self.lock:
+                    if run_id != self.run_id: continue
+                    merge_observed(self.observed,parse_observed_lines(line,run_id))
                     if line.startswith("Evidence folder:"):
                         self.last_evidence = line.partition(":")[2].strip()
                     self.log.append(line[:350])
         finally:
             code = proc.wait()
             with self.lock:
+                if run_id != self.run_id: return
                 self.return_code = code
                 self.finished_at = utc_now()
+                self.finished_mono = time.monotonic()
                 self.log.append("Physical session finished (runner exit code " + str(code) + ").")
+            # Finish evidence collection before permitting the next generation.
+            try:
+                final = self.status()
+                record = {k:final.get(k) for k in ("run_id","session","started_at","finished_at","return_code","profile","evidence_folder","telemetry","endpoint_identity","artifacts","runner_duration_ms","termination_reason")}
+                path = final.get("evidence_folder")
+                if path and Path(path).resolve().parent == cfg_path(self.cfg,"evidence_root").resolve():
+                    (Path(path)/"lab-run.json").write_text(json.dumps(record,indent=2),encoding="utf-8")
+                with self.lock:
+                    if self.run_id == run_id: self.history.append({k:record.get(k) for k in ("run_id","session","profile","return_code","evidence_folder")})
+            finally:
+                with self.lock:
+                    if self.run_id == run_id: self.active = False
 
     def start(self, body: dict):
         if not isinstance(body, dict):
@@ -243,6 +314,8 @@ class Runner:
         modes = body.get("modes", "f1c1r1")
         seconds = body.get("seconds", 30)
         label = body.get("label", "")
+        sharing=body.get("sharing_policy",0); usage=body.get("usage_policy",0); reserve=body.get("reserve_frames",1440)
+        run_id=uuid.uuid4().hex
         source = body.get("source", "mm1")
         engine_period = body.get("engine_period", "reference")
         capture_policy = body.get("capture_policy", "reference")
@@ -251,13 +324,13 @@ class Runner:
         if not all(isinstance(x, str) for x in (source, engine_period, capture_policy)):
             raise ValueError("Invalid Windows source selection")
         cmd = build_command(self.cfg, bursts=bursts, modes=modes, seconds=seconds, label=label,
-                            source=source, engine_period=engine_period, capture_policy=capture_policy)
+                            source=source, engine_period=engine_period, capture_policy=capture_policy, sharing=sharing, usage=usage, reserve=reserve, run_id=run_id)
         # Never honor a browser-supplied config/path. Product runner independently
         # reloads the protected local file and rechecks hashes before host launch.
         if source!="mm1" and not CONFIG_FILENAME.is_file():
             raise ValueError("Product launch requires the local config.json")
         with self.lock:
-            if self.process is not None and self.process.poll() is None:
+            if self.active or self.process is not None and self.process.poll() is None:
                 raise ValueError("A physical session is already running")
             problems = check_setup(self.cfg, verify_hashes=True, source=source)
             if not problems:
@@ -272,35 +345,54 @@ class Runner:
                 env["PATH"] = str(Path(adb).parent) + os.pathsep + env.get("PATH", "")
             env.pop("DESKFUSE_WASAPI_PACKET_TRACE", None)
             self.log.clear()
+            self.run_id = run_id
+            self.observed = {}
+            self.receipt = copy.deepcopy(report)
             self.last_evidence = None
             self.finished_at = None
             self.return_code = None
             self.started_at = utc_now()
+            self.started_mono = time.monotonic()
+            self.finished_mono = None
+            self.launch_failed = False
             self.started_meta = {"buffer_bursts": bursts, "modes": modes, "seconds": seconds, "label": label,
-                                 "source": source, "engine_period": engine_period, "capture_policy": capture_policy}
+                                 "source": source, "engine_period": engine_period, "capture_policy": capture_policy,
+                                 "sharing_policy":sharing,"usage_policy":usage,"reserve_frames":reserve,
+                                 "output_policy_version":1}
             self.last_profile = next(cmd[i+1] for i, v in enumerate(cmd[:-1]) if v == "-Profile")
             self.log.append("Launching existing GitHub qualification runner; matching Release hashes verified.")
-            self.process = subprocess.Popen(cmd, cwd=str(cfg_path(self.cfg, "repo_root")),
+            try:
+                self.process = subprocess.Popen(cmd, cwd=str(cfg_path(self.cfg, "repo_root")),
                                             env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                             text=True, encoding="utf-8", errors="replace", bufsize=1,
                                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            threading.Thread(target=self._collect, args=(self.process,), daemon=True).start()
-        return {"started": True, "profile": self.last_profile}
+            except OSError:
+                self.process=None; self.launch_failed=True; self.return_code=2
+                self.finished_at=utc_now(); self.finished_mono=time.monotonic()
+                raise
+            self.active = True
+            threading.Thread(target=self._collect, args=(self.process,run_id), daemon=True).start()
+        return {"started": True, "profile": self.last_profile,"run_id":run_id}
 
     def status(self) -> dict:
         with self.lock:
-            running = bool(self.process is not None and self.process.poll() is None)
+            running = self.active or bool(self.process is not None and self.process.poll() is None)
             status = {"running": running, "started_at": self.started_at,
                       "finished_at": self.finished_at, "return_code": self.return_code,
                       "profile": self.last_profile, "evidence_folder": self.last_evidence,
-                      "session": self.started_meta, "log": list(self.log)[-45:]}
-        evidence = self.last_evidence
-        if evidence is None and self.last_profile:
+                      "session": copy.deepcopy(self.started_meta), "log": list(self.log)[-45:],
+                      "android_telemetry_available":"android_observation" in self.observed,
+                      "run_id":self.run_id,"artifacts":copy.deepcopy(self.receipt),
+                      "telemetry":copy.deepcopy(self.observed),"recent_runs":copy.deepcopy(list(self.history))}
+            status["runner_duration_ms"]=(1000*((self.finished_mono or time.monotonic())-self.started_mono)) if self.started_mono is not None else None
+            status["termination_reason"]="runner_launch_failed" if self.launch_failed else None
+            evidence=self.last_evidence; profile=self.last_profile
+        if evidence is None and profile:
             # The checked-in PowerShell runner creates its timestamped folder
             # before writing any audio. Search only the configured evidence root.
             try:
                 folders = (p for p in cfg_path(self.cfg, "evidence_root").iterdir()
-                           if p.is_dir() and self.last_profile in p.name)
+                           if p.is_dir() and profile in p.name)
                 evidence = str(max(folders, key=lambda p: p.stat().st_mtime))
             except (OSError, ValueError):
                 pass
@@ -308,19 +400,29 @@ class Runner:
             status["evidence_folder"] = evidence
             root = cfg_path(self.cfg, "evidence_root").resolve()
             candidate = Path(evidence).resolve()
-            if candidate.parent == root:
-                records = {}
+            if candidate.parent == root and status["run_id"] and status["run_id"] in candidate.name:
+                records = status["telemetry"]
                 for name in ("windows-source.stdout.txt", "windows-source.stderr.txt", "android-receiver.txt"):
-                    records.update(parse_observed_lines(tail_file(candidate / name)))
+                    merge_observed(records,parse_observed_lines(tail_file(candidate / name),status["run_id"]))
                 status["telemetry"] = records
                 text=tail_file(candidate / "windows-source.stdout.txt")
                 for line in text.splitlines():
                     if line.startswith("LAB_ENDPOINT "):
                         try: status["endpoint_identity"]=json.loads(line[13:])["endpoint"]
                         except (ValueError,KeyError,TypeError): pass
+                if (status.get("session") or {}).get("source")=="mm1": status["endpoint_identity"]=self.cfg.get("endpoint_id")
                 status["physically_qualified"]=False
-                if status.get("session",{}).get("source")!="mm1":
-                    status["android_telemetry_available"]=False
+                if (status.get("session") or {}).get("source")!="mm1":
+                    status["android_telemetry_available"]="android_observation" in records
+        groups=status["telemetry"].get("measurements",{})
+        control="android_observation" in status["telemetry"]
+        log_only=(status.get("session") or {}).get("source")=="mm1" and any(k.startswith("android_") for k in groups)
+        status["android_telemetry_available"]=control or log_only
+        status["android_observation_source"]="authenticated_control" if control else "native_log" if log_only else None
+        trial=status["telemetry"].get("trial_result")
+        status["termination_reason"]=status["termination_reason"] or (trial.get("termination_reason") if trial else
+            ("runner_failed_without_native_result" if status["return_code"] not in (None,0) else
+             "runner_completed_without_native_window_evidence" if status["return_code"]==0 else "running" if status["running"] else None))
         return status
 
 
@@ -374,7 +476,7 @@ class LabHandler(BaseHTTPRequestHandler):
             cfg = self.server.runner.cfg
             with self.server.integration_lock:
                 now = time.monotonic()
-                running = bool(self.server.runner.process and self.server.runner.process.poll() is None)
+                running = self.server.runner.active or bool(self.server.runner.process and self.server.runner.process.poll() is None)
                 # Do not rehash binaries, query broker or touch local evidence
                 # repeatedly while real-time audio is running.
                 if running and self.server.integration_snapshot is None:
@@ -415,7 +517,7 @@ class LabHandler(BaseHTTPRequestHandler):
         if path == "/api/status":
             cfg = self.server.runner.cfg
             with self.server.integration_lock:
-                running=bool(self.server.runner.process and self.server.runner.process.poll() is None)
+                running=self.server.runner.active or bool(self.server.runner.process and self.server.runner.process.poll() is None)
                 if self.server.setup_snapshot is None or (not running and time.monotonic()-self.server.setup_at>60):
                     self.server.setup_snapshot={source:(["Setup checks deferred during playback"] if running else check_setup(cfg,source=source))
                                                 for source in ("mm1","deskfuse","direct_export")}
@@ -425,7 +527,7 @@ class LabHandler(BaseHTTPRequestHandler):
                                     "preflight": setup["mm1"],
                                     "source_preflight": setup,
                                     "token": self.server.token,
-                                    "supported": {"buffer_bursts": [0, 2, 3], "modes": "f[01]c[01]r[01]", "seconds": list(ALLOWED_SECONDS), "mode": "startup-only", "one_factor": True,
+                                    "supported": {"sharing_policy":[0,1],"usage_policy":[0,1],"reserve_frames":[1440,1200,960,720,480],"buffer_bursts": [0, 2, 3], "modes": "f[01]c[01]r[01]", "seconds": list(ALLOWED_SECONDS), "mode": "startup-only", "one_factor": True,
                                                   "windows_sources": ["mm1","deskfuse","direct_export"], "engine_period": ["reference","minimum"],
                                                   "capture_policy": ["reference", "minimum"]},
                                     **self.server.runner.status()})

@@ -118,6 +118,14 @@ data class TargetRecord(
 
 /** Host → client. Reliable, ordered control channel. */
 @Serializable
+data class NativeOutputPolicy(val version: Int = 1, val buffer_bursts: Int = 0,
+    val sharing_policy: Int = 0, val usage_policy: Int = 0, val reserve_frames: Int = 1440,
+    val modes: String = "f1c1r1") {
+    fun validate() { require(version == 1 && buffer_bursts in listOf(0,2,3) && sharing_policy in 0..1 &&
+        usage_policy in 0..1 && reserve_frames in listOf(1440,1200,960,720,480) && Regex("^f[01]c[01]r[01]$").matches(modes)) }
+}
+
+@Serializable
 sealed interface ServerMessage {
     @Serializable @SerialName("native_audio_challenge")
     data class NativeAudioChallenge(val version: Int, val grant: String, val expiresUnixMs: Long) : ServerMessage
@@ -125,7 +133,10 @@ sealed interface ServerMessage {
     data class NativeAudioVolume(val grant: String, val sequence: Long, val level: Int) : ServerMessage
     @Serializable @SerialName("native_audio_grant")
     data class NativeAudioGrant(val version: Int, val grant: String, val port: Int, val caPem: String,
-        val clientPem: String, val serverDer: String, val expiresUnixMs: Long) : ServerMessage
+        val clientPem: String, val serverDer: String, val expiresUnixMs: Long,
+        val lab: NativeOutputPolicy? = null, val runId: String? = null) : ServerMessage
+    @Serializable @SerialName("native_audio_observation_request")
+    data class NativeAudioObservationRequest(val grant: String, val requestId: String) : ServerMessage
 
     @Serializable @SerialName("hello")
     data class Hello(
@@ -259,6 +270,9 @@ sealed interface ClientMessage {
     data class NativeAudioVolumeApplied(val grant: String, val sequence: Long, val level: Int, val applied: Boolean) : ClientMessage
     @Serializable @SerialName("native_audio_csr")
     data class NativeAudioCsr(val grant: String, val csrPem: String) : ClientMessage
+    @Serializable @SerialName("native_audio_observation")
+    data class NativeAudioObservation(val grant: String, val sequence: Long, val requestId: String? = null,
+        val snapshot: kotlinx.serialization.json.JsonObject) : ClientMessage
 
     @Serializable @SerialName("hello")
     data class Hello(
@@ -278,6 +292,7 @@ sealed interface ClientMessage {
         val profile: PhoneProfile,
         val capabilities: List<String> = emptyList(),
         val nativeAudioVersion: Int = 0,
+        val nativeAudioLabVersion: Int = 0,
     ) : ClientMessage
 
     /** FR-DPI-09 — rotation/fold/font-scale re-derive the TARGET, nothing else. */

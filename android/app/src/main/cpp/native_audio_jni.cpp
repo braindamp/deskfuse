@@ -54,3 +54,22 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_focuswindow_client_media_NativeAudioBridge_stop(JNIEnv*, jobject) {
     if (auto stop = stop_function.load()) stop();
 }
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_focuswindow_client_media_NativeAudioBridge_labVersion(JNIEnv* env,jobject,jstring path) {
+    std::lock_guard<std::mutex> lock(load_lock);
+    return path && load(env,path) && dlsym(runtime,"deskfuse_native_audio_observation_v1") ? 1 : 0;
+}
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_focuswindow_client_media_NativeAudioBridge_observe(JNIEnv* env,jobject,jstring owner,jstring path) {
+    using Observe=int(*)(const char*,unsigned char*,unsigned);
+    Observe observe=nullptr;
+    { std::lock_guard<std::mutex> lock(load_lock);
+      if(!owner || !path || !load(env,path))return nullptr;
+      observe=reinterpret_cast<Observe>(dlsym(runtime,"deskfuse_native_audio_observation_v1")); }
+    if(!observe)return nullptr;
+    const char* id=env->GetStringUTFChars(owner,nullptr);if(!id)return nullptr;
+    unsigned char bytes[8192]{};int size=observe(id,bytes,sizeof(bytes));
+    env->ReleaseStringUTFChars(owner,id);
+    return size>0 && size<static_cast<int>(sizeof(bytes)) ? env->NewStringUTF(reinterpret_cast<const char*>(bytes)) : nullptr;
+}

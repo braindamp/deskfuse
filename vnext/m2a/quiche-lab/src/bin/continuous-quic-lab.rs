@@ -1161,6 +1161,7 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
     let mut input = [0u8; 65535];
     let mut datagram = [0u8; 1500];
 
+    let mut observation_at=Instant::now();
     println!("CONNECT continuous Android sink {} -> {} ; mutual TLS mandatory", local, remote);
     let loop_result=(|| -> Result<()> {
     loop {
@@ -1281,6 +1282,9 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                 }
             }
         }
+        if deskfuse_quiche_lab::lab_observation::enabled() && observation_at.elapsed()>=Duration::from_millis(500) {
+            publish_lab_observation(&state);observation_at=Instant::now();
+        }
         // Telemetry is diagnostic only. Authoritative recovery tickets drive
         // the challenge even when callback records are delayed or dropped.
         if state.anchor_pending.is_none() && authenticated_at.is_some_and(|at|
@@ -1369,6 +1373,8 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
     let stats=conn.stats();transport_final=Some((egress.udp_packets_sent,stats.lost));
     loop_result
     })();
+    publish_lab_observation(&state);
+    deskfuse_quiche_lab::lab_observation::finish();
     let mut native_status_error=None;
     if native_final.is_none() {
         if let Some(ref speaker)=state.audio {
@@ -1562,6 +1568,18 @@ mod recovery_boundary_tests {
     }
 }
 
+fn publish_lab_observation(state:&ClientMedia) {
+    use deskfuse_quiche_lab::lab_observation::{self,Sample};
+    if !lab_observation::enabled(){return}
+    if let Some(ref speaker)=state.audio {
+        if let Ok(audio)=speaker.snapshot(){lab_observation::publish(Sample {
+            audio,playout:speaker.playout_state().ok().flatten(),timing:speaker.timing_sample().ok(),
+            output:speaker.output_state(),render:state.latest_render_record.map(|x|x.0),
+            received:state.received,gaps:state.gaps,late:state.late,recovery:state.recover_started,
+            missing_frames:state.source_gap_frames,
+        });}
+    }
+}
 pub fn run_authorized(value:serde_json::Value)->Result<()> {
     let get=|name:&str|->Result<&str> {value[name].as_str().filter(|x|!x.is_empty()).ok_or_else(||format!("missing session {name}").into())};
     if value["version"].as_u64()!=Some(1) {return Err("native session ABI mismatch".into())}
@@ -1598,7 +1616,19 @@ pub fn run_authorized(value:serde_json::Value)->Result<()> {
             server(get("bind")?.parse()?,get("remote")?.parse()?,get("ca")?,get("cert")?,get("key")?,seconds,
                 Some(CaptureSource::DeskFuse {exe:get("capture")?,enrolled_peer:peer,certificate_der:get("peerDer")?}))
         }
-        "client"=>client(get("remote")?.parse()?,get("ca")?,get("cert")?,get("key")?,seconds,false,Some(get("library")?),PlayModes::default()),
+        "client"=>{
+            let mut modes=PlayModes::default();
+            if let Some(lab)=value.get("lab").filter(|x|!x.is_null()) {
+                if lab["version"].as_u64()!=Some(1){return Err("unsupported lab policy".into())}
+                let n=|k:&str|->Result<u32>{Ok(u32::try_from(lab[k].as_u64().ok_or("missing lab parameter")?)?)};
+                modes=PlayModes::parse(lab["modes"].as_str().ok_or("missing lab modes")?)?;
+                modes.buffer_bursts=n("buffer_bursts")?;modes.sharing_policy=n("sharing_policy")?;
+                modes.usage_policy=n("usage_policy")?;modes.reserve_frames=n("reserve_frames")?;
+                deskfuse_quiche_lab::android_audio::OutputConfigV8::new(modes.buffer_bursts,modes.sharing_policy,modes.usage_policy,modes.reserve_frames)?;
+                deskfuse_quiche_lab::lab_observation::begin(get("observationId")?)?;
+            }
+            client(get("remote")?.parse()?,get("ca")?,get("cert")?,get("key")?,seconds,false,Some(get("library")?),modes)
+        },
         _=>Err("unknown native session role".into()),
     }
 }

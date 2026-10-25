@@ -54,14 +54,21 @@ class ProcessJob:
         if self.handle: self.kernel.CloseHandle(self.handle); self.handle=None
 
 
-def command(cfg, backend, period, seconds):
+def command(cfg, backend, period, seconds, *, run_id=None, bursts=0, modes="f1c1r1", sharing=0, usage=0, reserve=1440, capture_policy="reference"):
     if backend not in ("loopback","committed") or period not in ("reference","minimum") or seconds not in (30,120):
         raise ValueError("Unsupported product experiment")
+    from bridge import build_command
+    # Reuse the same typed allowlists/one-factor gate, including direct callers.
+    build_command(cfg,bursts=bursts,modes=modes,seconds=seconds,label="",source="direct_export" if backend=="committed" else "deskfuse",engine_period=period,capture_policy=capture_policy,sharing=sharing,usage=usage,reserve=reserve,run_id=run_id)
+    import uuid
+    run_id=run_id or uuid.uuid4().hex
     return [str(product_artifacts(cfg)["product_agent"].resolve()),"run","--audio-lab",
             "--audio-lab-seconds",str(seconds),"--native-audio-exe",str(Path(cfg["windows_sender"]).resolve()),
             "--native-capture-exe",str(Path(cfg["windows_capture"]).resolve()),
             "--native-source-dll",str(Path(cfg["windows_source_control"]).resolve()),
-            "--native-audio-backend",backend,"--native-audio-period",period,"--no-open-qr"]
+            "--native-audio-backend",backend,"--native-audio-period",period,"--no-open-qr",
+            "--audio-lab-run-id",run_id,"--audio-lab-bursts",str(bursts),"--audio-lab-modes",modes,
+            "--audio-lab-sharing",str(sharing),"--audio-lab-usage",str(usage),"--audio-lab-reserve",str(reserve)]
 
 
 def run(cfg, args):
@@ -85,9 +92,9 @@ def run(cfg, args):
     folder=Path(cfg["evidence_root"]).resolve()/(stamp+"-"+args.profile)
     folder.mkdir(parents=True,exist_ok=False)
     print("Evidence folder: "+str(folder),flush=True)
-    manifest={"source":args.backend,"engine_period":args.engine_period,"capture_policy":args.capture_policy,
+    manifest={"run_id":args.run_id,"output_policy":{"version":1,"buffer_bursts":args.bursts,"modes":args.modes,"sharing_policy":args.sharing,"usage_policy":args.usage,"reserve_frames":args.reserve},"source":args.backend,"engine_period":args.engine_period,"capture_policy":args.capture_policy,
               "git_commit":head,"git_branch":branch,"receipt":report,"physical_qualified":False,
-              "android_telemetry":"Unavailable over product control; no acoustic latency inferred",
+              "android_telemetry":None,"audible_duration_ms":None,
               "comparison":"Compare actual LAB_ENDPOINT identity, period and the same product APK between dedicated runs. MM-1 uses the standalone receiver; cross-path timing is confounded unless native/profile differences are accounted for"}
     manifest_path=folder/"product-session.json"
     def save(): manifest_path.write_text(json.dumps(manifest,indent=2),encoding="utf-8")
@@ -111,7 +118,7 @@ def run(cfg, args):
     process=None; job=ProcessJob(); reader=None
     log=(folder/"windows-source.stdout.txt").open("w",encoding="utf-8")
     try:
-        process=subprocess.Popen(command(cfg,args.backend,args.engine_period,args.seconds),cwd=repo,
+        process=subprocess.Popen(command(cfg,args.backend,args.engine_period,args.seconds,run_id=args.run_id,bursts=args.bursts,modes=args.modes,sharing=args.sharing,usage=args.usage,reserve=args.reserve,capture_policy=args.capture_policy),cwd=repo,
             stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,
             text=True,encoding="utf-8",errors="replace",env=env,creationflags=subprocess.CREATE_NO_WINDOW)
         def drain():
@@ -135,7 +142,7 @@ def run(cfg, args):
         text=(folder/"windows-source.stdout.txt").read_text(encoding="utf-8")
         if "LAB_RESULT media_ready=1" not in text or not re.search(r"LAB_RESULT .* queued=[1-9][0-9]* .*exit=0",text): code=2
         from bridge import parse_observed_lines
-        manifest["observed"]=parse_observed_lines(text)
+        manifest["observed"]=parse_observed_lines(text,args.run_id)
         manifest["endpoint_identities"]=[json.loads(line[13:])["endpoint"] for line in text.splitlines() if line.startswith("LAB_ENDPOINT ")]
         manifest["exit_code"]=code;save()
         if code!=0: raise ValueError("Product run blocked/failed; inspect local product evidence. No physical qualification claimed")
@@ -152,12 +159,17 @@ def run(cfg, args):
 
 def main():
     p=argparse.ArgumentParser()
+    p.add_argument("--run-id",required=True)
+    p.add_argument("--bursts",type=int,choices=(0,2,3),default=0);p.add_argument("--modes",default="f1c1r1")
+    p.add_argument("--sharing",type=int,choices=(0,1),default=0);p.add_argument("--usage",type=int,choices=(0,1),default=0)
+    p.add_argument("--reserve",type=int,choices=(1440,1200,960,720,480),default=1440)
     p.add_argument("--config",required=True);p.add_argument("--backend",choices=("loopback","committed"),required=True)
     p.add_argument("--engine-period",choices=("reference","minimum"),required=True)
     p.add_argument("--capture-policy",choices=("reference","minimum"),required=True)
     p.add_argument("--seconds",type=int,choices=(30,120),required=True);p.add_argument("--profile",required=True)
     args=p.parse_args()
-    if not re.fullmatch(r"[A-Za-z0-9_-]{1,120}",args.profile): p.error("Invalid profile")
+    if not re.fullmatch(r"[0-9a-f]{32}",args.run_id): p.error("Invalid run ID")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,180}",args.profile): p.error("Invalid profile")
     try: return run(json.loads(Path(args.config).read_text(encoding="utf-8-sig")),args)
     except (OSError,ValueError,KeyError,RuntimeError,subprocess.SubprocessError) as error:
         print("Product preflight/run failed: "+str(error),file=sys.stderr);return 2
