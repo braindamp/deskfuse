@@ -1,0 +1,18 @@
+.windows-lab{padding:22px;margin:28px 0;border:1px solid #2c6447;background:linear-gradient(155deg,#0f1a13,#090e0b);border-radius:12px}
+.windows-lab h2{font-size:clamp(1.25rem,2vw,1.8rem);color:#cbf3d6;margin:8px 0}
+.windows-lab>p{color:#a3b5aa;line-height:1.55;max-width:95ch}
+.windows-lab-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:16px 0}
+.windows-lab .live-field{min-width:0}
+.win-rail{border-left:3px solid #70d49b;background:#15231b;padding:11px 15px;color:#c8e4d3!important;font-size:.82rem;letter-spacing:.03em}
+.win-cards{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:16px 0 22px}
+.win-card{border:1px solid #354239;background:#0d130f;border-radius:8px;padding:15px;display:flex;flex-direction:column;gap:9px}
+.win-card.selected{border-color:#71dba1;background:#102219}
+.win-card strong{font-size:.88rem;color:#d8f6e1}
+.win-card .win-tag{font-size:.7rem;letter-spacing:.04em;color:#d7c78d}
+.win-card small{font-size:.68rem;color:#8aa798}
+.win-card p{margin:0;font-size:.78rem;color:#a1b5a8;line-height:1.48}
+.win-readouts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+.win-readouts>div{background:#111b14;border:1px solid #304d38;padding:12px;display:flex;gap:9px;flex-direction:column}
+.win-readouts strong{font-size:.74rem;color:#99bda8}
+.win-readouts span{font-size:.85rem;color:#d0ebd6;font-weight:700}
+@media(max-width:920px){.windows-lab-grid,.win-cards,.win-readouts{grid-template-columns:1fr}.windows-lab{padding:15px}}
