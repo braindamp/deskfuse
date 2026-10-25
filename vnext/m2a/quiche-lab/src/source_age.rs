@@ -8,6 +8,20 @@ use std::time::Duration;
 pub const MAX_SOURCE_AGE_100NS: u64 = 600_000; // 60 ms upper bound
 pub const MAX_FUTURE_SKEW_100NS: u64 = 100_000; // 10 ms, report separately
 
+#[derive(Debug,Clone,Copy)]
+pub struct CommitTiming {pub commit_qpc:u64,pub presentation_qpc:u64}
+impl CommitTiming {
+    pub fn classify(self,now:u64)->AgeDecision {
+        if self.commit_qpc==0 || self.presentation_qpc==0 {return AgeDecision::MissingTimestamp}
+        if self.commit_qpc>now {return AgeDecision::FutureTimestamp}
+        if now-self.commit_qpc>MAX_SOURCE_AGE_100NS {return AgeDecision::Expired}
+        classify(now,self.presentation_qpc) // no WASAPI fragment exception
+    }
+    pub fn expiry(self)->Option<u64> {
+        self.commit_qpc.min(self.presentation_qpc).checked_add(MAX_SOURCE_AGE_100NS)?.checked_add(1)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgeDecision {
     Fresh { age_100ns: u64 },
@@ -109,6 +123,14 @@ pub fn local_qpc_100ns() -> io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn committed_age_cannot_be_refreshed_by_future_presentation() {
+        let timing=CommitTiming{commit_qpc:1_000_000,presentation_qpc:1_650_000};
+        assert_eq!(timing.classify(1_600_001),AgeDecision::Expired);
+        assert_eq!(CommitTiming{commit_qpc:1_600_000,presentation_qpc:1_700_001}.classify(1_600_000),AgeDecision::FutureTimestamp);
+        assert_eq!(CommitTiming{commit_qpc:1_600_001,presentation_qpc:1_600_000}.classify(1_600_000),AgeDecision::FutureTimestamp);
+        assert_eq!(timing.expiry(),Some(1_600_001));
+    }
     #[test]
     fn real_age_decisions_are_fail_closed_for_missing_and_old() {
         assert_eq!(classify(2_000_000, 0), AgeDecision::MissingTimestamp);

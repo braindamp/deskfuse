@@ -23,6 +23,9 @@ use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
+#[cfg(windows)]
+#[path="../direct_sender.rs"]
+mod direct_sender;
 const ALPN: &[u8] = b"df-continuous-m2a-1";
 const AUDIO_FRAMES: u64 = 240;
 const PAYLOAD_BYTES: usize = 960;
@@ -89,6 +92,7 @@ fn verified(conn: &quiche::Connection) -> Result<()> {
     if conn.peer_cert().is_none() {
         return Err("REFUSED: mutually authenticated TLS peer certificate absent".into());
     }
+    deskfuse_quiche_lab::session_control::verify(conn.peer_cert())?;
     Ok(())
 }
 
@@ -148,6 +152,11 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
     let mut cfg = config(ca, cert, key)?;
     let udp = socket(bind)?;
     let local = udp.local_addr()?;
+    deskfuse_quiche_lab::session_control::register_socket(&udp)?;
+    if deskfuse_quiche_lab::session_control::active() {
+        use std::io::Write;
+        println!("NATIVE_LISTEN {}",local.port());std::io::stdout().flush()?;
+    }
     let end_waiting = Instant::now() + CONNECT_LIMIT;
     let mut conn: Option<quiche::Connection> = None;
     let mut peer: Option<SocketAddr> = None;
@@ -195,6 +204,7 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
     let mut reader_summary: Option<Box<wasapi_pipe::ReaderSummary>> = None;
     let result = (|| -> Result<()> {
     loop {
+        if deskfuse_quiche_lab::session_control::stopping() {return Ok(())}
         let now = Instant::now();
         if capture.is_some() && capture_started.is_none() &&
             origin.is_some_and(|start| start.elapsed() >= CONNECT_LIMIT) {
@@ -615,7 +625,9 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
     // live owner/reader paths above. Cancel/join the child before its worker
     // releases the endpoint lease. Report missing summary honestly.
     let incomplete_reader = source.is_some() && reader_summary.is_none();
-    let cleanup_result = source.take().map(|mut source| source.stop()).transpose();
+    let cleanup_result = source.as_mut().map(|source| source.stop()).transpose();
+    outstanding.clear();drop(egress);drop(conn);
+    drop(source.take()); // endpoint lease is last, after acquisition and QUIC
     let flush_result = (|| -> io::Result<()> {
         let mut out = io::stderr().lock();
         trace.flush(&mut out)?;
@@ -1130,8 +1142,9 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
     drop(route);
     let udp = socket(SocketAddr::new(local_ip, 0))?;
     let local = udp.local_addr()?;
+    deskfuse_quiche_lab::session_control::register_socket(&udp)?;
     let scid = quiche::ConnectionId::from_ref(&[0x71; 16]); // isolated one-peer lab only
-    let mut conn = quiche::connect(Some("deskfuse-lab.local"), &scid, local, remote, &mut cfg)?;
+    let mut conn = quiche::connect(Some(if deskfuse_quiche_lab::session_control::active() {"deskfuse-session.local"} else {"deskfuse-lab.local"}), &scid, local, remote, &mut cfg)?;
     let mut egress = Egress::default();
     let started_waiting = Instant::now();
     let mut authenticated_at: Option<Instant> = None;
@@ -1142,6 +1155,7 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
     println!("CONNECT continuous Android sink {} -> {} ; mutual TLS mandatory", local, remote);
     let loop_result=(|| -> Result<()> {
     loop {
+        if deskfuse_quiche_lab::session_control::stopping() {return Ok(())}
         service_timeout(&mut conn);
         if conn.is_closed() { return Err("Android QUIC connection closed before receiving complete observation window".into()); }
 
@@ -1539,9 +1553,45 @@ mod recovery_boundary_tests {
     }
 }
 
+pub fn run_authorized(value:serde_json::Value)->Result<()> {
+    let get=|name:&str|->Result<&str> {value[name].as_str().filter(|x|!x.is_empty()).ok_or_else(||format!("missing session {name}").into())};
+    if value["version"].as_u64()!=Some(1) {return Err("native session ABI mismatch".into())}
+    let seconds=value["seconds"].as_u64().filter(|n|*n>0 && *n<=1800).ok_or("session duration outside grant")?;
+    let expected=std::fs::read(get("peerDer")?)?;
+    let _session=deskfuse_quiche_lab::session_control::Session::begin(expected)?;
+    #[cfg(windows)] {
+        // EOF of the inherited control pipe revokes this process's grant.
+        std::thread::spawn(|| {use std::io::Read;let mut b=[0u8;1];let _=std::io::stdin().read(&mut b);deskfuse_quiche_lab::session_control::stop();});
+    }
+    match get("role")? {
+        "server"=> {
+            let peer=get("peerId")?;
+            deskfuse_quiche_lab::endpoint_lease::validate_peer_id(peer)?;
+            let policy=get("enginePeriod")?;
+            if !["reference","minimum"].contains(&policy) {return Err("invalid period policy".into())}
+            if get("backend")?=="committed" {
+                #[cfg(windows)]
+                return direct_sender::run(get("bind")?.parse()?,get("remote")?.parse()?,get("ca")?,get("cert")?,get("key")?,seconds,
+                    peer,get("sourceDll")?,policy=="minimum");
+                #[cfg(not(windows))]
+                return Err("committed source requires Windows".into());
+            }
+            if get("backend")?!="loopback" {return Err("unknown source backend".into())}
+            // Setup-only, before source/thread creation. No process may host
+            // concurrent native sessions; Session::begin enforces ownership.
+            std::env::set_var("DESKFUSE_WASAPI_ENGINE_PERIOD",policy);
+            server(get("bind")?.parse()?,get("remote")?.parse()?,get("ca")?,get("cert")?,get("key")?,seconds,
+                Some(CaptureSource::DeskFuse {exe:get("capture")?,enrolled_peer:peer,certificate_der:get("peerDer")?}))
+        }
+        "client"=>client(get("remote")?.parse()?,get("ca")?,get("cert")?,get("key")?,seconds,false,Some(get("library")?),PlayModes::default()),
+        _=>Err("unknown native session role".into()),
+    }
+}
+
 fn run() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     match args.as_slice() {
+        [_,mode] if mode=="session-stdin"=>run_authorized(deskfuse_quiche_lab::session_control::bounded_stdin()?),
         [_, mode, bind, allow_ip, ca, cert, key, secs] if mode == "server" => {
             server(bind.parse()?, allow_ip.parse()?, ca, cert, key, positive_seconds(secs)?, None)
         }

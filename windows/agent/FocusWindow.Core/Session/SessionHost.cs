@@ -81,7 +81,7 @@ public sealed class SessionHost : IDisposable
                 try
                 {
                     (acceptedConnection, acceptedHello) = await _listener.AcceptAuthenticatedAsync(_offer,
-                        _options.CameraFreePairing ? _services.DeviceCredentials : null, ct)
+                        (_options.CameraFreePairing || _services.CreateNativeAudio is not null) ? _services.DeviceCredentials : null, ct)
                         .ConfigureAwait(false);
                 }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested)

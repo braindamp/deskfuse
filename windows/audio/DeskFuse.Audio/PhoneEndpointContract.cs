@@ -78,7 +78,8 @@ public static class PhoneEndpointContract
 }
 
 /// <summary>One request to the endpoint broker.</summary>
-public sealed record BrokerRequest(string Op, string? PeerId = null, string? Label = null);
+public sealed record BrokerRequest(string Op, string? PeerId = null, string? Label = null,
+    uint? ChildProcessId = null, string? SourceInstance = null, string? ClientLeaseNonce = null);
 
 /// <summary>One reply from the endpoint broker.</summary>
 public sealed record BrokerResponse(
@@ -88,11 +89,15 @@ public sealed record BrokerResponse(
     string? EndpointId = null,
     string? DeviceFriendlyName = null,
     string? DeviceInstanceId = null,
-    IReadOnlyList<BrokerResponse>? Endpoints = null);
+    IReadOnlyList<BrokerResponse>? Endpoints = null,
+    ulong? PcmFile = null, ulong? PcmSection = null, ulong? PcmEvent = null, ulong? PcmGeneration = null,
+    string? ClientLeaseNonce = null);
 
 /// <summary>The broker operations the host may ask for.</summary>
 public static class BrokerOps
 {
+    public const string RegisterCapture = "register_capture";
+    public const string GrantPcm = "grant_pcm";
     /// <summary>Create the endpoint for one enrolled phone.</summary>
     public const string Create = "create";
 

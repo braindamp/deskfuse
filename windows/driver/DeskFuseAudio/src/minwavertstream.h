@@ -16,6 +16,7 @@ Abstract:
 #define _SYSVAD_MINWAVERTSTREAM_H_
 
 #include "tonegenerator.h"
+#include "frame_clock.h"
 
 
 //
@@ -56,7 +57,14 @@ protected:
     PPORTWAVERTSTREAM           m_pPortStream;
     LIST_ENTRY                  m_NotificationList;
     PEX_TIMER                   m_pNotificationTimer;
-    ULONG                       m_ulNotificationIntervalMs;
+    ULONG                       m_PacketFrames;
+    deskfuse::FrameClock         m_FrameClock;
+    ULONGLONG                   m_LastNotifiedPacket;
+    ULONGLONG                   m_MissedNotifications;
+    ULONGLONG                   m_EosEndFrame;
+    BOOLEAN                     m_EosNotified;
+    BOOLEAN                     m_ShuttingDown;
+    VOID ArmNotificationLocked();
     ULONG                       m_ulCurrentWritePosition;
     LONG                        m_IsCurrentWritePositionUpdated;
     
@@ -104,6 +112,7 @@ protected:
     ULONGLONG                   m_ullPresentationPosition;
     ULONG                       m_ulLastOsReadPacket;
     ULONG                       m_ulLastOsWritePacket;
+    BOOLEAN                     m_HasLastWritePacket;
     LONGLONG                    m_llPacketCounter;
     ULONGLONG                   m_ullDmaTimeStamp;
     LARGE_INTEGER               m_ullPerformanceCounterFrequency;

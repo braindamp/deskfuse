@@ -21,4 +21,7 @@ PROTECTED_FILE_AUDIT.txt
 
 # Unified production native GPU build outputs (not a POC runtime)
 **/.build/
+/android/local.properties
+/android/app/.cxx/
+/windows/audio/DeskFuse.AudioBroker/.native-source-control/
 gpu-phone-workspace-evidence/

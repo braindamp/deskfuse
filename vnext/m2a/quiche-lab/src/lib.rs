@@ -5,6 +5,34 @@ pub mod deferred_trace;
 pub mod reactor;
 pub mod wasapi_pipe;
 pub mod endpoint_lease;
+pub mod session_control;
+#[cfg(windows)]
+pub mod committed_source;
+#[cfg(target_os="android")]
+extern crate self as deskfuse_quiche_lab;
+#[cfg(target_os="android")]
+#[path="bin/continuous-quic-lab.rs"]
+mod native_session;
+
+/// JNI adapter calls this on its dedicated owner thread. JSON contains only
+/// private-app paths/control, never PCM. No panic unwinds across C/JNI.
+#[cfg(target_os="android")]
+#[no_mangle]
+pub unsafe extern "C" fn deskfuse_native_audio_run(json:*const std::ffi::c_char)->i32 {
+    std::panic::catch_unwind(|| {
+        if json.is_null() {return -1}
+        let bytes=std::ffi::CStr::from_ptr(json).to_bytes();
+        if bytes.len()>16384 {return -1}
+        let Ok(value)=serde_json::from_slice(bytes) else {return -1};
+        match native_session::run_authorized(value) {Ok(())=>0,Err(_)=>-1}
+    }).unwrap_or(-1)
+}
+#[cfg(target_os="android")]
+#[no_mangle]
+pub extern "C" fn deskfuse_native_audio_stop() {session_control::stop();}
+#[cfg(target_os="android")]
+#[no_mangle]
+pub extern "C" fn deskfuse_native_audio_prepare()->bool {session_control::prepare()}
 pub mod android_audio;
 pub mod source_age;
 pub mod plaintext_expiry;

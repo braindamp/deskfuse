@@ -11,7 +11,13 @@ pub struct Identity {
     pub sequence: u32, pub source_frame: u64,
 }
 #[derive(Debug, Clone, Copy)]
-struct Pending { id: Identity, source_qpc: u64, original_packet_offset_frames: u32 }
+struct Pending { id: Identity, source_qpc: u64, original_packet_offset_frames: u32,
+    committed:Option<crate::source_age::CommitTiming> }
+impl Pending {
+    fn decision(&self,now:u64)->AgeDecision {
+        self.committed.map_or_else(||classify_wasapi(now,self.source_qpc,self.original_packet_offset_frames),|c|c.classify(now))
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueAdmission { Queued, Expired, Full }
 pub struct PlaintextExpiry {
@@ -68,11 +74,25 @@ impl PlaintextExpiry {
         }
     }
 
+    pub fn admit_committed(&mut self,conn:&mut Connection,wire:&[u8],timing:crate::source_age::CommitTiming,now:u64)
+        ->Result<QueueAdmission,quiche::Error> {
+        self.purge(conn,now);
+        if !matches!(timing.classify(now),AgeDecision::Fresh{..}) {return Ok(QueueAdmission::Expired)}
+        let id=Identity::from_wire(wire).ok_or(quiche::Error::InvalidState)?;
+        if self.entries.iter().any(|p|p.id==id){return Err(quiche::Error::InvalidState)}
+        if self.accept(id,timing.presentation_qpc,0).is_err(){return Ok(QueueAdmission::Full)}
+        self.entries.last_mut().unwrap().committed=Some(timing);
+        match conn.dgram_send(wire) {
+            Ok(())=>Ok(QueueAdmission::Queued),
+            Err(error)=> {self.entries.retain(|p|p.id!=id);if error==quiche::Error::Done{Ok(QueueAdmission::Full)}else{Err(error)}}
+        }
+    }
+
     fn accept(&mut self, id: Identity, source_qpc: u64,
               original_packet_offset_frames: u32) -> Result<(), &'static str> {
         if self.entries.len() >= CAPACITY { return Err("plaintext metadata bound"); }
         if self.entries.iter().any(|p| p.id == id) { return Err("duplicate plaintext identity"); }
-        self.entries.push(Pending{id, source_qpc, original_packet_offset_frames});
+        self.entries.push(Pending{id, source_qpc, original_packet_offset_frames,committed:None});
         self.high_water=self.high_water.max(self.entries.len());
         Ok(())
     }
@@ -92,8 +112,7 @@ impl PlaintextExpiry {
                     {
                         present[index].set(true);
                         expired[index].set(!matches!(
-                            classify_wasapi(now_qpc, entry.source_qpc,
-                                            entry.original_packet_offset_frames),
+                            entry.decision(now_qpc),
                             AgeDecision::Fresh { .. }
                         ));
                         expired[index].get()
@@ -129,11 +148,13 @@ impl PlaintextExpiry {
     pub fn next_expiry_wait(&self, now_qpc: u64) -> Option<Duration> {
         self.entries.iter().filter_map(|entry| {
             if !matches!(
-                classify_wasapi(now_qpc, entry.source_qpc,
-                                entry.original_packet_offset_frames),
+                entry.decision(now_qpc),
                 AgeDecision::Fresh { .. }
             ) {
                 return Some(Duration::ZERO);
+            }
+            if let Some(timing)=entry.committed {
+                return timing.expiry().map(|expiry|Duration::from_nanos(expiry.saturating_sub(now_qpc)*100));
             }
             entry.source_qpc.checked_add(MAX_SOURCE_AGE_100NS)?
                 .checked_add(1)

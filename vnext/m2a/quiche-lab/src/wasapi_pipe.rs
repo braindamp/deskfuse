@@ -44,6 +44,7 @@ pub enum CaptureEvent {
 /// capture process has exited. No thread/pipe queue outlives endpoint teardown.
 pub struct CaptureSession {
     receiver: Option<Receiver<CaptureEvent>>,
+    _lease: Arc<Mutex<Option<EndpointLease>>>,
     process: Arc<Mutex<Option<ProcessControl>>>,
     cancel: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
@@ -331,37 +332,50 @@ fn spawn_source(
     let cancel = Arc::new(AtomicBool::new(false));
     let worker_process = Arc::clone(&process);
     let worker_cancel = Arc::clone(&cancel);
+    let lease_owner=Arc::new(Mutex::new(None));
+    let worker_lease=Arc::clone(&lease_owner);
     let (sender, receiver) = mpsc::sync_channel(QUEUE_SLOTS);
     let worker = thread::spawn(move || {
         // Device setup may take seconds. It must never block the QUIC owner.
         let setup = (|| -> io::Result<_> {
             let lease = peer_id.as_ref().map(|peer| EndpointLease::provision(peer, &worker_cancel)).transpose()?;
-            let endpoint = lease.as_ref().map_or(device_id.as_str(), |x| x.endpoint_id.as_str());
+            let endpoint = lease.as_ref().map_or(device_id.clone(), |x| x.endpoint_id.clone());
             if let Some(ref lease) = lease {
                 eprintln!("DESKFUSE_SOURCE endpoint_id={} default_routing_changed=false", lease.endpoint_id);
             }
+            let is_dedicated=lease.is_some();
+            *worker_lease.lock().map_err(|_|io::Error::new(io::ErrorKind::Other,"lease ownership poisoned"))?=lease;
             let mut control = worker_process.lock().map_err(|_| io::Error::new(
                 io::ErrorKind::Other,"capture process control poisoned"))?;
             if worker_cancel.load(Ordering::Acquire) {
                 return Err(io::Error::new(io::ErrorKind::Interrupted,"capture startup cancelled"));
             }
             let mut command = Command::new(&exe);
+            #[cfg(windows)] if is_dedicated {
+                use std::os::windows::process::CommandExt;
+                command.creation_flags(0x00000004); // CREATE_SUSPENDED
+            }
             command.arg("--out").arg("-").arg("--seconds").arg(seconds.to_string());
-            if endpoint != "default" { command.arg("--device-id").arg(endpoint); }
+            if endpoint != "default" { command.arg("--device-id").arg(&endpoint); }
             let mut child = command.stdin(Stdio::null()).stdout(Stdio::piped())
                 .stderr(Stdio::inherit()).spawn()?;
             *control = match ProcessControl::duplicate(&child) {
                 Ok(process) => Some(process),
                 Err(e) => { let _=child.kill(); let _=child.wait(); return Err(e); }
             };
+            #[cfg(windows)] if let Some(ref lease)=*worker_lease.lock().map_err(|_|io::Error::new(io::ErrorKind::Other,"lease ownership poisoned"))? {
+                if let Err(e)=lease.register_capture(child.id()).and_then(|_|resume_capture(child.id())) {
+                    let _=child.kill(); let _=child.wait(); return Err(e);
+                }
+            }
             drop(control);
             let Some(stdout) = child.stdout.take() else {
                 let _=child.kill(); let _=child.wait();
                 return Err(io::Error::new(io::ErrorKind::Other,"capture pipe unavailable"));
             };
-            Ok((child,stdout,lease))
+            Ok((child,stdout))
         })();
-        let (mut child,mut stdout,lease) = match setup {
+        let (mut child,mut stdout) = match setup {
             Ok(setup) => setup,
             Err(e) => {
                 deliver_terminal(&sender,ReaderSummary::default(),Err(e.to_string()),Some(&notifier),wake_addr);
@@ -369,7 +383,7 @@ fn spawn_source(
             }
         };
         if sender.send(CaptureEvent::Started { at:Instant::now() }).is_err() {
-            let _=child.kill(); let _=child.wait(); drop(lease); return;
+            let _=child.kill(); let _=child.wait(); return;
         }
         let _=notifier.send(&[0xA1]);
         let (summary, mut outcome) =
@@ -389,14 +403,39 @@ fn spawn_source(
             }
             _ => {}
         }
-        // Closing this broker pipe releases only this session's endpoint.
-        // It MUST happen after native process exit, even on reactor failure.
-        drop(lease);
+        // Acquisition is joined, but the CaptureSession retains its broker
+        // lease until the owner has retired QUIC and drops the session.
         // Ordered terminal delivery happens after child cleanup and BEFORE
         // any diagnostic output. No writer exists on this reader path.
         deliver_terminal(&sender, summary, outcome, Some(&notifier), wake_addr);
     });
-    Ok(CaptureSession { receiver:Some(receiver), process, cancel, worker:Some(worker) })
+    Ok(CaptureSession { receiver:Some(receiver), _lease:lease_owner, process, cancel, worker:Some(worker) })
+}
+
+#[cfg(windows)]
+fn resume_capture(pid:u32)->io::Result<()> {
+    use windows_sys::Win32::{Foundation::{CloseHandle,INVALID_HANDLE_VALUE},
+        System::{Diagnostics::ToolHelp::*,Threading::{OpenThread,ResumeThread,THREAD_SUSPEND_RESUME}}};
+    unsafe {
+        let snapshot=CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD,0);
+        if snapshot==INVALID_HANDLE_VALUE {return Err(io::Error::last_os_error())}
+        let mut entry:THREADENTRY32=std::mem::zeroed();entry.dwSize=std::mem::size_of::<THREADENTRY32>() as u32;
+        let mut found=None;
+        let mut ok=Thread32First(snapshot,&mut entry);
+        while ok!=0 {
+            if entry.th32OwnerProcessID==pid {
+                let thread=OpenThread(THREAD_SUSPEND_RESUME,0,entry.th32ThreadID);
+                if !thread.is_null() {
+                    let result=ResumeThread(thread);CloseHandle(thread);
+                    found=Some(result!=u32::MAX);break;
+                }
+            }
+            ok=Thread32Next(snapshot,&mut entry);
+        }
+        CloseHandle(snapshot);
+        if found==Some(true) {Ok(())}
+        else {Err(io::Error::new(io::ErrorKind::Other,"suspended capture could not be resumed after job assignment"))}
+    }
 }
 
 fn deliver_terminal(sender:&SyncSender<CaptureEvent>, summary:ReaderSummary,

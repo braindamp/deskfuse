@@ -16,6 +16,7 @@ Abstract:
 #include "simple.h"
 #include "minwavert.h"
 #include "minwavertstream.h"
+#include "pcm_export.h"
 #include "UnittestData.h"
 #define MINWAVERTSTREAM_POOLTAG 'SRWM'
 #define HNSTIME_PER_MILLISECOND 10000
@@ -753,7 +754,7 @@ NTSTATUS CMiniportWaveRTStream::GetPresentationPosition(_Out_  KSAUDIO_PRESENTAT
         return status;
     }
 
-    _pPresentationPosition->u64PositionInBlocks = ullPresentationPosition * m_pWfExt->Format.nSamplesPerSec / m_pWfExt->Format.nAvgBytesPerSec;
+    _pPresentationPosition->u64PositionInBlocks = ullPresentationPosition / m_pWfExt->Format.nBlockAlign;
     _pPresentationPosition->u64QPCPosition = (UINT64)timeStamp.QuadPart;
 
     //Event type: eMINIPORT_GET_PRESENTATION_POSITION
@@ -814,7 +815,7 @@ NTSTATUS CMiniportWaveRTStream::SetCurrentWritePositionInternal(_In_  ULONG _ulC
         return STATUS_INVALID_DEVICE_REQUEST;
     }
 
-    if (_ulCurrentWritePosition > m_ulDmaBufferSize)
+    if (_ulCurrentWritePosition > m_ulDmaBufferSize || _ulCurrentWritePosition % m_pWfExt->Format.nBlockAlign)
     {
         return STATUS_INVALID_DEVICE_REQUEST;
     }
@@ -835,7 +836,7 @@ NTSTATUS CMiniportWaveRTStream::SetCurrentWritePositionInternal(_In_  ULONG _ulC
     //
     // Check for eMINIPORT_GLITCH_REPORT - Same WaveRT buffer write during event driven mode.
     //
-    if (m_ulNotificationIntervalMs > 0)
+    if (m_PacketFrames > 0)
     {
         if (m_ulCurrentWritePosition == _ulCurrentWritePosition)
         {
@@ -947,6 +948,7 @@ NTSTATUS CMiniportWaveRTStream::SetLoopbackProtection(_In_ CONSTRICTOR_OPTION pr
     // Miniport driver mutes/unmutes the loopback here.
     // 
     m_ToneGenerator.SetMute(protectionOption == CONSTRICTOR_OPTION_MUTE);
+    if (protectionOption != CONSTRICTOR_OPTION_DISABLE) DeskFusePcmDeny(m_pMiniport->m_PcmSource);
     
     return STATUS_SUCCESS;
 }
@@ -992,7 +994,13 @@ NTSTATUS CMiniportWaveRTStream::SetStreamCurrentWritePositionForLastBuffer(_In_ 
     ntStatus = SetCurrentWritePositionInternal(_ulWritePosition);
     if (NT_SUCCESS(ntStatus))
     {
+        if (m_KsState == KSSTATE_RUN) UpdatePosition(KeQueryPerformanceCounter(NULL));
+        const auto offset = _ulWritePosition % m_ulDmaBufferSize;
+        const auto current = m_ullLinearPosition % m_ulDmaBufferSize;
+        m_EosEndFrame = (m_ullLinearPosition + (offset + m_ulDmaBufferSize - current) % m_ulDmaBufferSize) /
+            m_pWfExt->Format.nBlockAlign;
         m_bEoSReceived = TRUE;
+        ArmNotificationLocked();
     }
 
     KeReleaseSpinLock(&m_PositionSpinLock, oldIrql);

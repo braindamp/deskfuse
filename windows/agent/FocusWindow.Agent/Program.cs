@@ -228,6 +228,11 @@ internal static class Program
             CreateEndpointAudioCapture: (endpointId, layouts, maxBytes) =>
                 new WindowsLoopbackAudioCapture(endpointId, layouts, maxBytes),
             PhoneSpeakers: new BrokerPhoneSpeakerProvider(brokerClient),
+            CreateNativeAudio: Opt(args, "--native-audio-exe") is string nativeExe &&
+                Opt(args, "--native-capture-exe") is string captureExe
+                ? (launch, ct) => NativeAudioProcess.StartAsync(Path.GetFullPath(nativeExe),
+                    Path.GetFullPath(captureExe), Path.GetFullPath(Opt(args, "--native-source-dll") ?? Path.Combine(Path.GetDirectoryName(Path.GetFullPath(captureExe))!, "deskfuse-source-control.dll")),
+                    Opt(args, "--native-audio-backend") ?? "committed", Opt(args, "--native-audio-period") ?? "reference", launch, ct) : null,
             CreatePhoneMicrophoneSink: allowMicrophone
                 ? id => string.Equals(id, microphoneDeviceId, StringComparison.Ordinal)
                     ? new WindowsPhoneMicrophoneCableSink(microphoneOutputId!)

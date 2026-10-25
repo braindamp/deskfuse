@@ -203,6 +203,67 @@ pub struct Readiness {
     pub writable: bool,
 }
 
+#[cfg(windows)]
+pub struct WindowsEvents {
+    socket:usize,event:isize,timer:*mut std::ffi::c_void,
+}
+#[cfg(windows)]
+impl WindowsEvents {
+    pub fn new(udp:&UdpSocket)->io::Result<Self> {
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::{Networking::WinSock::*,System::Threading::*};
+        unsafe {
+            let event=WSACreateEvent();if event==0{return Err(io::Error::last_os_error())}
+            let timer=CreateWaitableTimerExW(std::ptr::null(),std::ptr::null(),2,0x1f0003);
+            if timer.is_null(){WSACloseEvent(event);return Err(io::Error::last_os_error())}
+            let value=Self{socket:udp.as_raw_socket() as usize,event,timer};
+            if WSAEventSelect(value.socket,event,(FD_READ|FD_WRITE|FD_CLOSE) as i32)!=0 {
+                return Err(io::Error::from_raw_os_error(WSAGetLastError()))
+            }
+            Ok(value)
+        }
+    }
+    pub fn wait(&self,want_write:bool,source:Option<*mut std::ffi::c_void>,period:Option<*mut std::ffi::c_void>,deadline:Option<Instant>)
+        ->io::Result<(Readiness,bool)> {
+        use windows_sys::Win32::{Networking::WinSock::*,System::Threading::*};
+        unsafe {
+            let mut handles=[self.event as *mut std::ffi::c_void,self.timer,std::ptr::null_mut(),std::ptr::null_mut()];
+            let mut count=2;
+            if let Some(h)=source {if !h.is_null(){handles[count]=h;count+=1;}}
+            let period_index=if let Some(h)=period.filter(|h|!h.is_null()){handles[count]=h;count+=1;Some(count-1)}else{None};
+            if let Some(t)=deadline {
+                let duration=t.saturating_duration_since(Instant::now());
+                let hns=((duration.as_nanos()+99)/100).max(1).min(i64::MAX as u128) as i64;
+                let due=-hns;
+                if SetWaitableTimer(self.timer,&due,0,None,std::ptr::null(),0)==0{return Err(io::Error::last_os_error())}
+            } else {CancelWaitableTimer(self.timer);}
+            let result=WaitForMultipleObjects(count as u32,handles.as_ptr(),0,u32::MAX);
+            if result==u32::MAX{return Err(io::Error::last_os_error())}
+            let mut network:WSANETWORKEVENTS=std::mem::zeroed();
+            if WSAEnumNetworkEvents(self.socket,self.event,&mut network)!=0 {
+                return Err(io::Error::from_raw_os_error(WSAGetLastError()))
+            }
+            if network.lNetworkEvents & FD_CLOSE as i32!=0 {return Err(io::Error::new(io::ErrorKind::ConnectionAborted,"QUIC socket closed"))}
+            for index in [FD_READ_BIT,FD_WRITE_BIT] {
+                if network.iErrorCode[index as usize]!=0{return Err(io::Error::from_raw_os_error(network.iErrorCode[index as usize]))}
+            }
+            // Auto-reset audio event may be signalled concurrently with the
+            // socket event, so service it on every owner wake (padding bounds it).
+            let period_ready=period_index.is_some_and(|index|result==index as u32 || WaitForSingleObject(handles[index],0)==0);
+            Ok((Readiness{readable:network.lNetworkEvents & FD_READ as i32!=0,
+                writable:want_write && network.lNetworkEvents & FD_WRITE as i32!=0},period_ready))
+        }
+    }
+}
+#[cfg(windows)]
+impl Drop for WindowsEvents {
+    fn drop(&mut self){unsafe{
+        windows_sys::Win32::Networking::WinSock::WSAEventSelect(self.socket,0,0);
+        windows_sys::Win32::Networking::WinSock::WSACloseEvent(self.event);
+        windows_sys::Win32::Foundation::CloseHandle(self.timer);
+    }}
+}
+
 /// Wait for actual OS socket readiness or a dynamically armed deadline.
 /// The caller must set the socket nonblocking and service QUIC deadlines.
 pub fn wait_udp(

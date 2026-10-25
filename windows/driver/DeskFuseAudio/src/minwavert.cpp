@@ -15,6 +15,7 @@ Abstract:
 #pragma warning (disable : 4127)
 
 #include <DeskFuseAudio.h>
+#include <bcrypt.h>
 #include <limits.h>
 #include <MsApoFxProxy.h>
 #include "ContosoKeywordDetector.h"
@@ -23,6 +24,8 @@ Abstract:
 #include "minwavert.h"
 #include "minwavertstream.h"
 #include "IHVPrivatePropertySet.h"
+#include "timing_abi.h"
+#include "pcm_export.h"
 #include "AudioModuleHelper.h"
 
 
@@ -119,6 +122,7 @@ Return Value:
 {
     PAGED_CODE();
 
+    DeskFusePcmSourceDestroy(m_PcmSource);m_PcmSource=nullptr;
     DPF_ENTER(("[CMiniportWaveRT::~CMiniportWaveRT]"));
 
     if (m_pDeviceFormat)
@@ -388,6 +392,11 @@ Return Value:
     //
     // Init class data members
     //
+    ntStatus = BCryptGenRandom(NULL, reinterpret_cast<PUCHAR>(&m_TimingSourceInstance),
+        sizeof(m_TimingSourceInstance), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    if (!NT_SUCCESS(ntStatus)) return ntStatus;
+    ntStatus = DeskFusePcmSourceCreate(m_TimingSourceInstance,&m_PcmSource);
+    if (!NT_SUCCESS(ntStatus)) return ntStatus;
     m_ulLoopbackAllocated               = 0;
     m_ulSystemAllocated                 = 0;
     m_ulOffloadAllocated                = 0;
@@ -1266,6 +1275,12 @@ CMiniportWaveRT::StreamCreated
         ASSERT(i != count);
     }
 
+    if (IsSystemRenderPin(_Pin) || IsOffloadPin(_Pin)) {
+        const auto& f=_Stream->m_pWfExt->Format;
+        DeskFusePcmStreamOpen(m_PcmSource,_Stream,IsSystemRenderPin(_Pin) &&
+            IsEqualGUID(_Stream->m_SignalProcessingMode,AUDIO_SIGNALPROCESSINGMODE_DEFAULT) &&
+            f.nSamplesPerSec==48000 && f.nChannels==2 && f.wBitsPerSample==16 && f.nBlockAlign==4);
+    }
     return STATUS_SUCCESS;
 }
 
@@ -1279,6 +1294,8 @@ CMiniportWaveRT::StreamClosed
 )
 {
     PAGED_CODE();
+
+    if (IsSystemRenderPin(_Pin) || IsOffloadPin(_Pin)) DeskFusePcmStreamClose(m_PcmSource,_Stream);
 
     bool                      updateDrmRights = false;
     PCMiniportWaveRTStream  * streams         = NULL;
@@ -3176,7 +3193,25 @@ Return Value:
 
     pWaveHelper->AddRef();
 
-    if (IsEqualGUIDAligned(*PropertyRequest->PropertyItem->Set, KSPROPSETID_SysVAD))
+    if (IsEqualGUIDAligned(*PropertyRequest->PropertyItem->Set, KSPROPSETID_DeskFuseTiming)) {
+        if (PropertyRequest->PropertyItem->Id != DESKFUSE_TIMING_PROPERTY ||
+            PropertyRequest->Verb != KSPROPERTY_TYPE_GET) ntStatus = STATUS_INVALID_DEVICE_REQUEST;
+        else if (!PropertyRequest->ValueSize) {
+            PropertyRequest->ValueSize = sizeof(DeskFuseTimingCapabilities);
+            ntStatus = STATUS_BUFFER_OVERFLOW;
+        } else if (PropertyRequest->ValueSize < sizeof(DeskFuseTimingCapabilities)) ntStatus = STATUS_BUFFER_TOO_SMALL;
+        else {
+            DeskFuseTimingCapabilities c = {};
+            c.size = sizeof(c); c.abi = DESKFUSE_TIMING_ABI;
+            c.build = DESKFUSE_TIMING_BUILD; c.source_instance = pWaveHelper->m_TimingSourceInstance;
+            c.flags = DESKFUSE_TIMING_REQUIRED;
+            c.export_abi=DESKFUSE_PCM_ABI;
+            RtlCopyMemory(PropertyRequest->Value, &c, sizeof(c));
+            PropertyRequest->ValueSize = sizeof(c);
+            ntStatus = STATUS_SUCCESS;
+        }
+    }
+    else if (IsEqualGUIDAligned(*PropertyRequest->PropertyItem->Set, KSPROPSETID_SysVAD))
     {
         switch (PropertyRequest->PropertyItem->Id)
         {

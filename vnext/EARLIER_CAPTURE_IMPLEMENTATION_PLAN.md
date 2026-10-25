@@ -703,3 +703,36 @@ playback or silently change routing as part of implementation. Keep Android
 hardware experiments and reserve changes out of the Windows-source comparison.
 Planning is complete enough to start implementation after the user's go-ahead;
 no further general design paper or configuration framework is a prerequisite.
+
+## WIP checkpoint - 2026-10-25
+
+Work in progress, not ready for deployment. The current branch connects the
+corrected WaveRT clock, committed-PCM export, broker grants, authenticated native
+phone session, direct Rust source, and source/period reactor handling. No driver
+installation, endpoint activation, routing change or phone playback was performed.
+
+Remaining before treating this pipeline as complete:
+
+- Resolve the exact endpoint capability lookup: the connected adapter may expose
+  the topology filter, while the new timing/source-instance property currently
+  belongs to the Wave filter. Keep verification tied to the actual source image.
+- Finish the source-buffer stability proof for all legal producer/reuse paths.
+  The bounded copy now holds the position lock and requires two notifications;
+  synchronous SetWritePacket return alone is not the safety argument.
+- Review kernel revocation, process-exit, free-buffer, rundown and section-view
+  lifetime paths, including accepted commits in flight and successor sessions.
+- Rebuild the latest edits: the dedicated same-thread WASAPI period owner,
+  process-handle/nonce broker binding, and latest driver credit/lifetime changes
+  postdate some successful builds. Check source/period wakeups and teardown.
+- Qualify an authorized corrected driver and the complete own-endpoint-to-phone
+  path. Actual mix ownership, granted period, continuity and latency remain
+  unproven on hardware; same-endpoint loopback remains the comparator.
+
+Evidence already obtained during this implementation: unsigned WDK driver,
+Agent/Broker Release, Windows Rust Release sender and matching Android APK builds;
+four M1 CTests, ten focused .NET tests, and 41 Rust library plus six sender tests
+passed. These results do not imply that every latest edit was rebuilt or that
+physical playback/latency has been qualified. Keep native capture opt-in, explicit
+endpoint identity, original timestamps, 60 ms freshness, generation fences and
+bounded storage. Next action after this checkpoint is the focused remaining
+integration/correctness pass, not unrelated tuning or UI work.

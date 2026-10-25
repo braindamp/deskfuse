@@ -488,6 +488,7 @@ class SessionController(
     private suspend fun pumpControl() {
         transport.control.collect { msg ->
             when (msg) {
+                is ServerMessage.NativeAudioChallenge, is ServerMessage.NativeAudioGrant -> Unit // accessory speaker session only
                 is ServerMessage.Hello -> {
                     hostPcAudioAvailable = msg.pcAudioAvailable
                     hostMicAvailable = msg.phoneMicrophoneBridgeAvailable

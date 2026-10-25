@@ -60,8 +60,14 @@ internal sealed class DevicePeerSession(
             return;
         }
 
-        using var lease = peers.Attach(
-            hello.Profile.DeviceId, hello.Profile.DeviceLabel, shutdown, requested);
+        if (requested.Contains(DeviceCapabilities.Speakers) && services.CreateNativeAudio is not null &&
+            (hello.NativeAudioVersion != 1 || conn.AuthenticatedDeviceId != hello.Profile.DeviceId)) {
+            conn.SendControl(ServerMessages.Stage("speakers", "Native audio requires a matching receiver and per-device enrollment.", fatal:true));
+            return;
+        }
+
+        using var lease = await peers.AttachAsync(
+            hello.Profile.DeviceId, hello.Profile.DeviceLabel, shutdown, requested).ConfigureAwait(false);
         log.Info("Authenticated accessory peer joined: " + lease.Peer.DeviceId);
 
         // The phone's Windows playback endpoint. It is provisioned only when
@@ -69,7 +75,7 @@ internal sealed class DevicePeerSession(
         // for as long as this peer is connected.
         await using var speakers = new PhoneSpeakerRoute(conn, services, lease.Peer.Endpoints.Speakers,
             lease.Peer.Label, log);
-        var active = await speakers.ProvisionAsync(requested, shutdown).ConfigureAwait(false);
+        var active = await speakers.ProvisionAsync(requested, lease.Cancellation).ConfigureAwait(false);
 
         // A requested function is not the same thing as an active device.
         conn.SendControl(ServerMessages.BridgeState(
@@ -89,7 +95,7 @@ internal sealed class DevicePeerSession(
         var control = ReadControlsAsync(conn, mic, speakers, requested, linked.Token);
         try
         {
-            await Task.WhenAny(control, microphonePump, keepAlive, conn.Completion).ConfigureAwait(false);
+            await Task.WhenAny(control, microphonePump, keepAlive, conn.Completion, speakers.NativeCompletion).ConfigureAwait(false);
         }
         finally
         {
@@ -114,6 +120,11 @@ internal sealed class DevicePeerSession(
         await foreach (var msg in conn.Messages.ReadAllAsync(ct).ConfigureAwait(false))
         {
             if (msg is ClientBye) return;
+            if (msg is ClientNativeAudio native)
+            {
+                await speakers.AuthorizeNativeAsync(native).ConfigureAwait(false);
+                continue;
+            }
             if (msg is ClientMicrophone mic &&
                 requested.Contains(DeviceCapabilities.Microphone))
             {

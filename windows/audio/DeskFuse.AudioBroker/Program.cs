@@ -134,6 +134,8 @@ internal sealed class EndpointBroker
         public required string PeerId { get; init; }
         public required long Generation { get; init; }
         public required PhoneDevice Device { get; init; }
+        public required CaptureJob Capture { get; init; }
+        public PcmGrant? Pcm { get; set; }
         public required string EndpointId { get; init; }
         public required string FriendlyName { get; init; }
         public string? InstancePath { get; init; }
@@ -190,10 +192,21 @@ internal sealed class EndpointBroker
             inBufferSize: 64 * 1024, outBufferSize: 64 * 1024, security);
     }
 
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError=true)]
+    private static extern bool GetNamedPipeClientProcessId(Microsoft.Win32.SafeHandles.SafePipeHandle pipe, out uint pid);
+    [System.Runtime.InteropServices.DllImport("kernel32.dll",SetLastError=true)]
+    private static extern Microsoft.Win32.SafeHandles.SafeFileHandle OpenProcess(uint access,bool inherit,uint pid);
+
     private async Task ServeAsync(NamedPipeServerStream server, CancellationToken cancellationToken)
     {
         // Every instance created over this connection dies with it.
         var owned = new List<(string PeerId, long Generation)>();
+        if (!GetNamedPipeClientProcessId(server.SafePipeHandle, out var clientPid)) {
+            server.Dispose(); return;
+        }
+        using var clientProcess=OpenProcess(0x0040|0x00100000,false,clientPid);
+        if (clientProcess.IsInvalid) {server.Dispose();return;}
+        var clientNonce=Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(32));
         try
         {
             using (server)
@@ -211,7 +224,8 @@ internal sealed class EndpointBroker
                         break;
                     }
                     if (line is null) break;
-                    var response = await HandleAsync(line, owned, cancellationToken).ConfigureAwait(false);
+                    var response = await HandleAsync(line, owned, clientPid, clientProcess, clientNonce, cancellationToken).ConfigureAwait(false);
+                    if (response.Ok) response=response with {ClientLeaseNonce=clientNonce};
                     var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(response) + "\n");
                     try
                     {
@@ -231,7 +245,8 @@ internal sealed class EndpointBroker
         }
     }
 
-    private async Task<BrokerResponse> HandleAsync(string line, List<(string, long)> owned,
+    private async Task<BrokerResponse> HandleAsync(string line, List<(string, long)> owned, uint clientPid,
+        Microsoft.Win32.SafeHandles.SafeFileHandle clientProcess,string clientNonce,
         CancellationToken cancellationToken)
     {
         BrokerRequest? request;
@@ -247,6 +262,34 @@ internal sealed class EndpointBroker
 
         switch (request.Op)
         {
+            case BrokerOps.GrantPcm:
+                await _deviceGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+                try {
+                    Instance? instance;
+                    lock (_gate) instance=request.PeerId is null?null:_instances.GetValueOrDefault(request.PeerId.ToLowerInvariant());
+                    if (instance is null || !owned.Contains((instance.PeerId,instance.Generation)) ||
+                        instance.Pcm is not null || request.ClientLeaseNonce!=clientNonce ||
+                        !Guid.TryParse(request.SourceInstance,out var source))
+                        return new BrokerResponse(false,"Direct PCM requires this live endpoint lease.");
+                    try {instance.Pcm=new PcmGrant(instance.EndpointId,source,clientProcess);}
+                    catch (Exception error) {return new BrokerResponse(false,error.Message);}
+                    return new BrokerResponse(true,PcmFile:instance.Pcm.FileHandle,PcmSection:instance.Pcm.SectionHandle,
+                        PcmEvent:instance.Pcm.EventHandle,PcmGeneration:instance.Pcm.Generation);
+                }
+                finally {_deviceGate.Release();}
+            case BrokerOps.RegisterCapture:
+                await _deviceGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+                try {
+                    Instance? instance;
+                    lock (_gate) instance = request.PeerId is null ? null : _instances.GetValueOrDefault(request.PeerId.ToLowerInvariant());
+                    if (instance is null || !owned.Contains((instance.PeerId, instance.Generation)) ||
+                        request.ClientLeaseNonce!=clientNonce || request.ChildProcessId is not uint pid || pid == 0)
+                        return new BrokerResponse(false, "Capture registration requires this connection's live endpoint lease.");
+                    try { instance.Capture.Add(pid, clientPid); }
+                    catch (Exception ex) { return new BrokerResponse(false, ex.Message); }
+                    return new BrokerResponse(true);
+                }
+                finally { _deviceGate.Release(); }
             case BrokerOps.Ping:
                 return new BrokerResponse(true);
             case BrokerOps.List:
@@ -282,6 +325,10 @@ internal sealed class EndpointBroker
             // The endpoint id is resolved again: Windows gives an endpoint a
             // new id when the device is re-enumerated, and a stale id would
             // point at a device that no longer exists.
+            // Native old owner may be gone without running Drop. Kill and join
+            // its capture before transferring ownership of the stable endpoint.
+            existing.Pcm?.Dispose();
+            existing.Capture.Dispose();
             long existingLease;
             var refreshed = await ResolveAsync(existing, cancellationToken)
                 .ConfigureAwait(false);
@@ -295,6 +342,7 @@ internal sealed class EndpointBroker
                     PeerId = peerId,
                     Generation = existingLease,
                     Device = existing.Device,
+                    Capture = new CaptureJob(),
                     EndpointId = refreshed,
                     FriendlyName = existing.FriendlyName,
                     InstancePath = existing.InstancePath,
@@ -305,6 +353,7 @@ internal sealed class EndpointBroker
                 DeviceFriendlyName: existing.FriendlyName, DeviceInstanceId: existing.Device.InstancePath);
         }
 
+        var captureJob = new CaptureJob();
         PhoneDevice device;
         try
         {
@@ -314,6 +363,7 @@ internal sealed class EndpointBroker
         }
         catch (Exception ex) when (ex is InvalidOperationException or UnauthorizedAccessException)
         {
+            captureJob.Dispose();
             return new BrokerResponse(false, ex.Message);
         }
 
@@ -325,11 +375,13 @@ internal sealed class EndpointBroker
         }
         catch
         {
+            captureJob.Dispose();
             await DeviceInstance.RemoveAsync(device.InstancePath).ConfigureAwait(false);
             throw;
         }
         if (endpointId is null)
         {
+            captureJob.Dispose();
             await DeviceInstance.RemoveAsync(device.InstancePath).ConfigureAwait(false);
             return new BrokerResponse(false,
                 "Windows created the phone speaker device but no audio endpoint appeared for it. " +
@@ -345,6 +397,7 @@ internal sealed class EndpointBroker
                 PeerId = peerId,
                 Generation = lease,
                 Device = device,
+                Capture = captureJob,
                 EndpointId = endpointId,
                 FriendlyName = friendlyName,
                 InstancePath = device.InstancePath,
@@ -495,6 +548,9 @@ internal sealed class EndpointBroker
     /// </summary>
     private static async Task RemoveReleasedDeviceAsync(Instance removed)
     {
+        removed.Pcm?.Dispose();
+        removed.Capture.Dispose(); // must confirm acquisition exit before PnP removal
+
         await DeviceInstance.RemoveAsync(removed.Device.InstancePath).ConfigureAwait(false);
         Console.WriteLine($"speaker-endpoint-removed=True instance={removed.Device.InstancePath}");
     }

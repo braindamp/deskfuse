@@ -11,6 +11,28 @@ pub const REQUEST: u8 = 1;
 pub const ANCHOR: u8 = 2;
 pub const RETRY_MS: u64 = 120;
 pub const TIMEOUT_MS: u64 = 1_200;
+#[derive(Debug,Clone,Copy)]
+pub struct CommitFence {pub generation:u64,pub accepted:u64,pub end_frame:u64,pub request_qpc:u64}
+impl CommitFence {
+    pub fn accepts(self,generation:u64,min_commit:u64,oldest_commit_qpc:u64,first_frame:u64)->bool {
+        generation==self.generation && min_commit>self.accepted &&
+            oldest_commit_qpc>self.request_qpc && first_frame>=self.end_frame
+    }
+}
+#[cfg(test)]
+mod commit_fence_tests {
+    use super::*;
+    #[test]
+    fn reserved_pre_request_commit_stays_rejected_after_publication() {
+        let fence=CommitFence{generation:8,accepted:17,end_frame:2176,request_qpc:3_000_000};
+        assert!(!fence.accepts(8,17,3_000_001,2176));
+        assert!(!fence.accepts(8,18,2_999_999,2176));
+        assert!(!fence.accepts(9,18,3_000_001,2176));
+        assert!(!fence.accepts(8,18,3_000_001,2175));
+        assert!(fence.accepts(8,18,3_000_001,2176));
+        assert!(!fence.accepts(8,16,3_000_001,2400)); // mixed assembly includes old commit
+    }
+}
 
 /// Validate at every acceptance boundary, including after descheduling.
 pub fn require_live(started: std::time::Instant, now: std::time::Instant)

@@ -5,8 +5,12 @@
 // Emits timestamped PCM16 48kHz stereo blocks with source device positions.
 // A bounded eight-block writer queue drops on pressure: never stalls WASAPI
 // buffer ownership to wait for a pipe/file/transport consumer.
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #include <audioclient.h>
 #include <avrt.h>
@@ -14,6 +18,9 @@
 #include <functiondiscoverykeys_devpkey.h>
 #include <propvarutil.h>
 #include <ksmedia.h>
+#include <ksproxy.h>
+#include <devicetopology.h>
+#include "../../../windows/driver/DeskFuseAudio/src/timing_abi.h"
 #include <wrl/client.h>
 
 #include "spsc_capture_queue.h"
@@ -461,9 +468,37 @@ bool minimum_engine_period() {
 // loopback client continues using ordinary documented Initialize flags. Its
 // companion contributes only silence, never reroutes/copies the source, and is
 // serviced on audio events by the capture thread: no timer, pacer or worker.
+DeskFuseTimingCapabilities require_corrected_driver(IMMDevice& endpoint) {
+    // Walk only this endpoint's physical connector. No default/name lookup.
+    ComPtr<IDeviceTopology> topology;
+    check(endpoint.Activate(__uuidof(IDeviceTopology), CLSCTX_ALL, nullptr,
+                            reinterpret_cast<void**>(topology.GetAddressOf())), "endpoint topology");
+    ComPtr<IConnector> connector;
+    check(topology->GetConnector(0, &connector), "endpoint connector");
+    LPWSTR adapter_id = nullptr;
+    check(connector->GetDeviceIdConnectedTo(&adapter_id), "connected KS filter identity");
+    std::unique_ptr<wchar_t, decltype(&CoTaskMemFree)> owned_id(adapter_id, CoTaskMemFree);
+    ComPtr<IMMDeviceEnumerator> enumerator;
+    check(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+        IID_PPV_ARGS(&enumerator)), "driver identity enumerator");
+    ComPtr<IMMDevice> adapter;
+    check(enumerator->GetDevice(adapter_id, &adapter), "exact connected adapter");
+    ComPtr<IKsControl> ks;
+    check(adapter->Activate(__uuidof(IKsControl), CLSCTX_ALL, nullptr,
+        reinterpret_cast<void**>(ks.GetAddressOf())), "connected filter IKsControl");
+    KSPROPERTY property = {KSPROPSETID_DeskFuseTiming, DESKFUSE_TIMING_PROPERTY, KSPROPERTY_TYPE_GET};
+    DeskFuseTimingCapabilities caps = {};
+    ULONG returned = 0;
+    check(ks->KsProperty(&property, sizeof(property), &caps, sizeof(caps), &returned), "running driver timing ABI");
+    if (returned != sizeof(caps) || !DeskFuseTimingCompatible(caps))
+        throw std::runtime_error("minimum period refused: running driver timing contract incompatible");
+    return caps;
+}
+
 class EnginePeriodCompanion {
 public:
     void initialize(IMMDevice& device, const WAVEFORMATEX& format, const EnginePeriods& before) {
+        timing_ = require_corrected_driver(device);
         selected_ = minimum_legal_period(before); // validate before initializing any stream
         check(device.Activate(__uuidof(IAudioClient3), CLSCTX_ALL, nullptr,
             reinterpret_cast<void**>(audio_.GetAddressOf())), "Activate period companion");
@@ -505,10 +540,16 @@ public:
         running_ = false;
         return audio_->Stop();
     }
+    void verify_driver(IMMDevice& device) const {
+        const auto current = require_corrected_driver(device);
+        if (!IsEqualGUID(current.source_instance, timing_.source_instance))
+            throw std::runtime_error("driver source instance changed during capture setup");
+    }
     ~EnginePeriodCompanion() { stop(); }
     [[nodiscard]] HANDLE event() const { return ready_.get(); }
     [[nodiscard]] UINT32 selected() const { return selected_; }
 private:
+    DeskFuseTimingCapabilities timing_ = {};
     Handle ready_; // outlives the COM streams that reference this event
     ComPtr<IAudioClient3> audio_;
     ComPtr<IAudioRenderClient> render_;
@@ -600,6 +641,7 @@ void capture(IMMDeviceEnumerator& enumerator, const std::wstring& device_id,
     UINT32 allocated_frames = 0;
     check(audio->GetBufferSize(&allocated_frames), "GetBufferSize");
     const auto periods = engine_periods(*audio.Get(), *format);
+    if (lower_period_requested) companion.verify_driver(*dev.Get());
     if (lower_period_requested && (FAILED(periods.current_result) ||
         !periods.current_format_matches || periods.current != companion.selected()))
         throw std::runtime_error("requested earlier engine period was not granted; refusing fallback");
@@ -743,7 +785,7 @@ int wmain(int argc, wchar_t** argv) {
             } else {
                 throw std::runtime_error("usage: deskfuse-wasapi-capture --list | "
                                          "[--device-id <render-endpoint-id>] --out <file|-> "
-                                         "[--seconds 1..60]");
+                                         "[--seconds 1..1800]");
             }
         }
         ComApartment com;

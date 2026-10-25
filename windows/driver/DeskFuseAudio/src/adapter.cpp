@@ -21,6 +21,7 @@ Abstract:
 #define PUT_GUIDS_HERE
 
 #include <DeskFuseAudio.h>
+#include "pcm_export.h"
 #include <ContosoKeywordDetector.h>
 #include "IHVPrivatePropertySet.h"
 
@@ -321,6 +322,7 @@ Environment:
 
     DPF(D_TERSE, ("[DriverUnload]"));
 
+    DeskFusePcmShutdown();
     ReleaseRegistryStringBuffer();
 
     if (DriverObject == NULL)
@@ -582,10 +584,8 @@ Return Value:
     gPCDriverUnloadRoutine = DriverObject->DriverUnload;
     DriverObject->DriverUnload = DriverUnload;
 
-    //
-    // All done.
-    //
-    ntStatus = STATUS_SUCCESS;
+    ntStatus = DeskFusePcmInitialize(DriverObject);
+    if (!NT_SUCCESS(ntStatus)) goto Done;
     
 Done:
 

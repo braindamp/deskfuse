@@ -13,9 +13,11 @@ public sealed class DevicePeerRegistry
     public sealed record Endpoints(string Camera, string Microphone, string Speakers);
     public sealed record ConnectedPeer(string DeviceId, string Label, Endpoints Endpoints,
         IReadOnlyList<string> RequestedCapabilities);
-    private sealed record OnlineEntry(Guid Lease, ConnectedPeer Peer, CancellationTokenSource Stop);
+    private sealed record OnlineEntry(Guid Lease, ConnectedPeer Peer, CancellationTokenSource Stop,
+        TaskCompletionSource Terminated);
     private readonly Dictionary<string, OnlineEntry> _online = new(StringComparer.Ordinal);
     private readonly object _gate = new();
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, SemaphoreSlim> _takeover = new();
     private readonly string _hostScope;
 
     /// <param name="hostScope">Stable host-specific identity, not an IP/port.</param>
@@ -39,6 +41,27 @@ public sealed class DevicePeerRegistry
         return new Endpoints(Key("camera"), Key("microphone"), Key("speakers"));
     }
 
+    public async Task<PeerLease> AttachAsync(string deviceId, string label, CancellationToken shutdown,
+        IEnumerable<string>? requestedCapabilities = null)
+    {
+        var serial = _takeover.GetOrAdd(deviceId, _ => new SemaphoreSlim(1, 1));
+        await serial.WaitAsync(shutdown).ConfigureAwait(false);
+        try
+        {
+            OnlineEntry? prior;
+            lock (_gate) prior = _online.GetValueOrDefault(deviceId);
+            if (prior is not null)
+            {
+                try { prior.Stop.Cancel(); } catch (ObjectDisposedException) { }
+                // Completion is signalled by lease Dispose, AFTER async route
+                // disposal has joined acquisition and released its native owner.
+                await prior.Terminated.Task.WaitAsync(TimeSpan.FromSeconds(15), shutdown).ConfigureAwait(false);
+            }
+            return Attach(deviceId, label, shutdown, requestedCapabilities);
+        }
+        finally { serial.Release(); }
+    }
+
     public PeerLease Attach(string deviceId, string label, CancellationToken shutdown,
         IEnumerable<string>? requestedCapabilities = null)
     {
@@ -46,11 +69,12 @@ public sealed class DevicePeerRegistry
         var peer = new ConnectedPeer(deviceId, label, Identities(deviceId), requested);
         var token = CancellationTokenSource.CreateLinkedTokenSource(shutdown);
         var lease = Guid.NewGuid();
+        var terminated = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         OnlineEntry? prior;
         lock (_gate)
         {
             _online.TryGetValue(deviceId, out prior);
-            _online[deviceId] = new OnlineEntry(lease, peer, token);
+            _online[deviceId] = new OnlineEntry(lease, peer, token, terminated);
         }
         // A reconnect supersedes an older authenticated socket of the same
         // enrollment. Never allow its eventual teardown to evict the new peer.
@@ -60,7 +84,7 @@ public sealed class DevicePeerRegistry
             try { prior.Stop.Cancel(); }
             catch (ObjectDisposedException) { /* old session already finished */ }
         }
-        return new PeerLease(this, deviceId, lease, token, peer);
+        return new PeerLease(this, deviceId, lease, token, peer, terminated);
     }
 
     public IReadOnlyList<ConnectedPeer> Online
@@ -83,26 +107,32 @@ public sealed class DevicePeerRegistry
         private readonly string _deviceId;
         private readonly Guid _lease;
         private readonly CancellationTokenSource _source;
+        private readonly TaskCompletionSource _terminated;
         private int _disposed;
         public ConnectedPeer Peer { get; }
         public CancellationToken Cancellation => _source.Token;
 
         internal PeerLease(DevicePeerRegistry registry, string deviceId, Guid lease,
-            CancellationTokenSource source, ConnectedPeer peer)
+            CancellationTokenSource source, ConnectedPeer peer, TaskCompletionSource terminated)
         {
             _registry = registry;
             _deviceId = deviceId;
             _lease = lease;
             _source = source;
+            _terminated = terminated;
             Peer = peer;
         }
 
         public void Dispose()
         {
             if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
-            _registry.Release(_deviceId, _lease);
-            _source.Cancel();
-            _source.Dispose();
+            try { _source.Cancel(); }
+            finally
+            {
+                _registry.Release(_deviceId, _lease);
+                _source.Dispose();
+                _terminated.TrySetResult();
+            }
         }
     }
 }

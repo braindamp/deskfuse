@@ -27,7 +27,7 @@ public static class Wire
 /// <summary>Client -> host messages (ClientMessage in Protocol.kt).</summary>
 public abstract record ClientMessage;
 public sealed record ClientHello(int ProtocolVersion, string ClientVersion, PhoneProfile Profile,
-    string Role = "display", IReadOnlyList<string>? Capabilities = null) : ClientMessage;
+    string Role = "display", IReadOnlyList<string>? Capabilities = null, int NativeAudioVersion = 0) : ClientMessage;
 public sealed record ClientProfile(PhoneProfile Profile) : ClientMessage;
 public sealed record ClientDensity(string Preset) : ClientMessage;           // logical | native | one_to_one
 public sealed record ClientRefresh(int Hz) : ClientMessage;
@@ -50,6 +50,7 @@ public sealed record ClientMicrophone(string Action) : ClientMessage;
 /// <summary>The phone's own media volume, 0..100, after the user moved the
 /// phone's slider. The endpoint follows it, so both are one control.</summary>
 public sealed record ClientAudioVolume(int Level) : ClientMessage;
+public sealed record ClientNativeAudio(string Grant, string CsrPem) : ClientMessage;
 public sealed record ClientBye(string Reason) : ClientMessage;
 public sealed record ClientUnknown(string Type) : ClientMessage;
 public static class ClientMessageParser
@@ -86,7 +87,7 @@ public static class ClientMessageParser
                     root["protocolVersion"]?.GetValue<int>() ?? 0,
                     root["clientVersion"]?.GetValue<string>() ?? "?",
                     PhoneProfile.Parse(root["profile"]!.AsObject()), "accessory",
-                    ParseCapabilities(root)),
+                    ParseCapabilities(root), root["nativeAudioVersion"]?.GetValue<int>() ?? 0),
                 "profile" => new ClientProfile(PhoneProfile.Parse(root["profile"]!.AsObject())),
                 "density" => new ClientDensity(root["preset"]!.GetValue<string>()),
                 "refresh" => new ClientRefresh(root["hz"]!.GetValue<int>()),
@@ -100,6 +101,8 @@ public static class ClientMessageParser
                         ? layouts.Select(node => node?.GetValue<string>() ?? "").ToArray()
                         : Array.Empty<string>(),
                     Math.Clamp(root["maxPcmBytes"]?.GetValue<int>() ?? 3840, 384, 32768)),
+                "native_audio_csr" => new ClientNativeAudio(root["grant"]?.GetValue<string>() ?? "",
+                    root["csrPem"]?.GetValue<string>() ?? ""),
                 "microphone" => new ClientMicrophone(root["action"]?.GetValue<string>() ?? ""),
                 "audio_volume" => new ClientAudioVolume(
                     Math.Clamp(root["level"]?.GetValue<int>() ?? 0, 0, 100)),

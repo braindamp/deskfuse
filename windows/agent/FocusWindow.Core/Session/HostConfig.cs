@@ -137,4 +137,5 @@ public sealed record HostServices(
     Func<string, IPhoneMicrophoneSink?>? CreatePhoneMicrophoneSink = null,
     Func<string, bool>? CanUsePhoneMicrophone = null,
     IPhoneSpeakerProvider? PhoneSpeakers = null,
-    Func<string, IReadOnlyList<string>, int, IHostAudioCapture?>? CreateEndpointAudioCapture = null);
+    Func<string, IReadOnlyList<string>, int, IHostAudioCapture?>? CreateEndpointAudioCapture = null,
+    Func<NativeAudioLaunch, CancellationToken, Task<INativeAudioProcess>>? CreateNativeAudio = null);

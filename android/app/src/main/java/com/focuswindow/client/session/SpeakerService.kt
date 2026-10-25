@@ -97,7 +97,8 @@ class SpeakerService : Service() {
         controller = null
         running = true
         val output = PcAudioOutput(applicationContext)
-        val speaker = SpeakerController(scope, clientVersion(), output)
+        val speaker = SpeakerController(scope, clientVersion(), output,
+            com.focuswindow.client.media.NativeAudioSession(applicationContext, scope))
         controller = speaker
         stateJob = scope.launch {
             speaker.state.collect { current ->

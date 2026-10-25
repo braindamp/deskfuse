@@ -30,4 +30,16 @@
   <ItemGroup>
     <ProjectReference Include="..\DeskFuse.Audio\DeskFuse.Audio.csproj" />
   </ItemGroup>
+  <PropertyGroup>
+    <SourceControlRoot>$(MSBuildProjectDirectory)\..\..\..\vnext\m1</SourceControlRoot>
+    <SourceControlBuild>$(MSBuildProjectDirectory)\.native-source-control</SourceControlBuild>
+  </PropertyGroup>
+  <Target Name="BuildSourceControl" AfterTargets="Build" Condition="'$(OS)' == 'Windows_NT'">
+    <Exec Command='cmake -S &quot;$(SourceControlRoot)&quot; -B &quot;$(SourceControlBuild)&quot; -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF' />
+    <Exec Command='cmake --build &quot;$(SourceControlBuild)&quot; --target deskfuse-source-control --parallel 2' />
+    <Copy SourceFiles="$(SourceControlBuild)\deskfuse-source-control.dll" DestinationFolder="$(TargetDir)" />
+  </Target>
+  <Target Name="PackageSourceControl" AfterTargets="Publish" Condition="'$(OS)' == 'Windows_NT'">
+    <Copy SourceFiles="$(SourceControlBuild)\deskfuse-source-control.dll" DestinationFolder="$(PublishDir)" />
+  </Target>
 </Project>

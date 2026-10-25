@@ -1,3 +1,4 @@
+#include "timing_abi.h"
 /*++
 
 Copyright (c) Microsoft Corporation All Rights Reserved
@@ -325,6 +326,8 @@ PCCONNECTION_DESCRIPTOR SpeakerWaveMiniportConnections[] =
 static
 PCPROPERTY_ITEM PropertiesSpeakerWaveFilter[] =
 {
+    { &KSPROPSETID_DeskFuseTiming, DESKFUSE_TIMING_PROPERTY,
+      KSPROPERTY_TYPE_GET, PropertyHandler_WaveFilter },
     {
         &KSPROPSETID_Pin,
         KSPROPERTY_PIN_PROPOSEDATAFORMAT,

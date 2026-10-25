@@ -25,6 +25,7 @@ Abstract:
 //=============================================================================
 // Referenced Forward
 //=============================================================================
+struct DeskFusePcmSource;
 class CMiniportWaveRTStream;
 typedef CMiniportWaveRTStream *PCMiniportWaveRTStream;
 
@@ -212,6 +213,8 @@ private:
     AUDIOMODULE *                       m_pAudioModules;
 
 protected:
+    DeskFusePcmSource*                   m_PcmSource = nullptr;
+    GUID                                m_TimingSourceInstance;
     PADAPTERCOMMON                      m_pAdapterCommon;
     ULONG                               m_DeviceFlags;
     eDeviceType                         m_DeviceType;

@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.24)
+project(DeskFuseAudioJni LANGUAGES CXX)
+add_library(deskfuse_audio_jni SHARED native_audio_jni.cpp)
+target_compile_features(deskfuse_audio_jni PRIVATE cxx_std_20)
+target_link_libraries(deskfuse_audio_jni PRIVATE dl)
+add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../../../../../vnext/m2b/android-native" "${CMAKE_CURRENT_BINARY_DIR}/renderer")

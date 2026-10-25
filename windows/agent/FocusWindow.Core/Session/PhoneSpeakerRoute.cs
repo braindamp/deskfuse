@@ -20,6 +20,10 @@ internal sealed class PhoneSpeakerRoute(
     ILog log) : IAsyncDisposable
 {
     private IPhoneSpeakerEndpoint? _endpoint;
+    private NativePhoneSpeakerRoute? _native;
+    public Task NativeCompletion => _native?.Completion ?? Task.Delay(Timeout.Infinite, _ct);
+    public Task AuthorizeNativeAsync(ClientNativeAudio message) =>
+        _native?.AuthorizeAsync(message) ?? Task.FromException(new InvalidOperationException("Native audio not negotiated."));
     private IHostAudioCapture? _capture;
     // Timestamp is attached at the existing enqueue point; the buffer is
     // still owned by the queue and sent unchanged. The struct adds no heap
@@ -65,6 +69,12 @@ internal sealed class PhoneSpeakerRoute(
         _requested = requested;
         _ct = ct;
         if (!requested.Contains(DeviceCapabilities.Speakers)) return Array.Empty<string>();
+        if (services.CreateNativeAudio is not null)
+        {
+            _native = new NativePhoneSpeakerRoute(conn, services, peerId, ct);
+            _native.Begin();
+            return Array.Empty<string>(); // native owner announces usable source, not C# provisioning
+        }
         if (services.PhoneSpeakers is null)
         {
             log.Warn("The phone asked for speakers but this host has no phone speaker provider.");
@@ -310,6 +320,7 @@ internal sealed class PhoneSpeakerRoute(
     public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+        if (_native is not null) await _native.DisposeAsync().ConfigureAwait(false);
         await StopCaptureAsync().ConfigureAwait(false);
         if (_endpoint is not null)
         {

@@ -119,6 +119,12 @@ data class TargetRecord(
 /** Host → client. Reliable, ordered control channel. */
 @Serializable
 sealed interface ServerMessage {
+    @Serializable @SerialName("native_audio_challenge")
+    data class NativeAudioChallenge(val version: Int, val grant: String, val expiresUnixMs: Long) : ServerMessage
+    @Serializable @SerialName("native_audio_grant")
+    data class NativeAudioGrant(val version: Int, val grant: String, val port: Int, val caPem: String,
+        val clientPem: String, val serverDer: String, val expiresUnixMs: Long) : ServerMessage
+
     @Serializable @SerialName("hello")
     data class Hello(
         val protocolVersion: Int,
@@ -247,6 +253,9 @@ data class WindowEntry(val id: String, val title: String, val appLabel: String)
 /** Client → host. The phone is the display authority. */
 @Serializable
 sealed interface ClientMessage {
+    @Serializable @SerialName("native_audio_csr")
+    data class NativeAudioCsr(val grant: String, val csrPem: String) : ClientMessage
+
     @Serializable @SerialName("hello")
     data class Hello(
         val protocolVersion: Int = PROTOCOL_VERSION,
@@ -264,6 +273,7 @@ sealed interface ClientMessage {
         val clientVersion: String,
         val profile: PhoneProfile,
         val capabilities: List<String> = emptyList(),
+        val nativeAudioVersion: Int = 0,
     ) : ClientMessage
 
     /** FR-DPI-09 — rotation/fold/font-scale re-derive the TARGET, nothing else. */

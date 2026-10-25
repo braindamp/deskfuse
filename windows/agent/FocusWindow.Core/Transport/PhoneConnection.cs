@@ -98,6 +98,8 @@ public sealed class PhoneConnection : IAsyncDisposable
             itemDropped: _ => Interlocked.Increment(ref _audioEvicted));
     }
     public string VerificationCode => _chan.VerificationCode;
+    public string RemoteIp => ((System.Net.IPEndPoint)_tcp.Client.RemoteEndPoint!).Address.ToString();
+    public string? AuthenticatedDeviceId => _chan.CredentialDeviceId;
     public ChannelReader<ClientMessage> Messages => _incoming.Reader;
     public ChannelReader<PhoneMicrophonePacket> MicrophonePackets => _phoneMicrophone.Reader;
     public Task Completion => _completion.Task;

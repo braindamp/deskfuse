@@ -13,10 +13,44 @@ pub fn validate_peer_id(peer: &str) -> io::Result<String> {
 pub struct EndpointLease {
     pub endpoint_id: String,
     #[cfg(windows)]
+    peer_id: String,
+    #[cfg(windows)]
+    nonce:String,
+    #[cfg(windows)]
     _pipe: std::fs::File,
 }
 
 impl EndpointLease {
+    #[cfg(windows)]
+    pub fn grant_pcm(&self,source:&str)->io::Result<[u64;4]> {
+        use std::io::{Read,Write};
+        let mut pipe=&self._pipe;
+        writeln!(pipe,"{}",serde_json::json!({"Op":"grant_pcm","PeerId":self.peer_id,"SourceInstance":source,"ClientLeaseNonce":self.nonce}))?;
+        let mut reply=Vec::with_capacity(512);
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(5);
+        loop {
+            let mut byte=[0u8;1];
+            match pipe.read(&mut byte) {
+                Ok(1) if byte[0]==b'\n'=>break,
+                Ok(1)=>reply.push(byte[0]),
+                Ok(_)=>return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+                Err(e) if e.raw_os_error()==Some(232) || e.kind()==io::ErrorKind::WouldBlock=> {
+                    if std::time::Instant::now()>=deadline{return Err(io::Error::from(io::ErrorKind::TimedOut))}
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e)=>return Err(e),
+            }
+            if reply.len()>16384{return Err(io::Error::from(io::ErrorKind::InvalidData))}
+        }
+        let value:serde_json::Value=serde_json::from_slice(&reply)?;
+        if value["Ok"].as_bool()!=Some(true){return Err(io::Error::new(io::ErrorKind::PermissionDenied,"broker denied exact-endpoint PCM grant"))}
+        let mut handles=[0;4];
+        for (i,name) in ["PcmFile","PcmSection","PcmEvent","PcmGeneration"].iter().enumerate() {
+            handles[i]=value[name].as_u64().filter(|n|*n!=0 && *n!=u64::MAX)
+                .ok_or_else(||io::Error::new(io::ErrorKind::InvalidData,"broker PCM grant invalid"))?;
+        }
+        Ok(handles)
+    }
     #[cfg(not(windows))]
     pub fn provision(_: &str, _: &std::sync::atomic::AtomicBool) -> io::Result<Self> {
         Err(io::Error::new(io::ErrorKind::Unsupported, "DeskFuse endpoints require Windows"))
@@ -94,7 +128,41 @@ impl EndpointLease {
             }
         }
         let endpoint_id = validate_reply(&peer, &reply)?;
-        Ok(Self { endpoint_id, _pipe:pipe })
+        let value:serde_json::Value=serde_json::from_slice(&reply)?;
+        let nonce=value["ClientLeaseNonce"].as_str().filter(|s|s.len()==64 && s.bytes().all(|b|b.is_ascii_hexdigit()))
+            .ok_or_else(||io::Error::new(io::ErrorKind::PermissionDenied,"broker lacks session process-binding challenge"))?.to_owned();
+        Ok(Self { endpoint_id, peer_id:peer, nonce, _pipe:pipe })
+    }
+
+    /// Child is still CREATE_SUSPENDED. Broker validates the actual pipe
+    /// process and the opened child's parent before assigning its kill job.
+    #[cfg(windows)]
+    pub fn register_capture(&self, pid:u32) -> io::Result<()> {
+        use std::io::{Read,Write};
+        let mut pipe=&self._pipe;
+        writeln!(pipe,"{}",serde_json::json!({"Op":"register_capture",
+            "PeerId":self.peer_id,"ChildProcessId":pid,"ClientLeaseNonce":self.nonce}))?;
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(5);
+        let mut bytes=Vec::with_capacity(256);
+        loop {
+            let mut b=[0u8;1];
+            match pipe.read(&mut b) {
+                Ok(1) if b[0]==b'\n'=>break,
+                Ok(1)=>bytes.push(b[0]),
+                Ok(_)=>return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+                Err(e) if e.raw_os_error()==Some(232) || e.kind()==io::ErrorKind::WouldBlock=> {
+                    if std::time::Instant::now()>=deadline {return Err(io::Error::from(io::ErrorKind::TimedOut))}
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e)=>return Err(e),
+            }
+            if bytes.len()>16*1024 {return Err(io::Error::from(io::ErrorKind::InvalidData))}
+        }
+        let reply:serde_json::Value=serde_json::from_slice(&bytes)?;
+        if reply["Ok"].as_bool()!=Some(true) {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied,"broker refused capture lifetime registration"));
+        }
+        Ok(())
     }
 }
 

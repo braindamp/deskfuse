@@ -97,11 +97,12 @@
       <AdditionalIncludeDirectories>$(ProjectDir)src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
+      <AdditionalOptions>/INTEGRITYCHECK %(AdditionalOptions)</AdditionalOptions>
       <!--
         PortCls and the audio engine node live in portcls.lib; stdunk and
         cntpr come with the WDK, exactly as the upstream sample links them.
       -->
-      <AdditionalDependencies>%(AdditionalDependencies);$(DDK_LIB_PATH)portcls.lib;$(DDK_LIB_PATH)stdunk.lib;$(DDK_LIB_PATH)libcntpr.lib</AdditionalDependencies>
+      <AdditionalDependencies>%(AdditionalDependencies);$(DDK_LIB_PATH)cng.lib;$(DDK_LIB_PATH)wdmsec.lib;$(DDK_LIB_PATH)portcls.lib;$(DDK_LIB_PATH)stdunk.lib;$(DDK_LIB_PATH)libcntpr.lib</AdditionalDependencies>
     </Link>
     <!-- Required by the modern WDK SignTool: use SHA-256 for test signing. -->
     <DriverSign>
@@ -134,6 +135,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ClCompile Include="src\pcm_export.cpp" />
     <ClCompile Include="src\adapter.cpp" />
     <ClCompile Include="src\common.cpp" />
     <ClCompile Include="src\hw.cpp" />

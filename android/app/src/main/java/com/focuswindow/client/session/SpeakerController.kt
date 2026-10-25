@@ -33,6 +33,7 @@ class SpeakerController(
     private val scope: CoroutineScope,
     private val clientVersion: String,
     private val output: PcAudioOutput,
+    private val nativeAudio: com.focuswindow.client.media.NativeAudioSession? = null,
     private val transport: LanTransport = LanTransport(scope),
 ) {
     sealed interface State {
@@ -96,6 +97,7 @@ class SpeakerController(
         pumpJob = null
         audioJob = null
         transport.disconnectNow()
+        nativeAudio?.stop()
         output.stop()
         payload = null
         _state.value = State.Idle
@@ -118,6 +120,7 @@ class SpeakerController(
                             clientVersion = clientVersion,
                             profile = current,
                             capabilities = listOf("speakers"),
+                            nativeAudioVersion = if (nativeAudio?.available == true) 1 else 0,
                         )
                     )
                     if (!recovering) {
@@ -131,7 +134,8 @@ class SpeakerController(
                     if (event.recoverable) {
                         // Old AudioTrack samples are no longer valid across an
                         // authenticated TCP session. The new stream restarts it.
-                        output.stop()
+                        nativeAudio?.stop()
+        output.stop()
                         scheduleReconnect()
                     } else {
                         _state.value = State.Failed(event.reason)
@@ -167,6 +171,7 @@ class SpeakerController(
         reconnectGraceJob = null
         attempt = 0
         transport.disconnectNow()
+        nativeAudio?.stop()
         output.stop()
         recovering = false
         if (available) scheduleReconnect()
@@ -203,6 +208,24 @@ class SpeakerController(
     private suspend fun pumpControl() {
         transport.control.collect { message ->
             when (message) {
+                is ServerMessage.NativeAudioChallenge -> {
+                    val native = nativeAudio ?: error("Native receiver unavailable")
+                    output.stop()
+                    transport.send(native.challenge(message))
+                }
+                is ServerMessage.NativeAudioGrant -> {
+                    val native = nativeAudio ?: error("Native receiver unavailable")
+                    native.start(message, payload?.host ?: error("No authenticated host")) { result ->
+                        scope.launch {
+                            if (result != 0) {
+                                _state.value = State.Failed("Native audio session ended; reconnect required.")
+                                transport.disconnectNow()
+                            }
+                        }
+                    }
+                    recovering = false
+                    _state.value = State.Waiting("Native audio authenticated; select DeskFuse in Windows.")
+                }
                 is ServerMessage.BridgeState -> {
                     Log.i(TAG, "bridge state: requested=" + message.requestedCapabilities
                         + " active=" + message.activeCapabilities)
@@ -267,12 +290,14 @@ class SpeakerController(
             }
 
             "stopped" -> {
-                output.stop()
+                nativeAudio?.stop()
+        output.stop()
                 _state.value = State.Waiting("The PC stopped sending sound.")
             }
 
             "error" -> {
-                output.stop()
+                nativeAudio?.stop()
+        output.stop()
                 _state.value = State.Failed(message.detail ?: "The PC could not send sound to this phone.")
             }
         }
