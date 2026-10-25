@@ -110,7 +110,7 @@ for ($i = 0; $i -lt $files.Count; ++$i) {
 $receiptPath = Join-Path $wasapiBuild 'audio-pair-build.json'
 [pscustomobject]@{
     schema=1; source_commit=$sha; built_utc=(Get-Date).ToUniversalTime().ToString('o')
-    capabilities=@{android_audio_abi=8; windows_capture_policies=@('reference','minimum'); native_reserve_frames=@(1440,1200,960,720,480); callback_measurement=$true}
+    capabilities=@{android_audio_abi=8; windows_capture_policies=@('reference','minimum'); windows_engine_period_policies=@('reference','minimum'); windows_endpoint_lease=$true; native_reserve_frames=@(1440,1200,960,720,480); callback_measurement=$true}
     cargo_target_directory=$cargoTarget; artifacts=$receiptArtifacts
 } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $receiptPath -Encoding UTF8
 Write-Host ('Hash-bound local build receipt: ' + $receiptPath)

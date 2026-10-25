@@ -10,6 +10,8 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::thread;
 use std::time::{Duration, Instant};
+use crate::endpoint_lease::EndpointLease;
+use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 
 const HEADER: usize = 40;
 const FRAMES: usize = 240;
@@ -33,8 +35,103 @@ pub struct CaptureChunk {
 // preceding chunks. A malformed pipe or failed native capture must never
 // masquerade as an ordinary end-of-stream.
 pub enum CaptureEvent {
+    Started { at: Instant },
     Chunk(CaptureChunk),
     Finished { outcome: Result<(), String>, summary: Box<ReaderSummary> },
+}
+
+/// Explicit cancellation keeps a broker endpoint lease alive until its native
+/// capture process has exited. No thread/pipe queue outlives endpoint teardown.
+pub struct CaptureSession {
+    receiver: Option<Receiver<CaptureEvent>>,
+    process: Arc<Mutex<Option<ProcessControl>>>,
+    cancel: Arc<AtomicBool>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+impl CaptureSession {
+    pub fn try_recv(&self) -> Result<CaptureEvent, mpsc::TryRecvError> {
+        self.receiver.as_ref().ok_or(mpsc::TryRecvError::Disconnected)?.try_recv()
+    }
+    pub fn stop(&mut self) -> io::Result<()> {
+        // Unblock even a terminal sender waiting behind a full bounded channel.
+        drop(self.receiver.take());
+        self.cancel.store(true, Ordering::Release);
+        if let Some(process) = self.process.lock().map_err(|_| io::Error::new(
+            io::ErrorKind::Other,"capture process control poisoned"))?.as_ref() {
+            process.stop()?;
+        }
+        if let Some(worker) = self.worker.take() {
+            worker.join().map_err(|_| io::Error::new(io::ErrorKind::Other, "capture reader panicked during cleanup"))?;
+        }
+        Ok(())
+    }
+}
+impl Drop for CaptureSession {
+    fn drop(&mut self) { let _ = self.stop(); }
+}
+
+struct ProcessControl {
+    #[cfg(windows)]
+    handle: *mut std::ffi::c_void,
+}
+// An owned duplicated Windows process HANDLE is usable from any thread. It
+// points to an OS object, never Rust memory; the mutex serializes cancellation.
+unsafe impl Send for ProcessControl {}
+impl ProcessControl {
+    #[cfg(windows)]
+    fn duplicate(child: &std::process::Child) -> io::Result<Self> {
+        use std::os::windows::io::AsRawHandle;
+        #[link(name="Kernel32")]
+        unsafe extern "system" {
+            fn GetCurrentProcess() -> *mut std::ffi::c_void;
+            fn DuplicateHandle(source_process:*mut std::ffi::c_void, source:*mut std::ffi::c_void,
+                target_process:*mut std::ffi::c_void, target:*mut *mut std::ffi::c_void,
+                access:u32, inherit:i32, options:u32) -> i32;
+        }
+        let mut handle = std::ptr::null_mut();
+        let ok = unsafe { let process=GetCurrentProcess();
+            DuplicateHandle(process,child.as_raw_handle(),process,&mut handle,0,0,2) };
+        if ok == 0 { return Err(io::Error::last_os_error()); }
+        Ok(Self { handle })
+    }
+    #[cfg(not(windows))]
+    fn duplicate(_: &std::process::Child) -> io::Result<Self> {
+        Err(io::Error::new(io::ErrorKind::Unsupported,"Windows capture process required"))
+    }
+    #[cfg(windows)]
+    fn stop(&self) -> io::Result<()> {
+        #[link(name="Kernel32")]
+        unsafe extern "system" {
+            fn WaitForSingleObject(handle:*mut std::ffi::c_void, milliseconds:u32) -> u32;
+            fn TerminateProcess(handle:*mut std::ffi::c_void, code:u32) -> i32;
+        }
+        match unsafe { WaitForSingleObject(self.handle,0) } {
+            0 => return Ok(()),
+            258 => {},
+            _ => return Err(io::Error::last_os_error()),
+        }
+        if unsafe { TerminateProcess(self.handle,1) } == 0 {
+            // Process may have exited between the zero-time query and kill.
+            if unsafe { WaitForSingleObject(self.handle,0) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        if unsafe { WaitForSingleObject(self.handle,5000) } != 0 {
+            return Err(io::Error::new(io::ErrorKind::TimedOut,"native capture cleanup not confirmed"));
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    fn stop(&self) -> io::Result<()> { Ok(()) }
+}
+impl Drop for ProcessControl {
+    fn drop(&mut self) {
+        #[cfg(windows)] {
+            #[link(name="Kernel32")]
+            unsafe extern "system" { fn CloseHandle(handle:*mut std::ffi::c_void) -> i32; }
+            unsafe { CloseHandle(self.handle); }
+        }
+    }
 }
 
 pub struct ReaderSummary { pub drops:u64, trace:Ledger }
@@ -205,7 +302,21 @@ fn forward_chunks(
 
 pub fn spawn(
     exe: &str, device_id: &str, seconds: u64, wake_addr: SocketAddr
-) -> io::Result<Receiver<CaptureEvent>> {
+) -> io::Result<CaptureSession> {
+    spawn_source(exe, device_id, seconds, wake_addr, None)
+}
+
+pub fn spawn_deskfuse(
+    exe: &str, peer_id: &str, seconds: u64, wake_addr: SocketAddr,
+) -> io::Result<CaptureSession> {
+    let peer_id = crate::endpoint_lease::validate_peer_id(peer_id)?;
+    spawn_source(exe, "", seconds, wake_addr, Some(peer_id))
+}
+
+fn spawn_source(
+    exe: &str, device_id: &str, seconds: u64, wake_addr: SocketAddr,
+    peer_id: Option<String>,
+) -> io::Result<CaptureSession> {
     if !cfg!(windows) {
         return Err(io::Error::new(io::ErrorKind::Unsupported, "WASAPI is Windows-only"));
     }
@@ -214,18 +325,53 @@ pub fn spawn(
     let notifier = UdpSocket::bind(if wake_addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" })?;
     notifier.connect(wake_addr)?;
     notifier.set_nonblocking(true)?;
-    let mut command = Command::new(exe);
-    command.arg("--out").arg("-").arg("--seconds").arg(seconds.to_string());
-    if device_id != "default" {
-        command.arg("--device-id").arg(device_id);
-    }
-    let mut child = command.stdin(Stdio::null()).stdout(Stdio::piped())
-        .stderr(Stdio::inherit()).spawn()?;
-    let mut stdout = child.stdout.take().ok_or_else(||
-        io::Error::new(io::ErrorKind::Other, "capture pipe unavailable"))?;
-
+    let exe = exe.to_string();
+    let device_id = device_id.to_string();
+    let process = Arc::new(Mutex::new(None));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_process = Arc::clone(&process);
+    let worker_cancel = Arc::clone(&cancel);
     let (sender, receiver) = mpsc::sync_channel(QUEUE_SLOTS);
-    thread::spawn(move || {
+    let worker = thread::spawn(move || {
+        // Device setup may take seconds. It must never block the QUIC owner.
+        let setup = (|| -> io::Result<_> {
+            let lease = peer_id.as_ref().map(|peer| EndpointLease::provision(peer, &worker_cancel)).transpose()?;
+            let endpoint = lease.as_ref().map_or(device_id.as_str(), |x| x.endpoint_id.as_str());
+            if let Some(ref lease) = lease {
+                eprintln!("DESKFUSE_SOURCE endpoint_id={} default_routing_changed=false", lease.endpoint_id);
+            }
+            let mut control = worker_process.lock().map_err(|_| io::Error::new(
+                io::ErrorKind::Other,"capture process control poisoned"))?;
+            if worker_cancel.load(Ordering::Acquire) {
+                return Err(io::Error::new(io::ErrorKind::Interrupted,"capture startup cancelled"));
+            }
+            let mut command = Command::new(&exe);
+            command.arg("--out").arg("-").arg("--seconds").arg(seconds.to_string());
+            if endpoint != "default" { command.arg("--device-id").arg(endpoint); }
+            let mut child = command.stdin(Stdio::null()).stdout(Stdio::piped())
+                .stderr(Stdio::inherit()).spawn()?;
+            *control = match ProcessControl::duplicate(&child) {
+                Ok(process) => Some(process),
+                Err(e) => { let _=child.kill(); let _=child.wait(); return Err(e); }
+            };
+            drop(control);
+            let Some(stdout) = child.stdout.take() else {
+                let _=child.kill(); let _=child.wait();
+                return Err(io::Error::new(io::ErrorKind::Other,"capture pipe unavailable"));
+            };
+            Ok((child,stdout,lease))
+        })();
+        let (mut child,mut stdout,lease) = match setup {
+            Ok(setup) => setup,
+            Err(e) => {
+                deliver_terminal(&sender,ReaderSummary::default(),Err(e.to_string()),Some(&notifier),wake_addr);
+                return;
+            }
+        };
+        if sender.send(CaptureEvent::Started { at:Instant::now() }).is_err() {
+            let _=child.kill(); let _=child.wait(); drop(lease); return;
+        }
+        let _=notifier.send(&[0xA1]);
         let (summary, mut outcome) =
             forward_chunks(&mut stdout, &sender, Some(&notifier), wake_addr);
         // Do not kill a normally finishing process before its exit status is
@@ -243,11 +389,14 @@ pub fn spawn(
             }
             _ => {}
         }
+        // Closing this broker pipe releases only this session's endpoint.
+        // It MUST happen after native process exit, even on reactor failure.
+        drop(lease);
         // Ordered terminal delivery happens after child cleanup and BEFORE
         // any diagnostic output. No writer exists on this reader path.
         deliver_terminal(&sender, summary, outcome, Some(&notifier), wake_addr);
     });
-    Ok(receiver)
+    Ok(CaptureSession { receiver:Some(receiver), process, cancel, worker:Some(worker) })
 }
 
 fn deliver_terminal(sender:&SyncSender<CaptureEvent>, summary:ReaderSummary,
@@ -322,6 +471,7 @@ mod tests {
         match rx.try_recv().unwrap() {
             CaptureEvent::Chunk(chunk) => assert_eq!(chunk.device_frame, 240),
             CaptureEvent::Finished { .. } => panic!("terminal before accepted PCM"),
+            CaptureEvent::Started { .. } => panic!("unexpected startup event from raw forwarding test"),
         }
         assert!(rx.try_recv().is_err()); // incompatible PCM never forwarded
     }

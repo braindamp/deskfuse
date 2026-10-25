@@ -411,7 +411,16 @@ struct EnginePeriods {
     HRESULT interface_result = E_NOINTERFACE, legal_result = E_NOINTERFACE;
     HRESULT current_result = E_NOINTERFACE;
     UINT32 normal = 0, fundamental = 0, minimum = 0, maximum = 0, current = 0;
+    bool current_format_matches = false;
 };
+bool same_engine_format(const WAVEFORMATEX& a, const WAVEFORMATEX& b) {
+    return a.wFormatTag == b.wFormatTag && a.nChannels == b.nChannels &&
+        a.nSamplesPerSec == b.nSamplesPerSec && a.nAvgBytesPerSec == b.nAvgBytesPerSec &&
+        a.nBlockAlign == b.nBlockAlign && a.wBitsPerSample == b.wBitsPerSample &&
+        a.cbSize == b.cbSize && (a.cbSize == 0 ||
+        std::memcmp(reinterpret_cast<const uint8_t*>(&a) + sizeof(WAVEFORMATEX),
+                    reinterpret_cast<const uint8_t*>(&b) + sizeof(WAVEFORMATEX), a.cbSize) == 0);
+}
 EnginePeriods engine_periods(IAudioClient& audio, const WAVEFORMATEX& format) {
     EnginePeriods result;
     ComPtr<IAudioClient3> client;
@@ -422,9 +431,91 @@ EnginePeriods engine_periods(IAudioClient& audio, const WAVEFORMATEX& format) {
     WAVEFORMATEX* current_format = nullptr;
     result.current_result = client->GetCurrentSharedModeEnginePeriod(
         &current_format, &result.current);
+    if (SUCCEEDED(result.current_result) && current_format)
+        result.current_format_matches = same_engine_format(format, *current_format);
     CoTaskMemFree(current_format);
     return result;
 }
+
+// Capacity and engine periodicity are independent controls. Only a queried,
+// legal period no longer than the current matching engine period is admissible.
+// Never substitute a guessed period or silently run a reference experiment.
+UINT32 minimum_legal_period(const EnginePeriods& p) {
+    if (FAILED(p.legal_result) || FAILED(p.current_result) || !p.current_format_matches)
+        throw std::runtime_error("earlier capture requires legal/current periods in the same mix format");
+    if (!p.minimum || !p.fundamental || p.minimum > p.maximum ||
+        p.minimum % p.fundamental || !p.current || p.minimum > p.current)
+        throw std::runtime_error("selected endpoint exposes no valid minimum engine period");
+    return p.minimum;
+}
+
+bool minimum_engine_period() {
+    wchar_t policy[32]{};
+    const DWORD n = GetEnvironmentVariableW(L"DESKFUSE_WASAPI_ENGINE_PERIOD", policy, 32);
+    if (!n || (n < 32 && std::wstring(policy) == L"reference")) return false;
+    if (n < 32 && std::wstring(policy) == L"minimum") return true;
+    throw std::runtime_error("unsupported Windows engine-period policy");
+}
+
+// A supported IAudioClient3 render stream owns the short engine period. The
+// loopback client continues using ordinary documented Initialize flags. Its
+// companion contributes only silence, never reroutes/copies the source, and is
+// serviced on audio events by the capture thread: no timer, pacer or worker.
+class EnginePeriodCompanion {
+public:
+    void initialize(IMMDevice& device, const WAVEFORMATEX& format, const EnginePeriods& before) {
+        selected_ = minimum_legal_period(before); // validate before initializing any stream
+        check(device.Activate(__uuidof(IAudioClient3), CLSCTX_ALL, nullptr,
+            reinterpret_cast<void**>(audio_.GetAddressOf())), "Activate period companion");
+        AudioClientProperties properties{};
+        properties.cbSize = sizeof(properties);
+        properties.eCategory = AudioCategory_Other;
+        properties.Options = AUDCLNT_STREAMOPTIONS_MATCH_FORMAT;
+        check(audio_->SetClientProperties(&properties), "SetClientProperties period companion");
+        check(audio_->InitializeSharedAudioStream(AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+            selected_, &format, nullptr), "InitializeSharedAudioStream period companion");
+        ready_.reset(CreateEventW(nullptr, FALSE, FALSE, nullptr));
+        if (!ready_.get()) throw std::runtime_error("period companion CreateEvent failed");
+        check(audio_->SetEventHandle(ready_.get()), "SetEventHandle period companion");
+        check(audio_->GetBufferSize(&capacity_), "GetBufferSize period companion");
+        if (!capacity_) throw std::runtime_error("period companion has zero capacity");
+        check(audio_->GetService(__uuidof(IAudioRenderClient),
+            reinterpret_cast<void**>(render_.GetAddressOf())), "GetService period companion");
+        service(); // prime the whole render buffer with defined silence before Start
+    }
+    void start() {
+        if (!audio_) return;
+        check(audio_->Start(), "Start period companion");
+        running_ = true;
+    }
+    void service() {
+        if (!audio_) return;
+        UINT32 padding = 0;
+        check(audio_->GetCurrentPadding(&padding), "GetCurrentPadding period companion");
+        if (padding > capacity_) throw std::runtime_error("invalid period companion padding");
+        const UINT32 count = capacity_ - padding;
+        if (!count) return;
+        BYTE* unused = nullptr;
+        check(render_->GetBuffer(count, &unused), "GetBuffer period companion");
+        check(render_->ReleaseBuffer(count, AUDCLNT_BUFFERFLAGS_SILENT),
+            "ReleaseBuffer period companion");
+    }
+    HRESULT stop() noexcept {
+        if (!running_) return S_OK;
+        running_ = false;
+        return audio_->Stop();
+    }
+    ~EnginePeriodCompanion() { stop(); }
+    [[nodiscard]] HANDLE event() const { return ready_.get(); }
+    [[nodiscard]] UINT32 selected() const { return selected_; }
+private:
+    Handle ready_; // outlives the COM streams that reference this event
+    ComPtr<IAudioClient3> audio_;
+    ComPtr<IAudioRenderClient> render_;
+    UINT32 selected_ = 0, capacity_ = 0;
+    bool running_ = false;
+};
+
 void capabilities(IMMDeviceEnumerator& enumerator, const std::wstring& id) {
     if (id.empty()) throw std::runtime_error("capabilities requires explicit --device-id");
     ComPtr<IMMDevice> dev;
@@ -452,7 +543,15 @@ void capabilities(IMMDeviceEnumerator& enumerator, const std::wstring& id) {
                   << ",\"maximum_period_frames\":" << p.maximum;
     }
     if (SUCCEEDED(p.current_result)) std::cout << ",\"current_period_frames\":" << p.current;
-    std::cout << ",\"lower_period_implemented\":false,\"starts_stream\":false}\n";
+    UINT32 candidate = 0;
+    if (compatible) {
+        try { candidate = minimum_legal_period(p); }
+        catch (const std::exception&) { } // capability, not an execution fallback
+    }
+    std::cout << ",\"current_format_matches\":" << (p.current_format_matches ? "true" : "false")
+              << ",\"lower_period_implemented\":true,\"minimum_period_candidate_frames\":" << candidate
+              << ",\"earlier_period_candidate_frames\":" << (candidate < p.current ? candidate : 0)
+              << ",\"starts_stream\":false}\n";
 }
 
 REFERENCE_TIME capture_duration() {
@@ -487,6 +586,13 @@ void capture(IMMDeviceEnumerator& enumerator, const std::wstring& device_id,
                                  "required; refusing to mislabel frames.");
     }
 
+    const bool lower_period_requested = minimum_engine_period();
+    if (lower_period_requested && device_id.empty())
+        throw std::runtime_error("minimum engine period requires an explicit endpoint ID");
+    const auto before_periods = engine_periods(*audio.Get(), *format);
+    EnginePeriodCompanion companion;
+    if (lower_period_requested) companion.initialize(*dev.Get(), *format, before_periods);
+
     const REFERENCE_TIME requested_duration = capture_duration();
     check(audio->Initialize(AUDCLNT_SHAREMODE_SHARED,
                             AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
@@ -494,10 +600,19 @@ void capture(IMMDeviceEnumerator& enumerator, const std::wstring& device_id,
     UINT32 allocated_frames = 0;
     check(audio->GetBufferSize(&allocated_frames), "GetBufferSize");
     const auto periods = engine_periods(*audio.Get(), *format);
+    if (lower_period_requested && (FAILED(periods.current_result) ||
+        !periods.current_format_matches || periods.current != companion.selected()))
+        throw std::runtime_error("requested earlier engine period was not granted; refusing fallback");
     std::cerr << "WASAPI_CONFIG requested_capacity_100ns=" << requested_duration
               << " allocated_frames=" << allocated_frames
               << " legal_period_hresult=" << uint32_t(periods.legal_result)
               << " current_period_hresult=" << uint32_t(periods.current_result);
+    std::cerr << " engine_period_policy=" << (lower_period_requested ? "minimum" : "reference")
+              << " companion_period_frames=" << companion.selected();
+    if (lower_period_requested)
+        std::cerr << " period_already_active=" << (before_periods.current == companion.selected());
+    if (SUCCEEDED(before_periods.current_result))
+        std::cerr << " before_period_frames=" << before_periods.current;
     if (SUCCEEDED(periods.legal_result))
         std::cerr << " default_period_frames=" << periods.normal
                   << " minimum_period_frames=" << periods.minimum
@@ -521,17 +636,25 @@ void capture(IMMDeviceEnumerator& enumerator, const std::wstring& device_id,
     std::cerr << "WASAPI capturing selected render endpoint, 48k stereo PCM16; "
               << "queue_slots=" << kQueueSlots << " duration=" << seconds << "s\n";
     AudioMmcssTask mmcss;
-    HRESULT start_result = audio->Start();
-    if (FAILED(start_result)) {
-        writer.finish();
-        check(start_result, "IAudioClient::Start");
-    }
     try {
+        companion.start();
+        check(audio->Start(), "IAudioClient::Start");
+        if (lower_period_requested) {
+            const auto started_periods = engine_periods(*audio.Get(), *format);
+            if (FAILED(started_periods.current_result) || !started_periods.current_format_matches ||
+                started_periods.current != companion.selected())
+                throw std::runtime_error("engine period changed during source startup; refusing fallback");
+        }
         while (std::chrono::steady_clock::now() - start < std::chrono::seconds(seconds)) {
             if (writer.failed()) throw std::runtime_error("binary output writer failed");
-            const DWORD status = WaitForSingleObject(ready.get(), 250);
-            if (status == WAIT_FAILED) throw std::runtime_error("WaitForSingleObject failed");
-            if (status != WAIT_OBJECT_0) continue; // idle audio is not synthetic silence
+            HANDLE events[] = {ready.get(), companion.event()};
+            const DWORD count = companion.event() ? 2 : 1;
+            const DWORD status = WaitForMultipleObjects(count, events, FALSE, 250);
+            if (status == WAIT_FAILED) throw std::runtime_error("audio event wait failed");
+            if (status == WAIT_TIMEOUT) continue;
+            if (status >= WAIT_OBJECT_0 + count)
+                throw std::runtime_error("unexpected audio event wait result");
+            companion.service();
             for (;;) {
                 UINT32 available = 0;
                 check(reader->GetNextPacketSize(&available), "GetNextPacketSize");
@@ -573,6 +696,7 @@ void capture(IMMDeviceEnumerator& enumerator, const std::wstring& device_id,
         }
     } catch (...) {
         audio->Stop();
+        companion.stop();
         writer.finish();
         native_drops.report();
         std::cerr << "EARLY WASAPI capture source_frames_observed=" << observed
@@ -587,8 +711,10 @@ void capture(IMMDeviceEnumerator& enumerator, const std::wstring& device_id,
         throw;
     }
     const HRESULT stop_result = audio->Stop();
+    const HRESULT companion_stop_result = companion.stop();
     writer.finish();
     check(stop_result, "IAudioClient::Stop");
+    check(companion_stop_result, "period companion Stop");
     native_drops.report();
     packet_trace.save();
     writer.check_result();

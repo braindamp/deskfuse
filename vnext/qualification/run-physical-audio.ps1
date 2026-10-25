@@ -1,8 +1,10 @@
 # CP-001/MP-001 physical Windows-to-Xiaomi run. No driver/APK install,
 # endpoint rerouting, captured audio upload, or GitHub key operations.
-[CmdletBinding()]
+[CmdletBinding(DefaultParameterSetName='Endpoint')]
 param(
-    [Parameter(Mandatory=$true)][string]$EndpointId,
+    [Parameter(Mandatory=$true,ParameterSetName='Endpoint')][string]$EndpointId,
+    [Parameter(Mandatory=$true,ParameterSetName='DeskFuse')]
+    [ValidatePattern('^[0-9a-fA-F]{32}$')][string]$DeskFusePeerId,
     [Parameter(Mandatory=$true)][string]$AndroidExecutable,
     [Parameter(Mandatory=$true)][string]$AndroidNativeSo,
     [ValidatePattern('^f[01]c[01]r[01]$')][string]$Modes = 'f1c1r1',
@@ -21,12 +23,14 @@ param(
     [string]$WindowsCaptureExecutable,
     [string]$BuildReceipt,
     [ValidateSet('reference','minimum')][string]$WindowsCapturePolicy = 'reference',
+    [ValidateSet('reference','minimum')][string]$WindowsEnginePeriod = 'reference',
     [ValidateSet(0,1)][int]$AndroidSharingPolicy = 0,
     [ValidateSet(0,1)][int]$AndroidUsagePolicy = 0,
     [ValidateSet(1440,1200,960,720,480)][int]$NativeReserveFrames = 1440,
     [switch]$MeasureCallbacks
 )
 $ErrorActionPreference = 'Stop'
+$dedicatedSource = $PSCmdlet.ParameterSetName -eq 'DeskFuse'
 if ($Strict -and $Modes -ne 'f0c0r0') { throw 'Strict PCM verification requires f0c0r0 (no DSP or fade)' }
 if ($AndroidBufferBursts -ne 0 -and ($Strict -or $VerifyOnly)) { throw 'Buffer experiment requires adaptive speaker playback' }
 if ($Strict -and $VerifyOnly) { throw 'Choose either Strict AAudio verification or silent VerifyOnly, not both' }
@@ -84,6 +88,9 @@ $events = @(
     'modes=' + $Modes,
     'android_requested_buffer_bursts=' + $AndroidBufferBursts,
     'windows_capture_policy=' + $WindowsCapturePolicy,
+    'windows_engine_period_policy=' + $WindowsEnginePeriod,
+    'windows_source_kind=' + $(if ($dedicatedSource) { 'deskfuse-endpoint-loopback' } else { 'explicit-endpoint-loopback' }),
+    'deskfuse_enrolled_peer=' + $DeskFusePeerId,
     'android_sharing_policy=' + $AndroidSharingPolicy,
     'android_usage_policy=' + $AndroidUsagePolicy,
     'native_reserve_frames=' + $NativeReserveFrames,
@@ -140,6 +147,29 @@ foreach ($kind in $selectedArtifacts.Keys) {
 }
 if ($null -ne $receipt) {
     $events += ('build_receipt_source_commit=' + $receipt.source_commit)
+}
+if ($dedicatedSource -and $receipt.capabilities.windows_endpoint_lease -ne $true) {
+    throw 'Dedicated endpoint source requires the rebuilt Windows sender and matching receipt'
+}
+if ($WindowsEnginePeriod -ne 'reference' -and
+    $WindowsEnginePeriod -notin @($receipt.capabilities.windows_engine_period_policies)) {
+    throw 'Engine-period control requires the rebuilt capture executable and matching receipt'
+}
+$enrolledPeerDer = $null
+if ($dedicatedSource) {
+    # This is the operator's locally provisioned public client certificate,
+    # never a certificate learned from an untrusted network request.
+    $peerPem = Join-Path $KeysDir 'client.pem'
+    if ((Get-Item -LiteralPath $peerPem).Length -gt 65536) { throw 'Client certificate is oversized' }
+    $certificates = [regex]::Matches([IO.File]::ReadAllText($peerPem),
+        '-----BEGIN CERTIFICATE-----\s*([A-Za-z0-9+/=\s]+?)\s*-----END CERTIFICATE-----')
+    if ($certificates.Count -ne 1) { throw 'Expected exactly one enrolled client certificate' }
+    $der = [Convert]::FromBase64String($certificates[0].Groups[1].Value)
+    $peerCertificate = [Security.Cryptography.X509Certificates.X509Certificate2]::new($der)
+    try {
+        $enrolledPeerDer = Join-Path $folder 'enrolled-client-public.der'
+        [IO.File]::WriteAllBytes($enrolledPeerDer,$peerCertificate.RawData)
+    } finally { $peerCertificate.Dispose() }
 }
 $events += ('build_receipt=' + $receiptPath)
 $events + $hashes | Set-Content -LiteralPath $manifest -Encoding UTF8
@@ -205,14 +235,21 @@ $clientLog = Join-Path $folder 'android-receiver.txt'
 $sourceArgs = @('server-wasapi',($WindowsIP + ':48235'),$PhoneIP,
     (Join-Path $KeysDir 'ca.pem'),(Join-Path $KeysDir 'server.pem'),
     (Join-Path $KeysDir 'server.key'),$capture,$EndpointId,([string]$Seconds))
+if ($dedicatedSource) {
+    $sourceArgs = @('server-deskfuse',($WindowsIP + ':48235'),$PhoneIP,
+        (Join-Path $KeysDir 'ca.pem'),(Join-Path $KeysDir 'server.pem'),
+        (Join-Path $KeysDir 'server.key'),$capture,$DeskFusePeerId,$enrolledPeerDer,([string]$Seconds))
+}
 # Explicit opt-in diagnostic: the Windows child inherits this local-only path,
 # then passes it to its WASAPI capture child. No PCM is written to this CSV.
 # Only trace when the receiver has no AAudio output; restore caller environment.
 $traceEnv = 'DESKFUSE_WASAPI_PACKET_TRACE'
 $priorTrace = [Environment]::GetEnvironmentVariable($traceEnv, 'Process')
 $priorCapturePolicy = [Environment]::GetEnvironmentVariable('DESKFUSE_WASAPI_CAPTURE_POLICY','Process')
+$priorEnginePeriod = [Environment]::GetEnvironmentVariable('DESKFUSE_WASAPI_ENGINE_PERIOD','Process')
 try {
     [Environment]::SetEnvironmentVariable('DESKFUSE_WASAPI_CAPTURE_POLICY',$WindowsCapturePolicy,'Process')
+    [Environment]::SetEnvironmentVariable('DESKFUSE_WASAPI_ENGINE_PERIOD',$WindowsEnginePeriod,'Process')
     if ($VerifyOnly) {
         $tracePath = Join-Path $folder 'windows-original-wasapi-packets.csv'
         [Environment]::SetEnvironmentVariable($traceEnv, $tracePath, 'Process')
@@ -224,6 +261,7 @@ try {
 } finally {
     [Environment]::SetEnvironmentVariable($traceEnv, $priorTrace, 'Process')
     [Environment]::SetEnvironmentVariable('DESKFUSE_WASAPI_CAPTURE_POLICY',$priorCapturePolicy,'Process')
+    [Environment]::SetEnvironmentVariable('DESKFUSE_WASAPI_ENGINE_PERIOD',$priorEnginePeriod,'Process')
 }
 $observer = $null
 try {

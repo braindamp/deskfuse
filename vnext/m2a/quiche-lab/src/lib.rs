@@ -4,6 +4,7 @@
 pub mod deferred_trace;
 pub mod reactor;
 pub mod wasapi_pipe;
+pub mod endpoint_lease;
 pub mod android_audio;
 pub mod source_age;
 pub mod plaintext_expiry;

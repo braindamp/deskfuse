@@ -121,7 +121,30 @@ fn source_egress(
     })
 }
 
-fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, seconds: u64, capture: Option<(&str, &str)>) -> Result<()> {
+#[derive(Clone, Copy)]
+enum CaptureSource<'a> {
+    Endpoint { exe:&'a str, endpoint:&'a str },
+    DeskFuse { exe:&'a str, enrolled_peer:&'a str, certificate_der:&'a str },
+}
+
+fn require_enrolled_certificate(actual: Option<&[u8]>, expected: &[u8]) -> Result<()> {
+    if expected.is_empty() || actual != Some(expected) {
+        return Err("authenticated certificate does not match the enrolled endpoint owner".into());
+    }
+    Ok(())
+}
+
+fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, seconds: u64, capture: Option<CaptureSource<'_>>) -> Result<()> {
+    let expected_peer = if let Some(CaptureSource::DeskFuse { enrolled_peer, certificate_der, .. }) = capture {
+        use std::io::Read;
+        deskfuse_quiche_lab::endpoint_lease::validate_peer_id(enrolled_peer)?;
+        let mut bytes=Vec::new();
+        std::fs::File::open(certificate_der)?.take(16*1024+1).read_to_end(&mut bytes)?;
+        if bytes.is_empty() || bytes.len()>16*1024 || bytes[0]!=0x30 {
+            return Err("expected enrolled certificate must be bounded DER, not PEM".into());
+        }
+        Some(bytes)
+    } else { None };
     let mut cfg = config(ca, cert, key)?;
     let udp = socket(bind)?;
     let local = udp.local_addr()?;
@@ -129,6 +152,7 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
     let mut conn: Option<quiche::Connection> = None;
     let mut peer: Option<SocketAddr> = None;
     let mut origin: Option<Instant> = None;
+    let mut capture_started: Option<Instant> = None;
     let run_for = Duration::from_secs(seconds);
     let mut next_sequence = 0u64;
     let mut offered = 0u64;
@@ -172,6 +196,10 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
     let result = (|| -> Result<()> {
     loop {
         let now = Instant::now();
+        if capture.is_some() && capture_started.is_none() &&
+            origin.is_some_and(|start| start.elapsed() >= CONNECT_LIMIT) {
+            return Err("native endpoint/capture startup deadline expired".into());
+        }
         if origin.is_none() && now >= end_waiting { return Err("no authenticated Android client within connection deadline".into()); }
         if let Some(c) = conn.as_mut() {
             service_timeout(c);
@@ -218,9 +246,16 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
             if c.is_established() && origin.is_none() {
                 verified(c)?;
                 origin = Some(Instant::now());
-                if let Some((capture_exe, endpoint)) = capture {
+                if let Some(capture) = capture {
+                    if let Some(ref expected) = expected_peer {
+                        require_enrolled_certificate(c.peer_cert(),expected)?;
+                    }
                     println!("AUTH Windows: Android client verified; starting native WASAPI capture");
-                    source = Some(wasapi_pipe::spawn(capture_exe, endpoint, seconds, local)?);
+                    source = Some(match capture {
+                        CaptureSource::Endpoint {exe,endpoint} => wasapi_pipe::spawn(exe,endpoint,seconds,local)?,
+                        CaptureSource::DeskFuse {exe,enrolled_peer,..} =>
+                            wasapi_pipe::spawn_deskfuse(exe,enrolled_peer,seconds,local)?,
+                    });
                 } else {
                     println!("AUTH Windows: Android client CA and certificate verified; starting synthetic source-clock blocks");
                 }
@@ -259,6 +294,11 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                 // Never synthesize a 5-ms send tick or use ACKs as an audio clock.
                 for _ in 0..128 {
                     match receiver.try_recv() {
+                        Ok(CaptureEvent::Started { at }) => {
+                            if capture_started.replace(at).is_some() {
+                                return Err("duplicate native source startup event".into());
+                            }
+                        }
                         Ok(CaptureEvent::Chunk(chunk)) => {
                             // Observe before ALL age/QPC filters, so a source
                             // ingress gap cannot be confused with a filter drop.
@@ -463,7 +503,7 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                             }
                             // Successful native exit before the requested
                             // acquisition interval is not a healthy transport.
-                            if origin.is_some_and(|start| start.elapsed() < run_for) {
+                            if capture_started.is_none_or(|start| start.elapsed() < run_for) {
                                 return Err("native WASAPI capture ended before requested duration".into());
                             }
                             capture_completed = true;
@@ -503,7 +543,7 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
             if capture_completed { source = None; }
             // QUIC and this kernel socket have exactly one egress owner.
             source_egress(&mut egress, &udp, c, false, &mut outstanding, capture.is_some())?;
-            if let Some(start) = origin {
+            if let Some(start) = if capture.is_some() { capture_started } else { origin } {
                 // Stop source production at run_for, but leave the authenticated
                 // QUIC socket open long enough for final sealed packets and
                 // receiver ACK/control work; this is NOT new PCM pacing.
@@ -557,7 +597,10 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
         let wake = deadline(&[
             next_deadline(quic_wake, egress.deadline(), source_wake),
             expiry_wake,
-            if origin.is_none() { Some(end_waiting) } else { origin.and_then(|x| x.checked_add(run_for + Duration::from_secs(3))) },
+            if origin.is_none() { Some(end_waiting) }
+            else if capture.is_some() && capture_started.is_none() { origin.and_then(|x| x.checked_add(CONNECT_LIMIT)) }
+            else { (if capture.is_some() {capture_started} else {origin})
+                .and_then(|x| x.checked_add(run_for + Duration::from_secs(3))) },
         ]);
         let writable = egress.needs_write_readiness();
         let ready = wait_udp(&udp, writable, wake)?;
@@ -569,22 +612,23 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
     }
     })();
     // The reactor is quiescent. No diagnostic writer is reachable from the
-    // live owner/reader paths above. Dropping an unfinished source does not
-    // synchronously join its child; report missing summary honestly.
+    // live owner/reader paths above. Cancel/join the child before its worker
+    // releases the endpoint lease. Report missing summary honestly.
     let incomplete_reader = source.is_some() && reader_summary.is_none();
-    drop(source.take());
+    let cleanup_result = source.take().map(|mut source| source.stop()).transpose();
     let flush_result = (|| -> io::Result<()> {
         let mut out = io::stderr().lock();
         trace.flush(&mut out)?;
         if let Some(summary) = reader_summary { summary.flush(&mut out)?; }
         else if incomplete_reader {
             use std::io::Write;
-            writeln!(out,"TRACE Windows reader_summary_unavailable=true native_cleanup_confirmed=false")?;
+            writeln!(out,"TRACE Windows reader_summary_unavailable=true native_cleanup_confirmed={}",cleanup_result.is_ok())?;
         }
         Ok(())
     })();
     // Never replace the original media/transport failure with a log error.
     result?;
+    cleanup_result?;
     flush_result.map_err(|e| format!("deferred diagnostic output failed: {e}").into())
 }
 
@@ -1381,6 +1425,14 @@ fn write_client_summary(out:&mut impl io::Write,state:&ClientMedia,
 mod client_staging_tests {
     use super::*;
     #[test]
+    fn dedicated_endpoint_is_pinned_to_the_enrolled_tls_certificate() {
+        let expected = [0x30, 0x01, 0x02];
+        assert!(require_enrolled_certificate(Some(&expected), &expected).is_ok());
+        assert!(require_enrolled_certificate(None, &expected).is_err());
+        assert!(require_enrolled_certificate(Some(&[0x30,0x01,0x03]), &expected).is_err());
+        assert!(require_enrolled_certificate(Some(&[]), &[]).is_err());
+    }
+    #[test]
     fn production_finish_closes_before_output_and_preserves_primary_error() {
         use std::cell::Cell;
         use std::io::Write;
@@ -1498,7 +1550,11 @@ fn run() -> Result<()> {
         }
         [_, mode, bind, allow_ip, ca, cert, key, exe, device, secs] if mode == "server-wasapi" => {
             server(bind.parse()?, allow_ip.parse()?, ca, cert, key,
-                   positive_seconds(secs)?, Some((exe, device)))
+                   positive_seconds(secs)?, Some(CaptureSource::Endpoint {exe,endpoint:device}))
+        }
+        [_,mode,bind,allow_ip,ca,cert,key,exe,peer,peer_der,secs] if mode=="server-deskfuse" => {
+            server(bind.parse()?,allow_ip.parse()?,ca,cert,key,positive_seconds(secs)?,
+                Some(CaptureSource::DeskFuse {exe,enrolled_peer:peer,certificate_der:peer_der}))
         }
         [_, mode, remote, ca, cert, key, secs] if mode == "client-capture" => {
             client(remote.parse()?, ca, cert, key, positive_seconds(secs)?, false, None, PlayModes::default())

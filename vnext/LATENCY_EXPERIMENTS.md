@@ -1,5 +1,40 @@
 # Independent audio latency experiments
 
+## 25 October: earlier-capture implementation checkpoint
+
+Implemented the explicit DeskFuse source session (`server-deskfuse`) with an
+enrolled peer ID and pinned public DER client certificate. Provisioning runs
+off the QUIC owner after authentication. The broker lease remains in the source
+worker until native capture exits; cancellation stops/joins capture before
+lease release. No default lookup/restoration or physical-output fallback exists
+on this route. Existing endpoint-loopback mode remains the comparator.
+
+Completed/reviewed the native minimum-period companion: legal queried values,
+matching format, already-active handling, period readback and cleanup; silent
+render service uses audio events. Capacity and engine-period controls remain
+independent. Windows runner accepts `-DeskFusePeerId <enrolled-hash>` instead of
+`-EndpointId`, plus `-WindowsEnginePeriod reference|minimum`; it pins the locally
+provisioned public client certificate and requires rebuilt receipt capabilities.
+
+Verification: isolated Release capture build and its two CTests passed; Release
+Windows sender build and six sender tests passed. Library checks:36 passed in
+sandbox; the remaining TLS check passed with normal Windows crypto access.
+Existing broker Release build passed. No physical playback/device creation,
+driver installation or routing change was run. Android artifacts and the new
+four-artifact build receipt have NOT been rebuilt for this checkpoint. The
+candidate must not be deployed using the old73ef3d4 receipt.
+
+Installed service binary SHA256 matches DriverStore package599f40d336ee6bcb,
+version10/21/2026,16.1.56.615; it is not established as the current repo candidate.
+All four stored packages had valid signatures. Runtime source/period remains
+unqualified until an approved endpoint activation.
+
+NEXT: finish W-E1 physical gate using the exact enrolled identity; then W-E2
+fractional driver clock/late notification correction; W-E3 immediate committed
+PCM export and W-E4 direct Rust mapping/freshness/fence integration. Those driver
+changes are NOT implemented. Follow EARLIER_CAPTURE_IMPLEMENTATION_PLAN.md.
+Do not call this checkpoint proven earlier capture or a completed full plan.
+
 This experimental branch extends the existing native WASAPI → authenticated
 QUIC DATAGRAM → custom AAudio/sinc128 path. Reference settings remain MM-1,
 48 kHz stereo PCM16, 240-frame packets, shared/default usage, hardware buffer

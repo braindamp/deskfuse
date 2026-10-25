@@ -3,6 +3,32 @@
 #include "../src/wasapi_capture.cpp"
 
 int main() {
+    // Use queried legal periods, including an already-running short graph.
+    // Missing/mismatched observations must fail before a render stream opens.
+    {
+        EnginePeriods p;
+        p.legal_result = p.current_result = S_OK;
+        p.current_format_matches = true;
+        p.normal = p.maximum = p.current = 512;
+        p.minimum = p.fundamental = 128;
+        if (minimum_legal_period(p) != 128) return 10;
+        p.current = 128;
+        if (minimum_legal_period(p) != 128) return 11;
+        const auto rejects = [](const EnginePeriods& input) {
+            try { (void)minimum_legal_period(input); return false; }
+            catch (const std::exception&) { return true; }
+        };
+        p.current_format_matches = false;
+        if (!rejects(p)) return 12;
+        p.current_format_matches = true;
+        p.minimum = 129;
+        if (!rejects(p)) return 13;
+        p.minimum = 128; p.fundamental = 0;
+        if (!rejects(p)) return 14;
+        p.fundamental = 128; p.current_result = E_FAIL;
+        if (!rejects(p)) return 15;
+    }
+
     // A Stop/check exception must unwind through a joined writer, not a
     // joinable std::thread destructor (which would terminate the process).
     {

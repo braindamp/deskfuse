@@ -9,6 +9,9 @@ license = "MIT"
 # Exact quiche release; cargo generates Cargo.lock on first dependency resolution.
 quiche = "=0.30.0"
 
+[target.'cfg(windows)'.dependencies]
+serde_json = "=1.0.142"
+
 [dev-dependencies]
 rcgen = "=0.14.10"
 tempfile = "3.23"
