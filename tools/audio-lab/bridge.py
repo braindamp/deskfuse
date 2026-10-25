@@ -340,15 +340,26 @@ class LabHandler(BaseHTTPRequestHandler):
                 running = bool(self.server.runner.process and self.server.runner.process.poll() is None)
                 # Do not rehash binaries, query broker or touch local evidence
                 # repeatedly while real-time audio is running.
-                if self.server.integration_snapshot is None or (not running and now - self.server.integration_at > 60):
-                    summary = receipt_preflight(cfg, artifacts(cfg), checkout_head=checkout_head(cfg))
-                    self.server.integration_snapshot = {"source_options": source_comparison(),
-                        "broker": broker_preflight(), "receipt": summary,
+                if running and self.server.integration_snapshot is None:
+                    # Do not initiate a multi-binary hash or named-pipe probe
+                    # on first page load during an active physical experiment.
+                    snapshot = {"source_options": source_comparison(),
+                        "broker": {"state": "deferred", "detail": "Read-only broker probe deferred during playback"},
+                        "receipt": {"state": "deferred", "problems": [], "artifacts": {},
+                                    "source_commit": None, "capabilities": {}},
                         "windows_policies": ["reference", "minimum"],
                         "dedicated_launch_enabled": False,
                         "dedicated_reason": "Requires trusted enrollment/certificate binding from Codex Ultra; no manual peer hashes"}
-                    self.server.integration_at = now
-                snapshot = self.server.integration_snapshot
+                else:
+                    if self.server.integration_snapshot is None or (not running and now - self.server.integration_at > 60):
+                        summary = receipt_preflight(cfg, artifacts(cfg), checkout_head=checkout_head(cfg))
+                        self.server.integration_snapshot = {"source_options": source_comparison(),
+                            "broker": broker_preflight(), "receipt": summary,
+                            "windows_policies": ["reference", "minimum"],
+                            "dedicated_launch_enabled": False,
+                            "dedicated_reason": "Requires trusted enrollment/certificate binding from Codex Ultra; no manual peer hashes"}
+                        self.server.integration_at = now
+                    snapshot = self.server.integration_snapshot
             return self._json(200, snapshot)
         if path == "/api/status":
             cfg = self.server.runner.cfg

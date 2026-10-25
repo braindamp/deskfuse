@@ -79,6 +79,15 @@ class BridgeTests(unittest.TestCase):
                 self.assertGreater(len(content),100)
             status,_,_=req('GET','/atlas-controls.json')
             self.assertEqual(status,404)
+            # Opening the lab while playback is already running must never
+            # trigger first-use receipt hashing or a broker probe.
+            class Running:
+                def poll(self): return None
+            server.runner.process = Running()
+            status, body, _ = req('GET','/api/windows-integration')
+            self.assertEqual(status,200)
+            self.assertEqual(json.loads(body)['receipt']['state'],'deferred')
+            server.runner.process = None
         finally:
             server.shutdown();server.server_close();th.join(2)
 
