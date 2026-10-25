@@ -35,6 +35,9 @@
         'Native ABI: '+(cap.android_audio_abi??'not recorded'),'Capabilities: '+JSON.stringify(cap),binary,
         ...problems.map(p=>'BLOCKED: '+p),'Dedicated endpoint cannot launch until the separate trusted enrollment binding is supplied.'].filter(Boolean).join('\n'));
       update();
+      try { const obs=await fetch('/api/status',{cache:'no-store'}); if(obs.ok){const snap=await obs.json();const e=snap.telemetry||{};
+          text('win-observed-period',e.current_period_frames!==undefined?'Windows engine readback: '+e.current_period_frames+' frames; WASAPI allocated: '+(e.allocated_frames??'unknown')+' frames; source '+(snap.session?.source||'unknown')+' (not acoustic latency).':'No actual engine-period evidence in current session.');}}
+      catch(_){}
     }catch(_){last=null;text('win-broker','OFFLINE');text('win-receipt','OFFLINE');text('win-details','Local bridge unavailable. Planning-only controls remain functional.');update()}
   }
   document.addEventListener('DOMContentLoaded',()=>{cards();['win-source','win-engine-period','win-capture-policy'].forEach(id=>$(id).addEventListener('change',update));update();refresh();setInterval(refresh,5000)});

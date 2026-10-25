@@ -23,3 +23,5 @@ The bridge provides `GET /api/windows-integration`: a **read-only** named-pipe r
 No driver install, endpoint creation, broker launch, default device restoration, audio route change, product enrollment logic or WaveRT work is part of this Lab update. Windows preflight and Xiaomi listening were **not** physically tested in the development environment.
 
 Ultra handoff: implement the enrollment→mTLS certificate binding on the **production control plane**; expose a documented, narrowly scoped, authenticated identity-selection capability to the lab rather than accepting a manually supplied peer hash. Only after contract review should the blocked dedicated launch be enabled. Preserve the broker's generation ownership and the existing native runner.
+
+Read `CODEX_ULTRA_HANDOFF.md` before enabling dedicated endpoint launch.

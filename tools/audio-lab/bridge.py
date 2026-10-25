@@ -40,6 +40,8 @@ OBSERVED_METRICS = (
     "underrun_events", "reprime_events", "xrun_count", "xruns", "buffer_frames",
     "capacity_frames", "clipped_samples", "pre_quic_missing_frames", "quiche_queue_full",
     "qpc_future", "qpc_invalid", "queued_playable_frames", "playable_frames", "primed",
+    "allocated_frames", "current_period_frames", "minimum_period_frames",
+    "default_period_frames", "companion_period_frames", "requested_capacity_100ns",
     "anchor_replies", "reorder_full", "budget_drops", "source_missing_frames",
 )
 OBSERVED_SET = frozenset(OBSERVED_METRICS)
@@ -51,7 +53,7 @@ def parse_observed_lines(contents: str) -> dict:
     found = {}
     for line in contents.splitlines():
         if not line.startswith(("TRACE Android RECONSTRUCTION", "AUDIO Android speaker",
-                                "AUDIO_BACKEND", "DONE Windows WASAPI", "DONE Android sink")):
+                                "AUDIO_BACKEND", "WASAPI_CONFIG", "DONE Windows WASAPI", "DONE Android sink")):
             continue
         for key, value in re.findall(r"\b([a-z][a-z0-9_]*)=(-?[0-9]+)\b", line):
             if key in OBSERVED_SET:

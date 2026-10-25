@@ -38,6 +38,7 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(result['underrun_events'],2)
         self.assertEqual(result['pre_quic_missing_frames'],240)
         self.assertNotIn('SCRIPT_SECRET',result)
+        self.assertEqual(bridge.parse_observed_lines('WASAPI_CONFIG allocated_frames=960 current_period_frames=480')['current_period_frames'],480)
 
     def test_http_same_origin_controls_and_static_safety(self):
         server = bridge.LabServer(('127.0.0.1',0),bridge.Runner({}))
