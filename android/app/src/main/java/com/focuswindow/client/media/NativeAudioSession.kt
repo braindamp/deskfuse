@@ -13,8 +13,7 @@ import java.security.spec.ECGenParameterSpec
 import javax.security.auth.x500.X500Principal
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.SupervisorJob
 import org.json.JSONObject
 
 @Keep
@@ -25,18 +24,39 @@ internal object NativeAudioBridge {
     external fun stop()
 }
 
+private object NativeAudioOwners {
+    val coordinator = NativeOwnerCoordinator(
+        CoroutineScope(SupervisorJob() + Dispatchers.Default),
+        { library -> NativeAudioBridge.prepare(library) }, { NativeAudioBridge.stop() },
+    )
+}
+
 /** Control bootstrap only. PCM stays in the existing native QUIC/AAudio core. */
-class NativeAudioSession(private val context: Context, private val scope: CoroutineScope) {
+class NativeAudioSession(private val context: Context) {
     private var grant: String? = null
+    @Volatile private var authorization: String? = null
     private var key: KeyPair? = null
-    private var owner: Job? = null
+    private val owners = NativeAudioOwners.coordinator
+    private val client = owners.register()
+    @Volatile private var lease: NativeOwnerCoordinator.Lease? = null
+    @Volatile private var startedGeneration = -1L
     @Volatile private var generation = 0L
     val available: Boolean get() = NativeAudioBridge.available &&
         File(context.applicationInfo.nativeLibraryDir, "libdeskfuse_quiche_lab.so").isFile
-    fun stop() { generation++; if (NativeAudioBridge.available) NativeAudioBridge.stop(); grant = null; key = null }
+    fun acceptsVolume(grant: String): Boolean = grant == authorization && isCurrent()
+    fun isCurrent(): Boolean = generation == startedGeneration && owners.isCurrent(lease)
+    fun stop() {
+        generation++; val previous = lease; lease = null; grant = null; authorization = null; key = null
+        if (previous != null) owners.requestRetire(previous)
+    }
+    suspend fun retire() {
+        generation++; val previous = lease; lease = null; grant = null; authorization = null; key = null
+        if (previous != null) owners.retire(previous)
+    }
     suspend fun challenge(message: ServerMessage.NativeAudioChallenge): ClientMessage.NativeAudioCsr {
-        stop(); owner?.join(); owner = null
-        require(available && message.version == 1 && message.grant.length == 64 &&
+        retire()
+        lease = owners.claim(client)
+        require(available && message.version == 2 && message.grant.length == 64 &&
             message.expiresUnixMs >= System.currentTimeMillis()) { "Unsupported/expired native audio grant" }
         val generator = KeyPairGenerator.getInstance("EC")
         generator.initialize(ECGenParameterSpec("secp256r1"))
@@ -48,19 +68,22 @@ class NativeAudioSession(private val context: Context, private val scope: Corout
         signature.initSign(pair.private); signature.update(request)
         val algorithm = byteArrayOf(0x30,0x0a,0x06,0x08,0x2a,0x86.toByte(),0x48,0xce.toByte(),0x3d,0x04,0x03,0x02)
         val csr = der(0x30, request + algorithm + der(0x03, byteArrayOf(0) + signature.sign()))
-        grant = message.grant; key = pair
+        grant = message.grant; authorization = message.grant; key = pair
         return ClientMessage.NativeAudioCsr(message.grant, pem("CERTIFICATE REQUEST", csr))
     }
-    fun start(message: ServerMessage.NativeAudioGrant, host: String, finished: (Int) -> Unit) {
-        require(message.version == 1 && message.grant == grant && message.port in 1..65535 &&
-            message.expiresUnixMs > System.currentTimeMillis() && owner?.isActive != true)
+    suspend fun start(message: ServerMessage.NativeAudioGrant, host: String, finished: (Int) -> Unit) {
+        require(message.version == 2 && message.grant == grant && message.port in 1..65535 &&
+            message.expiresUnixMs > System.currentTimeMillis())
         val pair = key ?: error("No session key")
-        check(NativeAudioBridge.prepare(File(context.applicationInfo.nativeLibraryDir, "libdeskfuse_quiche_lab.so").absolutePath))
+        val selected = lease ?: error("No current native ownership")
         key = null; grant = null // one-use, bound to this authenticated control connection
-        val directory = File(context.noBackupFilesDir, "native-audio-${java.util.UUID.randomUUID()}")
-        check(directory.mkdir())
         val ownerGeneration = generation
-        owner = scope.launch(Dispatchers.IO) {
+        startedGeneration = ownerGeneration
+        owners.start(selected,
+            File(context.applicationInfo.nativeLibraryDir, "libdeskfuse_quiche_lab.so").absolutePath,
+            run = {
+            val directory = File(context.noBackupFilesDir, "native-audio-${java.util.UUID.randomUUID()}")
+            check(directory.mkdir())
             try {
                 fun write(name: String, value: String): String = File(directory, name).apply { writeText(value) }.absolutePath
                 val ca = write("ca.pem", message.caPem)
@@ -74,11 +97,10 @@ class NativeAudioSession(private val context: Context, private val scope: Corout
                     .put("remote", "$host:${message.port}").put("ca", ca).put("cert", cert).put("key", privateKey)
                     .put("peerDer", peer.absolutePath).put("seconds", remaining)
                     .put("library", File(context.applicationInfo.nativeLibraryDir, "libdeskfuse_android_audio.so").absolutePath)
-                val result = NativeAudioBridge.run(config.toString(),
+                NativeAudioBridge.run(config.toString(),
                     File(context.applicationInfo.nativeLibraryDir, "libdeskfuse_quiche_lab.so").absolutePath)
-                if (generation == ownerGeneration) finished(result)
             } finally { directory.deleteRecursively() }
-        }
+        }, finished = { result -> if (generation == ownerGeneration && owners.isCurrent(selected)) finished(result) })
     }
     private fun pem(kind: String, bytes: ByteArray): String = "-----BEGIN $kind-----\n" +
         Base64.encodeToString(bytes, Base64.NO_WRAP).chunked(64).joinToString("\n") + "\n-----END $kind-----\n"

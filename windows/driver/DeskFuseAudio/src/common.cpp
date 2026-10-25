@@ -19,6 +19,28 @@ Abstract:
 #include "hw.h"
 #include "IHVPrivatePropertySet.h"
 #include "simple.h"
+#include "timing_binding.h"
+
+static void RetireTimingBinding(PUNKNOWN miniport) {
+    if (!miniport) return;
+    IDeskFuseTimingBinding* binding=nullptr;
+    if (NT_SUCCESS(miniport->QueryInterface(IID_IDeskFuseTimingBinding,reinterpret_cast<void**>(&binding)))) {
+        binding->RetireTiming();binding->Release();
+    }
+}
+static NTSTATUS BindTimingPair(PUNKNOWN topology,PUNKNOWN wave) {
+    IDeskFuseTimingBinding *topo=nullptr,*source=nullptr;
+    auto status=wave->QueryInterface(IID_IDeskFuseTimingBinding,reinterpret_cast<void**>(&source));
+    if (!NT_SUCCESS(status)) return status;
+    status=topology->QueryInterface(IID_IDeskFuseTimingBinding,reinterpret_cast<void**>(&topo));
+    if (NT_SUCCESS(status)) {
+        DeskFuseTimingCapabilities caps{};status=source->GetTiming(&caps);
+        if (NT_SUCCESS(status)) status=topo->BindTiming(caps.source_instance);
+        topo->Release();
+    }
+    source->Release();return status;
+}
+
 
 #ifdef SYSVAD_BTH_BYPASS
 #include <limits.h>
@@ -2256,6 +2278,7 @@ CAdapterCommon::RemoveCachedSubdevice
 
         if (0 == wcscmp(Name, pRecord->Name))
         {
+            RetireTimingBinding(pRecord->MiniportInterface);
             SAFE_RELEASE(pRecord->PortInterface);
             SAFE_RELEASE(pRecord->MiniportInterface);
             SAFE_RELEASE(pRecord->PowerInterface);
@@ -2283,6 +2306,7 @@ CAdapterCommon::EmptySubdeviceCache()
         PLIST_ENTRY le = RemoveHeadList(&m_SubdeviceCache);
         MINIPAIR_UNKNOWN *pRecord = CONTAINING_RECORD(le, MINIPAIR_UNKNOWN, ListEntry);
 
+        RetireTimingBinding(pRecord->MiniportInterface);
         SAFE_RELEASE(pRecord->PortInterface);
         SAFE_RELEASE(pRecord->MiniportInterface);
         SAFE_RELEASE(pRecord->MiniportChange);
@@ -2562,7 +2586,12 @@ CAdapterCommon::InstallEndpointFilters
         }
     }
 
-    if (unknownTopology && unknownWave)
+    if (NT_SUCCESS(ntStatus) && unknownTopology && unknownWave)
+    {
+        // Both references came from this exact adapter/miniport pair.
+        ntStatus=BindTimingPair(unknownMiniTopo,unknownMiniWave);
+    }
+    if (NT_SUCCESS(ntStatus) && unknownTopology && unknownWave)
     {
         //
         // register wave <=> topology connections
@@ -2607,6 +2636,7 @@ CAdapterCommon::InstallEndpointFilters
     }
     else
     {
+        RetireTimingBinding(unknownMiniTopo);RetireTimingBinding(unknownMiniWave);
         if (bTopologyCreated && unknownTopology != NULL)
         {
             UnregisterSubdevice(unknownTopology);
@@ -2643,6 +2673,11 @@ CAdapterCommon::RemoveEndpointFilters
     
     NTSTATUS    ntStatus   = STATUS_SUCCESS;
     
+    PUNKNOWN timingTopo=nullptr,timingWave=nullptr;
+    GetCachedSubdevice(MiniportPair->TopoName,nullptr,&timingTopo);
+    GetCachedSubdevice(MiniportPair->WaveName,nullptr,&timingWave);
+    RetireTimingBinding(timingTopo);RetireTimingBinding(timingWave);
+    SAFE_RELEASE(timingTopo);SAFE_RELEASE(timingWave);
     if (UnknownTopology != NULL && UnknownWave != NULL)
     {
         ntStatus = DisconnectTopologies(

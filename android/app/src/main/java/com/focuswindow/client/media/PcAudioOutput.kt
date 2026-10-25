@@ -197,6 +197,17 @@ class PcAudioOutput(context: Context) {
         applyVolume()
     }
 
+    /** Native AAudio has no AudioTrack gain fallback. Require effective system
+     * media control and read it back before acknowledging audibility. */
+    fun applyNativeVolume(level: Int): Boolean {
+        if (level !in 0..100 || !canChangeSystemVolume) return false
+        requestedVolume = level / 100f
+        lastAppliedSystemIndex = -1 // do not trust a cached index after external changes
+        val applied = applyVolumeToSystem()
+        val expected = (requestedVolume * maxSystemIndex).roundToInt()
+        return applied && systemVolumeIndex() == expected
+    }
+
     /**
      * The Windows volume control is the phone's volume control: the level is
      * applied to the media stream itself, so the phone's own slider moves

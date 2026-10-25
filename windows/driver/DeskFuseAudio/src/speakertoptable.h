@@ -14,6 +14,7 @@ Abstract:
 
 #ifndef _SYSVAD_SPEAKERTOPTABLE_H_
 #define _SYSVAD_SPEAKERTOPTABLE_H_
+#include "timing_abi.h"
 
 //=============================================================================
 static
@@ -127,6 +128,8 @@ PCCONNECTION_DESCRIPTOR SpeakerTopoMiniportConnections[] =
 static
 PCPROPERTY_ITEM PropertiesSpeakerTopoFilter[] =
 {
+    { &KSPROPSETID_DeskFuseTiming, DESKFUSE_TIMING_PROPERTY,
+      KSPROPERTY_TYPE_GET, PropertyHandler_SpeakerTopoFilter },
     {
         &KSPROPSETID_Jack,
         KSPROPERTY_JACK_DESCRIPTION,

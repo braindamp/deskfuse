@@ -61,7 +61,7 @@ internal sealed class DevicePeerSession(
         }
 
         if (requested.Contains(DeviceCapabilities.Speakers) && services.CreateNativeAudio is not null &&
-            (hello.NativeAudioVersion != 1 || conn.AuthenticatedDeviceId != hello.Profile.DeviceId)) {
+            (hello.NativeAudioVersion != 2 || conn.AuthenticatedDeviceId != hello.Profile.DeviceId)) {
             conn.SendControl(ServerMessages.Stage("speakers", "Native audio requires a matching receiver and per-device enrollment.", fatal:true));
             return;
         }
@@ -120,6 +120,9 @@ internal sealed class DevicePeerSession(
         await foreach (var msg in conn.Messages.ReadAllAsync(ct).ConfigureAwait(false))
         {
             if (msg is ClientBye) return;
+            if (msg is ClientNativeAudioVolume applied) {
+                await speakers.ApplyNativeVolumeAsync(applied).ConfigureAwait(false);continue;
+            }
             if (msg is ClientNativeAudio native)
             {
                 await speakers.AuthorizeNativeAsync(native).ConfigureAwait(false);

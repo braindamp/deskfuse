@@ -175,6 +175,7 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
     let mut anchor_replies_sent = 0u64;
     let mut bytes = [0u8; 65535];
     let mut source = None;
+    let mut capture_completed=false; // retains acquisition/lease through transport retirement
     let mut assembler = Assembler::default();
     let mut source_chunks_too_old = 0u64;
     let mut last_capture_qpc = 0u64;
@@ -298,8 +299,7 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                     }
                 }
             }
-            let mut capture_completed = false;
-            if let Some(ref receiver) = source {
+            if let Some(receiver) = source.as_ref().filter(|_| !capture_completed) {
                 // Real WASAPI events wake this QUIC owner via the local UDP socket.
                 // Never synthesize a 5-ms send tick or use ACKs as an audio clock.
                 for _ in 0..128 {
@@ -310,6 +310,7 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                             }
                         }
                         Ok(CaptureEvent::Chunk(chunk)) => {
+                            if !deskfuse_quiche_lab::session_control::media_allowed(){continue}
                             // Observe before ALL age/QPC filters, so a source
                             // ingress gap cannot be confused with a filter drop.
                             ingress_chunks += 1;
@@ -550,7 +551,7 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                 }
     
             }
-            if capture_completed { source = None; }
+            // Completed acquisition retains its lease until the cleanup barrier below.
             // QUIC and this kernel socket have exactly one egress owner.
             source_egress(&mut egress, &udp, c, false, &mut outstanding, capture.is_some())?;
             if let Some(start) = if capture.is_some() { capture_started } else { origin } {
@@ -1561,7 +1562,13 @@ pub fn run_authorized(value:serde_json::Value)->Result<()> {
     let _session=deskfuse_quiche_lab::session_control::Session::begin(expected)?;
     #[cfg(windows)] {
         // EOF of the inherited control pipe revokes this process's grant.
-        std::thread::spawn(|| {use std::io::Read;let mut b=[0u8;1];let _=std::io::stdin().read(&mut b);deskfuse_quiche_lab::session_control::stop();});
+        std::thread::spawn(|| {
+            while let Ok(command)=deskfuse_quiche_lab::session_control::bounded_stdin() {
+                if command["command"].as_str()!=Some("media-ready") {break}
+                deskfuse_quiche_lab::session_control::enable_media();
+            }
+            deskfuse_quiche_lab::session_control::stop();
+        });
     }
     match get("role")? {
         "server"=> {

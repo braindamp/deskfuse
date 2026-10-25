@@ -121,6 +121,12 @@ public interface IPhoneMicrophoneSink : IDisposable
     void Write(ReadOnlySpan<byte> pcm16Mono);
 }
 
+public interface INativeEndpointVolume : IDisposable
+{
+    float Volume {get;}
+    void SetVolume(float volume);
+    event Action<float>? Changed;
+}
 public sealed record HostServices(
     Func<IDisplayBackend> CreateBackend,
     Func<IInputSink> CreateInput,
@@ -138,4 +144,5 @@ public sealed record HostServices(
     Func<string, bool>? CanUsePhoneMicrophone = null,
     IPhoneSpeakerProvider? PhoneSpeakers = null,
     Func<string, IReadOnlyList<string>, int, IHostAudioCapture?>? CreateEndpointAudioCapture = null,
-    Func<NativeAudioLaunch, CancellationToken, Task<INativeAudioProcess>>? CreateNativeAudio = null);
+    Func<NativeAudioLaunch, CancellationToken, Task<INativeAudioProcess>>? CreateNativeAudio = null,
+    Func<string,INativeEndpointVolume>? ObserveNativeEndpointVolume = null);

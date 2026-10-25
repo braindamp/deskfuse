@@ -122,6 +122,8 @@
     <ClInclude Include="src\AudioModuleHelper.h" />
     <ClInclude Include="src\ContosoKeywordDetector.h" />
     <ClInclude Include="src\IHVPrivatePropertySet.h" />
+    <ClInclude Include="src\pcm_geometry.h" />
+    <ClInclude Include="src\timing_binding.h" />
     <ClInclude Include="src\mintopo.h" />
     <ClInclude Include="src\minwavert.h" />
     <ClInclude Include="src\minwavertstream.h" />

@@ -173,3 +173,27 @@ internal sealed class BrokerPhoneSpeakerEndpoint : IPhoneSpeakerEndpoint
         }
     }
 }
+
+// Observes the exact Rust-owned endpoint without creating a broker lease or
+// participating in default routing. No audio samples pass through this object.
+internal sealed class NativeEndpointVolume : INativeEndpointVolume
+{
+    private readonly MMDevice _device;
+    private readonly AudioEndpointVolume _volume;
+    private readonly AudioEndpointVolumeNotificationDelegate _changed;
+    public NativeEndpointVolume(string endpointId) {
+        using var enumerator=new MMDeviceEnumerator();
+        _device=enumerator.GetDevice(endpointId);
+        try {
+            if (_device.DataFlow!=DataFlow.Render || _device.State!=DeviceState.Active)
+                throw new InvalidOperationException("Native endpoint is not an active render endpoint.");
+            _volume=_device.AudioEndpointVolume;
+            _changed=_=>Changed?.Invoke(Volume);
+            _volume.OnVolumeNotification+=_changed;
+        } catch {_device.Dispose();throw;}
+    }
+    public float Volume=>_volume.Mute?0f:_volume.MasterVolumeLevelScalar;
+    public event Action<float>? Changed;
+    public void SetVolume(float value) {_volume.MasterVolumeLevelScalar=Math.Clamp(value,0f,1f);}
+    public void Dispose() {_volume.OnVolumeNotification-=_changed;_device.Dispose();}
+}

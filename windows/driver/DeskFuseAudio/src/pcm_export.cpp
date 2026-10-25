@@ -42,6 +42,7 @@ struct DeskFusePcmSource {
     void* stream;
     bool removed, running, denied;
     ULONGLONG generation, correlationFrame, correlationQpc;
+    deskfuse::PcmGeometry geometry;
 };
 namespace {
 void ReleaseSource(DeskFusePcmSource* source) {
@@ -161,7 +162,7 @@ NTSTATUS Bind(FileContext* file,const DeskFusePcmBind& request,DeskFusePcmHandle
         if (source->active || source->removed || source->denied || source->streams>1) status=STATUS_DEVICE_BUSY;
         else {
             auto& c=s->map->control;c.size=sizeof(c);c.abi=DESKFUSE_PCM_ABI;c.source=source->id;
-            c.generation=source->generation;c.control_sequence=1;
+            c.generation=source->generation;c.control_sequence=1;c.geometry=source->geometry;
             c.state=source->running?DESKFUSE_PCM_RUNNING:DESKFUSE_PCM_WAITING;
             c.correlation_frame=source->correlationFrame;c.correlation_qpc_100ns=source->correlationQpc;
             source->active=s;Signal(s);file->session=s;
@@ -218,8 +219,11 @@ NTSTATUS Dispatch(PDEVICE_OBJECT device,PIRP irp) {
         if (code==DESKFUSE_PCM_REVOKE) {ReleaseStorage(s);status=STATUS_SUCCESS;break;}
         auto source=s->source;
         KIRQL irql;KeAcquireSpinLock(&source->lock,&irql);
-        if (source->active!=s || s->revoked || !s->map) status=STATUS_DEVICE_REMOVED;
-        else if ((code==DESKFUSE_PCM_SNAPSHOT || code==DESKFUSE_PCM_FENCE) && output>=sizeof(DeskFusePcmControl)) {
+        if (code==DESKFUSE_PCM_SNAPSHOT && s->map && output>=sizeof(DeskFusePcmControl)) {
+            *static_cast<DeskFusePcmControl*>(buffer)=s->map->control;
+            information=sizeof(DeskFusePcmControl);status=STATUS_SUCCESS;
+        } else if (source->active!=s || s->revoked || !s->map) status=STATUS_DEVICE_REMOVED;
+        else if (code==DESKFUSE_PCM_FENCE && output>=sizeof(DeskFusePcmControl)) {
             // FENCE and accepted/in-flight reservation assignment use this same lock.
             *static_cast<DeskFusePcmControl*>(buffer)=s->map->control;
             information=sizeof(DeskFusePcmControl);status=STATUS_SUCCESS;
@@ -280,17 +284,44 @@ NTSTATUS DeskFusePcmSourceCreate(const GUID& id,DeskFusePcmSource** result) {
     ExAcquireFastMutex(&RegistryLock);InsertTailList(&Sources,&source->link);ExReleaseFastMutex(&RegistryLock);
     *result=source;return STATUS_SUCCESS;
 }
+void DeskFusePcmSourceRetire(DeskFusePcmSource* source) {
+    if (!source) return;
+    // Registry -> source is the same lock order as process exit. Idempotent:
+    // retirement detaches identity/publication, destruction releases ownership.
+    ExAcquireFastMutex(&RegistryLock);
+    KIRQL irql;KeAcquireSpinLock(&source->lock,&irql);
+    if (!source->removed) {
+        source->removed=true;RemoveEntryList(&source->link);RevokeLocked(source);
+    }
+    KeReleaseSpinLock(&source->lock,irql);ExReleaseFastMutex(&RegistryLock);
+}
 void DeskFusePcmSourceDestroy(DeskFusePcmSource* source) {
     if (!source) return;
-    ExAcquireFastMutex(&RegistryLock);RemoveEntryList(&source->link);ExReleaseFastMutex(&RegistryLock);
-    KIRQL irql;KeAcquireSpinLock(&source->lock,&irql);source->removed=true;RevokeLocked(source);KeReleaseSpinLock(&source->lock,irql);
-    ReleaseSource(source);
+    DeskFusePcmSourceRetire(source);ReleaseSource(source);
+}
+NTSTATUS DeskFusePcmSourceQuery(const GUID& id,DeskFuseTimingCapabilities* result) {
+    if (!result) return STATUS_INVALID_PARAMETER;
+    DeskFusePcmSource* source=nullptr;
+    ExAcquireFastMutex(&RegistryLock);
+    for (auto e=Sources.Flink;e!=&Sources;e=e->Flink) {
+        auto candidate=CONTAINING_RECORD(e,DeskFusePcmSource,link);
+        if (RtlEqualMemory(&candidate->id,&id,sizeof(id))) {
+            source=candidate;InterlockedIncrement(&source->references);break;
+        }
+    }
+    ExReleaseFastMutex(&RegistryLock);
+    if (!source) return STATUS_DEVICE_REMOVED;
+    KIRQL irql;KeAcquireSpinLock(&source->lock,&irql);
+    const auto status=source->removed?STATUS_DEVICE_REMOVED:STATUS_SUCCESS;
+    if (NT_SUCCESS(status)) *result={sizeof(*result),DESKFUSE_TIMING_ABI,
+        DESKFUSE_TIMING_BUILD,source->id,DESKFUSE_TIMING_REQUIRED,DESKFUSE_PCM_ABI};
+    KeReleaseSpinLock(&source->lock,irql);ReleaseSource(source);return status;
 }
 void DeskFusePcmStreamOpen(DeskFusePcmSource* source,void* stream,bool eligible) {
     if (!source) return;
     KIRQL irql;KeAcquireSpinLock(&source->lock,&irql);
     ++source->streams;
-    if (source->streams==1 && eligible) {source->stream=stream;source->denied=false;}
+    if (source->streams==1 && eligible && !source->removed) {source->stream=stream;source->denied=false;source->geometry={};}
     else {source->stream=nullptr;source->denied=true;RevokeLocked(source);}
     KeReleaseSpinLock(&source->lock,irql);
 }
@@ -299,7 +330,7 @@ void DeskFusePcmStreamClose(DeskFusePcmSource* source,void* stream) {
     KIRQL irql;KeAcquireSpinLock(&source->lock,&irql);
     RevokeLocked(source);++source->generation;source->running=false;source->stream=nullptr;
     if (source->streams) --source->streams;
-    if (!source->streams) source->denied=false;
+    if (!source->streams) {source->denied=false;source->geometry={};}
     KeReleaseSpinLock(&source->lock,irql);
 }
 void DeskFusePcmState(DeskFusePcmSource* source,void* stream,bool running,ULONGLONG frame,ULONGLONG qpc) {
@@ -315,6 +346,21 @@ void DeskFusePcmState(DeskFusePcmSource* source,void* stream,bool running,ULONGL
     }
     KeReleaseSpinLock(&source->lock,irql);
 }
+void DeskFusePcmGeometryUpdate(DeskFusePcmSource* source,void* stream,
+    ULONG notifications,ULONG packetFrames,ULONG rate,ULONG channels,ULONG bits) {
+    if (!source) return;
+    const auto next=deskfuse::pcm_geometry(notifications,packetFrames,rate,channels,bits);
+    KIRQL irql;KeAcquireSpinLock(&source->lock,&irql);
+    if (source->stream==stream && !source->removed) {
+        const bool changed=source->geometry.state==1 && !deskfuse::same_geometry(source->geometry,next);
+        source->geometry=next;
+        if (source->active) {
+            auto s=source->active;s->map->control.geometry=next;++s->map->control.control_sequence;
+            if (changed) RevokeLocked(source);else Signal(s);
+        }
+    }
+    KeReleaseSpinLock(&source->lock,irql);
+}
 void DeskFusePcmDeny(DeskFusePcmSource* source) {
     if (!source) return;
     KIRQL irql;KeAcquireSpinLock(&source->lock,&irql);source->denied=true;RevokeLocked(source);KeReleaseSpinLock(&source->lock,irql);
@@ -325,7 +371,8 @@ bool DeskFusePcmReserve(DeskFusePcmSource* source,void* stream,ULONGLONG frame,U
     auto s=source->active;
     if (s && !source->denied && source->stream==stream && !s->revoked) {
         auto& c=s->map->control;++c.accepted_commit;c.accepted_end_frame=frame+frames;
-        if (s->credits.can_reserve(frames) && ExAcquireRundownProtection(&s->producers)) {
+        if (source->geometry.state==1 && frames<=source->geometry.packetFrames &&
+            s->credits.can_reserve(frames) && ExAcquireRundownProtection(&s->producers)) {
             const auto ticket=s->credits.reserve(frames);const auto index=static_cast<ULONG>((ticket-1)%DESKFUSE_PCM_SLOTS);
             auto& slot=s->map->slots[index];slot.ticket=0;slot.generation=c.generation;
             slot.commit_sequence=c.accepted_commit;slot.commit_qpc_100ns=qpc;slot.first_frame=frame;slot.frames=frames;

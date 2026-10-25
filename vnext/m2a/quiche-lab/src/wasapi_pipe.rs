@@ -341,6 +341,7 @@ fn spawn_source(
             let lease = peer_id.as_ref().map(|peer| EndpointLease::provision(peer, &worker_cancel)).transpose()?;
             let endpoint = lease.as_ref().map_or(device_id.clone(), |x| x.endpoint_id.clone());
             if let Some(ref lease) = lease {
+                crate::session_control::source_ready(peer_id.as_deref().unwrap(),&lease.endpoint_id)?;
                 eprintln!("DESKFUSE_SOURCE endpoint_id={} default_routing_changed=false", lease.endpoint_id);
             }
             let is_dedicated=lease.is_some();

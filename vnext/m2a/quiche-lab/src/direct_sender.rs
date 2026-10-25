@@ -75,6 +75,7 @@ pub fn run(bind:SocketAddr,allow_ip:IpAddr,ca:&str,cert:&str,key:&str,seconds:u6
                     }
                     for _ in 0..8 { // fixed owner work budget; one 240-frame assembler only
                         let Some(block)=current.next_block()? else {break};
+                        if !deskfuse_quiche_lab::session_control::media_allowed(){continue}
                         let now=source_age::local_qpc_100ns()?;
                         if !matches!(block.timing.classify(now),AgeDecision::Fresh{..}) {expired+=1;continue}
                         if let Some(ref mut request)=recovery {

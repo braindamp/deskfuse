@@ -525,7 +525,7 @@ NTSTATUS CMiniportWaveRTStream::AllocateBufferWithNotification
         return STATUS_UNSUCCESSFUL; 
     }
     
-    if (!NotificationCount_ || RequestedSize_ % m_pWfExt->Format.nBlockAlign ||
+    if (!deskfuse::valid_notifications(NotificationCount_) || RequestedSize_ % m_pWfExt->Format.nBlockAlign ||
         (RequestedSize_ / m_pWfExt->Format.nBlockAlign) % NotificationCount_)
     {
         return STATUS_INVALID_PARAMETER;
@@ -569,6 +569,8 @@ NTSTATUS CMiniportWaveRTStream::AllocateBufferWithNotification
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
+    DeskFusePcmGeometryUpdate(m_pMiniport->m_PcmSource,this,NotificationCount_,m_PacketFrames,
+        m_pWfExt->Format.nSamplesPerSec,m_pWfExt->Format.nChannels,m_pWfExt->Format.wBitsPerSample);
     *AudioBufferMdl_ = pBufferMdl;
     *ActualSize_ = RequestedSize_;
     *OffsetFromFirstPage_ = 0;
@@ -594,6 +596,8 @@ VOID CMiniportWaveRTStream::FreeBufferWithNotification
     KIRQL irql;
     KeAcquireSpinLock(&m_PositionSpinLock, &irql);
     m_KsState = KSSTATE_STOP;
+    DeskFusePcmGeometryUpdate(m_pMiniport->m_PcmSource,this,0,0,0,0,0);
+    DeskFusePcmState(m_pMiniport->m_PcmSource,this,false,m_FrameClock.frames,0);
     m_PacketFrames = 0;
     ExCancelTimer(m_pNotificationTimer, NULL);
     KeReleaseSpinLock(&m_PositionSpinLock, irql);
@@ -730,6 +734,12 @@ _In_        ULONG       Size_
 
     PAGED_CODE();
 
+    KIRQL irql;KeAcquireSpinLock(&m_PositionSpinLock,&irql);
+    m_KsState=KSSTATE_STOP;
+    DeskFusePcmGeometryUpdate(m_pMiniport->m_PcmSource,this,0,0,0,0,0);
+    DeskFusePcmState(m_pMiniport->m_PcmSource,this,false,m_FrameClock.frames,0);
+    ExCancelTimer(m_pNotificationTimer,NULL);
+    KeReleaseSpinLock(&m_PositionSpinLock,irql);
     if (Mdl_ != NULL)
     {
         if (m_pDmaBuffer != NULL)
@@ -795,6 +805,13 @@ _Out_   MEMORY_CACHING_TYPE    *CacheType_
 
     m_ulDmaBufferSize = RequestedSize_;
     m_ulNotificationsPerBuffer = 0;
+    if (!m_pDmaBuffer) {
+        m_pPortStream->FreePagesFromMdl(pBufferMdl);m_ulDmaBufferSize=0;
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    DeskFusePcmGeometryUpdate(m_pMiniport->m_PcmSource,this,0,
+        RequestedSize_/m_pWfExt->Format.nBlockAlign,m_pWfExt->Format.nSamplesPerSec,
+        m_pWfExt->Format.nChannels,m_pWfExt->Format.wBitsPerSample);
 
     *AudioBufferMdl_ = pBufferMdl;
     *ActualSize_ = RequestedSize_;

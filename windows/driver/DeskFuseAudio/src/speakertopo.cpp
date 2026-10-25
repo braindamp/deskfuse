@@ -54,9 +54,21 @@ Return Value:
     // MajorTarget is a pointer to miniport object for miniports.
     //
     NTSTATUS            ntStatus = STATUS_INVALID_DEVICE_REQUEST;
-    PCMiniportTopology  pMiniport = (PCMiniportTopology)PropertyRequest->MajorTarget;
+    PCMiniportTopology  pMiniport = static_cast<PCMiniportTopology>(static_cast<PMINIPORTTOPOLOGY>(PropertyRequest->MajorTarget));
 
-    if (IsEqualGUIDAligned(*PropertyRequest->PropertyItem->Set, KSPROPSETID_Jack))
+    if (IsEqualGUIDAligned(*PropertyRequest->PropertyItem->Set, KSPROPSETID_DeskFuseTiming))
+    {
+        if (PropertyRequest->PropertyItem->Id!=DESKFUSE_TIMING_PROPERTY ||
+            PropertyRequest->Verb!=KSPROPERTY_TYPE_GET) return STATUS_INVALID_DEVICE_REQUEST;
+        if (!PropertyRequest->ValueSize) {PropertyRequest->ValueSize=sizeof(DeskFuseTimingCapabilities);return STATUS_BUFFER_OVERFLOW;}
+        if (PropertyRequest->ValueSize<sizeof(DeskFuseTimingCapabilities)) return STATUS_BUFFER_TOO_SMALL;
+        DeskFuseTimingCapabilities caps{};
+        ntStatus=pMiniport->GetTiming(&caps);
+        if (NT_SUCCESS(ntStatus)) {
+            RtlCopyMemory(PropertyRequest->Value,&caps,sizeof(caps));PropertyRequest->ValueSize=sizeof(caps);
+        }
+    }
+    else if (IsEqualGUIDAligned(*PropertyRequest->PropertyItem->Set, KSPROPSETID_Jack))
     {
         if (PropertyRequest->PropertyItem->Id == KSPROPERTY_JACK_DESCRIPTION)
         {

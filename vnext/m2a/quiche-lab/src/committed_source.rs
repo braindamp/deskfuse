@@ -3,12 +3,24 @@
 use std::{io,ffi::c_void,sync::{Arc,atomic::AtomicBool},os::windows::io::{FromRawHandle,AsRawHandle}};
 use crate::{endpoint_lease::EndpointLease,source_age::CommitTiming,fresh_anchor::CommitFence};
 use windows_sys::Win32::{Foundation::*,System::{Memory::*,LibraryLoader::*,IO::DeviceIoControl}};
-const ABI:u32=1;const SNAPSHOT:u32=0x22e004;const ACK:u32=0x22e008;const FENCE:u32=0x22e00c;const REVOKE:u32=0x22e010;
+const ABI:u32=2;const SNAPSHOT:u32=0x22e004;const ACK:u32=0x22e008;const FENCE:u32=0x22e00c;const REVOKE:u32=0x22e010;
+#[repr(C)] #[derive(Clone,Copy,Default,Debug)]
+struct Geometry {state:u32,packet:u32,notifications:u32,rate:u32,channels:u32,bits:u32}
+impl Geometry {
+    fn validate(self)->io::Result<bool> {
+        match self.state {
+            0=>Ok(false),
+            1 if self.notifications==2 && (1..=240).contains(&self.packet) && self.rate==48000 && self.channels==2 && self.bits==16=>Ok(true),
+            _=>Err(invalid("unsupported committed PCM geometry: requires 48k stereo PCM16, two notifications, packet <=240 frames")),
+        }
+    }
+}
 #[repr(C)] #[derive(Clone,Copy,Default,Debug)]
 pub struct Control {
     pub size:u32,pub abi:u32,pub state:u32,pub reserved:u32,pub source:[u8;16],
     pub generation:u64,pub control_sequence:u64,pub accepted_commit:u64,pub accepted_end_frame:u64,pub dropped_frames:u64,
     pub correlation_frame:u64,pub correlation_qpc:u64,pub published:u64,pub acknowledged:u64,
+    geometry:Geometry,
 }
 #[repr(C)] #[derive(Clone,Copy,Default)]
 struct SlotHeader {ticket:u64,generation:u64,commit:u64,qpc:u64,frame:u64,frames:u32,reserved:u32}
@@ -48,7 +60,7 @@ impl Source {
             let object=open(endpoint.as_ptr(),minimum as u32,&mut timing,&mut event);
             if object.is_null(){FreeLibrary(module);return Err(invalid("running endpoint/period/export contract refused"))}
             let native=NativeControl{module,object,event,service:std::mem::transmute(service),close:std::mem::transmute(close)};
-            if timing.size as usize!=std::mem::size_of::<Timing>() || timing.abi!=1 || timing.build!=0x2026102501 ||
+            if timing.size as usize!=std::mem::size_of::<Timing>() || timing.abi!=1 || timing.build!=0x2026102502 ||
                 timing.flags&3!=3 || timing.export_abi!=ABI || timing.source==[0;16] {return Err(invalid("driver timing/source ABI mismatch"))}
             let handles=lease.grant_pcm(&guid_text(timing.source))?;
             let file=std::fs::File::from_raw_handle(handles[0] as HANDLE);
@@ -59,6 +71,7 @@ impl Source {
                 ticket:0,offset:0,slot:None,have:0,next_frame:None,first:0,oldest:0,min_commit:0,pcm:[0;960]};
             let control=source.snapshot()?;
             if control.source!=timing.source{return Err(invalid("mapped source differs from exact endpoint"))}
+            crate::session_control::source_ready(peer,&source.lease.as_ref().unwrap().endpoint_id)?;
             Ok(source)
         }
     }
@@ -75,6 +88,7 @@ impl Source {
     }
     pub fn snapshot(&self)->io::Result<Control> {
         let mut c=Control::default();self.ioctl(SNAPSHOT,None,&mut c)?;
+        c.geometry.validate()?;
         if c.size as usize!=std::mem::size_of::<Control>() || c.abi!=ABI || c.generation!=self.generation || c.state>1 ||
             c.acknowledged>c.published || c.published-c.acknowledged>8 {return Err(invalid("source control retired/incompatible"))}Ok(c)
     }
@@ -90,14 +104,14 @@ impl Source {
     pub fn arm(&self)->io::Result<()> {let c=self.snapshot()?;self.acknowledge(&c)}
     pub fn next_block(&mut self)->io::Result<Option<Block>> {
         let c=self.snapshot()?;
-        if c.state!=1 {self.acknowledge(&c)?;return Ok(None)}
+        if c.state!=1 || !c.geometry.validate()? {self.acknowledge(&c)?;return Ok(None)}
         if !c.correlation_qpc.gt(&0){return Err(invalid("RUN without source-clock correlation"))}
         for _ in 0..8 {
             if self.slot.is_none() {
                 if self.ticket>=c.published {self.acknowledge(&c)?;return Ok(None)}
                 let h=unsafe{std::ptr::read_volatile(&(*self.map).slots[(self.ticket%8)as usize].header)};
                 std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
-                if h.ticket!=self.ticket+1 || h.generation!=self.generation || h.frames==0 || h.frames>960 || h.reserved!=0 ||
+                if h.ticket!=self.ticket+1 || h.generation!=self.generation || h.frames==0 || h.frames>c.geometry.packet || h.reserved!=0 ||
                     h.qpc==0 || h.frame.checked_add(h.frames as u64).is_none() {return Err(invalid("invalid/in-flight committed descriptor"))}
                 self.slot=Some(h);self.offset=0;
             }
@@ -178,9 +192,20 @@ mod tests {
         }
     }
     #[test]
+    fn actual_geometry_qualifies_the_entire_future_packet() {
+        assert!(!Geometry::default().validate().unwrap());
+        let good=Geometry{state:1,packet:128,notifications:2,rate:48000,channels:2,bits:16};
+        assert!(good.validate().unwrap());
+        assert!(Geometry{packet:240,..good}.validate().unwrap());
+        assert!(Geometry{packet:480,..good}.validate().is_err());
+        assert!(Geometry{notifications:1,..good}.validate().is_err());
+        assert!(Geometry{state:2,..good}.validate().is_err());
+        assert!(crate::source_age::CommitTiming{commit_qpc:1_000_000,presentation_qpc:1_100_000}.classify(1_000_000)==crate::source_age::AgeDecision::Fresh{age_100ns:0});
+    }
+    #[test]
     fn driver_mapping_layout_is_exact(){
-        assert_eq!(std::mem::size_of::<Control>(),104);
+        assert_eq!(std::mem::size_of::<Control>(),128);
         assert_eq!(std::mem::size_of::<Slot>(),3888);
-        assert_eq!(std::mem::size_of::<Mapping>(),31208);
+        assert_eq!(std::mem::size_of::<Mapping>(),31232);
     }
 }

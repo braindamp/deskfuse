@@ -24,6 +24,8 @@ internal sealed class PhoneSpeakerRoute(
     public Task NativeCompletion => _native?.Completion ?? Task.Delay(Timeout.Infinite, _ct);
     public Task AuthorizeNativeAsync(ClientNativeAudio message) =>
         _native?.AuthorizeAsync(message) ?? Task.FromException(new InvalidOperationException("Native audio not negotiated."));
+    public Task ApplyNativeVolumeAsync(ClientNativeAudioVolume message) =>
+        _native?.ApplyVolumeAsync(message) ?? Task.FromException(new InvalidOperationException("Native route missing."));
     private IHostAudioCapture? _capture;
     // Timestamp is attached at the existing enqueue point; the buffer is
     // still owned by the queue and sent unchanged. The struct adds no heap
@@ -71,6 +73,7 @@ internal sealed class PhoneSpeakerRoute(
         if (!requested.Contains(DeviceCapabilities.Speakers)) return Array.Empty<string>();
         if (services.CreateNativeAudio is not null)
         {
+            if (_native is not null) return Array.Empty<string>();
             _native = new NativePhoneSpeakerRoute(conn, services, peerId, ct);
             _native.Begin();
             return Array.Empty<string>(); // native owner announces usable source, not C# provisioning
@@ -106,6 +109,7 @@ internal sealed class PhoneSpeakerRoute(
     /// </summary>
     public void HandleVolume(int level)
     {
+        if (_native is not null) {_native.HandleVolume(level);return;}
         if (_endpoint is null) return;
         // Prevent echo of the Android slider back to the same phone.
         Interlocked.Exchange(ref _pendingVolume, -1);
@@ -117,6 +121,15 @@ internal sealed class PhoneSpeakerRoute(
     /// <summary>Starts or stops the audio stream for this phone's endpoint.</summary>
     public async Task HandleAsync(ClientAudio request)
     {
+        if (services.CreateNativeAudio is not null)
+        {
+            if (request.Action=="stop_phone_speakers") {
+                if (_native is not null) await _native.DisposeAsync().ConfigureAwait(false);
+            } else if (request.Action=="start_phone_speakers" && _native is null) {
+                await ProvisionAsync(_requested,_ct).ConfigureAwait(false);
+            }
+            return; // no legacy capture, duplicate challenge or AudioTrack start
+        }
         if (request.Action == "stop_phone_speakers")
         {
             await StopCaptureAsync().ConfigureAwait(false);

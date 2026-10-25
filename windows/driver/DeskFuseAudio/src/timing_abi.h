@@ -2,7 +2,7 @@
 // Fixed x64 ABI. Queried on the exact endpoint's KS filter, never by filename.
 // Bump build for any clock/ownership semantic change, ABI for layout changes.
 #define DESKFUSE_TIMING_ABI 1u
-#define DESKFUSE_TIMING_BUILD 0x2026102501ull
+#define DESKFUSE_TIMING_BUILD 0x2026102502ull
 #define DESKFUSE_TIMING_PROPERTY 0u
 #define DESKFUSE_TIMING_FRAME_CLOCK 1u
 #define DESKFUSE_TIMING_ONESHOT 2u

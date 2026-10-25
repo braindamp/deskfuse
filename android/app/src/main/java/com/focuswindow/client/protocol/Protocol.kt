@@ -121,6 +121,8 @@ data class TargetRecord(
 sealed interface ServerMessage {
     @Serializable @SerialName("native_audio_challenge")
     data class NativeAudioChallenge(val version: Int, val grant: String, val expiresUnixMs: Long) : ServerMessage
+    @Serializable @SerialName("native_audio_volume")
+    data class NativeAudioVolume(val grant: String, val sequence: Long, val level: Int) : ServerMessage
     @Serializable @SerialName("native_audio_grant")
     data class NativeAudioGrant(val version: Int, val grant: String, val port: Int, val caPem: String,
         val clientPem: String, val serverDer: String, val expiresUnixMs: Long) : ServerMessage
@@ -253,6 +255,8 @@ data class WindowEntry(val id: String, val title: String, val appLabel: String)
 /** Client → host. The phone is the display authority. */
 @Serializable
 sealed interface ClientMessage {
+    @Serializable @SerialName("native_audio_volume_applied")
+    data class NativeAudioVolumeApplied(val grant: String, val sequence: Long, val level: Int, val applied: Boolean) : ClientMessage
     @Serializable @SerialName("native_audio_csr")
     data class NativeAudioCsr(val grant: String, val csrPem: String) : ClientMessage
 

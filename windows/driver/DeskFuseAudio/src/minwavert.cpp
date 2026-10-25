@@ -31,6 +31,13 @@ Abstract:
 
 #define EFFECTS_LIST_COUNT 2
 
+#pragma code_seg("PAGE")
+STDMETHODIMP_(NTSTATUS) CMiniportWaveRT::GetTiming(DeskFuseTimingCapabilities* result) {
+    PAGED_CODE();return DeskFusePcmSourceQuery(m_TimingSourceInstance,result);
+}
+STDMETHODIMP_(void) CMiniportWaveRT::RetireTiming() {
+    PAGED_CODE();DeskFusePcmSourceRetire(m_PcmSource);
+}
 //=============================================================================
 // CMiniportWaveRT
 //=============================================================================
@@ -792,6 +799,10 @@ Return Value:
     if (IsEqualGUIDAligned(Interface, IID_IUnknown))
     {
         *Object = PVOID(PUNKNOWN(PMINIPORTWAVERT(this)));
+    }
+    else if (IsEqualGUIDAligned(Interface, IID_IDeskFuseTimingBinding))
+    {
+        *Object = static_cast<IDeskFuseTimingBinding*>(this);
     }
     else if (IsEqualGUIDAligned(Interface, IID_IMiniport))
     {
@@ -3202,13 +3213,11 @@ Return Value:
         } else if (PropertyRequest->ValueSize < sizeof(DeskFuseTimingCapabilities)) ntStatus = STATUS_BUFFER_TOO_SMALL;
         else {
             DeskFuseTimingCapabilities c = {};
-            c.size = sizeof(c); c.abi = DESKFUSE_TIMING_ABI;
-            c.build = DESKFUSE_TIMING_BUILD; c.source_instance = pWaveHelper->m_TimingSourceInstance;
-            c.flags = DESKFUSE_TIMING_REQUIRED;
-            c.export_abi=DESKFUSE_PCM_ABI;
-            RtlCopyMemory(PropertyRequest->Value, &c, sizeof(c));
-            PropertyRequest->ValueSize = sizeof(c);
-            ntStatus = STATUS_SUCCESS;
+            ntStatus=pWaveHelper->GetTiming(&c);
+            if (NT_SUCCESS(ntStatus)) {
+                RtlCopyMemory(PropertyRequest->Value, &c, sizeof(c));
+                PropertyRequest->ValueSize = sizeof(c);
+            }
         }
     }
     else if (IsEqualGUIDAligned(*PropertyRequest->PropertyItem->Set, KSPROPSETID_SysVAD))

@@ -1,6 +1,7 @@
 #pragma once
 #include "timing_abi.h"
-#define DESKFUSE_PCM_ABI 1u
+#include "pcm_geometry.h"
+#define DESKFUSE_PCM_ABI 2u
 #define DESKFUSE_PCM_SLOTS 8u
 #define DESKFUSE_PCM_FRAMES 960u
 #define DESKFUSE_PCM_BYTES_PER_FRAME 4u
@@ -20,6 +21,7 @@ struct DeskFusePcmControl {
     GUID source;
     unsigned long long generation, control_sequence, accepted_commit, accepted_end_frame, dropped_frames;
     unsigned long long correlation_frame, correlation_qpc_100ns, published, acknowledged;
+    deskfuse::PcmGeometry geometry; // 0 waiting, 1 qualified, 2 unsupported
 };
 struct DeskFusePcmSlot {
     unsigned long long ticket, generation, commit_sequence, commit_qpc_100ns, first_frame;
@@ -29,4 +31,4 @@ struct DeskFusePcmSlot {
 struct DeskFusePcmMapping { DeskFusePcmControl control; DeskFusePcmSlot slots[DESKFUSE_PCM_SLOTS]; };
 struct DeskFusePcmAck { unsigned long long generation, ticket, observed_control; };
 static_assert(sizeof(DeskFusePcmSlot)==3888, "PCM ABI packing");
-static_assert(sizeof(DeskFusePcmControl)==104, "control ABI packing");
+static_assert(sizeof(DeskFusePcmControl)==128, "control ABI packing");

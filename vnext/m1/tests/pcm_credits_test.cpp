@@ -1,8 +1,18 @@
 #include "../../../windows/driver/DeskFuseAudio/src/pcm_credits.h"
+#include "../../../windows/driver/DeskFuseAudio/src/pcm_geometry.h"
 #include <cstdlib>
 #include <cstdio>
 static void require(bool value){if(!value)std::abort();}
 int main(){
+    require(deskfuse::valid_notifications(1) && deskfuse::valid_notifications(2));
+    require(!deskfuse::valid_notifications(0) && !deskfuse::valid_notifications(3));
+    require(deskfuse::pcm_geometry(0,0,0,0,0).state==0);
+    require(deskfuse::pcm_geometry(0,480,48000,2,16).state==2);
+    require(deskfuse::pcm_geometry(2,128,48000,2,16).state==1);
+    require(deskfuse::pcm_geometry(2,240,48000,2,16).state==1);
+    require(deskfuse::pcm_geometry(2,480,48000,2,16).state==2);
+    require(deskfuse::pcm_geometry(1,128,48000,2,16).state==2);
+    require(deskfuse::pcm_geometry(2,128,44100,2,16).state==2);
     deskfuse::PcmCredits ring{};
     const auto reserved=ring.reserve(960);require(reserved==1 && !ring.can_reserve(1));
     require(!ring.ack(reserved)); // in-flight copy owns all 960 credits

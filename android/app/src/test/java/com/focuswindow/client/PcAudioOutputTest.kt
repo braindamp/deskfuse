@@ -70,4 +70,19 @@ class PcAudioOutputTest {
         } finally { output.stop() }
     }
 
+    @Test
+    fun native_volume_reads_back_system_state_without_opening_a_track() {
+        val output = PcAudioOutput(context)
+        assertTrue(output.applyNativeVolume(0))
+        assertEquals(0, output.systemVolumeIndex())
+        assertNull(ReflectionHelpers.getField<AudioTrack?>(output, "track"))
+        assertTrue(output.applyNativeVolume(60))
+        // A separate user/system change invalidates a previously cached index.
+        manager.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0)
+        assertTrue(output.applyNativeVolume(60))
+        assertTrue(output.systemVolumeIndex()!! > 0)
+        assertFalse(output.applyNativeVolume(101))
+        assertTrue(output.applyNativeVolume(0))
+        assertEquals(0, output.systemVolumeIndex())
+    }
 }

@@ -18,6 +18,31 @@ Abstract:
 #include "simple.h"
 #include "minwavert.h"
 #include "mintopo.h"
+#include "pcm_export.h"
+
+#pragma code_seg("PAGE")
+STDMETHODIMP_(NTSTATUS) CMiniportTopology::GetTiming(DeskFuseTimingCapabilities* result) {
+    PAGED_CODE();
+    KIRQL irql;KeAcquireSpinLock(&m_TimingLock,&irql);
+    const auto id=m_TimingSource;const auto bound=m_TimingBound;
+    KeReleaseSpinLock(&m_TimingLock,irql);
+    // Never nest topology spin lock with passive source-registry operations.
+    return bound?DeskFusePcmSourceQuery(id,result):STATUS_DEVICE_REMOVED;
+}
+STDMETHODIMP_(NTSTATUS) CMiniportTopology::BindTiming(const GUID& source) {
+    PAGED_CODE();
+    DeskFuseTimingCapabilities caps{};auto status=DeskFusePcmSourceQuery(source,&caps);
+    if (!NT_SUCCESS(status)) return status;
+    KIRQL irql;KeAcquireSpinLock(&m_TimingLock,&irql);
+    if (m_TimingBound && !IsEqualGUID(m_TimingSource,source)) status=STATUS_DEVICE_BUSY;
+    else {m_TimingSource=source;m_TimingBound=true;}
+    KeReleaseSpinLock(&m_TimingLock,irql);return status;
+}
+STDMETHODIMP_(void) CMiniportTopology::RetireTiming() {
+    PAGED_CODE();KIRQL irql;KeAcquireSpinLock(&m_TimingLock,&irql);
+    m_TimingBound=false;KeReleaseSpinLock(&m_TimingLock,irql);
+}
+
 
 //=============================================================================
 #pragma code_seg("PAGE")
@@ -354,7 +379,11 @@ Return Value:
 
     if (IsEqualGUIDAligned(Interface, IID_IUnknown))
     {
-        *Object = PVOID(PUNKNOWN(this));
+        *Object = PVOID(PUNKNOWN(PMINIPORTTOPOLOGY(this)));
+    }
+    else if (IsEqualGUIDAligned(Interface, IID_IDeskFuseTimingBinding))
+    {
+        *Object = static_cast<IDeskFuseTimingBinding*>(this);
     }
     else if (IsEqualGUIDAligned(Interface, IID_IMiniport))
     {
@@ -1072,8 +1101,7 @@ Return Value:
     // MajorTarget is a pointer to miniport object for miniports.
     //
     return 
-        ((PCMiniportTopology)
-        (PropertyRequest->MajorTarget))->PropertyHandlerGeneric
+        static_cast<PCMiniportTopology>(static_cast<PMINIPORTTOPOLOGY>(PropertyRequest->MajorTarget))->PropertyHandlerGeneric
                     (
                         PropertyRequest
                     );

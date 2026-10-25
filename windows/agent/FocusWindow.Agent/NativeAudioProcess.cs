@@ -14,6 +14,12 @@ internal sealed class NativeAudioProcess : INativeAudioProcess
     private Task? _errors;
     public int Port { get; private set; }
     public Task Completion => _process.WaitForExitAsync();
+    private readonly TaskCompletionSource<string> _endpointReady=new(TaskCreationOptions.RunContinuationsAsynchronously);
+    public Task<string> EndpointReady=>_endpointReady.Task;
+    public async Task EnableMediaAsync(CancellationToken ct) {
+        await _process.StandardInput.WriteLineAsync("{\"command\":\"media-ready\"}".AsMemory(),ct).ConfigureAwait(false);
+        await _process.StandardInput.FlushAsync(ct).ConfigureAwait(false);
+    }
     private NativeAudioProcess(Process process, string directory) { _process=process; _directory=directory; }
     public static async Task<INativeAudioProcess> StartAsync(string executable, string capture,string sourceDll,string backend,string period,
         NativeAudioLaunch launch, CancellationToken ct)
@@ -65,10 +71,24 @@ internal sealed class NativeAudioProcess : INativeAudioProcess
                     throw new IOException("Invalid native listener identity.");
                 owner.Port=port; break;
             }
-            owner._output=DrainAsync(process.StandardOutput);
+            owner._output=owner.ReadOutputAsync(process.StandardOutput,launch.PeerId);
             return owner;
         }
         catch { await owner.DisposeAsync().ConfigureAwait(false); throw; }
+    }
+    private async Task ReadOutputAsync(StreamReader reader,string peer)
+    {
+        try {
+            while (await reader.ReadLineAsync().ConfigureAwait(false) is string line) {
+                if (!line.StartsWith("NATIVE_SOURCE ",StringComparison.Ordinal)) continue;
+                using var value=JsonDocument.Parse(line[14..]);
+                var endpoint=value.RootElement.GetProperty("endpoint").GetString();
+                if (!string.Equals(value.RootElement.GetProperty("peer").GetString(),peer,StringComparison.OrdinalIgnoreCase) || string.IsNullOrWhiteSpace(endpoint) || endpoint.Length>4096)
+                    throw new IOException("Native source identity differs from the authorized lease.");
+                _endpointReady.TrySetResult(endpoint);
+            }
+            _endpointReady.TrySetException(new IOException("Native source retired before endpoint readiness."));
+        } catch (Exception error) {_endpointReady.TrySetException(error);throw;}
     }
     private static async Task DrainAsync(StreamReader reader)
     { while (await reader.ReadLineAsync().ConfigureAwait(false) is not null) { } }
@@ -90,8 +110,10 @@ internal sealed class NativeAudioProcess : INativeAudioProcess
         catch (InvalidOperationException) { /* launch failed before a process existed */ }
         finally
         {
-            if (_output is not null) await _output.ConfigureAwait(false);
-            if (_errors is not null) await _errors.ConfigureAwait(false);
+            try {
+                if (_output is not null) await _output.ConfigureAwait(false);
+                if (_errors is not null) await _errors.ConfigureAwait(false);
+            } finally {
             _process.Dispose();
             var resolved=Path.GetFullPath(_directory);
             var parent=Path.GetFullPath(Path.GetTempPath()).TrimEnd(Path.DirectorySeparatorChar)+Path.DirectorySeparatorChar;
@@ -100,6 +122,7 @@ internal sealed class NativeAudioProcess : INativeAudioProcess
                 (File.GetAttributes(resolved)&FileAttributes.ReparsePoint)!=0)
                 throw new IOException("Refusing unexpected session directory cleanup.");
             Directory.Delete(resolved,recursive:true);
+            }
         }
     }
 }

@@ -15,6 +15,8 @@ Abstract:
 #ifndef _SYSVAD_MINWAVERT_H_
 #define _SYSVAD_MINWAVERT_H_
 
+#include "timing_binding.h"
+
 #ifdef SYSVAD_BTH_BYPASS
 #include "bthhfpmicwavtable.h"
 #endif // SYSVAD_BTH_BYPASS
@@ -154,6 +156,7 @@ private:
 #pragma code_seg()
 class CMiniportWaveRT : 
     public IMiniportWaveRT,
+    public IDeskFuseTimingBinding,
     public IMiniportAudioEngineNode,
     public IMiniportAudioSignalProcessing,
     public CUnknown
@@ -215,6 +218,9 @@ private:
 protected:
     DeskFusePcmSource*                   m_PcmSource = nullptr;
     GUID                                m_TimingSourceInstance;
+    STDMETHODIMP_(NTSTATUS) GetTiming(DeskFuseTimingCapabilities* result) override;
+    STDMETHODIMP_(NTSTATUS) BindTiming(const GUID&) override {return STATUS_NOT_SUPPORTED;}
+    STDMETHODIMP_(void) RetireTiming() override;
     PADAPTERCOMMON                      m_pAdapterCommon;
     ULONG                               m_DeviceFlags;
     eDeviceType                         m_DeviceType;

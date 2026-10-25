@@ -15,17 +15,17 @@ internal sealed class PcmGrant : IDisposable
     {
         // Bind the private source context back to THIS lease's exact endpoint.
         if (deskfuse_endpoint_query(endpoint,out var identity)!=0 || identity.Abi!=1 ||
-            identity.Build!=0x2026102501UL || identity.ExportAbi!=1 || identity.Source!=source)
+            identity.Build!=0x2026102502UL || identity.ExportAbi!=2 || identity.Source!=source)
             throw new InvalidOperationException("Endpoint and running direct-source identity do not match.");
         _file=CreateFileW(@"\\.\DeskFusePcm",0xc0000000,0,IntPtr.Zero,3,0,IntPtr.Zero);
         if (_file.IsInvalid) throw new Win32Exception();
         try
         {
-            var request=new Bind {Size=(uint)Marshal.SizeOf<Bind>(),Abi=1,Source=source,
+            var request=new Bind {Size=(uint)Marshal.SizeOf<Bind>(),Abi=2,Source=source,
                 Process=unchecked((ulong)consumer.DangerousGetHandle().ToInt64())};
             if (!DeviceIoControl(_file,BindCode,ref request,Marshal.SizeOf<Bind>(),out var reply,
                 Marshal.SizeOf<Reply>(),out var returned,IntPtr.Zero) || returned!=Marshal.SizeOf<Reply>() ||
-                reply.Size!=Marshal.SizeOf<Reply>() || reply.Abi!=1)
+                reply.Size!=Marshal.SizeOf<Reply>() || reply.Abi!=2)
                 throw new Win32Exception();
             if (consumer.IsInvalid || !DuplicateHandle(GetCurrentProcess(),_file,consumer,out var remote,0, false,2))
                 throw new Win32Exception();

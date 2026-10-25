@@ -228,6 +228,7 @@ internal static class Program
             CreateEndpointAudioCapture: (endpointId, layouts, maxBytes) =>
                 new WindowsLoopbackAudioCapture(endpointId, layouts, maxBytes),
             PhoneSpeakers: new BrokerPhoneSpeakerProvider(brokerClient),
+            ObserveNativeEndpointVolume: endpoint => new NativeEndpointVolume(endpoint),
             CreateNativeAudio: Opt(args, "--native-audio-exe") is string nativeExe &&
                 Opt(args, "--native-capture-exe") is string captureExe
                 ? (launch, ct) => NativeAudioProcess.StartAsync(Path.GetFullPath(nativeExe),

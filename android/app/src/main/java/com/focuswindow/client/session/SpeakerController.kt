@@ -8,6 +8,7 @@ import com.focuswindow.client.protocol.ServerMessage
 import com.focuswindow.client.transport.AudioConsumptionMeter
 import com.focuswindow.client.transport.LanTransport
 import com.focuswindow.client.transport.PairingPayload
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -120,7 +121,7 @@ class SpeakerController(
                             clientVersion = clientVersion,
                             profile = current,
                             capabilities = listOf("speakers"),
-                            nativeAudioVersion = if (nativeAudio?.available == true) 1 else 0,
+                            nativeAudioVersion = if (nativeAudio?.available == true) 2 else 0,
                         )
                     )
                     if (!recovering) {
@@ -128,27 +129,28 @@ class SpeakerController(
                     }
                 }
 
-                is LanTransport.TransportEvent.Closed -> {
-                    // The PC can go away and come back. Keep trying, the
-                    // same way the workspace session does.
-                    if (event.recoverable) {
-                        // Old AudioTrack samples are no longer valid across an
-                        // authenticated TCP session. The new stream restarts it.
-                        nativeAudio?.stop()
-        output.stop()
-                        scheduleReconnect()
-                    } else {
-                        _state.value = State.Failed(event.reason)
-                    }
-                }
+                is LanTransport.TransportEvent.Closed ->
+                    endConnection(event.reason, event.recoverable)
 
-                is LanTransport.TransportEvent.Failed -> {
-                    if (event.retryable) scheduleReconnect()
-                    else _state.value = State.Failed(event.detail)
-                }
+                is LanTransport.TransportEvent.Failed ->
+                    endConnection(event.detail, event.retryable)
 
                 else -> Unit
             }
+        }
+    }
+
+    private suspend fun endConnection(detail: String, retry: Boolean) {
+        nativeAudio?.retire()
+        output.stop()
+        transport.disconnectNow()
+        if (payload == null) return
+        if (retry) scheduleReconnect()
+        else {
+            recovering = false
+            reconnectJob?.cancel(); reconnectJob = null
+            reconnectGraceJob?.cancel(); reconnectGraceJob = null
+            _state.value = State.Failed(detail)
         }
     }
 
@@ -207,20 +209,27 @@ class SpeakerController(
 
     private suspend fun pumpControl() {
         transport.control.collect { message ->
-            when (message) {
+            try { when (message) {
                 is ServerMessage.NativeAudioChallenge -> {
                     val native = nativeAudio ?: error("Native receiver unavailable")
                     output.stop()
+                    check(output.applyNativeVolume(0)) { "This output cannot enforce native volume/mute." }
                     transport.send(native.challenge(message))
+                }
+                is ServerMessage.NativeAudioVolume -> {
+                    val native = nativeAudio ?: error("Native receiver unavailable")
+                    if (native.acceptsVolume(message.grant)) {
+                        val applied = output.applyNativeVolume(message.level)
+                        transport.send(ClientMessage.NativeAudioVolumeApplied(message.grant, message.sequence, message.level, applied))
+                        check(applied) { "Native volume/mute could not be applied." }
+                    }
                 }
                 is ServerMessage.NativeAudioGrant -> {
                     val native = nativeAudio ?: error("Native receiver unavailable")
-                    native.start(message, payload?.host ?: error("No authenticated host")) { result ->
+                    native.start(message, payload?.host ?: error("No authenticated host")) {
                         scope.launch {
-                            if (result != 0) {
-                                _state.value = State.Failed("Native audio session ended; reconnect required.")
-                                transport.disconnectNow()
-                            }
+                            // Check at final dispatch, after any controller/session replacement.
+                            if (native.isCurrent()) endConnection("Native audio session ended.", retry = true)
                         }
                     }
                     recovering = false
@@ -247,7 +256,8 @@ class SpeakerController(
                     if (message.stage == "speakers") _state.value = State.Failed(message.detail)
 
                 else -> Unit
-            }
+            } } catch (cancel: CancellationException) { throw cancel }
+            catch (error: Exception) { endConnection(error.message ?: "Native audio initialization failed.", retry = true) }
         }
     }
 

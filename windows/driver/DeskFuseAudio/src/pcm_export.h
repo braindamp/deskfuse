@@ -5,11 +5,15 @@ struct DeskFusePcmReservation { void* session; ULONG slot; ULONGLONG generation;
 NTSTATUS DeskFusePcmInitialize(PDRIVER_OBJECT driver);
 void DeskFusePcmShutdown();
 NTSTATUS DeskFusePcmSourceCreate(const GUID& id, DeskFusePcmSource** source);
+void DeskFusePcmSourceRetire(DeskFusePcmSource* source);
+NTSTATUS DeskFusePcmSourceQuery(const GUID& id, DeskFuseTimingCapabilities* result);
 void DeskFusePcmSourceDestroy(DeskFusePcmSource* source);
 void DeskFusePcmStreamOpen(DeskFusePcmSource* source, void* stream, bool eligible);
 void DeskFusePcmStreamClose(DeskFusePcmSource* source, void* stream);
 void DeskFusePcmState(DeskFusePcmSource* source, void* stream, bool running,
     ULONGLONG frame, ULONGLONG qpc100ns);
+void DeskFusePcmGeometryUpdate(DeskFusePcmSource* source, void* stream,
+    ULONG notifications, ULONG packetFrames, ULONG rate, ULONG channels, ULONG bits);
 void DeskFusePcmDeny(DeskFusePcmSource* source);
 bool DeskFusePcmReserve(DeskFusePcmSource* source, void* stream, ULONGLONG frame,
     ULONG frames, ULONGLONG commitQpc100ns, DeskFusePcmReservation* reservation);

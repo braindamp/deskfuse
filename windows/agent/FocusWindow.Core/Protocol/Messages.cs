@@ -51,6 +51,7 @@ public sealed record ClientMicrophone(string Action) : ClientMessage;
 /// phone's slider. The endpoint follows it, so both are one control.</summary>
 public sealed record ClientAudioVolume(int Level) : ClientMessage;
 public sealed record ClientNativeAudio(string Grant, string CsrPem) : ClientMessage;
+public sealed record ClientNativeAudioVolume(string Grant,long Sequence,int Level,bool Applied) : ClientMessage;
 public sealed record ClientBye(string Reason) : ClientMessage;
 public sealed record ClientUnknown(string Type) : ClientMessage;
 public static class ClientMessageParser
@@ -101,6 +102,8 @@ public static class ClientMessageParser
                         ? layouts.Select(node => node?.GetValue<string>() ?? "").ToArray()
                         : Array.Empty<string>(),
                     Math.Clamp(root["maxPcmBytes"]?.GetValue<int>() ?? 3840, 384, 32768)),
+                "native_audio_volume_applied" => new ClientNativeAudioVolume(root["grant"]?.GetValue<string>() ?? "",
+                    root["sequence"]?.GetValue<long>() ?? 0,root["level"]?.GetValue<int>() ?? -1,root["applied"]?.GetValue<bool>() ?? false),
                 "native_audio_csr" => new ClientNativeAudio(root["grant"]?.GetValue<string>() ?? "",
                     root["csrPem"]?.GetValue<string>() ?? ""),
                 "microphone" => new ClientMicrophone(root["action"]?.GetValue<string>() ?? ""),

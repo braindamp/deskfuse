@@ -2,6 +2,7 @@
 use std::{io,net::{SocketAddr,UdpSocket},sync::{Mutex,atomic::{AtomicBool,Ordering}}};
 static ACTIVE:AtomicBool=AtomicBool::new(false);
 static STOP:AtomicBool=AtomicBool::new(false);
+static MEDIA_READY:AtomicBool=AtomicBool::new(false);
 static PIN:Mutex<Option<Vec<u8>>>=Mutex::new(None);
 static WAKE:Mutex<Option<SocketAddr>>=Mutex::new(None);
 pub struct Session;
@@ -15,6 +16,7 @@ impl Session {
         STOP.store(false,Ordering::Release);
         #[cfg(target_os="android")]
         if STOP.load(Ordering::Acquire) {ACTIVE.store(false,Ordering::Release);return Err(io::Error::from(io::ErrorKind::Interrupted))}
+        MEDIA_READY.store(false,Ordering::Release);
         *PIN.lock().unwrap()=Some(pin); Ok(Self)
     }
 }
@@ -44,8 +46,20 @@ pub fn register_socket(socket:&UdpSocket)->io::Result<()> {
     }
     Ok(())
 }
+pub fn media_allowed()->bool {!active() || MEDIA_READY.load(Ordering::Acquire)}
+pub fn enable_media() {MEDIA_READY.store(true,Ordering::Release);wake();}
+pub fn source_ready(peer:&str,endpoint:&str)->io::Result<()> {
+    if active() {
+        use io::Write;
+        println!("NATIVE_SOURCE {}",serde_json::json!({"peer":peer,"endpoint":endpoint}));
+        io::stdout().flush()?;
+    }
+    Ok(())
+}
 pub fn stop() {
-    STOP.store(true,Ordering::Release);
+    STOP.store(true,Ordering::Release);wake();
+}
+fn wake() {
     if let Some(addr)=*WAKE.lock().unwrap() {
         if let Ok(wake)=UdpSocket::bind("127.0.0.1:0") {let _=wake.send_to(&[0],addr);}
     }

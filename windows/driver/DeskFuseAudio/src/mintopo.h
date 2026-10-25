@@ -17,6 +17,7 @@ Abstract:
 #define _SYSVAD_MINTOPO_H_
 
 #include "basetopo.h"
+#include "timing_binding.h"
 
 //=============================================================================
 // Classes
@@ -30,10 +31,14 @@ Abstract:
 class CMiniportTopology : 
     public CMiniportTopologySYSVAD,
     public IMiniportTopology,
+    public IDeskFuseTimingBinding,
     public CUnknown
 {
   private:
     eDeviceType             m_DeviceType;
+    KSPIN_LOCK               m_TimingLock;
+    GUID                    m_TimingSource{};
+    bool                    m_TimingBound=false;
 
     typedef struct
     {
@@ -67,6 +72,7 @@ public:
       m_DeviceType(DeviceType),
       m_DeviceContext(DeviceContext)
     {
+        KeInitializeSpinLock(&m_TimingLock);
         m_PostureCache.Orientation = AUDIOPOSTURE_ORIENTATION_NOTROTATED;  
 
 #if defined(SYSVAD_BTH_BYPASS) || defined(SYSVAD_USB_SIDEBAND)
@@ -84,6 +90,9 @@ public:
     ~CMiniportTopology();
 
     IMP_IMiniportTopology;
+    STDMETHODIMP_(NTSTATUS) GetTiming(DeskFuseTimingCapabilities* result) override;
+    STDMETHODIMP_(NTSTATUS) BindTiming(const GUID& source) override;
+    STDMETHODIMP_(void) RetireTiming() override;
 
     NTSTATUS PropertyHandlerJackDescription
     (
