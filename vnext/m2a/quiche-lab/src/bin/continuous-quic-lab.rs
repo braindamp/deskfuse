@@ -489,6 +489,7 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                                 ) {
                                     Ok(QueueAdmission::Queued) => {
                                         offered += 1;
+                                        deskfuse_quiche_lab::session_control::pcm_admitted(offered);
                                         trace.record(TraceEvent::Admitted { sequence: assigned_sequence, frame: block.first_device_frame, qpc: block.first_qpc_100ns, count: offered });
                                         source_egress(&mut egress, &udp, c, false, &mut outstanding, capture.is_some())?;
                                     }
@@ -627,6 +628,13 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
     // releases the endpoint lease. Report missing summary honestly.
     let incomplete_reader = source.is_some() && reader_summary.is_none();
     let cleanup_result = source.as_mut().map(|source| source.stop()).transpose();
+    if deskfuse_quiche_lab::session_control::active() && capture.is_some() {
+        // Product control may stop before the natural CLI deadline. Preserve
+        // existing counters off the live owner path; do not invent reader totals.
+        println!("DONE Windows WASAPI source product_stop=1 real_pcm_blocks_queued={} quiche_queue_full={} qpc_expired={} qpc_invalid={} qpc_future={} pre_quic_source_gaps={} pre_quic_missing_frames={} reader_summary_available={} native_cleanup_confirmed={}",
+            offered,not_queued,expired_source_qpc,invalid_source_qpc,future_source_qpc,
+            capture_source_gaps,capture_source_missing_frames,reader_summary.is_some() as u8,cleanup_result.is_ok() as u8);
+    }
     outstanding.clear();drop(egress);drop(conn);
     drop(source.take()); // endpoint lease is last, after acquisition and QUIC
     let flush_result = (|| -> io::Result<()> {

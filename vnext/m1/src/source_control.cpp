@@ -15,6 +15,7 @@ struct SourceControl {
     Handle stop{CreateEventW(nullptr,TRUE,FALSE,nullptr)};
     Handle failed{CreateEventW(nullptr,TRUE,FALSE,nullptr)};
     DeskFuseTimingCapabilities identity{};
+    UINT32 period_frames=0;
     std::thread worker;
     SourceControl(const wchar_t* id,bool minimum) {
         if (!id || !*id || !ready.get() || !stop.get() || !failed.get()) throw std::runtime_error("source control setup failed");
@@ -26,17 +27,27 @@ struct SourceControl {
                 EnginePeriodCompanion period;
                 identity=require_corrected_driver(*endpoint.Get());
                 if (identity.export_abi!=DESKFUSE_PCM_ABI) throw std::runtime_error("direct ABI unavailable");
-                if (minimum) {
+                {
                     ComPtr<IAudioClient> audio;
                     check(endpoint->Activate(__uuidof(IAudioClient),CLSCTX_ALL,nullptr,reinterpret_cast<void**>(audio.GetAddressOf())),"source format");
                     WAVEFORMATEX* raw=nullptr;check(audio->GetMixFormat(&raw),"source mix format");
                     std::unique_ptr<WAVEFORMATEX,decltype(&CoTaskMemFree)> format(raw,CoTaskMemFree);
-                    period.initialize(*endpoint.Get(),*format,engine_periods(*audio.Get(),*format));period.start();
-                    period.verify_driver(*endpoint.Get());
+                    if (minimum) {
+                        period.initialize(*endpoint.Get(),*format,engine_periods(*audio.Get(),*format));period.start();
+                        period.verify_driver(*endpoint.Get());
+                    }
                     const auto granted=engine_periods(*audio.Get(),*format);
-                    if (FAILED(granted.current_result) || !granted.current_format_matches || granted.current!=period.selected())
-                        throw std::runtime_error("direct period not granted");
+                    if (FAILED(granted.current_result) || !granted.current_format_matches || granted.current==0 || granted.current>240 ||
+                        (minimum && granted.current!=period.selected()))
+                        throw std::runtime_error("direct actual period unavailable or unsupported (requires 1-240 frames); request minimum or use loopback");
+                    period_frames=granted.current;
                 }
+                // Setup evidence only; never emitted per committed packet.
+                std::cerr << "DIRECT_CONFIG driver_verified=1 timing_abi=" << identity.abi
+                          << " driver_build=" << identity.build << " export_abi=" << identity.export_abi
+                          << " period_verified=1";
+                std::cerr << " current_period_frames=" << period_frames;
+                std::cerr << "\n";
                 SetEvent(ready.get());
                 HANDLE waits[]={stop.get(),period.event()};
                 for (;;) {
@@ -45,6 +56,9 @@ struct SourceControl {
                     if (minimum && result==WAIT_OBJECT_0+1) period.service();
                     else throw std::runtime_error("period event wait failed");
                 }
+            } catch (const std::exception& error) {
+                std::cerr << "DIRECT_BLOCKED " << error.what() << "\n";
+                SetEvent(failed.get());SetEvent(ready.get());
             } catch (...) {SetEvent(failed.get());SetEvent(ready.get());}
         });
         if (WaitForSingleObject(ready.get(),30000)!=WAIT_OBJECT_0 || WaitForSingleObject(failed.get(),0)==WAIT_OBJECT_0) {
@@ -70,3 +84,7 @@ extern "C" __declspec(dllexport) int deskfuse_source_service(void* value) noexce
     return WaitForSingleObject(static_cast<SourceControl*>(value)->failed.get(),0)==WAIT_OBJECT_0?-1:0;
 }
 extern "C" __declspec(dllexport) void deskfuse_source_close(void* value) noexcept {delete static_cast<SourceControl*>(value);}
+
+extern "C" __declspec(dllexport) unsigned deskfuse_source_period_frames(void* value) noexcept {
+    return value?static_cast<SourceControl*>(value)->period_frames:0;
+}

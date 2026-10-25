@@ -204,6 +204,12 @@ internal static class Program
         if (allowMicrophone)
             log.Warn("Development microphone bridge ENABLED for one explicitly selected Windows playback endpoint. " +
                 "Use a virtual audio cable only; a physical endpoint would play the phone microphone aloud.");
+        using var lab = args.Contains("--audio-lab") ? new AudioLabRun(Int(args,"--audio-lab-seconds",30),ct) : null;
+        if (lab is not null && (Opt(args,"--native-audio-exe") is null || Opt(args,"--native-capture-exe") is null ||
+            args.Contains("--legacy-qr") || args.Contains("--auto-approve") || args.Contains("--single-session") || args.Contains("--new-pairing")))
+            throw new ArgumentException("Audio Lab requires the enrolled native path without approval/pairing overrides.");
+        options=options with { AudioLabOnly=lab is not null };
+        if (lab is not null) ct=lab.Token;
         var guards = new List<PhysicalDisplayGuard>();
         using var sources = new WorkspaceApplicationCatalog();
         WindowsDisplayBackend? backend = null;
@@ -217,7 +223,7 @@ internal static class Program
                 guards.Add(g);
                 return g;
             },
-            Approval: new ConsoleApproval(args.Contains("--auto-approve"), log),
+            Approval: lab is null ? new ConsoleApproval(args.Contains("--auto-approve"), log) : new AudioLabApproval(log),
             PairingStore: new DpapiPairingStore(),
             DeviceCredentials: new DpapiDeviceCredentialStore(),
             Clipboard: new WindowsClipboardBridge(),
@@ -231,9 +237,12 @@ internal static class Program
             ObserveNativeEndpointVolume: endpoint => new NativeEndpointVolume(endpoint),
             CreateNativeAudio: Opt(args, "--native-audio-exe") is string nativeExe &&
                 Opt(args, "--native-capture-exe") is string captureExe
-                ? (launch, ct) => NativeAudioProcess.StartAsync(Path.GetFullPath(nativeExe),
+                ? (launch, ct) => lab is null ? NativeAudioProcess.StartAsync(Path.GetFullPath(nativeExe),
                     Path.GetFullPath(captureExe), Path.GetFullPath(Opt(args, "--native-source-dll") ?? Path.Combine(Path.GetDirectoryName(Path.GetFullPath(captureExe))!, "deskfuse-source-control.dll")),
-                    Opt(args, "--native-audio-backend") ?? "committed", Opt(args, "--native-audio-period") ?? "reference", launch, ct) : null,
+                    Opt(args, "--native-audio-backend") ?? "committed", Opt(args, "--native-audio-period") ?? "reference", launch, ct) : lab.StartAsync(
+                    Path.GetFullPath(nativeExe),Path.GetFullPath(captureExe),
+                    Path.GetFullPath(Opt(args,"--native-source-dll") ?? Path.Combine(Path.GetDirectoryName(Path.GetFullPath(captureExe))!,"deskfuse-source-control.dll")),
+                    Opt(args,"--native-audio-backend") ?? "committed",Opt(args,"--native-audio-period") ?? "reference",launch,ct) : null,
             CreatePhoneMicrophoneSink: allowMicrophone
                 ? id => string.Equals(id, microphoneDeviceId, StringComparison.Ordinal)
                     ? new WindowsPhoneMicrophoneCableSink(microphoneOutputId!)
@@ -248,6 +257,7 @@ internal static class Program
                 File.WriteAllText(path, outcome.Evidence.ToMarkdown("Last session density evidence"));
                 log.Info("density evidence written to " + path);
             });
+        if (lab is not null) await lab.ArmAsync().ConfigureAwait(false);
         using var host = new SessionHost(options, services, log);
         var offer = await host.StartAsync(ct);
         if (!options.CameraFreePairing)
@@ -255,8 +265,9 @@ internal static class Program
         else
             Console.WriteLine("  DeskFuse is discoverable on the LAN. Approve a new phone on this PC once.");
         Console.WriteLine("  Waiting for a phone. Ctrl+C to quit.\n");
-        await host.RunSessionsAsync(ct);
-        return 0;
+        try { await host.RunSessionsAsync(ct); }
+        catch (OperationCanceledException) when (lab is not null && ct.IsCancellationRequested) { }
+        return lab is null?0:await lab.CompleteAsync().ConfigureAwait(false);
     }
     private static int TrustedPhones(string[] args)
     {

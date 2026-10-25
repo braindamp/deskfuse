@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#070b09">
+  <meta name="description" content="DeskFuse Audio Lab — personal media configuration atlas, simulated tuning and optional local physical audio bridge.">
+  <title>DeskFuse / Audio Lab</title>
+  <link rel="stylesheet" href="./styles.css">
+  <script defer src="./app.js"></script>
+  <script defer src="./live.js"></script>
+  <script defer src="./atlas-data.js"></script>
+  <script defer src="./atlas.js"></script>
+  <script defer src="./windows-lab.js"></script>
+  <link rel="stylesheet" href="./windows-lab.css">
+  <link rel="stylesheet" href="./live.css">
+  <link rel="stylesheet" href="./atlas.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar">
+      <a class="brand" href="#overview" aria-label="DeskFuse Audio Lab overview">
+        <span class="brand-icon" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+        <span class="brand-stack"><strong>DESKFUSE</strong><small>ENGINEERING CONSOLE</small></span>
+      </a>
+      <div class="side-divider"></div>
+      <div class="nav-heading">WORKSPACE <span>01</span></div>
+      <nav class="sidebar-nav" aria-label="Sections">
+        <a href="#overview" class="nav-link active"><span class="nav-symbol">◈</span> Overview <span class="nav-counter">01</span></a>
+        <a href="#windows-integration" class="nav-link"><span class="nav-symbol">▤</span> Windows capture <span class="nav-counter">NEW</span></a>
+        <a href="#live-lab" class="nav-link"><span class="nav-symbol">◉</span> Physical audio <span class="nav-counter">LIVE</span></a>
+        <a href="#tuning" class="nav-link"><span class="nav-symbol">≋</span> Tuning matrix <span class="nav-counter">16</span></a>
+        <a href="#signal" class="nav-link"><span class="nav-symbol">⌁</span> Signal path <span class="nav-counter">07</span></a>
+        <a href="#atlas" class="nav-link"><span class="nav-symbol">▦</span> Configuration atlas <span class="nav-counter" id="atlas-nav-total">—</span></a>
+        <a href="#advanced" class="nav-link"><span class="nav-symbol">⊞</span> Legacy advanced <span class="nav-counter">26+</span></a>
+        <a href="#experiment" class="nav-link"><span class="nav-symbol">⌑</span> Test notebook <span class="nav-counter">NEW</span></a>
+        <a href="#compare" class="nav-link"><span class="nav-symbol">◇</span> A / B snapshots <span class="nav-counter">02</span></a>
+      </nav>
+      <div class="side-divider wide"></div>
+      <div class="nav-heading">EXPERIMENT STATUS</div>
+      <div class="side-status"><span class="status-bullet"></span> Simulation active</div>
+      <div class="side-device">
+        <small>OUTPUT DEVICE</small>
+        <strong>Android / Xiaomi</strong>
+        <div class="device-note">Illustrative device profile</div>
+        <div class="device-scan" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div>
+      </div>
+      <div class="side-bottom">
+        <span class="outline-pill"><span class="pill-dot"></span> OPTIONAL LOCAL TEST BRIDGE</span>
+        <p>Standalone laboratory integration.<br>Optional physical test bridge.<br>Graph estimates are simulated.</p>
+        <div class="build-identifier">AUDIO LAB // TEST WORKSPACE V0.6</div>
+      </div>
+    </aside>
+
+    <main class="main-content">
+      <header class="topbar">
+        <div class="breadcrumb"><span>DESKFUSE</span><span class="slash">/</span><span>AUDIO SYSTEMS</span><span class="slash">/</span><strong>LAB</strong></div>
+        <div class="topbar-right"><span class="live-clock" id="clock">--:--:--</span><span class="top-rule"></span><span class="sim-status"><span class="status-bullet"></span> MODEL + OPTIONAL LOCAL BRIDGE</span><button type="button" class="top-icon-button" id="menu-button" aria-label="Toggle menu" aria-expanded="false">☰</button></div>
+      </header>
+
+      <div class="content-frame" id="overview">
+        <div class="eyebrow"><span class="eyebrow-square"></span> INTERACTIVE AUDIO SYSTEMS / LABORATORY 001</div>
+        <div class="hero-title-row">
+          <div>
+            <h1>Shape the <span>latency.</span><br>Keep the detail.</h1>
+            <p class="hero-description">Use your own audio laboratory: start from the latest listening-test reference, change one factor, record what you hear, and compare repeatable settings. All projected graphs remain illustrative; real counters appear separately in the Physical audio panel.</p>
+          </div>
+          <div class="hero-motif" aria-hidden="true"><span class="orbit orbit-1"></span><span class="orbit orbit-2"></span><span class="orbit orbit-3"></span><span class="motif-cross">+</span><span class="motif-label">DF // AUDIO</span></div>
+        </div>
+        <div class="warning-strip"><span class="warning-mark">ⓘ</span><span><strong>TEST REFERENCE + SIMULATION</strong> — the pinned configuration below is transcribed from recent listening tests. Latency predictions and moving plots are hypothetical; physical playback requires the separate localhost bridge.</span><span class="strip-tag">UNVERIFIED</span></div>
+
+        <section class="windows-lab" id="windows-integration" aria-label="Windows earlier capture integration comparison">
+          <div class="section-kicker">WINDOWS EARLIER CAPTURE / ENGINEERING QUALIFICATION MAP · v0.7</div>
+          <h2>Where does PCM become available?</h2>
+          <p>Compare reference MM-1 loopback with DeskFuse-owned endpoint loopback and the planned <strong>accepted-WaveRT-PCM export</strong>. This panel follows the <strong>W-E1 → W-E4</strong> implementation plan, with the immediate engineering priority <strong>correct driver timing → qualify own-endpoint audio → export committed PCM → integrate direct Rust consumption</strong>. <strong>Architecture plans are not runnable configurations.</strong></p>
+          <div class="windows-lab-grid">
+            <label class="live-field">CAPTURE SOURCE<select id="win-source"><option value="mm1">MM-1 · physical WASAPI loopback (reference)</option><option value="deskfuse">DeskFuse same-endpoint loopback · runtime gated</option><option value="direct_export">Committed WaveRT PCM · runtime gated</option></select></label>
+            <label class="live-field">ENGINE PERIOD<select id="win-engine-period"><option value="reference">Reference engine period</option><option value="minimum">Minimum engine period · live driver + period gate</option></select></label>
+            <label class="live-field">WASAPI CAPTURE ALLOCATION<select id="win-capture-policy"><option value="reference">Reference capacity policy</option><option value="minimum">Minimum capture capacity request (experimental)</option></select></label>
+          </div>
+          <p id="win-change-status" class="win-rail">REFERENCE SELECTED · No hardware changes.</p>
+          <div id="win-cards" class="win-cards" aria-label="Compare capture architecture implementation states"></div>
+          <div class="win-workgroup">
+            <div class="win-contrast-head"><h3>Capture path for selected architecture</h3><span id="win-path-mode">REFERENCE</span></div>
+            <div id="win-pipeline" class="win-pipeline" aria-live="polite"></div>
+            <p class="win-note" id="win-path-note"></p>
+          </div>
+          <div class="win-workgroup">
+            <div class="win-contrast-head"><h3>Implementation gates · W-E1 through W-E4</h3><span>NATIVE CHECKPOINT · 2421b68</span></div>
+            <p class="win-note">These are source-inspection checkpoints, not automatic driver-state detection. A built artifact, reported hardware capability, or advertised minimum period is not proof of a corrected installed driver.</p>
+            <div class="win-gates" id="win-gates" aria-label="Windows early capture implementation checklist"></div>
+          </div>
+          <div class="win-workgroup">
+            <div class="win-contrast-head"><h3>Evidence required to compare sources</h3><span>EMPTY VALUES ARE NOT ZERO</span></div>
+            <p class="win-note">For the direct-export comparison, hold the DeskFuse endpoint, engine period, format, routing and load constant. QPC when PCM was committed, when it became available, and when the Rust sender admitted it are <em>different</em> clocks/events. No end-to-end or acoustic benefit is asserted without measurements.</p>
+            <div class="win-table-scroller"><table class="win-compare-table" aria-label="Evidence provenance comparison"><thead><tr><th>OBSERVATION</th><th>W0 · MM-1</th><th>W1 · DESKFUSE LOOPBACK</th><th>W2 · DIRECT EXPORT</th></tr></thead><tbody id="win-evidence-rows"></tbody></table></div>
+            <div class="win-bottom-actions"><button type="button" id="win-export-plan" class="win-export">EXPORT NON-EXECUTABLE TEST PLAN</button><span id="win-export-note">No measurement or hardware action is implied.</span></div>
+          </div>
+          <h3>Read-only integration preflight</h3>
+          <div class="win-readouts"><div><strong>Local broker pipe</strong><span id="win-broker">Not checked</span></div><div><strong>Matched Release receipt</strong><span id="win-receipt">Not checked</span></div><div><strong>Authenticated identity</strong><span id="win-identity">Not yet connected</span></div><div><strong>Corrected driver / period</strong><span id="win-driver-status">Not attested</span></div></div>
+          <p class="win-rail">LAST SESSION · NATIVE REPORTED VALUES ONLY: <span id="win-observed-period">No actual engine-period evidence yet</span></p>
+          <p class="live-small" id="win-details" style="white-space:pre-wrap">Checking optional local bridge. No endpoints will be created during this check.</p>
+          <p class="live-small">These readouts are preflight evidence, not acoustic latency measurements. The read-only bridge does not invoke default-device restoration or system routing. No endpoint provisioning is performed during preflight. Minimum-period requests are rejected until driver timing identity is independently established; dedicated launch uses the existing enrolled product host and pinned QUIC binding.</p>
+        </section>
+        <section class="live-lab" id="live-lab" aria-label="Physical audio lab with local bridge">
+          <div class="live-lab-title">
+            <div><div class="section-kicker">PHYSICAL LISTENING / SEPARATE LOCAL BRIDGE</div>
+              <h2>Hear the actual difference.</h2>
+              <p class="live-sub">Run the existing authenticated Windows → Xiaomi audio receiver from this browser. Only currently implemented <strong>startup settings</strong> are executable. Other sliders and graphs remain modeled experiments.</p>
+            </div>
+            <span id="live-state" class="live-status wait">CHECKING LOCAL BRIDGE</span>
+          </div>
+          <div class="live-note">Observed evidence: a 30-second platform-default buffer run was uninterrupted (zero active reprimes/reanchors); the three-burst trial had more interruptions and 12 reprimes. A later 120-second control failed early. <strong>No Game Mode preset is qualified yet.</strong></div>
+          <div class="live-grid">
+            <div class="live-panel">
+              <h3>01 / Physical test configuration</h3>
+              <label class="live-field">TEST ONE FACTOR<select id="live-factor">
+                <option value="baseline">Reference — buffer default (0), fade/conceal/sinc ON</option>
+                <option value="b2">Buffer size — request 2 bursts (experimental)</option>
+                <option value="b3">Buffer size — request 3 bursts (previously worse)</option>
+                <option value="fade">Fade — disable (2 ms is reference)</option>
+                <option value="conceal">Concealment — disable (10 ms is reference)</option>
+                <option value="bypass">128-tap sinc — identity bypass (NOT linear interpolation)</option>
+              </select></label>
+              <p id="live-message" class="live-caption">Reference remains selected.</p>
+              <button id="live-from-grid" type="button" class="live-button secondary">USE SUPPORTED TUNING-GRID CHANGE</button>
+              <div class="form-row">
+                <label class="live-field">TEST DURATION<select id="live-duration"><option value="30">30 seconds</option><option value="120">120 seconds (not continuity-qualified)</option></select></label>
+                <label class="live-field">OPTIONAL LABEL<input id="live-label" type="text" maxlength="35" placeholder="music-control-01" pattern="[A-Za-z0-9_-]*"></label>
+              </div>
+              <button id="live-start" type="button" class="live-button" disabled>▶ START PHYSICAL TEST</button>
+              <p class="live-caption">Explicit action only. The bridge verifies matching Release hashes, uses the checked-in physical runner, and starts the existing Android receiver through ADB. A trial cannot be reconfigured mid-stream. Trial duration is fixed.</p>
+              <div class="live-music"><div class="section-kicker">LOCAL MUSIC PLAYER / OPTIONAL</div>
+                <input id="live-music-file" type="file" accept="audio/*" aria-label="Choose audio file for playback on the Windows computer">
+                <audio id="live-audio" controls preload="none" aria-label="Local music player"></audio>
+                <p id="live-music-caption" class="live-caption">Plays locally in the browser. Select Windows' correct browser output route so this music actually reaches MM-1; the lab does not change Windows audio routing.</p>
+              </div>
+            </div>
+            <div class="live-panel">
+              <h3>02 / Real session and capture counters</h3>
+              <p class="live-small" id="live-setup" style="white-space:pre-wrap">Bridge setup not checked yet.</p>
+              <div class="live-readouts">
+                <div class="live-readout"><span>NATIVE UNDERRUNS</span><strong id="live-underruns">—</strong></div>
+                <div class="live-readout"><span>REPRIMES</span><strong id="live-reprimes">—</strong></div>
+                <div class="live-readout"><span>DEVICE X-RUNS</span><strong id="live-xruns">—</strong></div>
+                <div class="live-readout"><span>AAUDIO BUFFER FRAMES</span><strong id="live-queue">—</strong></div>
+                <div class="live-readout"><span>PRE-QUIC MISSING FRAMES</span><strong id="live-gaps">—</strong></div>
+                <div class="live-readout"><span>CLIPPED SAMPLES</span><strong id="live-clipping">—</strong></div>
+              </div>
+              <p class="live-caption">These figures populate only from physical receiver/sender log lines. No acoustic or end-to-end delay is measured here. A zero device X-run count does not prove uninterrupted audio.</p>
+              <div class="section-kicker" style="margin-top:12px">RECENT RUNNER OUTPUT</div>
+              <pre class="live-console" id="live-console">No physical session has been started.</pre>
+              <div class="live-small">PROFILE: <span id="live-trial">None</span></div>
+              <div class="live-small">LOCAL EVIDENCE: <span id="live-evidence" class="live-evidence">Not yet recorded</span></div>
+            </div>
+          </div>
+          <p class="live-caption">Model charts below remain simulations. Never treat a proposed buffer value as proven faster; the latest real tests found that shrinking Android's buffer can make continuity worse.</p>
+        </section>
+        <section class="reference-section" aria-label="Listening-test reference" id="reference">
+          <div class="reference-top"><div><div class="section-kicker">REPORTED FROM LISTENING TESTS / CANDIDATE STANDARD</div><h2>Listening-test reference <span class="ref-version">REF 01</span></h2><p>Protected benchmark for the lab, not a universal default or a verified measurement of current GitHub binaries.</p></div><div class="reference-actions"><span class="baseline-diff" id="baseline-diff">REFERENCE ACTIVE</span><button type="button" class="button-outline" id="load-reference">↶ RESTORE REFERENCE</button></div></div>
+          <div class="reference-grid">
+            <div><span>WINDOWS SOURCE</span><strong>MM-1</strong></div><div><span>PCM</span><strong>48 kHz · stereo · PCM16</strong></div><div><span>QUIC PACKET</span><strong>240 frames · 5 ms</strong></div><div><span>ANDROID REQUEST</span><strong>Shared · Low latency</strong></div><div><span>AAUDIO BUFFER POLICY</span><strong>Default = 0</strong><small>Reported size: 4,104 frames (85.5 ms capacity, <em>not</em> measured delay)</small></div><div><span>POST-CALLBACK RESERVE</span><strong>1,440 frames · 30 ms</strong></div><div><span>RESAMPLER</span><strong>128-tap streaming sinc</strong></div><div><span>DRIFT CONTROL</span><strong>±400 ppm · slew ≤100 ppm/s</strong></div><div><span>FADES</span><strong>On · 96 frames / 2 ms</strong></div><div><span>SHORT GAPS</span><strong>Conceal on · ≤480 frames / 10 ms</strong></div>
+          </div>
+          <div class="reference-foot"><span id="reference-compare">Reference configuration loaded.</span><span>Only explicitly reported values are certified as reference.</span></div>
+        </section>
+
+        <section class="preset-section" aria-labelledby="presets-label">
+          <div class="section-topline"><div><div class="section-kicker">01 / STARTING POINT</div><h2 id="presets-label">Choose a listening profile</h2></div><span class="section-detail">EXPERIMENTAL PRESETS · REFERENCE ABOVE</span></div>
+          <div class="preset-grid" id="presets">
+            <button class="preset" data-preset="ultra" type="button"><span class="preset-top"><span>01 / INTERACTIVE</span><span class="preset-arrow">↗</span></span><strong>GAME <i>ULTRA</i></strong><small>Latency first. Minimal headroom.</small><span class="preset-bottom"><span class="preset-bars p-ultra"><b></b><b></b><b></b><b></b></span><span>MAX SPEED</span></span></button>
+            <button class="preset" data-preset="safe" type="button"><span class="preset-top"><span>02 / INTERACTIVE</span><span class="preset-arrow">↗</span></span><strong>GAME <i>SAFE</i></strong><small>Fast, with room to breathe.</small><span class="preset-bottom"><span class="preset-bars p-safe"><b></b><b></b><b></b><b></b></span><span>LOW LATENCY</span></span></button>
+            <button class="preset" data-preset="balanced" type="button"><span class="preset-top"><span>03 / EVERYDAY</span><span class="preset-arrow">↗</span></span><strong>BALANCED</strong><small>Proposed everyday experiment.</small><span class="preset-bottom"><span class="preset-bars p-balanced"><b></b><b></b><b></b><b></b></span><span>ALL-ROUND</span></span></button>
+            <button class="preset" data-preset="quality" type="button"><span class="preset-top"><span>04 / FIDELITY</span><span class="preset-arrow">↗</span></span><strong>QUALITY</strong><small>More headroom for complex audio.</small><span class="preset-bottom"><span class="preset-bars p-quality"><b></b><b></b><b></b><b></b></span><span>STABLE SOUND</span></span></button>
+          </div>
+        </section>
+
+        <section class="performance-layout" aria-label="Interactive speed and quality plot">
+          <div class="panel tradeoff-panel">
+            <div class="panel-top"><div><div class="section-kicker">02 / RESPONSE SURFACE</div><h2>Speed / quality frontier</h2></div><span class="panel-badge"><span class="tiny-flash"></span> MODELED</span></div>
+            <p class="panel-subtitle">Horizontal position favors responsiveness; vertical position represents modeled playback resilience. Presets form a comparison field, not measured benchmarks.</p>
+            <div class="tradeoff-plot" id="tradeoff-plot">
+              <div class="plot-inner" id="plot-inner">
+                <div class="plot-quadrant q-tl">MORE HEADROOM</div>
+                <div class="plot-quadrant q-tr">IDEAL ZONE</div>
+                <div class="plot-quadrant q-bl">CONSERVATIVE</div>
+                <div class="plot-quadrant q-br">FRAGILE / FAST</div>
+                <div class="point preset-point" id="point-quality" data-name="QUALITY"><span></span><small>QUALITY</small></div>
+                <div class="point preset-point" id="point-balanced" data-name="BALANCED"><span></span><small>BALANCED</small></div>
+                <div class="point preset-point" id="point-safe" data-name="GAME SAFE"><span></span><small>GAME SAFE</small></div>
+                <div class="point preset-point" id="point-ultra" data-name="GAME ULTRA"><span></span><small>ULTRA</small></div>
+                <div class="point live-point" id="point-current" data-name="CURRENT"><span class="point-glow"></span><span class="point-core"></span><small>CURRENT</small></div>
+              </div>
+              <div class="plot-y-label">PLAYBACK RESILIENCE ↑</div>
+              <div class="plot-x-axis"><span>← QUALITY / HEADROOM</span><span>RESPONSIVENESS / SPEED →</span></div>
+            </div>
+            <div class="master-controls">
+              <div class="master-heading"><div><span class="section-kicker">MASTER BIAS</span><strong>Quality <span class="bidirectional">↔</span> Speed</strong></div><span class="master-value" id="master-readout">50<span>/ 100</span></span></div>
+              <input type="range" id="master-bias" min="0" max="100" value="50" step="1" aria-label="Master quality versus speed bias">
+              <div class="master-labels"><span>MORE BUFFERED</span><span>FASTER RESPONSE</span></div>
+              <p class="master-footnote">Master bias adjusts application buffering, hardware-burst target and concealment. Fine controls below always remain independently editable.</p>
+            </div>
+          </div>
+
+          <div class="readouts">
+            <div class="metric-card hero-metric"><div class="metric-title"><span>PROJECTED TOTAL DELAY</span><span class="metric-glyph">↘</span></div><div class="metric-number" id="metric-latency">--<small>ms</small></div><div class="metric-caption"><span class="colored-square"></span> Illustrative end-to-end model</div><div class="latency-range"><div class="range-thresholds"><span>QUICK</span><span>MODERATE</span><span>SLOW</span></div><div class="latency-bar"><i id="latency-marker"></i></div></div></div>
+            <div class="metrics-row"><div class="metric-card small-metric"><div class="metric-title">STABILITY <span>◎</span></div><div class="small-value" id="metric-stability">--<small>%</small></div><div class="microbar"><span id="stability-bar"></span></div><small class="metric-hint">Predicted continuity index</small></div><div class="metric-card small-metric"><div class="metric-title">FIDELITY <span>♧</span></div><div class="small-value" id="metric-fidelity">--<small>/ 100</small></div><div class="microbar"><span id="fidelity-bar"></span></div><small class="metric-hint">Resampler quality model</small></div></div>
+            <div class="metric-card telemetry-panel"><div class="metric-title"><span>STREAM TELEMETRY</span><span class="fake-live"><span class="status-bullet"></span> SIMULATED</span></div><div class="sparkline-container"><canvas id="telemetry-chart" aria-label="Simulated latency over time" role="img"></canvas></div><div class="telemetry-foot"><span><i class="legend-line"></i> MODELED LATENCY</span><span>LAST 60 S</span></div></div>
+          </div>
+        </section>
+
+        <section class="tuning-section" id="tuning">
+          <div class="section-topline with-actions"><div><div class="section-kicker">03 / ENGINE CONTROLS</div><h2>The tuning matrix <span class="h2-count">16 CONTROLS</span></h2><p class="section-description">Start from the test-reported reference. Experiment by changing one factor, then record audible results below. Chips indicate expected integration scope, not deployed runtime controls.</p></div><div class="legend-chips"><span class="mode-chip chip-dev">◉ DEV CONTROL</span><span class="mode-chip chip-live">◇ LIVE DESIGN</span><span class="mode-chip chip-restart">↻ RESTART</span><span class="mode-chip chip-future">⌘ FUTURE</span></div></div>
+          <div class="controls-grid" id="controls-grid"></div>
+        </section>
+
+        <section id="atlas" class="atlas-section" aria-label="DeskFuse configuration atlas">
+          <div class="atlas-hero">
+            <div>
+              <div class="section-kicker">CONFIGURATION PLATFORM / EXPANDABLE CONTROL REGISTRY</div>
+              <h2>Every route. <em>Your rules.</em></h2>
+              <p class="atlas-intro">A comprehensive, searchable laboratory for current and future DeskFuse media sessions: local Wi-Fi, cellular, video, two-way, reverse-direction and device-to-device. Group controls by the action needed before they take effect and by what they influence. Make your own draft profile without changing real hardware.</p>
+            </div>
+            <div class="atlas-stat"><strong id="atlas-total">—</strong><span>CONTROLS · <span id="atlas-group-total">—</span> SYSTEMS</span></div>
+          </div>
+          <div class="atlas-warning"><span>ⓘ</span><span><strong>PLANNING ONLY, unless explicitly staged in the physical panel.</strong> The change-boundary colors show the intended engineering lifecycle, not proof that a runtime control exists. Only four setting families are supported by the present native runner (Android buffer 0/2/3; sinc, fades and concealment on/off). The actual audio path and listening-test reference remain untouched.</span></div>
+          <div class="section-kicker">CHANGE BOUNDARY / CLICK A COLOR TO FILTER</div>
+          <div id="atlas-legend" class="atlas-legend" aria-label="Change application categories"></div>
+          <div class="atlas-toolbar">
+            <div class="section-kicker" style="margin-bottom:9px">SESSION TOPOLOGY / WHAT ARE YOU BUILDING?</div>
+            <div class="atlas-scenarios" id="atlas-scenarios"></div>
+            <div class="atlas-filters">
+              <label class="atlas-field">SEARCH CONTROLS<input type="search" id="atlas-search" placeholder="Search a setting, clock, codec, queue, route…" autocomplete="off"></label>
+              <label class="atlas-field">CHANGE REQUIRES<select id="atlas-phase"></select></label>
+              <label class="atlas-field">AFFECTS<select id="atlas-impact"></select></label>
+              <label class="atlas-field">IMPLEMENTATION<select id="atlas-status"></select></label>
+            </div>
+            <div class="atlas-toolbar-footer"><span id="atlas-visible">— OPTIONS VISIBLE</span><div class="atlas-actions"><button type="button" id="atlas-clear" class="atlas-btn">CLEAR FILTERS</button><button type="button" id="atlas-expand" class="atlas-btn">EXPAND ALL</button><button type="button" id="atlas-collapse" class="atlas-btn">COLLAPSE ALL</button></div></div>
+          </div>
+          <div class="atlas-planning-strip">
+            <div class="atlas-plan-stats"><strong id="atlas-changed">0</strong><span>PLANNED DEVIATIONS <small id="atlas-apply-cost">NO CHANGES STAGED</small><small id="atlas-plan-note">No changes staged.</small></span></div>
+            <div class="atlas-plan-actions"><button type="button" class="atlas-btn strong" id="atlas-export">↓ EXPORT PROFILE</button><button type="button" class="atlas-btn" id="atlas-import-trigger">↑ IMPORT PROFILE</button><button type="button" class="atlas-btn" id="atlas-reset">RESET DRAFT</button><input type="file" id="atlas-import" class="atlas-plan-import" accept=".json,application/json"></div>
+          </div>
+          <div class="section-kicker" style="margin:17px 0 9px">IMPACT LENS / SELECT A PROPERTY TO FILTER</div>
+          <div class="atlas-impact-strip" id="atlas-impact-strip"></div>
+          <div class="atlas-messages" id="atlas-messages" role="status" aria-live="polite"></div>
+          <div id="atlas-groups" aria-label="Detailed configuration options"></div>
+          <p class="live-caption">The catalog is an extensible <code>atlas-controls.json</code> registry. Values tagged PROPOSED are planning inputs; no latency, power or quality benefit is asserted without evidence. Hardware- and session-specific tuning should be measured on the actual route.</p>
+        </section>
+
+        <section id="experiment" class="experiment-section">
+          <div class="section-topline"><div><div class="section-kicker">TEST NOTEBOOK / PERSONAL LABORATORY</div><h2>Change one factor. Listen. Record.</h2><p class="section-description">Keep other settings at the listening-test reference when isolating a change. Record actual observations separately from simulated graphs. Test records can be saved locally and exported.</p></div><span class="section-detail">USER-REPORTED EVIDENCE</span></div>
+          <div class="experiment-layout">
+            <div class="panel experiment-form">
+              <div class="experiment-head"><span class="section-kicker">CONTROLLED EXPERIMENT</span><span class="factor-pill" id="factor-count">0 DIFFERENCES</span></div>
+              <label class="lab-field">FOCUS PARAMETER<select id="focus-factor" class="select-native"></select></label>
+              <div class="experiment-actions"><button class="button-outline" id="isolate-factor" type="button">ISOLATE THIS FACTOR</button><button class="button-secondary" id="revert-factor" type="button">RESTORE FOCUS TO REFERENCE</button></div>
+              <p class="factor-explanation" id="factor-explanation">The reference state is loaded.</p>
+              <form id="test-form">
+                <div class="form-row"><label class="lab-field">SESSION LABEL<input type="text" id="test-label" maxlength="100" placeholder="e.g. Skyrim · evening Wi-Fi"></label><label class="lab-field">DEVICE / ROUTE<input type="text" id="test-route" maxlength="90" value="Xiaomi phone speaker"></label></div>
+                <div class="form-row"><label class="lab-field">PERCEIVED DELAY<select id="test-delay"><option value="not-assessed">Not assessed</option><option value="imperceptible">Imperceptible</option><option value="slight">Slight</option><option value="noticeable">Noticeable</option><option value="severe">Severe</option></select></label><label class="lab-field">PLAYBACK CONTINUITY<select id="test-continuity"><option value="not-assessed">Not assessed</option><option value="clean">Clean</option><option value="occasional">Occasional clicks / gaps</option><option value="recurring">Recurring dropouts</option><option value="starved">Starvation / re-prime</option></select></label></div>
+                <div class="form-row"><label class="lab-field">LISTENING QUALITY<select id="test-quality"><option value="unrated">Unrated</option><option value="1">1 / Unusable</option><option value="2">2 / Poor</option><option value="3">3 / Fair</option><option value="4">4 / Good</option><option value="5">5 / Excellent</option></select></label><label class="lab-field">MEASURED DELAY (MS, OPTIONAL)<input type="number" id="test-measured" min="0" max="2000" step="0.1" placeholder="Only if physically measured"></label></div>
+                <label class="lab-field">WHAT YOU HEARD<textarea id="test-notes" maxlength="2500" rows="4" placeholder="Clicks, stuttering, starvation, priming, recovery time, game and PC load…"></textarea></label>
+                <button class="button-primary" type="submit">⊕ SAVE LISTENING TEST</button>
+              </form>
+            </div>
+            <div class="panel experiment-ledger"><div class="experiment-head"><div><span class="section-kicker">SAVED IN THIS BROWSER</span><h3>Listening sessions <span id="test-count">0</span></h3></div><button type="button" id="export-notebook" class="button-outline">↓ EXPORT LAB .JSON</button></div>
+              <p class="subtle">Records capture the exact settings and your subjective notes. No simulated estimate is presented as a measured outcome.</p>
+              <div id="test-records" class="test-records"><p class="empty-notebook">No tests yet. Change a parameter, then save your first observation.</p></div>
+              <div class="notebook-tools"><label class="import-label button-secondary" for="import-notebook">↑ IMPORT LAB .JSON</label><input id="import-notebook" type="file" accept=".json,application/json" hidden><button type="button" class="button-secondary" id="clear-notebook">CLEAR LOCAL RECORDS</button></div>
+              <p class="storage-note" id="storage-note">Saved locally when browser storage is available. Export JSON as your portable backup. No network calls.</p>
+            </div>
+          </div>
+        </section>
+
+        <section id="signal" class="signal-section">
+          <div class="section-topline"><div><div class="section-kicker">04 / SYSTEM TIMELINE</div><h2>Where the milliseconds go</h2></div><span class="section-detail">MODEL, NOT DEVICE MEASUREMENT</span></div>
+          <div class="panel signal-panel"><div class="signal-header"><div><strong>WINDOWS → PHONE</strong><span>Illustrative latency allocation</span></div><div class="signal-total" id="signal-total">-- ms <small>TOTAL</small></div></div><div class="signal-pipeline" id="signal-pipeline"></div><div class="signal-stack" id="signal-stack"></div><div class="signal-hint">The 200 ms WASAPI engine buffer is a capacity setting, <strong>not</strong> an automatic 200 ms delay. Similarly, an 80 ms receiver ring is capacity, not necessarily 80 ms of queued audio.</div></div>
+        </section>
+
+        <section id="advanced" class="advanced-section">
+          <div class="section-topline"><div><div class="section-kicker">05 / ENGINE ROOM</div><h2>Advanced &amp; experimental</h2><p class="section-description">All additional options are exposed, but conceptual controls are never represented as deployed features. Expand a subsystem to inspect it.</p></div><span class="section-detail">READ-ONLY / EXPERIMENTAL</span></div>
+          <div class="advanced-groups" id="advanced-groups"></div>
+        </section>
+
+        <section id="compare" class="compare-section">
+          <div class="section-topline"><div><div class="section-kicker">06 / TRADE-OFF RECORDING</div><h2>Pin two experiments</h2><p class="section-description">Capture A and B configurations inside this browser tab and compare projected results. Nothing is sent anywhere.</p></div><button class="button-outline" id="export-button" type="button">↓ EXPORT SETTINGS .JSON</button></div>
+          <div class="comparison-layout"><div class="compare-slot" id="snapshot-a"><div class="snapshot-top">SNAPSHOT A <span>EMPTY</span></div><p>No configuration pinned</p><button class="button-secondary" data-snapshot="a" type="button">⊕ PIN CURRENT AS A</button></div><div class="compare-center" aria-hidden="true">VS</div><div class="compare-slot" id="snapshot-b"><div class="snapshot-top">SNAPSHOT B <span>EMPTY</span></div><p>No configuration pinned</p><button class="button-secondary" data-snapshot="b" type="button">⊕ PIN CURRENT AS B</button></div></div><div class="comparison-result" id="comparison-result">Pin two configurations to compare their modeled delay, stability and fidelity.</div>
+        </section>
+
+        <footer><span>DESKFUSE / AUDIO LAB</span><span>STANDALONE USER LAB · OPTIONAL PHYSICAL BRIDGE · MODELED CHARTS</span><span>TEST WORKSPACE V0.5</span></footer>
+      </div>
+    </main>
+  </div>
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+</body>
+</html>

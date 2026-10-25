@@ -5,8 +5,13 @@ param(
     [Parameter(Mandatory=$true,ParameterSetName='Endpoint')][string]$EndpointId,
     [Parameter(Mandatory=$true,ParameterSetName='DeskFuse')]
     [ValidatePattern('^[0-9a-fA-F]{32}$')][string]$DeskFusePeerId,
-    [Parameter(Mandatory=$true)][string]$AndroidExecutable,
-    [Parameter(Mandatory=$true)][string]$AndroidNativeSo,
+    [Parameter(Mandatory=$true,ParameterSetName='Product')][string]$ProductConfig,
+    [Parameter(ParameterSetName='Product')][string]$PythonExecutable = 'python',
+    [Parameter(ParameterSetName='Product')][ValidateSet('loopback','committed')][string]$WindowsSourceBackend = 'committed',
+    [Parameter(Mandatory=$true,ParameterSetName='Endpoint')]
+    [Parameter(Mandatory=$true,ParameterSetName='DeskFuse')][string]$AndroidExecutable,
+    [Parameter(Mandatory=$true,ParameterSetName='Endpoint')]
+    [Parameter(Mandatory=$true,ParameterSetName='DeskFuse')][string]$AndroidNativeSo,
     [ValidatePattern('^f[01]c[01]r[01]$')][string]$Modes = 'f1c1r1',
     [switch]$Strict,
     [switch]$VerifyOnly,
@@ -30,6 +35,13 @@ param(
     [switch]$MeasureCallbacks
 )
 $ErrorActionPreference = 'Stop'
+if ($PSCmdlet.ParameterSetName -eq 'Product') {
+    if ($Strict -or $VerifyOnly -or $Modes -ne 'f1c1r1' -or $AndroidBufferBursts -ne 0 -or $AndroidSharingPolicy -ne 0 -or $AndroidUsagePolicy -ne 0 -or $NativeReserveFrames -ne 1440 -or $MeasureCallbacks) {
+        throw 'Product source comparison uses unchanged Android reference settings only'
+    }
+    & $PythonExecutable (Join-Path $PSScriptRoot '../../tools/audio-lab/product_runner.py') --config $ProductConfig --backend $WindowsSourceBackend --engine-period $WindowsEnginePeriod --capture-policy $WindowsCapturePolicy --seconds $Seconds --profile $Profile
+    exit $LASTEXITCODE
+}
 $dedicatedSource = $PSCmdlet.ParameterSetName -eq 'DeskFuse'
 if ($Strict -and $Modes -ne 'f0c0r0') { throw 'Strict PCM verification requires f0c0r0 (no DSP or fade)' }
 if ($AndroidBufferBursts -ne 0 -and ($Strict -or $VerifyOnly)) { throw 'Buffer experiment requires adaptive speaker playback' }

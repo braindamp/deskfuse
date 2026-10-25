@@ -88,6 +88,7 @@ internal sealed class ConsoleApproval : IApprovalPolicy, IEnrollmentApprovalPoli
         _autoApprove = autoApprove;
         _log = log;
     }
+    internal bool WasApproved(string deviceId) => Load(_path).Contains(deviceId) && Load(_fullFilesPath).Contains(deviceId);
     public void ForgetDevice(string deviceId)
     {
         foreach (var path in new[] { _path, _fullFilesPath })

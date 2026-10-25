@@ -2,11 +2,12 @@
 # No ADB deployment, credentials, driver installs or existing APK changes.
 [CmdletBinding()]
 param(
-    [string]$LabRoot = 'D:\Coding\DeskFuse\vnext-wp001',
+    [string]$LabRoot = (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent),
     [string]$AndroidSdk = 'D:\Android\Sdk',
     [string]$AndroidNdk = 'D:\Android\Sdk\ndk\30.0.16248370',
-    [string]$ExpectedBranch = 'feature/vnext-wp001-native-lab',
-    [ValidateSet('release','debug')][string]$RustProfile = 'release'
+    [string]$ExpectedBranch = 'experiment/vnext-audio-latency',
+    [ValidateSet('release','debug')][string]$RustProfile = 'release',
+    [switch]$IncludeProduct
 )
 $ErrorActionPreference = 'Stop'
 if (-not (Test-Path -LiteralPath $LabRoot -PathType Container)) {
@@ -107,11 +108,32 @@ for ($i = 0; $i -lt $files.Count; ++$i) {
     $role = @('windows_rust','android_rust','android_native','windows_capture')[$i]
     $receiptArtifacts += [pscustomobject]@{role=$role; path=(Resolve-Path -LiteralPath $file).Path; sha256=$hash; profile=$profile}
 }
+$sourceControl = Join-Path $wasapiBuild 'deskfuse-source-control.dll'
+if (-not (Test-Path -LiteralPath $sourceControl -PathType Leaf)) { throw 'Native source-control DLL missing' }
+$receiptArtifacts += [pscustomobject]@{role='windows_source_control';path=$sourceControl;sha256=(Get-FileHash -LiteralPath $sourceControl -Algorithm SHA256).Hash.ToLowerInvariant();profile='release'}
+$productBundle = @()
+if ($IncludeProduct) {
+    if ($RustProfile -ne 'release') { throw 'Product comparisons require optimized native transport' }
+    $productDir = Join-Path $wasapiBuild 'product-agent'
+    & dotnet publish (Join-Path $LabRoot 'windows/agent/FocusWindow.Agent/FocusWindow.Agent.csproj') -c Release -p:Platform=x64 -r win-x64 --self-contained false -o $productDir
+    if ($LASTEXITCODE -ne 0) { throw 'Product audio host Release publish failed' }
+    & (Join-Path $LabRoot 'android/gradlew.bat') -p (Join-Path $LabRoot 'android') :app:assembleDebug --no-daemon --console=plain
+    if ($LASTEXITCODE -ne 0) { throw 'Product receiver APK build failed' }
+    $productAgent=Join-Path $productDir 'FocusWindow.Agent.exe'
+    $productApk=Join-Path $LabRoot 'android/app/build/outputs/apk/debug/app-debug.apk'
+    foreach ($pair in @(@('product_agent',$productAgent,'release'),@('product_android_apk',$productApk,'debug'))) {
+        $receiptArtifacts += [pscustomobject]@{role=$pair[0];path=$pair[1];sha256=(Get-FileHash -LiteralPath $pair[1] -Algorithm SHA256).Hash.ToLowerInvariant();profile=$pair[2]}
+    }
+    foreach ($file in Get-ChildItem -LiteralPath $productDir -File -Recurse) {
+        $relative=$file.FullName.Substring($productDir.Length).TrimStart('\','/') -replace '\\','/'
+        $productBundle += [pscustomobject]@{path=$relative;sha256=(Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()}
+    }
+}
 $receiptPath = Join-Path $wasapiBuild 'audio-pair-build.json'
 [pscustomobject]@{
     schema=1; source_commit=$sha; built_utc=(Get-Date).ToUniversalTime().ToString('o')
-    capabilities=@{android_audio_abi=8; windows_capture_policies=@('reference','minimum'); windows_engine_period_policies=@('reference','minimum'); windows_endpoint_lease=$true; native_reserve_frames=@(1440,1200,960,720,480); callback_measurement=$true}
-    cargo_target_directory=$cargoTarget; artifacts=$receiptArtifacts
-} | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $receiptPath -Encoding UTF8
+    capabilities=@{product_audio_lab=$(if ($IncludeProduct) {1} else {0}); product_android_package='com.focuswindow.client.debug'; product_renderer_profile='debug (Gradle APK)'; committed_pcm_abi=2; driver_timing_build='2026102502'; running_driver_verification='native-exact-endpoint'; android_audio_abi=8; windows_capture_policies=@('reference','minimum'); windows_engine_period_policies=@('reference','minimum'); windows_endpoint_lease=$true; native_reserve_frames=@(1440,1200,960,720,480); callback_measurement=$true}
+    git_worktree_clean=($dirty.Count -eq 0); product_agent_bundle=$productBundle; cargo_target_directory=$cargoTarget; artifacts=$receiptArtifacts
+} | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $receiptPath -Encoding UTF8
 Write-Host ('Hash-bound local build receipt: ' + $receiptPath)
 Write-Host 'Built locally. No device or driver was changed.'

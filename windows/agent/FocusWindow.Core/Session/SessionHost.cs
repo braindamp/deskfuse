@@ -101,6 +101,12 @@ public sealed class SessionHost : IDisposable
                 var connection = acceptedConnection;
                 var hello = acceptedHello;
 
+                if (_options.AudioLabOnly && !AudioLabAdmission.Allows(hello, connection.AuthenticatedDeviceId,
+                    accessoryTasks.Any(task => !task.IsCompleted)))
+                {
+                    await connection.DisposeAsync().ConfigureAwait(false);
+                    continue;
+                }
                 if (acceptedHello.Role is "media" or "accessory")
                 {
                     // Accessory identities MUST be backed by per-device

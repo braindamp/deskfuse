@@ -18,6 +18,8 @@ public sealed record HostOptions
     // --auto-approve must never imply full filesystem access.
     public bool AllowFullUserFiles { get; init; } = true;
     public bool SingleSession { get; init; }
+    // Lab host accepts only one authenticated, speaker-only accessory.
+    public bool AudioLabOnly { get; init; }
     public bool CameraFreePairing { get; init; }
     /// <summary>Opt-in per-phone exact-DPR virtual backing display calibration.
     /// Remains experimental until real-device viewport/window UX is qualified.</summary>

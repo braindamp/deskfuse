@@ -1,0 +1,17 @@
+{
+  "repo_root": "C:\\Path\\To\\deskfuse",
+  "expected_branch": "experiment/vnext-audio-latency",
+  "windows_sender": "C:\\Path\\To\\deskfuse\\vnext\\m2a\\quiche-lab\\target\\release\\continuous-quic-lab.exe",
+  "android_receiver": "C:\\Path\\To\\deskfuse\\vnext\\m2a\\quiche-lab\\target\\aarch64-linux-android\\release\\continuous-quic-lab",
+  "android_renderer": "C:\\Path\\To\\deskfuse\\vnext\\m2b\\android-native\\build-android\\libdeskfuse_android_audio.so",
+  "evidence_root": "C:\\Path\\To\\deskfuse-audio-evidence",
+  "keys_dir": "C:\\Path\\To\\DeskFuseLocalKeys",
+  "adb_path": "C:\\Path\\To\\Android\\platform-tools\\adb.exe",
+  "endpoint_id": "REPLACE_WITH_EXACT_MM1_WASAPI_ENDPOINT_ID",
+  "build_receipt": "",
+  "windows_capture": "",
+  "windows_source_control": "",
+  "product_agent": "",
+  "product_android_apk": "",
+  "product_android_package": "com.focuswindow.client.debug"
+}

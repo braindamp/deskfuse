@@ -10,19 +10,27 @@ internal sealed class NativeAudioProcess : INativeAudioProcess
 {
     private readonly Process _process;
     private readonly string _directory;
+    private Action<string>? _diagnostic;
+    private Action? _mediaReady;
     private Task? _output;
     private Task? _errors;
     public int Port { get; private set; }
-    public Task Completion => _process.WaitForExitAsync();
+    private Task _completion=Task.CompletedTask;
+    public Task Completion => _completion;
+    private async Task WaitForCompletionAsync() {
+        await _process.WaitForExitAsync().ConfigureAwait(false);
+        if (_process.ExitCode!=0) throw new IOException("Native audio owner exited with code "+_process.ExitCode);
+    }
     private readonly TaskCompletionSource<string> _endpointReady=new(TaskCreationOptions.RunContinuationsAsynchronously);
     public Task<string> EndpointReady=>_endpointReady.Task;
     public async Task EnableMediaAsync(CancellationToken ct) {
         await _process.StandardInput.WriteLineAsync("{\"command\":\"media-ready\"}".AsMemory(),ct).ConfigureAwait(false);
         await _process.StandardInput.FlushAsync(ct).ConfigureAwait(false);
+        _mediaReady?.Invoke();
     }
     private NativeAudioProcess(Process process, string directory) { _process=process; _directory=directory; }
     public static async Task<INativeAudioProcess> StartAsync(string executable, string capture,string sourceDll,string backend,string period,
-        NativeAudioLaunch launch, CancellationToken ct)
+        NativeAudioLaunch launch, CancellationToken ct, Action<string>? diagnostic = null, Action? mediaReady = null)
     {
         if (!Path.IsPathFullyQualified(executable) || !Path.IsPathFullyQualified(capture))
             throw new ArgumentException("Native executables require explicit absolute paths.");
@@ -42,7 +50,7 @@ internal sealed class NativeAudioProcess : INativeAudioProcess
             UseShellExecute=false, CreateNoWindow=true, RedirectStandardInput=true,
             RedirectStandardOutput=true, RedirectStandardError=true } };
         process.StartInfo.ArgumentList.Add("session-stdin");
-        var owner = new NativeAudioProcess(process,directory);
+        var owner = new NativeAudioProcess(process,directory) { _diagnostic=diagnostic, _mediaReady=mediaReady };
         try
         {
             var ca=Path.Combine(directory,"ca.pem"); var cert=Path.Combine(directory,"server.pem");
@@ -59,7 +67,7 @@ internal sealed class NativeAudioProcess : INativeAudioProcess
                 ca, cert, key, peerDer=peer, capture, peerId=launch.PeerId,
                 seconds=1800, backend, sourceDll, enginePeriod=period })).ConfigureAwait(false);
             await process.StandardInput.FlushAsync(ct).ConfigureAwait(false);
-            owner._errors=DrainAsync(process.StandardError); // no output on real-time paths
+            owner._errors=owner.DrainAsync(process.StandardError); // no output on real-time paths
             using var timeout=CancellationTokenSource.CreateLinkedTokenSource(ct);
             timeout.CancelAfter(TimeSpan.FromSeconds(10));
             while (true)
@@ -71,6 +79,7 @@ internal sealed class NativeAudioProcess : INativeAudioProcess
                     throw new IOException("Invalid native listener identity.");
                 owner.Port=port; break;
             }
+            owner._completion=owner.WaitForCompletionAsync();
             owner._output=owner.ReadOutputAsync(process.StandardOutput,launch.PeerId);
             return owner;
         }
@@ -80,18 +89,34 @@ internal sealed class NativeAudioProcess : INativeAudioProcess
     {
         try {
             while (await reader.ReadLineAsync().ConfigureAwait(false) is string line) {
-                if (!line.StartsWith("NATIVE_SOURCE ",StringComparison.Ordinal)) continue;
+                if (!line.StartsWith("NATIVE_SOURCE ",StringComparison.Ordinal)) {Report(line);continue;}
                 using var value=JsonDocument.Parse(line[14..]);
                 var endpoint=value.RootElement.GetProperty("endpoint").GetString();
                 if (!string.Equals(value.RootElement.GetProperty("peer").GetString(),peer,StringComparison.OrdinalIgnoreCase) || string.IsNullOrWhiteSpace(endpoint) || endpoint.Length>4096)
                     throw new IOException("Native source identity differs from the authorized lease.");
+                Report(line);
                 _endpointReady.TrySetResult(endpoint);
             }
             _endpointReady.TrySetException(new IOException("Native source retired before endpoint readiness."));
         } catch (Exception error) {_endpointReady.TrySetException(error);throw;}
     }
-    private static async Task DrainAsync(StreamReader reader)
-    { while (await reader.ReadLineAsync().ConfigureAwait(false) is not null) { } }
+    // Only native observations, never session configuration/certificates, leave this owner.
+    private void Report(string line)
+    {
+        if (line.StartsWith("NATIVE_SOURCE ",StringComparison.Ordinal)) {
+            using var value=JsonDocument.Parse(line[14..]);
+            _diagnostic?.Invoke("LAB_ENDPOINT "+JsonSerializer.Serialize(new { endpoint=value.RootElement.GetProperty("endpoint").GetString() }));
+        } else if (line.StartsWith("WASAPI_CONFIG ",StringComparison.Ordinal) ||
+                   line.StartsWith("NATIVE_PCM ",StringComparison.Ordinal) ||
+                   line.StartsWith("DIRECT_BLOCKED ",StringComparison.Ordinal) ||
+                   line.StartsWith("DIRECT_TOTALS ",StringComparison.Ordinal) ||
+                   line.StartsWith("DIRECT_CONFIG ",StringComparison.Ordinal) ||
+                   line.StartsWith("DIRECT_GEOMETRY ",StringComparison.Ordinal) ||
+                   line.StartsWith("DONE Windows WASAPI ",StringComparison.Ordinal) ||
+                   line.StartsWith("DONE committed source ",StringComparison.Ordinal)) _diagnostic?.Invoke(line);
+    }
+    private async Task DrainAsync(StreamReader reader)
+    { while (await reader.ReadLineAsync().ConfigureAwait(false) is string line) Report(line); }
     public async ValueTask DisposeAsync()
     {
         try
@@ -111,6 +136,7 @@ internal sealed class NativeAudioProcess : INativeAudioProcess
         finally
         {
             try {
+                try {await _completion.ConfigureAwait(false);} catch (IOException) { /* reported through Completion */ }
                 if (_output is not null) await _output.ConfigureAwait(false);
                 if (_errors is not null) await _errors.ConfigureAwait(false);
             } finally {

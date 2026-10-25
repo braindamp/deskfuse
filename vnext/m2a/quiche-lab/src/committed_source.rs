@@ -38,7 +38,7 @@ unsafe impl Send for NativeControl {} // opaque event/thread owner; no COM servi
 pub struct Source {
     file:std::fs::File,section:HANDLE,pub event:HANDLE,map:*const Mapping,native:NativeControl,
     lease:Option<EndpointLease>,generation:u64,ticket:u64,offset:usize,slot:Option<SlotHeader>,
-    have:usize,next_frame:Option<u64>,first:u64,oldest:u64,min_commit:u64,pcm:[u8;960],
+    geometry_reported:bool,have:usize,next_frame:Option<u64>,first:u64,oldest:u64,min_commit:u64,pcm:[u8;960],
 }
 unsafe impl Send for Source {} // transferred once from setup; used by ONE owner thereafter
 fn invalid(s:&str)->io::Error {io::Error::new(io::ErrorKind::InvalidData,s)}
@@ -53,13 +53,16 @@ impl Source {
             let open=GetProcAddress(module,b"deskfuse_source_open\0".as_ptr());
             let service=GetProcAddress(module,b"deskfuse_source_service\0".as_ptr());
             let close=GetProcAddress(module,b"deskfuse_source_close\0".as_ptr());
-            if open.is_none() || service.is_none() || close.is_none(){FreeLibrary(module);return Err(invalid("source DLL ABI unavailable"))}
+            let period=GetProcAddress(module,b"deskfuse_source_period_frames\0".as_ptr());
+            if open.is_none() || service.is_none() || close.is_none() || period.is_none(){FreeLibrary(module);return Err(invalid("source DLL ABI unavailable"))}
             let open:unsafe extern "C" fn(*const u16,u32,*mut Timing,*mut HANDLE)->*mut c_void=std::mem::transmute(open);
             let endpoint:Vec<u16>=lease.endpoint_id.encode_utf16().chain(Some(0)).collect();
             let mut timing=Timing::default();let mut event=std::ptr::null_mut();
             let object=open(endpoint.as_ptr(),minimum as u32,&mut timing,&mut event);
             if object.is_null(){FreeLibrary(module);return Err(invalid("running endpoint/period/export contract refused"))}
             let native=NativeControl{module,object,event,service:std::mem::transmute(service),close:std::mem::transmute(close)};
+            let period:unsafe extern "C" fn(*mut c_void)->u32=std::mem::transmute(period);
+            if !(1..=240).contains(&period(object)){return Err(invalid("actual direct engine period not qualified"))}
             if timing.size as usize!=std::mem::size_of::<Timing>() || timing.abi!=1 || timing.build!=0x2026102502 ||
                 timing.flags&3!=3 || timing.export_abi!=ABI || timing.source==[0;16] {return Err(invalid("driver timing/source ABI mismatch"))}
             let handles=lease.grant_pcm(&guid_text(timing.source))?;
@@ -68,7 +71,7 @@ impl Source {
             let view=MapViewOfFile(section,FILE_MAP_READ,0,0,std::mem::size_of::<Mapping>());
             if view.Value.is_null(){CloseHandle(section);CloseHandle(source_event);return Err(io::Error::last_os_error())}
             let source=Self{file,section,event:source_event,map:view.Value.cast(),native,lease:Some(lease),generation:handles[3],
-                ticket:0,offset:0,slot:None,have:0,next_frame:None,first:0,oldest:0,min_commit:0,pcm:[0;960]};
+                ticket:0,offset:0,slot:None,geometry_reported:false,have:0,next_frame:None,first:0,oldest:0,min_commit:0,pcm:[0;960]};
             let control=source.snapshot()?;
             if control.source!=timing.source{return Err(invalid("mapped source differs from exact endpoint"))}
             crate::session_control::source_ready(peer,&source.lease.as_ref().unwrap().endpoint_id)?;
@@ -105,6 +108,10 @@ impl Source {
     pub fn next_block(&mut self)->io::Result<Option<Block>> {
         let c=self.snapshot()?;
         if c.state!=1 || !c.geometry.validate()? {self.acknowledge(&c)?;return Ok(None)}
+        if !self.geometry_reported {
+            eprintln!("DIRECT_GEOMETRY geometry_qualified=1 packet_frames={} notifications={} sample_rate={} channels={} bits={}",c.geometry.packet,c.geometry.notifications,c.geometry.rate,c.geometry.channels,c.geometry.bits);
+            self.geometry_reported=true;
+        }
         if !c.correlation_qpc.gt(&0){return Err(invalid("RUN without source-clock correlation"))}
         for _ in 0..8 {
             if self.slot.is_none() {

@@ -95,7 +95,7 @@ pub fn run(bind:SocketAddr,allow_ip:IpAddr,ca:&str,cert:&str,key:&str,seconds:u6
                         let wire=captured_packet(sequence as u32,block.first_frame,&block.pcm);sequence+=1;
                         source_egress(&mut egress,&udp,c,false,&mut pending,true)?;
                         match pending.admit_committed(c,&wire,block.timing,source_age::local_qpc_100ns()?)? {
-                            QueueAdmission::Queued=>sent+=1,QueueAdmission::Expired=>expired+=1,QueueAdmission::Full=>dropped+=1,
+                            QueueAdmission::Queued=>{sent+=1;deskfuse_quiche_lab::session_control::pcm_admitted(sent);},QueueAdmission::Expired=>expired+=1,QueueAdmission::Full=>dropped+=1,
                         }
                         source_egress(&mut egress,&udp,c,false,&mut pending,true)?;
                     }
@@ -118,7 +118,12 @@ pub fn run(bind:SocketAddr,allow_ip:IpAddr,ca:&str,cert:&str,key:&str,seconds:u6
     // Acquire any completed setup before cleanup; no setup-owned acquisition
     // may outlive transport termination and endpoint release.
     if let Some(preparing)=setup.take(){if let Some(Ok(ready))=preparing.finish(){source=Some(ready);}}
-    if let Some(ref mut current)=source{current.stop();}
+    if let Some(ref mut current)=source{
+        // Final snapshot on the quiescent owner, before revoking its view.
+        if let Ok(c)=current.snapshot(){eprintln!("DIRECT_TOTALS accepted_commit={} accepted_end_frame={} driver_dropped_frames={} source_generation={} published={} acknowledged={}",
+            c.accepted_commit,c.accepted_end_frame,c.dropped_frames,c.generation,c.published,c.acknowledged);}
+        current.stop();
+    }
     pending.clear();drop(egress);drop(connection); // transport retires before endpoint lease
     drop(source);
     eprintln!("DONE committed source queued={sent} expired={expired} dropped={dropped}");

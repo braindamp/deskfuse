@@ -56,6 +56,10 @@ pub fn source_ready(peer:&str,endpoint:&str)->io::Result<()> {
     }
     Ok(())
 }
+pub fn pcm_admitted(count:u64) {
+    // One lifecycle observation, after real freshness-checked QUIC admission.
+    if active() && count==1 {println!("NATIVE_PCM queued=1");}
+}
 pub fn stop() {
     STOP.store(true,Ordering::Release);wake();
 }

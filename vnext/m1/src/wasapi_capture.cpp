@@ -652,7 +652,8 @@ void capture(IMMDeviceEnumerator& enumerator, const std::wstring& device_id,
     std::cerr << " engine_period_policy=" << (lower_period_requested ? "minimum" : "reference")
               << " companion_period_frames=" << companion.selected();
     if (lower_period_requested)
-        std::cerr << " period_already_active=" << (before_periods.current == companion.selected());
+        std::cerr << " driver_verified=1 driver_build=" << DESKFUSE_TIMING_BUILD << " timing_abi=" << DESKFUSE_TIMING_ABI
+                  << " period_verified=1 period_already_active=" << (before_periods.current == companion.selected());
     if (SUCCEEDED(before_periods.current_result))
         std::cerr << " before_period_frames=" << before_periods.current;
     if (SUCCEEDED(periods.legal_result))
