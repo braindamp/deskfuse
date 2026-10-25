@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <new>
 #include <time.h>
@@ -50,6 +51,7 @@ struct IdentityStats {
 std::atomic<uint64_t> next_output_generation{1};
 class Renderer {
 public:
+    explicit Renderer(uint32_t reserve) noexcept : core(reserve) {}
     AAudioStream* stream = nullptr;
     uint64_t output_generation = 0; // immutable for this stream lifetime
     df_audio::RenderCore core;
@@ -57,15 +59,32 @@ public:
     std::atomic<int32_t> stream_error{AAUDIO_OK};
     // v1/v2/v3 records remain ABI-stable; v4 is the coherent record.
     std::atomic<uint64_t> callbacks{0};
+    bool measure_callbacks = false; // immutable after lifecycle setup
+    std::array<std::atomic<uint64_t>,6> size_buckets{};
+    std::atomic<uint64_t> measured_calls{0}, total_wall_ns{0}, maximum_wall_ns{0}, clock_failures{0};
 
     static aaudio_data_callback_result_t callback(
         AAudioStream*, void* arg, void* audio, int32_t frames) noexcept {
         auto* r = static_cast<Renderer*>(arg);
         if (frames <= 0) return AAUDIO_CALLBACK_RESULT_CONTINUE;
+        timespec before{},after{};
+        const bool before_ok = r->measure_callbacks && clock_gettime(CLOCK_MONOTONIC,&before)==0;
         const uint32_t options = r->modes.load(std::memory_order_acquire);
         r->core.render(static_cast<int16_t*>(audio),
             static_cast<uint32_t>(frames),
             {(options & 1u) != 0, (options & 2u) != 0});
+        if (r->measure_callbacks) {
+            const bool after_ok=clock_gettime(CLOCK_MONOTONIC,&after)==0;
+            const int64_t elapsed=(int64_t(after.tv_sec)-before.tv_sec)*1000000000+after.tv_nsec-before.tv_nsec;
+            if (before_ok && after_ok && elapsed>=0) {
+                r->measured_calls.fetch_add(1,std::memory_order_relaxed);
+                r->total_wall_ns.fetch_add(uint64_t(elapsed),std::memory_order_relaxed);
+                const auto old=r->maximum_wall_ns.load(std::memory_order_relaxed);
+                if(uint64_t(elapsed)>old)r->maximum_wall_ns.store(uint64_t(elapsed),std::memory_order_relaxed);
+            } else r->clock_failures.fetch_add(1,std::memory_order_relaxed);
+        }
+        const size_t bucket=frames<=96?0:frames<=240?1:frames<=480?2:frames<=960?3:frames<=1920?4:5;
+        r->size_buckets[bucket].fetch_add(1,std::memory_order_relaxed);
         // These mirrors serve old ABI callers only; coherent consumers use
         // df_audio_snapshot_v4() and the bounded off-callback queue.
         // Gather the callback's exact counters by its own nonblocking mailbox
@@ -104,13 +123,16 @@ public:
 #else
 #define DF_EXPORT extern "C"
 #endif
-DF_EXPORT uint32_t df_audio_abi_version() noexcept { return 7; }
+DF_EXPORT uint32_t df_audio_abi_version() noexcept { return 8; }
 
-static int32_t open_audio(void** out, uint32_t buffer_bursts) noexcept {
+static int32_t open_audio(void** out, const df_audio::OutputConfigV8& config) noexcept {
     if (!out) return -1;
     *out = nullptr;
-    std::unique_ptr<Renderer> r(new (std::nothrow) Renderer{});
+    std::unique_ptr<Renderer> r(new (std::nothrow) Renderer(config.reserve_frames));
     if (!r) return -2;
+    const char* measure=std::getenv("DESKFUSE_AUDIO_MEASURE_CALLBACK");
+    if(measure && std::strcmp(measure,"0") && std::strcmp(measure,"1"))return -6;
+    r->measure_callbacks=measure && !std::strcmp(measure,"1");
     AAudioStreamBuilder* builder = nullptr;
     const auto created = AAudio_createStreamBuilder(&builder);
     if (created != AAUDIO_OK) return created;
@@ -118,7 +140,9 @@ static int32_t open_audio(void** out, uint32_t buffer_bursts) noexcept {
     AAudioStreamBuilder_setSampleRate(builder, 48000);
     AAudioStreamBuilder_setChannelCount(builder, 2);
     AAudioStreamBuilder_setFormat(builder, AAUDIO_FORMAT_PCM_I16);
-    AAudioStreamBuilder_setSharingMode(builder, AAUDIO_SHARING_MODE_SHARED);
+    AAudioStreamBuilder_setSharingMode(builder, config.sharing_policy == 1 ?
+        AAUDIO_SHARING_MODE_EXCLUSIVE : AAUDIO_SHARING_MODE_SHARED);
+    if (config.usage_policy == 1) AAudioStreamBuilder_setUsage(builder, AAUDIO_USAGE_GAME);
     AAudioStreamBuilder_setPerformanceMode(builder, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
     AAudioStreamBuilder_setDataCallback(builder, &Renderer::callback, r.get());
     AAudioStreamBuilder_setErrorCallback(builder, &Renderer::error, r.get());
@@ -132,14 +156,14 @@ static int32_t open_audio(void** out, uint32_t buffer_bursts) noexcept {
         return -5;
     }
     const int32_t requested = df_audio::requested_buffer_frames(
-        buffer_bursts, AAudioStream_getFramesPerBurst(r->stream));
+        config.buffer_bursts, AAudioStream_getFramesPerBurst(r->stream));
     if (requested < 0) { AAudioStream_close(r->stream); return -6; }
     const int32_t set_result = requested == 0 ?
         AAudioStream_getBufferSizeInFrames(r->stream) :
         AAudioStream_setBufferSizeInFrames(r->stream, requested);
     if (set_result < 0) {
         std::fprintf(stderr, "AUDIO_BUFFER request_bursts=%u requested_frames=%d setter_error=%d\n",
-            buffer_bursts, requested, set_result);
+            config.buffer_bursts, requested, set_result);
         AAudioStream_close(r->stream);
         return set_result;
     }
@@ -151,7 +175,18 @@ static int32_t open_audio(void** out, uint32_t buffer_bursts) noexcept {
         AAudioStream_getFormat(r->stream),AAudioStream_getSharingMode(r->stream),
         AAudioStream_getPerformanceMode(r->stream),AAudioStream_getFramesPerBurst(r->stream),
         AAudioStream_getBufferSizeInFrames(r->stream),AAudioStream_getBufferCapacityInFrames(r->stream),
-        AAudioStream_getXRunCount(r->stream), buffer_bursts, requested, set_result);
+        AAudioStream_getXRunCount(r->stream), config.buffer_bursts, requested, set_result);
+    std::fprintf(stderr,
+        "AUDIO_CONFIG sharing_request=%u usage_policy=%u actual_usage=%d reserve_frames=%u "
+        "configured_callback_frames=%d device=%d\n", config.sharing_policy, config.usage_policy,
+        AAudioStream_getUsage(r->stream), config.reserve_frames,
+        AAudioStream_getFramesPerDataCallback(r->stream), AAudioStream_getDeviceId(r->stream));
+    const int32_t known_demand = AAudioStream_getFramesPerDataCallback(r->stream);
+    if (known_demand > 0 && uint64_t(known_demand) + config.reserve_frames +
+        df_audio::StreamingSinc::past > df_audio::RenderCore::capacity) {
+        AAudioStream_close(r->stream);
+        return -7;
+    }
     const auto started = AAudioStream_requestStart(r->stream);
     if (started != AAUDIO_OK) {
         AAudioStream_close(r->stream);
@@ -161,13 +196,36 @@ static int32_t open_audio(void** out, uint32_t buffer_bursts) noexcept {
     *out = r.release();
     return 0;
 }
-DF_EXPORT int32_t df_audio_open(void** out) noexcept { return open_audio(out, 0); }
+DF_EXPORT int32_t df_audio_open(void** out) noexcept { return open_audio(out, {}); }
 DF_EXPORT int32_t df_audio_open_config_v7(
     const df_audio::OutputConfigV7* config, void** out) noexcept {
     if (!out) return -1;
     *out = nullptr;
     if (!config || !df_audio::valid_output_config(*config)) return -6;
-    return open_audio(out, config->buffer_bursts);
+    df_audio::OutputConfigV8 current;
+    current.buffer_bursts = config->buffer_bursts;
+    return open_audio(out, current);
+}
+DF_EXPORT int32_t df_audio_open_config_v8(
+    const df_audio::OutputConfigV8* config, void** out) noexcept {
+    if (!out) return -1;
+    *out = nullptr;
+    if (!config || !df_audio::valid_output_config(*config)) return -6;
+    return open_audio(out, *config);
+}
+DF_EXPORT uint32_t df_audio_unsupported_demand_v8(void* ctx) noexcept {
+    return ctx ? static_cast<Renderer*>(ctx)->core.unsupported_demand() : 0;
+}
+DF_EXPORT int32_t df_audio_callback_metrics_v8(void* ctx,df_audio::CallbackMetricsV8* out) noexcept {
+    if(!ctx||!out)return -1;
+    auto* r=static_cast<Renderer*>(ctx);*out={};
+    for(size_t i=0;i<6;++i)out->size_buckets[i]=r->size_buckets[i].load(std::memory_order_relaxed);
+    out->measurement_enabled=r->measure_callbacks?1:0;
+    out->measured_calls=r->measured_calls.load(std::memory_order_relaxed);
+    out->total_wall_ns=r->total_wall_ns.load(std::memory_order_relaxed);
+    out->maximum_wall_ns=r->maximum_wall_ns.load(std::memory_order_relaxed);
+    out->clock_failures=r->clock_failures.load(std::memory_order_relaxed);
+    return 0; // pre-close aggregate observation, not an atomic callback snapshot
 }
 DF_EXPORT int32_t df_audio_set_diagnostic_modes(void* ctx, uint32_t flags) noexcept {
     if (!ctx || (flags & ~3u)) return -1;

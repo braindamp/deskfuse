@@ -7,6 +7,7 @@
 #include "adaptive_clock.h"
 #include "clock_qualification.h"
 #include "streaming_sinc.h"
+#include "output_config.h"
 #include <array>
 #include <atomic>
 #include <algorithm>
@@ -98,7 +99,11 @@ public:
     static constexpr uint64_t capacity = kRingFrames;
     static constexpr uint64_t prime = kPrimeFrames;
     static constexpr uint32_t fade_frames = 96;
-    RenderCore() noexcept = default;
+    explicit RenderCore(uint32_t reserve_frames = kTargetFrames) noexcept
+        : reserve_frames_(reserve_frames) {}
+    uint32_t unsupported_demand() const noexcept {
+        return unsupported_demand_.load(std::memory_order_acquire);
+    }
     RenderCore(const RenderCore&) = delete;
     RenderCore& operator=(const RenderCore&) = delete;
 
@@ -214,6 +219,18 @@ private:
 public:
     void render(int16_t* out, uint32_t count, RenderOptions options) noexcept {
         if (!out || !count) return;
+        // Terminal unsupported configuration, never an automatic reserve change.
+        // Preserve source/phase/storage until the owner closes the stream.
+        if (unsupported_demand() || !valid_reserve(reserve_frames_) ||
+            (options.linear && uint64_t(count) + reserve_frames_ + StreamingSinc::past > capacity)) {
+            if (!unsupported_demand()) unsupported_demand_.store(count, std::memory_order_release);
+            std::memset(out, 0, size_t(count) * kChannels * sizeof(int16_t));
+            silence_ += count;
+            committed_output_ += count;
+            ++callbacks_;
+            legacy_silence_.store(silence_, std::memory_order_release);
+            return;
+        }
         playout_sequence_.fetch_add(1, std::memory_order_acq_rel);
         const uint32_t required_future = options.linear ?
             std::max(StreamingSinc::future, options.fade ? fade_frames : 0u) : 0u;
@@ -257,7 +274,7 @@ public:
         // repair promptly. No extra queue: prime to that SAME controller
         // operating point, allowing the retained FIR history to fit too.
         const uint64_t priming_threshold = options.linear ?
-            uint64_t(count) + kTargetFrames : prime;
+            uint64_t(count) + reserve_frames_ : prime;
         const bool priming_fits = !options.linear ||
             priming_threshold <= capacity-StreamingSinc::past;
         if (!primed_ && !recovery_deferred) {
@@ -278,7 +295,7 @@ public:
             if (options.linear) {
                 ppm = follower_.update(count,
                     static_cast<int64_t>(ready),
-                    static_cast<int64_t>(kTargetFrames));
+                    static_cast<int64_t>(reserve_frames_));
                 step += static_cast<int64_t>(
                     static_cast<double>(kOneQ32) * ppm / 1'000'000.0);
             }
@@ -605,6 +622,8 @@ private:
     uint32_t max_callback_frames_ = 0;
     uint64_t callbacks_ = 0, committed_output_ = 0, rendered_ = 0;
     uint64_t silence_ = 0, released_ = 0, discarded_ = 0;
+    const uint32_t reserve_frames_;
+    std::atomic<uint32_t> unsupported_demand_{0};
     uint64_t concealed_outputs_ = 0, underruns_ = 0, reprimes_ = 0;
     uint64_t invalidations_ = 0;
     int32_t drift_ppm_ = 0;

@@ -255,12 +255,13 @@ struct PacketObservation {
 struct PacketTimingTrace {
     std::wstring path;
     LARGE_INTEGER frequency{};
-    // Fixed 160-KiB budget, sufficient for every 480-frame original
-    // GetBuffer packet during the short <=20s silent diagnostic. No
-    // allocation, lock, log write or wait on the capture thread.
-    std::unique_ptr<std::array<PacketObservation, 4096>> samples;
+    // Fixed budget allocated before capture for explicit trace sessions.
+    // All packet sizes are eligible; omissions are reported, never hidden.
+    std::unique_ptr<std::array<PacketObservation, 32768>> samples;
     size_t recorded = 0;
     uint64_t eligible = 0;
+    uint64_t packets = 0;
+    uint32_t minimum_frames = UINT32_MAX, maximum_frames = 0;
 
     PacketTimingTrace() {
         wchar_t value[2048]{};
@@ -273,10 +274,13 @@ struct PacketTimingTrace {
             throw std::runtime_error("packet trace QPC frequency unavailable");
         // Allocate the fixed diagnostic budget ONCE at startup, only for an
         // explicit silent trace. The production capture path allocates none.
-        samples = std::make_unique<std::array<PacketObservation, 4096>>();
+        samples = std::make_unique<std::array<PacketObservation, 32768>>();
     }
     void observe(UINT64 frame, UINT32 frames, UINT64 first_qpc100, DWORD flags) {
-        if (path.empty() || frames < 480) return;
+        ++packets;
+        minimum_frames = std::min(minimum_frames, frames);
+        maximum_frames = std::max(maximum_frames, frames);
+        if (path.empty()) return;
         ++eligible;
         // No disk I/O, allocations, locks or waits on WASAPI capture
         // thread. An exhaustive bounded trace prevents independently
@@ -291,6 +295,11 @@ struct PacketTimingTrace {
         (*samples)[recorded++] = {frame, first_qpc100, current, frames, flags};
     }
     void save() const {
+        std::cerr << "WASAPI_PACKETS count=" << packets
+                  << " minimum_frames=" << (packets ? minimum_frames : 0)
+                  << " maximum_frames=" << maximum_frames
+                  << " trace_eligible=" << eligible << " trace_recorded=" << recorded
+                  << " trace_omitted=" << (eligible-recorded) << "\n";
         if (path.empty()) return;
         Handle file(CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
                                 nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr));
@@ -315,10 +324,10 @@ struct PacketTimingTrace {
                 std::to_string(p.local_qpc100) + "," +
                 std::to_string(p.source_frame) + "," +
                 std::to_string(p.packet_qpc100) + "," +
-                std::to_string(p.source_frame + 240) + "," +
-                std::to_string(later) + "," +
+                (p.frames>=480 ? std::to_string(p.source_frame + 240) : "") + "," +
+                (p.frames>=480 ? std::to_string(later) : "") + "," +
                 std::to_string(first_future) + "," +
-                std::to_string(second_future) + "\n";
+                (p.frames>=480 ? std::to_string(second_future) : "") + "\n";
             write_all(file.get(), reinterpret_cast<const uint8_t*>(row.data()), row.size());
         }
     }
@@ -398,6 +407,63 @@ void enumerate(IMMDeviceEnumerator& e) {
     }
 }
 
+struct EnginePeriods {
+    HRESULT interface_result = E_NOINTERFACE, legal_result = E_NOINTERFACE;
+    HRESULT current_result = E_NOINTERFACE;
+    UINT32 normal = 0, fundamental = 0, minimum = 0, maximum = 0, current = 0;
+};
+EnginePeriods engine_periods(IAudioClient& audio, const WAVEFORMATEX& format) {
+    EnginePeriods result;
+    ComPtr<IAudioClient3> client;
+    result.interface_result = audio.QueryInterface(IID_PPV_ARGS(&client));
+    if (FAILED(result.interface_result)) return result;
+    result.legal_result = client->GetSharedModeEnginePeriod(&format,
+        &result.normal, &result.fundamental, &result.minimum, &result.maximum);
+    WAVEFORMATEX* current_format = nullptr;
+    result.current_result = client->GetCurrentSharedModeEnginePeriod(
+        &current_format, &result.current);
+    CoTaskMemFree(current_format);
+    return result;
+}
+void capabilities(IMMDeviceEnumerator& enumerator, const std::wstring& id) {
+    if (id.empty()) throw std::runtime_error("capabilities requires explicit --device-id");
+    ComPtr<IMMDevice> dev;
+    check(enumerator.GetDevice(id.c_str(), &dev), "GetDevice capabilities");
+    ComPtr<IAudioClient> audio;
+    check(dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
+        reinterpret_cast<void**>(audio.GetAddressOf())), "Activate capabilities");
+    WAVEFORMATEX* raw = nullptr;
+    check(audio->GetMixFormat(&raw), "GetMixFormat capabilities");
+    std::unique_ptr<WAVEFORMATEX, decltype(&CoTaskMemFree)> format(raw, CoTaskMemFree);
+    bool floating = false;
+    const bool compatible = supported_mix(*format, floating);
+    const auto p = engine_periods(*audio.Get(), *format);
+    std::cout << "{\"schema\":1,\"capture_policies\":[\"reference\",\"minimum\"],"
+              << "\"format_compatible\":" << (compatible ? "true" : "false")
+              << ",\"sample_rate\":" << format->nSamplesPerSec
+              << ",\"channels\":" << format->nChannels
+              << ",\"client3_hresult\":" << uint32_t(p.interface_result)
+              << ",\"legal_period_hresult\":" << uint32_t(p.legal_result)
+              << ",\"current_period_hresult\":" << uint32_t(p.current_result);
+    if (SUCCEEDED(p.legal_result)) {
+        std::cout << ",\"default_period_frames\":" << p.normal
+                  << ",\"fundamental_period_frames\":" << p.fundamental
+                  << ",\"minimum_period_frames\":" << p.minimum
+                  << ",\"maximum_period_frames\":" << p.maximum;
+    }
+    if (SUCCEEDED(p.current_result)) std::cout << ",\"current_period_frames\":" << p.current;
+    std::cout << ",\"lower_period_implemented\":false,\"starts_stream\":false}\n";
+}
+
+REFERENCE_TIME capture_duration() {
+    wchar_t policy[32]{};
+    const DWORD n = GetEnvironmentVariableW(L"DESKFUSE_WASAPI_CAPTURE_POLICY", policy, 32);
+    if (n >= 32) throw std::runtime_error("unsupported Windows capture policy");
+    if (!n || std::wstring(policy) == L"reference") return kBufferDuration;
+    if (n < 32 && std::wstring(policy) == L"minimum") return 0;
+    throw std::runtime_error("unsupported Windows capture policy");
+}
+
 void capture(IMMDeviceEnumerator& enumerator, const std::wstring& device_id,
              HANDLE out, uint32_t seconds) {
     ComPtr<IMMDevice> dev;
@@ -421,9 +487,24 @@ void capture(IMMDeviceEnumerator& enumerator, const std::wstring& device_id,
                                  "required; refusing to mislabel frames.");
     }
 
+    const REFERENCE_TIME requested_duration = capture_duration();
     check(audio->Initialize(AUDCLNT_SHAREMODE_SHARED,
                             AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                            kBufferDuration, 0, format.get(), nullptr), "IAudioClient::Initialize");
+                            requested_duration, 0, format.get(), nullptr), "IAudioClient::Initialize");
+    UINT32 allocated_frames = 0;
+    check(audio->GetBufferSize(&allocated_frames), "GetBufferSize");
+    const auto periods = engine_periods(*audio.Get(), *format);
+    std::cerr << "WASAPI_CONFIG requested_capacity_100ns=" << requested_duration
+              << " allocated_frames=" << allocated_frames
+              << " legal_period_hresult=" << uint32_t(periods.legal_result)
+              << " current_period_hresult=" << uint32_t(periods.current_result);
+    if (SUCCEEDED(periods.legal_result))
+        std::cerr << " default_period_frames=" << periods.normal
+                  << " minimum_period_frames=" << periods.minimum
+                  << " fundamental_period_frames=" << periods.fundamental
+                  << " maximum_period_frames=" << periods.maximum;
+    if (SUCCEEDED(periods.current_result)) std::cerr << " current_period_frames=" << periods.current;
+    std::cerr << "\n"; // lifecycle only; before capture starts
     Handle ready(CreateEventW(nullptr, FALSE, FALSE, nullptr));
     if (!ready.get()) throw std::runtime_error("CreateEvent failed");
     check(audio->SetEventHandle(ready.get()), "SetEventHandle");
@@ -520,12 +601,13 @@ void capture(IMMDeviceEnumerator& enumerator, const std::wstring& device_id,
 #ifndef DESKFUSE_CAPTURE_LIFECYCLE_TEST
 int wmain(int argc, wchar_t** argv) {
     try {
-        bool list = false;
+        bool list = false, probe = false;
         std::wstring device_id, path;
         uint32_t seconds = 10;
         for (int i = 1; i < argc; ++i) {
             const std::wstring arg = argv[i];
             if (arg == L"--list") list = true;
+            else if (arg == L"--capabilities") probe = true;
             else if (arg == L"--device-id" && i + 1 < argc) device_id = argv[++i];
             else if (arg == L"--out" && i + 1 < argc) path = argv[++i];
             else if (arg == L"--seconds" && i + 1 < argc) {
@@ -543,9 +625,11 @@ int wmain(int argc, wchar_t** argv) {
         check(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
                                IID_PPV_ARGS(&enumerator)), "CoCreateInstance");
         if (list) {
+            if (probe) throw std::runtime_error("choose --list or --capabilities");
             enumerate(*enumerator.Get());
             return 0;
         }
+        if (probe) { capabilities(*enumerator.Get(), device_id); return 0; }
         if (path.empty()) throw std::runtime_error("explicit --out <file|-> required");
         Handle file;
         HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);

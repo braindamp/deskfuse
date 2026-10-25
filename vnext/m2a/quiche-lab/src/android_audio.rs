@@ -119,6 +119,35 @@ impl OutputConfigV7 {
         Ok(Self {size:16,version:7,buffer_bursts,reserved:0})
     }
 }
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct OutputConfigV8 {
+    pub size:u32, pub version:u32, pub buffer_bursts:u32,
+    pub sharing_policy:u32, pub usage_policy:u32, pub reserve_frames:u32,
+    pub reserved0:u32, pub reserved1:u32,
+}
+impl OutputConfigV8 {
+    pub fn new(buffer_bursts:u32,sharing_policy:u32,usage_policy:u32,reserve_frames:u32)->Result<Self,String>{
+        OutputConfigV7::new(buffer_bursts)?;
+        if sharing_policy>1 || usage_policy>1 || !matches!(reserve_frames,1440|1200|960|720|480){
+            return Err("unsupported sharing, usage or native reserve".into());
+        }
+        Ok(Self{size:32,version:8,buffer_bursts,sharing_policy,usage_policy,reserve_frames,reserved0:0,reserved1:0})
+    }
+}
+impl Default for OutputConfigV8 {
+    fn default()->Self {Self::new(0,0,0,1440).expect("constant reference config")}
+}
+pub fn validate_abi_v8(actual:u32)->Result<(),String>{
+    if actual==8 {Ok(())} else {Err(format!("AAudio ABI mismatch expected v8, got v{actual}: redeploy both Android binaries"))}
+}
+#[repr(C)]
+#[derive(Debug,Default,Clone,Copy)]
+pub struct CallbackMetricsV8 {
+    pub size_buckets:[u64;6],
+    pub measured_calls:u64,pub total_wall_ns:u64,pub maximum_wall_ns:u64,pub clock_failures:u64,
+    pub measurement_enabled:u32,pub reserved:u32,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Admission {
     Accepted,
@@ -139,6 +168,18 @@ pub fn validate_abi_v7(actual: u32) -> Result<(), String> {
 #[cfg(test)]
 mod abi_tests {
     use super::*;
+    #[test]
+    fn experiment_config_is_validated_and_v8_is_fail_closed(){
+        assert_eq!(std::mem::size_of::<OutputConfigV8>(),32);
+        assert_eq!(std::mem::size_of::<CallbackMetricsV8>(),88);
+        assert_eq!(std::mem::offset_of!(OutputConfigV8,reserve_frames),20);
+        for r in [1440,1200,960,720,480] {assert!(OutputConfigV8::new(0,1,1,r).is_ok());}
+        for (b,s,u,r) in [(1,0,0,1440),(0,2,0,1440),(0,0,2,1440),(0,0,0,479)] {
+            assert!(OutputConfigV8::new(b,s,u,r).is_err());
+        }
+        for v in [0,7,9,u32::MAX] {assert!(validate_abi_v8(v).is_err());}
+        assert!(validate_abi_v8(8).is_ok());
+    }
     #[test]
     fn reject_mismatched_library_versions_before_struct_io() {
         for version in [0, 1, 2, 3, 4, 5, 6, 8, u32::MAX] {
@@ -165,7 +206,7 @@ mod abi_tests {
 
 #[cfg(target_os = "android")]
 mod native {
-    use super::{TimingSampleV7, OutputConfigV7, Admission, AudioStats, RenderIdentity, RenderSnapshot, PresentationTimeV5, PlayoutState};
+    use super::{TimingSampleV7, OutputConfigV8, CallbackMetricsV8, Admission, AudioStats, RenderIdentity, RenderSnapshot, PresentationTimeV5, PlayoutState};
     use std::ffi::{c_char, c_int, c_void, CString};
     use std::ptr;
 
@@ -177,7 +218,9 @@ mod native {
         fn dlclose(handle:*mut c_void) -> c_int;
     }
     type Abi=unsafe extern "C" fn() -> u32;
-    type Open=unsafe extern "C" fn(*const OutputConfigV7,*mut *mut c_void)->i32;
+    type Open=unsafe extern "C" fn(*const OutputConfigV8,*mut *mut c_void)->i32;
+    type Unsupported=unsafe extern "C" fn(*mut c_void)->u32;
+    type CallbackMetrics=unsafe extern "C" fn(*mut c_void,*mut CallbackMetricsV8)->i32;
     type Close=unsafe extern "C" fn(*mut c_void);
     type Modes=unsafe extern "C" fn(*mut c_void,u32)->i32;
     type PushV5=unsafe extern "C" fn(
@@ -197,12 +240,15 @@ mod native {
         library:*mut c_void, ctx:*mut c_void,
         push:PushV5, stats:Stats, identity_stats:IdentityStats,
         modes:Modes, close:Close, request:Request, applied:Applied,
-        snapshot:Snapshot, presentation:Presentation, playout:Playout, timing:Timing,
+        snapshot:Snapshot, presentation:Presentation, playout:Playout, timing:Timing, unsupported:Unsupported,
+        callback_metrics:CallbackMetrics,
     }
     impl Renderer {
         pub fn open(path:&str)->Result<Self,String> {Self::open_with_buffer(path,0)}
         pub fn open_with_buffer(path:&str,buffer_bursts:u32)->Result<Self,String> {
-            let output_config=OutputConfigV7::new(buffer_bursts)?;
+            Self::open_with_config(path,OutputConfigV8::new(buffer_bursts,0,0,1440)?)
+        }
+        pub fn open_with_config(path:&str,output_config:OutputConfigV8)->Result<Self,String> {
             let path_c=CString::new(path).map_err(|_|"invalid library path")?;
             let library=unsafe{dlopen(path_c.as_ptr(),RTLD_NOW)};
             if library.is_null() {return Err(format!("cannot load Android audio library: {path}"));}
@@ -218,12 +264,12 @@ mod native {
                 Err(e)=>{unsafe{dlclose(library)};return Err(e);}
             };
             let actual=unsafe{abi()};
-            if let Err(error)=super::validate_abi_v7(actual) {
+            if let Err(error)=super::validate_abi_v8(actual) {
                 unsafe{dlclose(library)};
                 return Err(error);
             }
             let funcs=(||Ok::<_,String>((
-                sym(b"df_audio_open_config_v7\0")?,
+                sym(b"df_audio_open_config_v8\0")?,
                 sym(b"df_audio_close\0")?,
                 sym(b"df_audio_set_diagnostic_modes\0")?,
                 sym(b"df_audio_push_guarded_v5\0")?,
@@ -235,8 +281,10 @@ mod native {
                 sym(b"df_audio_presentation_time_v5\0")?,
                 sym(b"df_audio_playout_state_v6\0")?,
                 sym(b"df_audio_timing_sample_v7\0")?,
+                sym(b"df_audio_unsupported_demand_v8\0")?,
+                sym(b"df_audio_callback_metrics_v8\0")?,
             )))();
-            let (open,close,modes,push,stats,identity_stats,request,applied,snapshot,presentation,playout,timing)=match funcs{
+            let (open,close,modes,push,stats,identity_stats,request,applied,snapshot,presentation,playout,timing,unsupported,callback_metrics)=match funcs{
                 Ok(parts)=>parts,
                 Err(e)=>{unsafe{dlclose(library)};return Err(e);}
             };
@@ -260,6 +308,8 @@ mod native {
                 presentation:unsafe{std::mem::transmute(presentation)},
                 playout:unsafe{std::mem::transmute(playout)},
                 timing:unsafe{std::mem::transmute(timing)},
+                unsupported:unsafe{std::mem::transmute(unsupported)},
+                callback_metrics:unsafe{std::mem::transmute(callback_metrics)},
             })
         }
         pub fn set_diagnostic_modes(&mut self,fades:bool,linear:bool)->Result<(),String>{
@@ -318,9 +368,16 @@ mod native {
             }
         }
         pub fn snapshot(&self)->Result<AudioStats,String>{
+            let demand=unsafe{(self.unsupported)(self.ctx)};
+            if demand!=0 {return Err(format!("unsupported callback demand={demand} for selected reserve; experiment failed"));}
             let mut value=AudioStats::default();
             let code=unsafe{(self.stats)(self.ctx,&mut value)};
             if code==0{Ok(value)}else{Err(format!("AAudio stats code={code}"))}
+        }
+        pub fn callback_metrics(&self)->Result<CallbackMetricsV8,String>{
+            let mut value=CallbackMetricsV8::default();
+            let code=unsafe{(self.callback_metrics)(self.ctx,&mut value)};
+            if code==0{Ok(value)}else{Err(format!("callback metrics error={code}"))}
         }
         pub fn identity_snapshot(&self)->Result<RenderIdentity,String>{
             let mut value=RenderIdentity::default();
@@ -340,6 +397,8 @@ pub struct AndroidAudio;
 impl AndroidAudio{
     pub fn open(_p:&str)->Result<Self,String>{Err("Android AAudio required".into())}
     pub fn open_with_buffer(_p:&str,_b:u32)->Result<Self,String>{Err("Android AAudio required".into())}
+    pub fn open_with_config(_p:&str,_c:OutputConfigV8)->Result<Self,String>{Err("Android AAudio required".into())}
+    pub fn callback_metrics(&self)->Result<CallbackMetricsV8,String>{Err("Android AAudio required".into())}
     pub fn set_diagnostic_modes(&mut self,_f:bool,_r:bool)->Result<(),String>{
         Err("Android AAudio required".into())
     }

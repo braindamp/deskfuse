@@ -17,7 +17,14 @@ param(
     [string]$Profile = 'audio-only',
     [string]$ExpectedBranch = 'feature/vnext-wp001-native-lab',
     [string]$WindowsExecutable,
-    [ValidateSet(0,2,3)][int]$AndroidBufferBursts = 0
+    [ValidateSet(0,2,3)][int]$AndroidBufferBursts = 0,
+    [string]$WindowsCaptureExecutable,
+    [string]$BuildReceipt,
+    [ValidateSet('reference','minimum')][string]$WindowsCapturePolicy = 'reference',
+    [ValidateSet(0,1)][int]$AndroidSharingPolicy = 0,
+    [ValidateSet(0,1)][int]$AndroidUsagePolicy = 0,
+    [ValidateSet(1440,1200,960,720,480)][int]$NativeReserveFrames = 1440,
+    [switch]$MeasureCallbacks
 )
 $ErrorActionPreference = 'Stop'
 if ($Strict -and $Modes -ne 'f0c0r0') { throw 'Strict PCM verification requires f0c0r0 (no DSP or fade)' }
@@ -42,6 +49,10 @@ $source = if ([string]::IsNullOrWhiteSpace($WindowsExecutable)) {
     Join-Path $cargoTarget 'release\continuous-quic-lab.exe'
 } else { $WindowsExecutable }
 $capture = Join-Path $LabRoot 'vnext\m1\build\deskfuse-wasapi-capture.exe'
+if ($WindowsCaptureExecutable) { $capture = (Resolve-Path -LiteralPath $WindowsCaptureExecutable).Path }
+if (($Strict -or $VerifyOnly) -and ($AndroidSharingPolicy -ne 0 -or $AndroidUsagePolicy -ne 0 -or $NativeReserveFrames -ne 1440)) {
+    throw 'Hardware/reserve experiments require adaptive speaker playback'
+}
 $native = (Resolve-Path -LiteralPath $AndroidNativeSo).Path
 $android = (Resolve-Path -LiteralPath $AndroidExecutable).Path
 foreach ($p in @($source, $capture, $android, $native, (Join-Path $KeysDir 'ca.pem'), (Join-Path $KeysDir 'server.pem'), (Join-Path $KeysDir 'server.key'))) {
@@ -49,13 +60,13 @@ foreach ($p in @($source, $capture, $android, $native, (Join-Path $KeysDir 'ca.p
 }
 $source = (Resolve-Path -LiteralPath $source).Path
 if (-not (Get-Command adb -ErrorAction SilentlyContinue)) { throw 'adb not on PATH' }
-$branch = (& git -C $LabRoot branch --show-current).Trim()
-$sha = (& git -C $LabRoot rev-parse HEAD).Trim()
+$branch = (& git -c ("safe.directory=" + $LabRoot) -C $LabRoot branch --show-current).Trim()
+$sha = (& git -c ("safe.directory=" + $LabRoot) -C $LabRoot rev-parse HEAD).Trim()
 if ($LASTEXITCODE -ne 0 -or $branch -ne $ExpectedBranch -or
     $branch -in @('main', 'master') -or $branch.StartsWith('reference/')) {
     throw 'Only the isolated development branch is permitted'
 }
-$worktree = @(& git -C $LabRoot status --porcelain)
+$worktree = @(& git -c ("safe.directory=" + $LabRoot) -C $LabRoot status --porcelain)
 if ($LASTEXITCODE -ne 0) { throw 'Unable to inspect local Git worktree' }
 $worktreeClean = ($worktree.Count -eq 0)
 if (-not $worktreeClean) {
@@ -72,6 +83,11 @@ $events = @(
     'profile=' + $Profile,
     'modes=' + $Modes,
     'android_requested_buffer_bursts=' + $AndroidBufferBursts,
+    'windows_capture_policy=' + $WindowsCapturePolicy,
+    'android_sharing_policy=' + $AndroidSharingPolicy,
+    'android_usage_policy=' + $AndroidUsagePolicy,
+    'native_reserve_frames=' + $NativeReserveFrames,
+    'measure_callbacks=' + [bool]$MeasureCallbacks,
     'strict_pcm=' + [bool]$Strict,
     'verify_only_no_aaudio=' + [bool]$VerifyOnly,
     'duration_seconds=' + $Seconds,
@@ -93,6 +109,7 @@ $hashes = @($capture,$source,$native,$android) | ForEach-Object {
 # Match the selected artifacts against the build script's hash-bound receipt.
 $receipt = $null
 $receiptPath = Join-Path $LabRoot 'vnext\m1\build\audio-pair-build.json'
+if ($BuildReceipt) { $receiptPath = (Resolve-Path -LiteralPath $BuildReceipt).Path }
 if (Test-Path -LiteralPath $receiptPath -PathType Leaf) {
     try { $receipt = Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json }
     catch { Write-Warning 'Local build receipt is unreadable; build profiles remain unverified.' }
@@ -104,13 +121,22 @@ foreach ($kind in $selectedArtifacts.Keys) {
     $verifiedProfile = 'unverified'
     if ($null -ne $receipt -and $receipt.schema -eq 1) {
         foreach ($artifact in $receipt.artifacts) {
-            if ($artifact.path -ieq $selected -and $artifact.sha256 -ieq $selectedHash -and
+            $artifactRole = $artifact.role
+            if (-not $artifactRole) {
+                $originalPath = $artifact.path -replace '\\','/'
+                $artifactRole = if ($originalPath -match 'aarch64-linux-android/.*/continuous-quic-lab$') { 'android_rust' }
+                    elseif ($originalPath -match 'deskfuse-wasapi-capture.exe$') { 'windows_capture' }
+                    elseif ($originalPath -match 'libdeskfuse_android_audio.so$') { 'android_native' }
+                    elseif ($originalPath -match 'continuous-quic-lab.exe$') { 'windows_rust' } else { '' }
+            }
+            if ($artifactRole -eq $kind -and $artifact.sha256 -ieq $selectedHash -and
                 $artifact.profile -in @('release','debug')) {
                 $verifiedProfile = $artifact.profile
             }
         }
     }
     $events += ($kind + '_build_profile=' + $verifiedProfile)
+    if ($verifiedProfile -eq 'unverified') { throw ('No role/hash-matched receipt for ' + $kind) }
 }
 if ($null -ne $receipt) {
     $events += ('build_receipt_source_commit=' + $receipt.source_commit)
@@ -184,7 +210,9 @@ $sourceArgs = @('server-wasapi',($WindowsIP + ':48235'),$PhoneIP,
 # Only trace when the receiver has no AAudio output; restore caller environment.
 $traceEnv = 'DESKFUSE_WASAPI_PACKET_TRACE'
 $priorTrace = [Environment]::GetEnvironmentVariable($traceEnv, 'Process')
+$priorCapturePolicy = [Environment]::GetEnvironmentVariable('DESKFUSE_WASAPI_CAPTURE_POLICY','Process')
 try {
+    [Environment]::SetEnvironmentVariable('DESKFUSE_WASAPI_CAPTURE_POLICY',$WindowsCapturePolicy,'Process')
     if ($VerifyOnly) {
         $tracePath = Join-Path $folder 'windows-original-wasapi-packets.csv'
         [Environment]::SetEnvironmentVariable($traceEnv, $tracePath, 'Process')
@@ -195,6 +223,7 @@ try {
     $proc = Start-Process -FilePath $source -ArgumentList $sourceArgs -RedirectStandardOutput $serverOut -RedirectStandardError $serverErr -WorkingDirectory (Join-Path $LabRoot 'vnext\m2a\quiche-lab') -WindowStyle Hidden -PassThru
 } finally {
     [Environment]::SetEnvironmentVariable($traceEnv, $priorTrace, 'Process')
+    [Environment]::SetEnvironmentVariable('DESKFUSE_WASAPI_CAPTURE_POLICY',$priorCapturePolicy,'Process')
 }
 $observer = $null
 try {
@@ -245,8 +274,13 @@ try {
     $verb = if ($VerifyOnly) { 'client-capture' } elseif ($Strict) { 'client-playback-strict' } else { 'client-playback-modes' }
     $modeArg = if ($Strict -or $VerifyOnly) { '' } else { $Modes + ' ' }
     if ($AndroidBufferBursts -ne 0) { $verb='client-playback-buffer'; $modeArg=$Modes + ' ' + $AndroidBufferBursts + ' ' }
+    if ($AndroidSharingPolicy -ne 0 -or $AndroidUsagePolicy -ne 0 -or $NativeReserveFrames -ne 1440) {
+        $verb='client-playback-experiment'
+        $modeArg=($Modes,$AndroidBufferBursts,$AndroidSharingPolicy,$AndroidUsagePolicy,$NativeReserveFrames -join ' ') + ' '
+    }
     $rendererArg = if ($VerifyOnly) { '' } else { '/data/local/tmp/libdeskfuse_android_audio.so ' }
-    $cmd = 'LD_LIBRARY_PATH=/data/local/tmp /data/local/tmp/deskfuse-vnext-continuous ' + $verb + ' ' + $WindowsIP + ':48235 /data/local/tmp/df-lab-ca.pem /data/local/tmp/df-lab-client.pem /data/local/tmp/df-lab-client.key ' + $rendererArg + $modeArg + $Seconds
+    $measurementEnv = if ($MeasureCallbacks) { 'DESKFUSE_AUDIO_MEASURE_CALLBACK=1 ' } else { 'DESKFUSE_AUDIO_MEASURE_CALLBACK=0 ' }
+    $cmd = 'LD_LIBRARY_PATH=/data/local/tmp ' + $measurementEnv + '/data/local/tmp/deskfuse-vnext-continuous ' + $verb + ' ' + $WindowsIP + ':48235 /data/local/tmp/df-lab-ca.pem /data/local/tmp/df-lab-client.pem /data/local/tmp/df-lab-client.key ' + $rendererArg + $modeArg + $Seconds
     if ($VerifyOnly) {
         Write-Host 'VERIFY ONLY: Android validates incoming QUIC PCM but NEVER starts AAudio. No Xiaomi speaker playback.'
     }

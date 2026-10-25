@@ -20,6 +20,23 @@ static void publish(RenderCore& core, uint64_t source, int amplitude, bool conce
                 static_cast<uint8_t>(concealed)})==Admission::Accepted,"PCM admission");
 }
 static int qualify() {
+    for(uint32_t reserve:{1440u,1200u,960u,720u,480u}) {
+        RenderCore experiment(reserve);
+        uint64_t source=0;
+        std::array<int16_t,3840*kChannels> out{};
+        while(source<960+reserve) {publish(experiment,source,1000);source+=240;}
+        experiment.render(out.data(),960,{true,true});
+        PlayoutState state{};
+        require(experiment.playout_state(state)&&state.primed&&
+            state.queued_playable_frames+96>=reserve,"selected reserve primes at same follower target");
+        const auto rd=experiment.read(),wr=experiment.write();
+        experiment.render(out.data(),3840,{true,true});
+        require(experiment.unsupported_demand()==3840&&experiment.read()==rd&&experiment.write()==wr,
+            "oversized demand fails even after priming without source release");
+        experiment.render(out.data(),240,{true,true});
+        require(experiment.unsupported_demand()==3840&&experiment.read()==rd,
+            "unsupported demand remains terminal rather than silently reprime");
+    }
     for(uint32_t demand:{48u,240u,480u,960u,1280u}) {
         RenderCore core;
         uint64_t source=0;

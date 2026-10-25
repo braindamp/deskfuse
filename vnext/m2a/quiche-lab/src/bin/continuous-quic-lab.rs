@@ -591,6 +591,7 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
 #[derive(Copy, Clone)]
 struct PlayModes {
     buffer_bursts:u32,
+    sharing_policy:u32, usage_policy:u32, reserve_frames:u32,
     fades: bool,
     conceal: bool,
     linear: bool,
@@ -598,12 +599,12 @@ struct PlayModes {
 }
 impl Default for PlayModes {
     fn default() -> Self {
-        Self { buffer_bursts:0, fades: true, conceal: true, linear: true, strict: false }
+        Self { buffer_bursts:0, sharing_policy:0,usage_policy:0,reserve_frames:1440, fades: true, conceal: true, linear: true, strict: false }
     }
 }
 impl PlayModes {
     fn strict() -> Self {
-        Self { buffer_bursts:0, fades: false, conceal: false, linear: false, strict: true }
+        Self { buffer_bursts:0, sharing_policy:0,usage_policy:0,reserve_frames:1440, fades: false, conceal: false, linear: false, strict: true }
     }
     // Exact, deliberately boring mode specification: f1c0r1
     // f: fade; c: short-gap concealment; r: adaptive bandlimited resampling.
@@ -616,6 +617,7 @@ impl PlayModes {
         }
         Ok(Self {
             buffer_bursts:0,
+            sharing_policy:0,usage_policy:0,reserve_frames:1440,
             fades: x[1] == b'1',
             conceal: x[3] == b'1',
             linear: x[5] == b'1',
@@ -694,6 +696,7 @@ struct ClientMedia {
     fresh_anchor_nonce:u64, authorized_recovery:u64, confirmed_reanchors:u64,
     audio:Option<AndroidAudio>,
     diagnostics:AndroidTrace,
+    callback_metrics:Option<deskfuse_quiche_lab::android_audio::CallbackMetricsV8>,
     latest_render_record:Option<(deskfuse_quiche_lab::android_audio::RenderSnapshot,u64)>,
     coherent_records_read:u64,
     strict_baseline:Option<(deskfuse_quiche_lab::android_audio::RenderSnapshot,u64)>,
@@ -1067,7 +1070,9 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
     // before the handshake can cause Windows to start sending PCM. The
     // callback emits defined silence until authenticated media is admitted.
     if let Some(library)=playback_library {
-        let mut renderer=AndroidAudio::open_with_buffer(library,modes.buffer_bursts)
+        let config=deskfuse_quiche_lab::android_audio::OutputConfigV8::new(
+            modes.buffer_bursts,modes.sharing_policy,modes.usage_policy,modes.reserve_frames)?;
+        let mut renderer=AndroidAudio::open_with_config(library,config)
             .map_err(|e|format!("Android speaker renderer initialization failed: {e}"))?;
         renderer.set_diagnostic_modes(modes.fades,modes.linear)
             .map_err(|e|format!("Android diagnostic mode configuration failed: {e}"))?;
@@ -1312,6 +1317,9 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
         }
     }
     let complete=result.is_ok();
+    if let Some(ref speaker)=state.audio {
+        state.callback_metrics=speaker.callback_metrics().ok();
+    }
     let audio=state.audio.take();
     finish_client(result,||drop(audio),|| {
         use std::io::Write;
@@ -1335,6 +1343,11 @@ fn write_client_summary(out:&mut impl io::Write,state:&ClientMedia,
     transport:Option<(u64,usize)>,native:Option<(AudioStats,Option<PlayoutState>)>,
     playback:bool,complete:bool,status_error:Option<&str>)->io::Result<()> {
     let prefix=if complete {"DONE"}else{"PARTIAL"};
+    if let Some(m)=state.callback_metrics {
+        writeln!(out,"AUDIO Android callback_metrics preclose_aggregate=1 measurement_enabled={} measured_calls={} total_wall_ns={} maximum_wall_ns={} clock_failures={} size_le96={} size_le240={} size_le480={} size_le960={} size_le1920={} size_larger={}",
+            m.measurement_enabled,m.measured_calls,m.total_wall_ns,m.maximum_wall_ns,m.clock_failures,
+            m.size_buckets[0],m.size_buckets[1],m.size_buckets[2],m.size_buckets[3],m.size_buckets[4],m.size_buckets[5])?;
+    }
     if let Some((udp,lost))=transport {
         writeln!(out,"{prefix} Android sink received={} first_seq={:?} last_seq={:?} missing_between={} source_missing_frames={} concealed_frames={} unfilled_frames={} stale={} udp_packets={} quic_lost={} reorder_full={} reorder_duplicates={} reorder_budget_drops={} mode={}",
             state.received,state.first_sequence,state.last_sequence,state.gaps,state.source_gap_frames,
@@ -1505,6 +1518,17 @@ fn run() -> Result<()> {
             let mut modes=PlayModes::parse(flags)?;
             modes.buffer_bursts=bursts.parse()?;
             deskfuse_quiche_lab::android_audio::OutputConfigV7::new(modes.buffer_bursts)?;
+            client(remote.parse()?,ca,cert,key,positive_seconds(secs)?,false,Some(library),modes)
+        }
+        [_,mode,remote,ca,cert,key,library,flags,bursts,sharing,usage,reserve,secs]
+            if mode=="client-playback-experiment" => {
+            let mut modes=PlayModes::parse(flags)?;
+            modes.buffer_bursts=bursts.parse()?;
+            modes.sharing_policy=sharing.parse()?;
+            modes.usage_policy=usage.parse()?;
+            modes.reserve_frames=reserve.parse()?;
+            deskfuse_quiche_lab::android_audio::OutputConfigV8::new(
+                modes.buffer_bursts,modes.sharing_policy,modes.usage_policy,modes.reserve_frames)?;
             client(remote.parse()?,ca,cert,key,positive_seconds(secs)?,false,Some(library),modes)
         }
         _ => Err("usage: continuous-quic-lab server <bind:port> <allowed-ip> <ca> <server-cert> <server-key> <secs> | server-wasapi <bind:port> <allowed-ip> <ca> <server-cert> <server-key> <wasapi-capture.exe> <endpoint-id|default> <secs> | client|client-capture <windows-ip:port> <ca> <client-cert> <client-key> <secs> | client-playback <windows-ip:port> <ca> <client-cert> <client-key> <libdeskfuse_android_audio.so> <secs> | client-playback-modes <windows-ip:port> <ca> <client-cert> <client-key> <libdeskfuse_android_audio.so> <f1c1r1> <secs> | client-playback-buffer <windows-ip:port> <ca> <client-cert> <client-key> <library> <f1c1r1> <bursts:0|2|3> <secs> | client-playback-strict <windows-ip:port> <ca> <client-cert> <client-key> <libdeskfuse_android_audio.so> <secs>".into()),

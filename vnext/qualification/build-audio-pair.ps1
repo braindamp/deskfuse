@@ -1,4 +1,4 @@
-# Build the matching Windows sender and ABI v7 Android pair.
+# Build the matching Windows sender and ABI v8 Android pair.
 # No ADB deployment, credentials, driver installs or existing APK changes.
 [CmdletBinding()]
 param(
@@ -12,12 +12,12 @@ $ErrorActionPreference = 'Stop'
 if (-not (Test-Path -LiteralPath $LabRoot -PathType Container)) {
     throw 'Isolated DeskFuse vNext checkout missing'
 }
-$branch = (& git -C $LabRoot branch --show-current).Trim()
+$branch = (& git -c ("safe.directory=" + $LabRoot) -C $LabRoot branch --show-current).Trim()
 if ($LASTEXITCODE -ne 0 -or $branch -ne $ExpectedBranch -or
     $branch -in @('main', 'master') -or $branch.StartsWith('reference/')) {
     throw 'Refusing to build from main, preserved reference or unknown branch'
 }
-$dirty = @(& git -C $LabRoot status --porcelain)
+$dirty = @(& git -c ("safe.directory=" + $LabRoot) -C $LabRoot status --porcelain)
 if ($LASTEXITCODE -ne 0) { throw 'Unable to inspect local Git worktree' }
 if ($dirty.Count -gt 0) {
     Write-Warning ('Building with {0} local Git worktree change(s). No files will be deleted, stashed, or reset. Binary SHA256 hashes will still be printed; this is not clean-commit qualification evidence.' -f $dirty.Count)
@@ -86,7 +86,7 @@ foreach ($file in $files) {
         throw ('Expected local output missing: ' + $file)
     }
 }
-$sha = (& git -C $LabRoot rev-parse HEAD).Trim()
+$sha = (& git -c ("safe.directory=" + $LabRoot) -C $LabRoot rev-parse HEAD).Trim()
 foreach ($tree in @($wasapiBuild, $nativeBuild)) {
     $cache = Join-Path $tree 'CMakeCache.txt'
     $buildType = @(Select-String -LiteralPath $cache -Pattern '^CMAKE_BUILD_TYPE:STRING=Release$')
@@ -104,11 +104,13 @@ for ($i = 0; $i -lt $files.Count; ++$i) {
     $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
     Write-Host ($hash + '  ' + $file)
     $profile = if ($i -lt 2) { $RustProfile } else { 'release' }
-    $receiptArtifacts += [pscustomobject]@{path=(Resolve-Path -LiteralPath $file).Path; sha256=$hash; profile=$profile}
+    $role = @('windows_rust','android_rust','android_native','windows_capture')[$i]
+    $receiptArtifacts += [pscustomobject]@{role=$role; path=(Resolve-Path -LiteralPath $file).Path; sha256=$hash; profile=$profile}
 }
 $receiptPath = Join-Path $wasapiBuild 'audio-pair-build.json'
 [pscustomobject]@{
     schema=1; source_commit=$sha; built_utc=(Get-Date).ToUniversalTime().ToString('o')
+    capabilities=@{android_audio_abi=8; windows_capture_policies=@('reference','minimum'); native_reserve_frames=@(1440,1200,960,720,480); callback_measurement=$true}
     cargo_target_directory=$cargoTarget; artifacts=$receiptArtifacts
 } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $receiptPath -Encoding UTF8
 Write-Host ('Hash-bound local build receipt: ' + $receiptPath)

@@ -46,6 +46,10 @@ def analyze(folder: Path) -> dict:
             raise ValueError("original WASAPI packet CSV schema incomplete")
         for row in reader:
             try:
+                # Smaller original packets are valid trace observations but
+                # cannot contain the two complete 240-frame fragments here.
+                if 0 < int(row['packet_frames']) < 480:
+                    continue
                 p = {name: int(row[name]) for name in REQUIRED}
                 if (p["packet_frames"] < 480
                     or p["first_frame"] != p["first_fragment_frame"]
