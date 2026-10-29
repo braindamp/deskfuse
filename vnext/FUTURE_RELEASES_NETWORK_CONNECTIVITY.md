@@ -82,3 +82,13 @@ It was chosen to confirm the earlier first/second 240-frame split provenance cor
 ## 5. Design caution
 
 The current port 48235 is an **implementation setting for the local physical lab**, not a promise that a production release must expose this static port. Future LAN discovery, QR pairing, interface hopping, app packaging, desktop audio/video, remote WAN and relay topologies require their own verified security/network contracts. Until those decisions exist, do not hard-code additional open ports or call an Internet-wide firewall rule a DeskFuse requirement.
+
+## 6. Related design improvement: playback modes and network handover
+
+The requested Game / Interactive / Streaming policies, mouse-triggered catch-up
+and accelerated audio/video Live button are recorded as
+[DI-001 in the design improvements backlog](../plans/Design_Improvements_Backlog.md).
+That proposal also requires automatic Wi-Fi/cellular handover and explicit
+content-retention/recovery limits. WAN reachability, path overlap and authenticated
+replacement delivery still need design and implementation; this historical LAN
+runbook does not establish them.

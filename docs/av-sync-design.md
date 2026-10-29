@@ -1,5 +1,11 @@
 # Audio/video synchronisation and pipeline latency
 
+**Historical design note.** Its pipeline/current-state descriptions predate the
+native audio and v0.6 programme. The requested three delivery/playback modes,
+including mouse-triggered catch-up and accelerated A/V Live playback, are recorded
+in [Design Improvements DI-001](../plans/Design_Improvements_Backlog.md).
+The two-mode sketch below does not establish implemented mode support.
+
 The phone shows the PC's picture and plays the PC's sound, but they are two
 independent pipelines with two independent clocks, so they drift apart. This
 is the design for putting them on one clock, and for choosing the trade-off

@@ -2,6 +2,12 @@
 
 Status: delivery checklist, 20 October 2026. Distinguish implemented building blocks from a tested product.
 
+Later design additions are recorded in the
+[design improvements backlog](Design_Improvements_Backlog.md). DI-001 (29 October)
+adds the requested Game / Interactive / Streaming policies, mouse-triggered
+catch-up and accelerated A/V Live control under DF-14/DF-20. These are recorded
+requirements, not implemented modes or a replacement of the v0.6 programme.
+
 ## Product invariants
 
 1. **Default mode:** one focused Windows app fills the phone, with Android-style switching and no physical-desktop rearrangement. **Separate extended-display mode:** a phone/tablet can instead behave as an additional ordinary Windows monitor. These modes must not be conflated.
