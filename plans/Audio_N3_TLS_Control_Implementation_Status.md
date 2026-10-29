@@ -1,9 +1,10 @@
 # N3 native TLS/control — foundation checkpoint
 
 29 October 2026, High. **N3 is partial, production authority disabled.**
-Continue with the focused
-[source-release Ultra decision](Audio_N3_Source_Release_Ultra_Stop.md), then
-return to High for integration. The original v0.6 programme, native ownership
+The focused [Ultra design](Audio_Stop_Game_And_Handover_High_Handoff.md) now
+selects negative-only source Stop and Game-only current mode admission. These
+remain design only; its handover topic awaits Arena research before the full
+three-topic handoff is complete. The original v0.6 programme, native ownership
 handoff and accepted N2 retention decision remain authoritative.
 
 ## Completed this iteration
@@ -74,7 +75,7 @@ or Android native-owner/JNI integration is activated by these modules. The
 phone wrapper remains quarantined; approved-phone control/media is N6 wiring.
 
 The numeric Stop control framing does not define or implement source-release
-authentication. Settle that contract in the focused Ultra handoff before
+authentication. Implement the selected contract in the focused Ultra handoff before
 integrating network lifecycle dispatch. Existing internal Stop/revoke/expiry
 fences remain intact. N4 actual source/egress/cutoff/rundown, N5 source adapter
 wiring, N6 independent Android renewal/recovery, installed qualification and

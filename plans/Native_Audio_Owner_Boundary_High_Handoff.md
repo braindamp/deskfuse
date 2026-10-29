@@ -2,8 +2,9 @@
 
 **Latest N3 checkpoint, 29 October:** in-memory TLS/control foundations are
 implemented/offline checked; [current status](Audio_N3_TLS_Control_Implementation_Status.md).
-Before finishing dispatch, settle the focused
-[source-release Ultra stop](Audio_N3_Source_Release_Ultra_Stop.md). N3 is partial;
+The subsequent [focused Ultra handoff](Audio_Stop_Game_And_Handover_High_Handoff.md)
+selects source Stop and Game-only mode admission; handover awaits Arena review.
+These are design decisions awaiting implementation. N3 is partial;
 production remains disabled. The N2 continuation text below is historical.
 
 **N2 retention decision selected on Ultra, 29 October:**

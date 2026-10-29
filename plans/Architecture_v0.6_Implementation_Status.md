@@ -399,3 +399,9 @@ offline TLS/control checks and Windows/Android builds. N3 is partial: before
 broker/native dispatch integration, settle the focused
 [source-release authority decision on Ultra](Audio_N3_Source_Release_Ultra_Stop.md).
 This preserves the original implementation path; production stays disabled.
+
+The subsequent [focused Ultra design](Audio_Stop_Game_And_Handover_High_Handoff.md)
+selects negative-only source Stop and Game-only current source semantics. It is
+documentation only, with no source/build/test change. Wi-Fi/cellular handover
+selection awaits the user's [Arena research](Audio_Handover_Arena_Research_Question.md)
+before the three-topic High handoff is complete.

@@ -9,6 +9,13 @@ timing/retention contracts explicitly before implementation.
 ## DI-001 — Game, Interactive and Streaming delivery modes
 
 **Requested by the user, 29 October 2026; recorded, not implemented.**
+
+**Subsequent focused Ultra design:**
+[current source v1 is Game-only](Audio_Stop_Game_And_Handover_High_Handoff.md#2-current-source-contract-is-game-prepare-two-later-modes-at-setup),
+with setup admission reserving the two future mode names and rejecting them
+until supported. Future buffered modes require a new authenticated source
+version and separately selected owner. No buffering/runtime implementation was
+performed. Handover remains pending [Arena research](Audio_Handover_Arena_Research_Question.md).
 Let the user choose whether a session prioritizes staying live, preserving
 content while idle, or steady buffered playback. These are delivery/playback
 policies, independent of focused-app versus extended-display mode and of which
