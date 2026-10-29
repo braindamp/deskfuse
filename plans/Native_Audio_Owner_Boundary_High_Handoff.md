@@ -1,5 +1,11 @@
 # Native audio ownership — focused Ultra decision and High handoff
 
+**Latest N3 checkpoint, 29 October:** in-memory TLS/control foundations are
+implemented/offline checked; [current status](Audio_N3_TLS_Control_Implementation_Status.md).
+Before finishing dispatch, settle the focused
+[source-release Ultra stop](Audio_N3_Source_Release_Ultra_Stop.md). N3 is partial;
+production remains disabled. The N2 continuation text below is historical.
+
 **N2 retention decision selected on Ultra, 29 October:**
 [Audio_N2_Bounded_Request_Retention_High_Decision.md](Audio_N2_Bounded_Request_Retention_High_Decision.md).
 Its focused High implementation is now source-complete/offline checked; see

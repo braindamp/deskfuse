@@ -392,3 +392,10 @@ are implemented/offline checked. Next is N3 native TLS/control on High, then
 actual source/egress/rundown, N5 wiring and N6 renewal/recovery. Production stays
 disabled; installed and physical gates remain open. This continues the original
 v0.6 programme and does not reopen completed media optimizations.
+
+N2/N5 foundations were committed/pushed as `d57d734`. The subsequent
+[N3 foundation checkpoint](Audio_N3_TLS_Control_Implementation_Status.md) passes
+offline TLS/control checks and Windows/Android builds. N3 is partial: before
+broker/native dispatch integration, settle the focused
+[source-release authority decision on Ultra](Audio_N3_Source_Release_Ultra_Stop.md).
+This preserves the original implementation path; production stays disabled.

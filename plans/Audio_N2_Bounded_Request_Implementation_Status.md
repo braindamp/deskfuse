@@ -2,14 +2,16 @@
 
 29 October 2026. The focused implementation of
 [Audio_N2_Bounded_Request_Retention_High_Decision.md](Audio_N2_Bounded_Request_Retention_High_Decision.md)
-is implemented in source and checked offline. No further design stop was found.
-Continue **N3 native TLS/control on High** under the existing native ownership
-handoff. This is not installed/live E6 qualification or production activation.
+is implemented in source and checked offline. The N2 decision is resolved.
+The subsequent [N3 foundation status](Audio_N3_TLS_Control_Implementation_Status.md)
+records its partial implementation and focused source-release Ultra stop.
+This is not installed/live E6 qualification or production activation.
 
 Checkout: `D:\Coding\DeskFuse\vnext-audio-latency`, branch
-`experiment/vnext-audio-latency`, committed base
-`09fd7a86b3c674fb1580705b734e64086a5b4e1a`. The N2 draft, independent High/N5
-foundation and this continuation remain uncommitted/unpushed. Preserve all work.
+`experiment/vnext-audio-latency`. This N2 continuation and independent High/N5
+foundation were committed/pushed as `d57d7344f8535f4768b1894a672b290f5a805bc2`.
+The verification receipt below retains its original base `09fd7a8`; it predates
+that commit. Preserve all work.
 
 ## Implemented
 
@@ -103,7 +105,16 @@ installation, driver/PnP, endpoint/route, device or phone operation was performe
 actual TLS identity/connection, COM/device, power/resume, endpoint/driver and
 performance gates remain their existing independent qualification work.
 
-## Next High step
+## Subsequent N3 continuation
+
+The N2/N5 foundation checkpoint was committed and pushed as `d57d734`.
+N3 TLS/control foundations are now implemented/offline checked; see
+[current N3 status](Audio_N3_TLS_Control_Implementation_Status.md). A focused
+[source-release Ultra decision](Audio_N3_Source_Release_Ultra_Stop.md) is required
+before completing dispatch. The next-step description below remains its overall
+integration scope, not a claim that N3 is complete.
+
+## Next integration scope
 
 N3 supplies per-delivery in-memory keys and actual TLS/quarantined connection
 ownership, routes bounded typed public controls over the registered worker pipe,

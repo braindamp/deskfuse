@@ -45,6 +45,7 @@
     <Compile Include="..\..\audio\DeskFuse.AudioBroker\BrokerAudioOwner.cs" Link="Audio\BrokerAudioOwner.cs" />
     <None Include="..\..\..\tools\protocol3\audio-worker-control-v1.json" Link="Fixtures\audio-worker-control-v1.json" CopyToOutputDirectory="PreserveNewest" />
     <None Include="..\..\..\tools\protocol3\audio-authority-v1.json" Link="Fixtures\audio-authority-v1.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\..\tools\protocol3\audio-transport-v1.json" Link="Fixtures\audio-transport-v1.json" CopyToOutputDirectory="PreserveNewest" />
     <Compile Include="..\..\audio\DeskFuse.AudioBroker\BrokerEnrollmentState.cs" Link="Audio\BrokerEnrollmentState.cs" />
     <Compile Include="..\..\audio\DeskFuse.AudioBroker\BrokerLaunchContract.cs" Link="Audio\BrokerLaunchContract.cs" />
     <Compile Include="..\..\audio\DeskFuse.AudioBroker\BrokerLocalPipe.cs" Link="Audio\BrokerLocalPipe.cs" />

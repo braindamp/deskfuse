@@ -11,6 +11,28 @@ namespace FocusWindow.Tests;
 public sealed class AudioAuthorityTests
 {
     [Fact]
+    public void Native_transport_vector_uses_the_actual_canonical_source_binding_and_delivery()
+    {
+        using var fixture = JsonDocument.Parse(File.ReadAllBytes(Path.Combine(AppContext.BaseDirectory, "Fixtures", "audio-transport-v1.json")));
+        byte[] Bytes(string key) => Convert.FromHexString(fixture.RootElement.GetProperty(key).GetString()!);
+        byte[] Hash(byte value) => Enumerable.Repeat(value, 32).ToArray();
+        Guid Id(byte value) => new(Enumerable.Repeat(value, 16).ToArray(), true);
+        var identity = new AudioAuthorityIdentity(Hash(1), Id(2), Id(3), Hash(4),
+            Convert.FromHexString("01020000000000051500000001000000"), Id(5),
+            Convert.FromHexString("0103000000000005050000002A00000054000000"), 42, 1, 1234, 5678);
+        var source = new AudioSourceDescriptor(identity, new(Id(6), 7, Id(8), AudioSourceBackend.Committed,
+            Hash(9), false, new(1000, 200), new(11, 12, 13)));
+        Assert.Equal(Bytes("sourceHex"), source.Bytes);
+        var binding = AudioAuthorityProtocol.Binding(source, new(Id(8), "owned-endpoint", Id(10), 2, 0x2026102502, 1, 7));
+        Assert.Equal(Bytes("bindingHex"), binding);
+        var delivery = new AudioDeliveryDescriptor(source, SHA256.HashData(binding), new(10, Hash(15), Hash(16), Request(1, 14), Hash(17)));
+        Assert.Equal(Bytes("deliveryHex"), delivery.Bytes);
+        var grant = new AudioControlGrant(Hash(1), Id(2), Id(3), Hash(18), Id(5), Id(6), 7, source.Digest,
+            SHA256.HashData(binding), 10, delivery.Digest, 12, 20000, 13, true, false);
+        Assert.Equal(Bytes("controlHex"), AudioAuthorityProtocol.Control(grant));
+    }
+
+    [Fact]
     public void Frozen_request_deadline_and_exact_receipt_retry_do_not_refresh_authority()
     {
         using var f = new Fixture();

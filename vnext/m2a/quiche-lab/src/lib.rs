@@ -5,6 +5,9 @@
 pub mod deferred_trace;
 pub mod broker_control;
 pub mod audio_authority;
+pub mod audio_tls;
+pub mod audio_control;
+pub mod audio_transport;
 pub mod reactor;
 pub mod wasapi_pipe;
 pub mod endpoint_lease;

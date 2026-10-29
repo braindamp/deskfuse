@@ -1,5 +1,11 @@
 # Independent High continuation while N2 awaits Ultra
 
+**Subsequent checkpoint:** this work and the completed N2 continuation were
+committed/pushed as `d57d734`. See the later
+[N3 status](Audio_N3_TLS_Control_Implementation_Status.md) and focused
+[source-release Ultra stop](Audio_N3_Source_Release_Ultra_Stop.md). The original
+uncommitted/awaiting-Ultra chronology below is historical.
+
 29 October 2026. User explicitly authorized independent High work while away.
 Checkout: `D:\Coding\DeskFuse\vnext-audio-latency`, branch
 `experiment/vnext-audio-latency`, committed base
