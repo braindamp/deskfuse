@@ -75,6 +75,13 @@ extern "C" __declspec(dllexport) int deskfuse_endpoint_query(const wchar_t* id,D
         if (identity.export_abi!=DESKFUSE_PCM_ABI) return -1;*result=identity;return 0;
     } catch (...) {return -1;}
 }
+// Owned loopback needs the corrected timing/source identity, independently of
+// whether this driver build advertises the committed PCM export ABI.
+extern "C" __declspec(dllexport) int deskfuse_owned_endpoint_query(const wchar_t* id,DeskFuseTimingCapabilities* result) noexcept {
+    if (!result) return -1;
+    try {ComApartment com;auto endpoint=exact_endpoint(id);*result=require_corrected_driver(*endpoint.Get());return 0;}
+    catch (...) {return -1;}
+}
 extern "C" __declspec(dllexport) void* deskfuse_source_open(const wchar_t* id,unsigned minimum,DeskFuseTimingCapabilities* result,HANDLE* event) noexcept {
     if (!result || !event || minimum>1) return nullptr;
     try {auto source=std::make_unique<SourceControl>(id,minimum!=0);*result=source->identity;*event=source->failed.get();return source.release();}
@@ -88,3 +95,5 @@ extern "C" __declspec(dllexport) void deskfuse_source_close(void* value) noexcep
 extern "C" __declspec(dllexport) unsigned deskfuse_source_period_frames(void* value) noexcept {
     return value?static_cast<SourceControl*>(value)->period_frames:0;
 }
+
+#include "owned_loopback.cpp"

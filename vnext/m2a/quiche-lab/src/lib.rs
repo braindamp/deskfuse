@@ -4,6 +4,7 @@
 //! No heap allocation is needed in encode/decode.
 pub mod deferred_trace;
 pub mod broker_control;
+pub mod audio_authority;
 pub mod reactor;
 pub mod wasapi_pipe;
 pub mod endpoint_lease;
@@ -11,6 +12,8 @@ pub mod session_control;
 pub mod lab_observation;
 #[cfg(windows)]
 pub mod committed_source;
+#[cfg(windows)]
+pub mod native_loopback;
 #[cfg(target_os="android")]
 extern crate self as deskfuse_quiche_lab;
 #[cfg(target_os="android")]

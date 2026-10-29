@@ -20,6 +20,7 @@ internal interface IInstalledBrokerWorkerImage : IDisposable
 {
     string ExecutablePath { get; }
     string WorkingDirectory { get; }
+    byte[] InstalledProfileSha256 { get; }
     void RevalidateHeldProfile();
 }
 
@@ -406,7 +407,7 @@ internal sealed class BrokerWorkerLauncher
 
 /// <summary>Retained process object created by the broker. No public PID-based registration path exists.</summary>
 [SupportedOSPlatform("windows")]
-internal sealed class BrokerRegisteredWorker : IBrokerRegisteredWorker, IDisposable
+internal sealed class BrokerRegisteredWorker : IBrokerAudioWorker, IDisposable
 {
     internal SafeProcessHandle ProcessHandle { get; }
     internal SafeWaitHandle ThreadHandle { get; }
@@ -416,6 +417,7 @@ internal sealed class BrokerRegisteredWorker : IBrokerRegisteredWorker, IDisposa
     public uint ProcessId { get; }
     public ulong CreationFileTime { get; private set; }
     private readonly IInstalledBrokerWorkerImage image;
+    public byte[] InstalledProfileSha256 => image.InstalledProfileSha256;
     private readonly BrokerWorkerLauncher.WorkerJob job;
     internal BrokerLocalPipe? ControlPipe { get; private set; }
     private bool stopped, disposed;

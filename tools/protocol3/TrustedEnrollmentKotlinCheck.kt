@@ -23,7 +23,7 @@ object TrustedEnrollmentKotlinCheck {
         val signer = BrokerDeviceSigner(keys); val host = TrustedEnrollmentProtocol.hash(offer.hostSpki)
         val identity = signer.prepareEnrollment(host, offer.enrollment)
         val (proposal, signature) = signer.signEnrollmentProposal(host, offer.enrollment, identity.publicSpkiSha256,
-            offerBytes, ByteArray(32), listOf(BrokerScope.SPEAKER))
+            offerBytes, ByteArray(32), listOf(BrokerScope.SPEAKER, BrokerScope.DISPLAY))
         println(hex.formatHex(proposal)); println(hex.formatHex(signature))
         val transcript = hex.parseHex(readln()); val parsed = TrustedEnrollmentProtocol.parseTranscript(transcript)
         check(transcript.contentEquals(TrustedEnrollmentProtocol.transcript(parsed)))
@@ -40,7 +40,7 @@ object TrustedEnrollmentKotlinCheck {
         check(runCatching { signer.signEnrollmentProposal(ByteArray(32), offer.enrollment, identity.publicSpkiSha256,
             offerBytes, ByteArray(32), listOf(BrokerScope.SPEAKER)) }.isFailure)
         val challenge = hex.parseHex(readln())
-        val proofContext = BrokerProofApproval(offer.peer, ByteArray(32), BrokerOperation.ACQUIRE, BrokerScope.SPEAKER,
+        val proofContext = BrokerProofApproval(offer.peer, ByteArray(32), BrokerOperation.ACQUIRE, BrokerScope.DISPLAY,
             offer.ui, 1, host, offer.namespace, offer.enrollment, offer.subject)
         val signedFrozen = hex.parseHex(readln()); val signedReceipt = hex.parseHex(readln()); val hostChallengeSignature = hex.parseHex(readln())
         val records = object : TrustedEnrollmentPersistence {
@@ -67,12 +67,116 @@ object TrustedEnrollmentKotlinCheck {
         check(proof.contentEquals(signer.signCommittedProof(active, challenge, hostChallengeSignature, proofContext)))
         check(runCatching { signer.signCommittedProof(active, challenge, ByteArray(8), proofContext) }.isFailure)
         println(hex.formatHex(proof))
-        val foreign = BrokerProofApproval(offer.peer, ByteArray(32), BrokerOperation.ACQUIRE, BrokerScope.SPEAKER,
+        val foreign = BrokerProofApproval(offer.peer, ByteArray(32), BrokerOperation.ACQUIRE, BrokerScope.DISPLAY,
             offer.ui, 1, ByteArray(32), offer.namespace, offer.enrollment, offer.subject)
         check(runCatching { signer.signExisting(host, offer.enrollment, identity.publicSpkiSha256, challenge, foreign) }.isFailure)
-        val v1 = BrokerProofApproval(offer.peer, ByteArray(32), BrokerOperation.ACQUIRE, BrokerScope.SPEAKER, offer.ui, 1)
+        val v1 = BrokerProofApproval(offer.peer, ByteArray(32), BrokerOperation.ACQUIRE, BrokerScope.DISPLAY, offer.ui, 1)
         check(runCatching { BrokerProofTranscript.requireApproved(challenge, v1) }.isFailure)
+        // N2 uses shipping typed descriptor/proof/receipt code, including local BOOTTIME cutoffs.
+        val audioSourceBytes = hex.parseHex(readln()); val audioNonce = hex.parseHex(readln())
+        val audioChallenge = hex.parseHex(readln()); val audioHostSignature = hex.parseHex(readln())
+        val audioSource = AudioSourceApproval(audioSourceBytes)
+        val audioApproval = AudioProofApproval.acquire(audioSource, audioNonce)
+        check(runCatching { signer.signCommittedProof(active, audioChallenge, audioHostSignature, audioApproval.brokerApproval()) }.isFailure)
+        var audioNow = 1000000000L
+        val audioOwner = AudioPhoneRequests(audioSource) { audioNow }
+        val sourcePending = audioOwner.begin(audioApproval)
+        sourcePending.setChallenge(audioChallenge, audioHostSignature)
+        val sourceSignature = signer.signAudioProof(active, sourcePending)
+        check(sourceSignature.contentEquals(signer.signAudioProof(active, sourcePending)))
+        val savedKeys = keys.values.toMap(); keys.values.clear()
+        check(runCatching { signer.signAudioProof(active, sourcePending) }.isFailure)
+        keys.values.putAll(savedKeys)
+        check(sourceSignature.contentEquals(signer.signAudioProof(active, sourcePending)))
+        audioOwner.confirmProof(sourcePending)
+        println(hex.formatHex(sourceSignature))
+        val sourceReceipt = hex.parseHex(readln())
+        audioNow = 1100000000L
+        val sourceWindow = audioOwner.accept(active, sourcePending, sourceReceipt, 1000)
+        check(sourceWindow === audioOwner.accept(active, sourcePending, sourceReceipt, 1000))
+        check(sourceWindow.deadlineNanos == 1499500000L)
+        check(runCatching { AudioSourceApproval(audioSourceBytes + 0) }.isFailure)
+        println("AUDIO_SOURCE_PASS")
+        val audioBinding = hex.parseHex(readln()); val deliveryBytes = hex.parseHex(readln())
+        val deliveryChallenge = hex.parseHex(readln()); val deliveryHostSignature = hex.parseHex(readln())
+        val deliveryRequest = AudioFrozenProof(deliveryChallenge).requestId()
+        val deliveryApproval = AudioProofApproval.delivery(audioSource, audioBinding, deliveryBytes, AudioOperation.ATTACH_DELIVERY,
+            ByteArray(32) { 4 }, ByteArray(32) { 5 }, deliveryRequest)
+        check(runCatching { AudioProofApproval.delivery(audioSource, audioBinding, deliveryBytes, AudioOperation.ATTACH_DELIVERY,
+            ByteArray(32) { 8 }, ByteArray(32) { 5 }, deliveryRequest) }.isFailure)
+        val deliveryPending = audioOwner.begin(deliveryApproval)
+        deliveryPending.setChallenge(deliveryChallenge, deliveryHostSignature)
+        println(hex.formatHex(signer.signAudioProof(active, deliveryPending)))
+        audioOwner.confirmProof(deliveryPending)
+        val deliveryReceipt = hex.parseHex(readln())
+        val window = audioOwner.accept(active, deliveryPending, deliveryReceipt, 1000)
+        check(window.revision == 3uL)
+        check(window === audioOwner.accept(active, deliveryPending, deliveryReceipt, 1000))
+        val tampered = deliveryReceipt.copyOf().also { it[it.lastIndex] = (it.last().toInt() xor 1).toByte() }
+        check(runCatching { audioOwner.accept(active, deliveryPending, tampered, 1000) }.isFailure)
+        check(runCatching { audioOwner.accept(active, sourcePending, sourceReceipt, 1000) }.isFailure)
+        check(records.reads == readCount)
+        println("AUDIO_DELIVERY_PASS")
+        val queryOne = audioOwner.beginResync(); check(queryOne.contentEquals(audioOwner.beginResync()))
+        println(hex.formatHex(queryOne))
+        check(runCatching { audioOwner.resync(active, hex.parseHex(readln())) }.isFailure) // Valid root, wrong query, MAX floor.
+        val statusOne = hex.parseHex(readln())
+        check(runCatching { audioOwner.resync(active, statusOne.copyOf().also { it[it.lastIndex] = (it.last().toInt() xor 1).toByte() }) }.isFailure)
+        audioOwner.resync(active, statusOne)
+        check(AudioRequestId(audioOwner.nextRequestId()).sequence == 3uL)
+        fun renewal(id: ByteArray) = AudioProofApproval.delivery(audioSource, audioBinding, deliveryBytes, AudioOperation.RENEW,
+            ByteArray(32) { 4 }, ByteArray(32) { 5 }, id, TrustedEnrollmentProtocol.hash(deliveryBytes))
+        val renewalApproval = renewal(audioOwner.nextRequestId())
+        val renewalPending = audioOwner.begin(renewalApproval)
+        println(hex.formatHex(audioOwner.beginResync()))
+        val foreignStatus = hex.parseHex(readln())
+        check(runCatching { audioOwner.resync(active, foreignStatus) }.isFailure)
+        audioOwner.resync(active, hex.parseHex(readln())) // Floor 2: proposal not yet reserved.
+        check(audioOwner.nextRequestId().contentEquals(renewalApproval.nonce()))
+        check(renewalPending === audioOwner.begin(renewalApproval) && renewalPending.firstSendNanos == 1100000000L)
+        println(hex.formatHex(renewalApproval.nonce()))
+        println(hex.formatHex(audioOwner.beginResync()))
+        audioOwner.resync(active, hex.parseHex(readln())) // Floor 3, retiring same identity: burned request is stale.
+        check(renewalPending.isRetired() && AudioRequestId(audioOwner.nextRequestId()).sequence == 4uL)
+        audioNow += 50000000L
+        val successor = audioOwner.begin(renewal(audioOwner.nextRequestId()))
+        check(successor.firstSendNanos == audioNow && successor.firstSendNanos > renewalPending.firstSendNanos)
+        audioOwner.retirePending()
+        check(AudioRequestId(audioOwner.nextRequestId()).sequence == 4uL) // Unreserved proposal never burns the local floor.
+        check(AudioRequestId(AudioRequestId.fresh(1uL shl 63)).sequence == 1uL shl 63)
+        check(AudioRequestId(AudioRequestId.fresh(ULong.MAX_VALUE)).sequence == ULong.MAX_VALUE)
+        val cold = AudioPhoneRequests(audioSource) { audioNow }
+        check(runCatching { cold.accept(active, sourcePending, sourceReceipt, 1000) }.isFailure)
+        check(runCatching { cold.begin(renewal(cold.nextRequestId())) }.isFailure)
+        // Real pending machinery, fault-injected synchronous key operation: an
+        // uncertain signature is never retried, and cancellation cannot release
+        // the operation slot before that actual call completes.
+        val failureOwner = AudioPhoneRequests(audioSource) { audioNow }
+        val failureApproval = AudioProofApproval.acquire(audioSource, audioNonce)
+        val failurePending = failureOwner.begin(failureApproval)
+        failurePending.setChallenge(audioChallenge, audioHostSignature)
+        var attempts = 0
+        repeat(2) { check(runCatching { failurePending.signWith { _, _, _ -> attempts++; throw java.io.IOException("Injected key failure") } }.isFailure) }
+        check(attempts == 1)
+        val blockedOwner = AudioPhoneRequests(audioSource) { audioNow }
+        val blockedApproval = AudioProofApproval.acquire(audioSource, audioNonce)
+        val blocked = blockedOwner.begin(blockedApproval); blocked.setChallenge(audioChallenge, audioHostSignature)
+        val entered = java.util.concurrent.CountDownLatch(1); val release = java.util.concurrent.CountDownLatch(1)
+        val task = Thread { runCatching { blocked.signWith { _, _, _ -> entered.countDown(); check(release.await(5, java.util.concurrent.TimeUnit.SECONDS)); ByteArray(8) } } }
+        task.start(); check(entered.await(5, java.util.concurrent.TimeUnit.SECONDS)); blockedOwner.retirePending()
+        check(blocked.isSigning() && runCatching { blockedOwner.begin(AudioProofApproval.acquire(audioSource, audioNonce)) }.isFailure)
+        release.countDown(); task.join(5000); check(!task.isAlive && !blocked.isSigning())
+        check(blockedOwner.begin(AudioProofApproval.acquire(audioSource, blockedOwner.nextRequestId())) !== blocked)
+        audioNow = window.deadlineNanos
+        check(runCatching { audioOwner.accept(active, deliveryPending, deliveryReceipt, 1000) }.isFailure)
+        check(runCatching { audioOwner.nextRequestId() }.isFailure)
+        println("AUDIO_STATUS_PASS")
+        val denialOwner = AudioPhoneRequests(audioSource) { 1100000000L }
+        val denialPending = denialOwner.begin(AudioProofApproval.acquire(audioSource, audioNonce))
+        denialPending.setChallenge(audioChallenge, audioHostSignature)
+        signer.signAudioProof(active, denialPending)
         repository.remove(host, offer.enrollment)
+        check(runCatching { signer.signAudioProof(active, denialPending) }.isFailure)
         check(runCatching { active.requireCurrent() }.isFailure)
         check(runCatching { signer.signCommittedProof(active, challenge, hostChallengeSignature, proofContext) }.isFailure)
         println("TRUSTED_ENROLLMENT_KOTLIN_PASS")

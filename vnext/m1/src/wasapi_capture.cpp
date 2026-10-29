@@ -122,12 +122,14 @@ class NativeDropLedger {
     };
 public:
     void record(const Block& b) noexcept {
+        record(b.first_device_frame, b.qpc_100ns, b.frame_count, b.flags);
+    }
+    void record(uint64_t frame, uint64_t qpc, uint32_t frames, uint32_t flags) noexcept {
         const uint64_t ordinal = ++count_;
         const size_t slot = ordinal <= 8
             ? static_cast<size_t>(ordinal - 1)
             : 8 + static_cast<size_t>((ordinal - 9) % 8);
-        entries_[slot] = {b.first_device_frame, b.qpc_100ns,
-                          b.frame_count, b.flags};
+        entries_[slot] = {frame, qpc, frames, flags};
     }
     void report() const {
         auto emit = [&](size_t slot, uint64_t ordinal) {
@@ -369,7 +371,7 @@ int16_t float_to_pcm(float sample) {
 void convert(const uint8_t* data, bool is_float, DWORD flags,
              UINT32 frame_offset, Block& b) {
     if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
-        std::fill(b.pcm.begin(), b.pcm.begin() + b.frame_count * 4, 0);
+        std::fill(b.pcm.begin(), b.pcm.begin() + b.frame_count * 4, uint8_t{0});
         return;
     }
     const uint8_t* src = data + static_cast<size_t>(frame_offset) * (is_float ? 8 : 4);

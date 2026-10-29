@@ -240,11 +240,81 @@ pub struct Readiness {
 }
 
 #[cfg(windows)]
+pub struct AudioReadiness {
+    pub network:Readiness,
+    pub control:bool,
+    pub terminal:bool,
+    pub source:bool,
+}
+
+#[cfg(all(windows,test))]
+mod audio_event_tests {
+    use super::*;
+    use windows_sys::Win32::{System::Threading::*,Foundation::CloseHandle};
+    #[test]
+    fn control_terminal_and_auto_reset_source_wakes_share_the_socket_wait() {
+        let socket=UdpSocket::bind("127.0.0.1:0").unwrap();socket.set_nonblocking(true).unwrap();
+        let events=WindowsEvents::new(&socket).unwrap();
+        unsafe {
+            let control=CreateEventW(std::ptr::null(),1,0,std::ptr::null());
+            let terminal=CreateEventW(std::ptr::null(),1,0,std::ptr::null());
+            let source=CreateEventW(std::ptr::null(),0,0,std::ptr::null());
+            assert!(!control.is_null() && !terminal.is_null() && !source.is_null());
+            SetEvent(control);SetEvent(source);
+            let wake=events.wait_audio(false,control,terminal,source,Some(Instant::now()+Duration::from_secs(1))).unwrap();
+            assert!(wake.control && wake.source && !wake.terminal);
+            assert_eq!(WaitForSingleObject(source,0),258); // consumed hint; queue indices would remain truth
+            ResetEvent(control);SetEvent(terminal);
+            let wake=events.wait_audio(false,control,terminal,source,None).unwrap();assert!(wake.terminal);
+            assert!(events.wait_audio(false,control,control,source,None).is_err());
+            CloseHandle(control);CloseHandle(terminal);CloseHandle(source);
+        }
+    }
+}
+
+#[cfg(windows)]
 pub struct WindowsEvents {
     socket:usize,event:isize,timer:*mut std::ffi::c_void,
 }
 #[cfg(windows)]
 impl WindowsEvents {
+    /// Control/terminal precede source/network in the kernel wait. These are
+    /// borrowed events, not ownership transfers. The owner must inspect queue
+    /// indices/terminal state before sleeping and recheck authority after EVERY
+    /// wake; an event hint or timer wake never grants authority.
+    pub fn wait_audio(&self,want_write:bool,control:*mut std::ffi::c_void,
+        terminal:*mut std::ffi::c_void,source:*mut std::ffi::c_void,deadline:Option<Instant>)
+        ->io::Result<AudioReadiness> {
+        use windows_sys::Win32::{Networking::WinSock::*,System::Threading::*};
+        let handles=[control,terminal,source,self.event as *mut std::ffi::c_void,self.timer];
+        if handles.iter().enumerate().any(|(i,h)|h.is_null() || handles[..i].contains(h)) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput,"audio wait requires distinct live events"));
+        }
+        unsafe {
+            if let Some(t)=deadline {
+                let duration=t.saturating_duration_since(Instant::now());
+                let due=-(((duration.as_nanos()+99)/100).max(1).min(i64::MAX as u128) as i64);
+                if SetWaitableTimer(self.timer,&due,0,None,std::ptr::null(),0)==0{return Err(io::Error::last_os_error())}
+            } else {CancelWaitableTimer(self.timer);}
+            let result=WaitForMultipleObjects(handles.len() as u32,handles.as_ptr(),0,u32::MAX);
+            if result==u32::MAX{return Err(io::Error::last_os_error())}
+            if result>=handles.len() as u32{return Err(io::Error::other("unexpected audio event wait result"))}
+            let mut network:WSANETWORKEVENTS=std::mem::zeroed();
+            if WSAEnumNetworkEvents(self.socket,self.event,&mut network)!=0 {
+                return Err(io::Error::from_raw_os_error(WSAGetLastError()))
+            }
+            if network.lNetworkEvents & FD_CLOSE as i32!=0{return Err(io::Error::new(io::ErrorKind::ConnectionAborted,"QUIC socket closed"))}
+            for index in [FD_READ_BIT,FD_WRITE_BIT] {
+                if network.iErrorCode[index as usize]!=0{return Err(io::Error::from_raw_os_error(network.iErrorCode[index as usize]))}
+            }
+            // Never ResetEvent: an auto-reset publication between empty-check
+            // and wait remains a persistent hint. Queue indices remain truth.
+            let signaled=|index:usize|result==index as u32 || WaitForSingleObject(handles[index],0)==0;
+            Ok(AudioReadiness{network:Readiness{readable:network.lNetworkEvents&FD_READ as i32!=0,
+                writable:want_write && network.lNetworkEvents&FD_WRITE as i32!=0},
+                control:signaled(0),terminal:signaled(1),source:signaled(2)})
+        }
+    }
     pub fn new(udp:&UdpSocket)->io::Result<Self> {
         use std::os::windows::io::AsRawSocket;
         use windows_sys::Win32::{Networking::WinSock::*,System::Threading::*};

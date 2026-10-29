@@ -81,6 +81,11 @@ internal sealed class EnrollmentPersistenceOwner : IAsyncDisposable
         return new(receipt, store.CaptureCommittedResponse(offer.EnrollmentId));
     }
 
+    internal Task<TrustedBrokerEnrollmentStore.SpeakerAssociation> SpeakerAssociationAsync(Guid enrollment)
+    {
+        lock (gate) return Enqueue(() => store.GetSpeakerAssociation(enrollment));
+    }
+
     internal Task<EnrollmentOutcome> CancelAsync(EnrollmentCeremony ceremony)
     {
         if (ceremony.CancelBeforeCommit()) return Task.FromResult(EnrollmentOutcome.Aborted);

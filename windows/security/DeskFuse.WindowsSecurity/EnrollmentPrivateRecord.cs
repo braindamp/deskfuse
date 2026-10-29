@@ -5,7 +5,7 @@ namespace DeskFuse.WindowsSecurity;
 public enum EnrollmentPrivateRecordKind { Evidence, Commit, Receipt, Revocation }
 
 /// <summary>
-/// Cold enrollment-only write custody. No stream escapes; successful completion
+/// Cold enrollment/peer-association write custody. No stream escapes; successful completion
 /// belongs to this exact held object and owner, never to a readable pathname.
 /// </summary>
 [SupportedOSPlatform("windows")]

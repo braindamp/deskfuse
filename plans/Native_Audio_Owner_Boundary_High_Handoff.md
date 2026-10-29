@@ -1,5 +1,12 @@
 # Native audio ownership — focused Ultra decision and High handoff
 
+**N2 retention decision selected on Ultra, 29 October:**
+[Audio_N2_Bounded_Request_Retention_High_Decision.md](Audio_N2_Bounded_Request_Retention_High_Decision.md).
+Its focused High implementation is now source-complete/offline checked; see
+[current N2 status](Audio_N2_Bounded_Request_Implementation_Status.md). Continue
+N3 native TLS/control on High. Production remains disabled. The original
+[draft stop](Audio_N2_Request_Retention_Ultra_Stop.md) remains background.
+
 **Current implementation, 29 October 2026:**
 [Native_Worker_Thread_Launch_High_Decision.md](Native_Worker_Thread_Launch_High_Decision.md)
 records the accepted/implemented private-token thread policy and N1 bootstrap.
@@ -279,6 +286,11 @@ devices. Established broker-pipe loss remains terminal even if network reconnect
 would otherwise be allowed.
 
 ## 6. WASAPI fallback: one native queue, no PCM subprocess
+
+**29 October execution update:** The independent native ABI/queue/capture, Rust
+borrowed adapter/assembler and combined event-wait foundation is implemented and
+offline checked. See [Audio_Independent_High_Continuation_Status.md](Audio_Independent_High_Continuation_Status.md).
+This does not complete production wiring, N2 or installed qualification.
 
 Preserve C++ endpoint/format checks, conversion, device-frame positions, original
 packet QPC/offset, discontinuity/silent/timestamp-error flags, period policy and

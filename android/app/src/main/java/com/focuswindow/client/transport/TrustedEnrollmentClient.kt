@@ -80,7 +80,7 @@ internal class TrustedEnrollmentClient private constructor(
         }
         val prepared = withContext(Dispatchers.IO) { repository.prepare(snapshot) }
         withContext(Dispatchers.Main.immediate) {
-            require(isForeground() && !stopped.get() && MessageDigest.isEqual(checkedHash, prepared.binding().hash)) { "Consent is no longer current" }
+            require(isForeground() && !stopped.get() && !approvalIssued && MessageDigest.isEqual(checkedHash, prepared.binding().hash)) { "Consent is no longer current" }
             approvalIssued = true // Final local approval admission, only after durable Prepared.
         }
         return withContext(Dispatchers.IO) {

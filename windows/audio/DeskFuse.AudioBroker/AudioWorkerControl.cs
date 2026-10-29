@@ -5,7 +5,7 @@ using System.Security.Principal;
 
 namespace DeskFuse.AudioBroker;
 
-internal enum AudioWorkerFrameKind : byte { Hello = 1, Ready = 2, Stop = 3 }
+internal enum AudioWorkerFrameKind : byte { Hello = 1, Ready = 2, Stop = 3, Authority = 4, AuthorityObserved = 5 }
 internal sealed record AudioWorkerFrame(AudioWorkerFrameKind Kind, byte[] Body);
 
 /// <summary>Bounded local native control, distinct from enrollment/network framing.</summary>
@@ -72,11 +72,17 @@ internal sealed class BrokerAudioWorkerSession
 {
     private readonly AudioWorkerControl control;
     private readonly BrokerCallerBinding caller;
+    private readonly byte[] boot;
+    private readonly object publicationGate = new();
+    private Task? publication;
+    private Task? stopOperation;
+    private BrokerAudioOwner? audioOwner;
+    private bool stopping;
     private bool stopped;
     internal BrokerRegisteredWorker Worker { get; }
     internal IBrokerObservedCaller Caller => caller;
-    private BrokerAudioWorkerSession(BrokerRegisteredWorker worker, BrokerCallerBinding caller, AudioWorkerControl control)
-    { Worker = worker; this.caller = caller; this.control = control; }
+    private BrokerAudioWorkerSession(BrokerRegisteredWorker worker, BrokerCallerBinding caller, AudioWorkerControl control, byte[] boot)
+    { Worker = worker; this.caller = caller; this.control = control; this.boot = boot; }
 
     internal static async Task<BrokerAudioWorkerSession> ConnectAsync(BrokerRegisteredWorker worker, byte[] serviceBoot, CancellationToken ct)
     {
@@ -107,7 +113,7 @@ internal sealed class BrokerAudioWorkerSession
             var ready = await control.ReadAsync(setup.Token).ConfigureAwait(false);
             if (ready.Kind != AudioWorkerFrameKind.Ready || !ready.Body.AsSpan().SequenceEqual(hello) || !caller.Matches(worker))
                 throw new UnauthorizedAccessException("Native readiness did not confirm the exact bootstrap.");
-            return new(worker, caller, control);
+            return new(worker, caller, control, hello.AsSpan(17, 32).ToArray());
         }
         catch (Exception failure)
         {
@@ -118,15 +124,63 @@ internal sealed class BrokerAudioWorkerSession
         }
     }
 
+    internal Task<bool> PublishAuthorityAsync(BrokerAudioOwner owner, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        lock (publicationGate)
+        {
+            if (stopping || !owner.IsWorker(Worker) || audioOwner is not null && !ReferenceEquals(audioOwner, owner))
+                throw new UnauthorizedAccessException("Audio publication is outside its retained source/worker owner.");
+            if (publication is { IsCompleted: false }) throw new InvalidOperationException("A native authority operation is already retained.");
+            audioOwner = owner;
+            var operation = PublishCore(owner, ct); publication = operation; return operation;
+        }
+    }
+    private async Task<bool> PublishCore(BrokerAudioOwner owner, CancellationToken ct)
+    {
+        try
+        {
+            var snapshot = owner.ControlSnapshot();
+            if (!snapshot.Boot.AsSpan().SequenceEqual(boot)) throw new UnauthorizedAccessException("Native service boot changed.");
+            var bytes = AudioAuthorityProtocol.Control(snapshot);
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct); timeout.CancelAfter(TimeSpan.FromSeconds(3));
+            if (!owner.IsControlCurrent(snapshot)) return false;
+            await control.WriteAsync(AudioWorkerFrameKind.Authority, bytes, timeout.Token).ConfigureAwait(false);
+            var observed = await control.ReadAsync(timeout.Token).ConfigureAwait(false);
+            if (observed.Kind != AudioWorkerFrameKind.AuthorityObserved || !observed.Body.AsSpan().SequenceEqual(bytes) || !caller.Matches(Worker))
+                throw new UnauthorizedAccessException("Native authority acknowledgement changed context.");
+            var current = owner.IsControlCurrent(snapshot);
+            // This confirms only native authorization-state observation. N4
+            // source setup and actual resource rundown require their own facts.
+            // A newer benign state supersedes this reply; it does not restart
+            // the healthy source. The serialized N3 owner publishes the latest.
+            return current;
+        }
+        catch { owner.CloseAdmission(); throw; }
+    }
+
     // Must be called by the serialized resource owner after native-resource
     // retirement, not under an authority lock. Failure retains this owner.
-    internal async Task StopAndJoinAsync()
+    internal Task StopAndJoinAsync()
     {
-        if (stopped) return;
+        lock (publicationGate)
+        {
+            if (stopped) return Task.CompletedTask;
+            if (stopOperation is { IsFaulted: false }) return stopOperation;
+            stopping = true; audioOwner?.CloseAdmission(); var pending = publication;
+            // One retained cold operation, shared by cancellation/shutdown.
+            // No process wait or pipe I/O occurs under publicationGate.
+            return stopOperation = Task.Run(() => StopCore(pending));
+        }
+    }
+    private async Task StopCore(Task? pending)
+    {
+        if (pending is not null)
+            try { await pending.ConfigureAwait(false); } catch { /* Retain/finish actual I/O before worker join. */ }
         using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(3));
         try { await control.WriteAsync(AudioWorkerFrameKind.Stop, ReadOnlyMemory<byte>.Empty, deadline.Token).ConfigureAwait(false); }
         catch (Exception error) when (error is IOException or OperationCanceledException or ObjectDisposedException) { }
         Worker.StopAndJoin(); // Actual retained job/process completion, regardless of cooperative reply.
-        caller.Dispose(); stopped = true;
+        caller.Dispose(); lock (publicationGate) stopped = true;
     }
 }

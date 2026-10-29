@@ -207,6 +207,24 @@ public sealed class SecurePrivateStorageRoot : IDisposable
         };
         var name = id.ToString("N") + suffix;
         var path = ResolveRelative(DirectoryPath, "enrollments/" + name);
+        return HoldAuthorityRecord(path, kind, create);
+    }
+
+    public EnrollmentPrivateRecord OpenSpeakerAssociation(byte[] identitySha256)
+        => HoldSpeakerAssociation(identitySha256, false);
+    public EnrollmentPrivateRecord CreateSpeakerAssociation(byte[] identitySha256)
+        => HoldSpeakerAssociation(identitySha256, true);
+    private EnrollmentPrivateRecord HoldSpeakerAssociation(byte[] identitySha256, bool create)
+    {
+        if (identitySha256 is not { Length: 32 }) throw new InvalidDataException("Invalid speaker association identity.");
+        RequireEnrollmentPersistenceProfile();
+        var name = "speaker-" + Convert.ToHexString(identitySha256).ToLowerInvariant() + ".v1.json";
+        return HoldAuthorityRecord(ResolveRelative(DirectoryPath, "bootstrap/" + name), EnrollmentPrivateRecordKind.Evidence, create);
+    }
+
+    private EnrollmentPrivateRecord HoldAuthorityRecord(string path, EnrollmentPrivateRecordKind kind, bool create)
+    {
+        var name = Path.GetFileName(path);
         var parent = ProtectedDirectoryInspection.OpenExistingForInspection(Path.GetDirectoryName(path)!);
         FileStream? file = null;
         try

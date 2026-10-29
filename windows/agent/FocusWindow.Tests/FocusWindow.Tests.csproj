@@ -32,13 +32,19 @@
     <Compile Include="..\..\audio\DeskFuse.AudioBroker\EnrollmentFraming.cs" Link="Audio\EnrollmentFraming.cs" />
     <Compile Include="..\..\audio\DeskFuse.AudioBroker\EnrollmentCeremony.cs" Link="Audio\EnrollmentCeremony.cs" />
     <Compile Include="..\..\audio\DeskFuse.AudioBroker\EnrollmentRecordFiles.cs" Link="Audio\EnrollmentRecordFiles.cs" />
+    <Compile Include="..\..\audio\DeskFuse.AudioBroker\EnrollmentPersistenceOwner.cs" Link="Audio\EnrollmentPersistenceOwner.cs" />
+    <Compile Include="..\..\audio\DeskFuse.AudioBroker\BrokerEnrollmentRundown.cs" Link="Audio\BrokerEnrollmentRundown.cs" />
     <Compile Include="..\..\audio\DeskFuse.AudioBroker\EnrollmentSetupSelection.cs" Link="Audio\EnrollmentSetupSelection.cs" />
     <Compile Include="..\..\audio\DeskFuse.AudioBroker\TrustedBrokerEnrollmentStore.cs" Link="Audio\TrustedBrokerEnrollmentStore.cs" />
     <Compile Include="..\..\audio\DeskFuse.AudioBroker\BrokerAuthority.cs" Link="Audio\BrokerAuthority.cs" />
     <Compile Include="..\..\audio\DeskFuse.AudioBroker\BrokerWorkerLauncher.cs" Link="Audio\BrokerWorkerLauncher.cs" />
     <Compile Include="..\..\audio\DeskFuse.AudioBroker\BrokerWorkerToken.cs" Link="Audio\BrokerWorkerToken.cs" />
     <Compile Include="..\..\audio\DeskFuse.AudioBroker\AudioWorkerControl.cs" Link="Audio\AudioWorkerControl.cs" />
+    <Compile Include="..\..\audio\DeskFuse.AudioBroker\AudioAuthorityProtocol.cs" Link="Audio\AudioAuthorityProtocol.cs" />
+    <Compile Include="..\..\audio\DeskFuse.AudioBroker\AudioRequestProtocol.cs" Link="Audio\AudioRequestProtocol.cs" />
+    <Compile Include="..\..\audio\DeskFuse.AudioBroker\BrokerAudioOwner.cs" Link="Audio\BrokerAudioOwner.cs" />
     <None Include="..\..\..\tools\protocol3\audio-worker-control-v1.json" Link="Fixtures\audio-worker-control-v1.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\..\tools\protocol3\audio-authority-v1.json" Link="Fixtures\audio-authority-v1.json" CopyToOutputDirectory="PreserveNewest" />
     <Compile Include="..\..\audio\DeskFuse.AudioBroker\BrokerEnrollmentState.cs" Link="Audio\BrokerEnrollmentState.cs" />
     <Compile Include="..\..\audio\DeskFuse.AudioBroker\BrokerLaunchContract.cs" Link="Audio\BrokerLaunchContract.cs" />
     <Compile Include="..\..\audio\DeskFuse.AudioBroker\BrokerLocalPipe.cs" Link="Audio\BrokerLocalPipe.cs" />

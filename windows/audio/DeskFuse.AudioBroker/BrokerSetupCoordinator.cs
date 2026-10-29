@@ -92,6 +92,7 @@ internal sealed class BrokerSetupCoordinator
                 uiRead = uiFrames.ReadAsync(stop.Token).AsTask(); networkRead = networkFrames.ReadAsync(stop.Token).AsTask();
                 var pending = new List<Pending>();
                 Task<EnrollmentOutcome>? cancel = null;
+                var cancellationRequested = false;
                 var approvalConnection = 0UL;
                 Task<EnrollmentPersistenceOwner.Reply>? commit = null;
                 (ulong Connection, byte[] Hash, bool Recovery)? receiptSent = null;
@@ -127,7 +128,7 @@ internal sealed class BrokerSetupCoordinator
                         if (frame.Kind == EnrollmentFrameKind.Confirm)
                         { ceremony.ConfirmFromUi(uiCaller, ui, frame.Body); MaybeCommit(); }
                         else if (frame.Kind == EnrollmentFrameKind.Cancel && (frame.Body.Length == 0 || ceremony.MatchesFrozenBinding(EnrollmentProtocol.ParsePhoneApproval(frame.Body))))
-                        { cancel ??= persistence.CancelAsync(ceremony); operations.Add(cancel); }
+                        { cancellationRequested = true; cancel ??= persistence.CancelAsync(ceremony); operations.Add(cancel); }
                         else throw new InvalidDataException("Unexpected protected UI operation.");
                         uiRead = uiFrames.ReadAsync(stop.Token).AsTask();
                     }
@@ -184,8 +185,8 @@ internal sealed class BrokerSetupCoordinator
                         pending.Remove(item);
                         EnrollmentPersistenceOwner.Reply reply;
                         try { reply = await item.Operation.ConfigureAwait(false); }
-                        catch (Exception) when (cancel is not null && ReferenceEquals(item.Operation, commit))
-                        { continue; } // Await the actual revoke/rundown result, not a raced commit rejection.
+                        catch (Exception) when (cancellationRequested && ReferenceEquals(item.Operation, commit))
+                        { continue; } // The cancellation/rundown result wins even if its task was already consumed.
                         if (!persistence.AdmitResponse(reply)) continue; // A newer denial wins, including delayed signed status.
                         SendNetwork(item.Connection, item.Kind, reply.Bytes);
                         if (item.Kind == EnrollmentFrameKind.Receipt)

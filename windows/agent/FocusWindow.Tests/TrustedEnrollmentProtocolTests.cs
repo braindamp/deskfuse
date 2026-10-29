@@ -11,7 +11,7 @@ public sealed class TrustedEnrollmentProtocolTests
     internal static byte[] User => [1, 1, 0, 0, 0, 0, 0, 5, 21, 0, 0, 0];
     internal static byte[] Logon => [1, 3, 0, 0, 0, 0, 0, 5, 5, 0, 0, 0, 22, 0, 0, 0, 33, 0, 0, 0];
     internal static Guid Id => new("00112233-4455-6677-8899-aabbccddeeff");
-    internal static EnrollmentOffer Offer => new(Public, Id, Id, Id, new byte[32], EnrollmentAction.New, Guid.Empty,
+    internal static EnrollmentOffer Offer => new(Public, Id, Id, Id, Enumerable.Repeat((byte)0x23, 32).ToArray(), EnrollmentAction.New, Guid.Empty,
         new byte[32], new byte[32], Id, new byte[32], User, Logon, 42, 1, User, Id, 101, 200,
         [BrokerProofScope.Speaker, BrokerProofScope.Display], 310000);
 
@@ -94,7 +94,7 @@ public sealed class TrustedEnrollmentProtocolTests
             await process.StandardInput.WriteLineAsync(Convert.ToHexString(value));
         await process.StandardInput.WriteLineAsync(EnrollmentProtocol.VerificationText(binding.TranscriptSha256));
         await process.StandardInput.WriteLineAsync(EnrollmentProtocol.VerificationQr(Id, binding.TranscriptSha256));
-        var context = new BrokerProofContext(Offer.PeerIdentity, new byte[32], BrokerProofOperation.Acquire, BrokerProofScope.Speaker,
+        var context = new BrokerProofContext(Offer.PeerIdentity, new byte[32], BrokerProofOperation.Acquire, BrokerProofScope.Display,
             Id, User, Logon, 42, 1, 101, 200, 1, new(binding.HostSha256, binding.AuthorityNamespace, binding.EnrollmentId, User));
         var challenges = new BrokerProofChallenges(() => 10000);
         var challenge = challenges.Issue(context, parsed.PhoneSpki, 1000);
@@ -110,6 +110,62 @@ public sealed class TrustedEnrollmentProtocolTests
         await process.StandardInput.WriteLineAsync(Convert.ToHexString(SignRoot(hostChallenge)));
         var proof = Convert.FromHexString((await process.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(30)))!);
         Assert.True(challenges.Consume(challenge.Nonce, proof, context, parsed.PhoneSpki));
+        var audioSource = new AudioSourceDescriptor(new(binding.HostSha256, binding.AuthorityNamespace, binding.EnrollmentId, Offer.PeerIdentity,
+            User, Id, Logon, 42, 1, 101, 200), new(Guid.Parse("11112222-3333-4444-8888-9999aabbccdd"), 1,
+                Guid.Parse("ffeeddcc-bbaa-9988-7766-554433221100"), AudioSourceBackend.Committed, Enumerable.Repeat((byte)11, 32).ToArray(),
+                false, new(1000, 200), new(2, 3, 4)));
+        byte[] SignChallenge(IssuedBrokerChallenge c) => SignRoot(AudioRequestProtocol.ChallengeMessage(c.Transcript));
+        var audioContext = new BrokerProofContext(Offer.PeerIdentity, audioSource.Digest, BrokerProofOperation.Acquire, BrokerProofScope.Speaker,
+            Id, User, Logon, 42, 1, 101, 200, 1, new(binding.HostSha256, binding.AuthorityNamespace, binding.EnrollmentId, User));
+        byte[] Request(ulong sequence) { var b = Enumerable.Repeat((byte)9, 32).ToArray(); System.Buffers.Binary.BinaryPrimitives.WriteUInt64BigEndian(b, sequence); return b; }
+        var audioNonce = Request(1); var audioBoot = Enumerable.Repeat((byte)7, 32).ToArray();
+        var sourceProofBinding = new AudioProofBinding(audioBoot, audioSource.Intent.Grant, 1, audioSource.Digest,
+            AudioOperationKind.AcquireSource, audioNonce, 0, 110000000);
+        var audioChallenge = challenges.Issue(audioContext, parsed.PhoneSpki, 1000, sourceProofBinding, 11000);
+        foreach (var value in new[] { audioSource.Bytes, audioNonce, audioChallenge.Transcript, SignChallenge(audioChallenge) })
+            await process.StandardInput.WriteLineAsync(Convert.ToHexString(value));
+        var audioProof = Convert.FromHexString((await process.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(30)))!);
+        Assert.True(challenges.Consume(audioChallenge.Nonce, audioProof, audioContext, parsed.PhoneSpki, out _, sourceProofBinding));
+        var audioReceipt = AudioAuthorityProtocol.Receipt(new(AudioOperationKind.AcquireSource, binding.HostSha256, binding.AuthorityNamespace,
+            binding.EnrollmentId, audioBoot, Id, audioSource.Intent.Grant, 1, audioSource.Digest, new byte[32], 0, 1, 110000000,
+            SHA256.HashData(audioChallenge.Transcript), audioNonce, 5000000));
+        await process.StandardInput.WriteLineAsync(Convert.ToHexString(EnrollmentFraming.Signed(audioReceipt, SignRoot(audioReceipt))));
+        Assert.Equal("AUDIO_SOURCE_PASS", await process.StandardOutput.ReadLineAsync());
+        var audioBinding = AudioAuthorityProtocol.Binding(audioSource, new(audioSource.Intent.DeviceKey, "owned-endpoint", Id, 2, 0x2026102502, 1, 7));
+        var delivery = new AudioDeliveryDescriptor(audioSource, SHA256.HashData(audioBinding), new(1,
+            Enumerable.Repeat((byte)4, 32).ToArray(), Enumerable.Repeat((byte)5, 32).ToArray(),
+            Request(2), Enumerable.Repeat((byte)6, 32).ToArray()));
+        var deliveryContext = new BrokerProofContext(Offer.PeerIdentity, delivery.Digest, BrokerProofOperation.Acquire, BrokerProofScope.Speaker,
+            Id, User, Logon, 42, 1, 101, 200, 1, new(binding.HostSha256, binding.AuthorityNamespace, binding.EnrollmentId, User));
+        var deliveryProofBinding = new AudioProofBinding(audioBoot, audioSource.Intent.Grant, 1, audioSource.Digest,
+            AudioOperationKind.AttachDelivery, Request(2), 2, 110000000);
+        var deliveryChallenge = challenges.Issue(deliveryContext, parsed.PhoneSpki, 1000, deliveryProofBinding, 11000);
+        foreach (var value in new[] { audioBinding, delivery.Bytes, deliveryChallenge.Transcript, SignChallenge(deliveryChallenge) })
+            await process.StandardInput.WriteLineAsync(Convert.ToHexString(value));
+        var deliveryProof = Convert.FromHexString((await process.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(30)))!);
+        Assert.True(challenges.Consume(deliveryChallenge.Nonce, deliveryProof, deliveryContext, parsed.PhoneSpki, out _, deliveryProofBinding));
+        var deliveryReceipt = AudioAuthorityProtocol.Receipt(new(AudioOperationKind.AttachDelivery, binding.HostSha256, binding.AuthorityNamespace,
+            binding.EnrollmentId, audioBoot, Id, audioSource.Intent.Grant, 1, audioSource.Digest, delivery.Digest, 1, 3, 110000000,
+            SHA256.HashData(deliveryChallenge.Transcript), delivery.Intent.PhoneRequestNonce, 5000000));
+        await process.StandardInput.WriteLineAsync(Convert.ToHexString(EnrollmentFraming.Signed(deliveryReceipt, SignRoot(deliveryReceipt))));
+        Assert.Equal("AUDIO_DELIVERY_PASS", await process.StandardOutput.ReadLineAsync());
+        AudioRequestStatus RequestStatus(byte[] query, ulong floor) => new(query, audioSource.Identity, audioBoot,
+            audioSource.Intent.Grant, 1, audioSource.Digest, AudioAuthorityPhase.Prepared, SHA256.HashData(audioBinding), 1,
+            delivery.Digest, 3, 110000000, floor, new byte[32], AudioRequestStage.Empty, 0, 0);
+        async Task SendRequestStatus(AudioRequestStatus value)
+        { var message = AudioRequestProtocol.Status(value); await process.StandardInput.WriteLineAsync(Convert.ToHexString(EnrollmentFraming.Signed(message, SignRoot(message)))); }
+        var queryOne = Convert.FromHexString((await process.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(30)))!);
+        var wrongQuery = queryOne.ToArray(); wrongQuery[0] ^= 0x80;
+        await SendRequestStatus(RequestStatus(wrongQuery, ulong.MaxValue));
+        await SendRequestStatus(RequestStatus(queryOne, 2));
+        var queryTwo = Convert.FromHexString((await process.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(30)))!);
+        await SendRequestStatus(RequestStatus(queryTwo, ulong.MaxValue) with { Source = Guid.NewGuid() });
+        await SendRequestStatus(RequestStatus(queryTwo, 2));
+        var retiredRequest = Convert.FromHexString((await process.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(30)))!);
+        var queryThree = Convert.FromHexString((await process.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(30)))!);
+        await SendRequestStatus(RequestStatus(queryThree, 3) with { ActiveRequest = retiredRequest, Stage = AudioRequestStage.Retiring,
+            ActiveKind = AudioOperationKind.Renew, ProofExpiryMilliseconds = 11000 });
+        Assert.Equal("AUDIO_STATUS_PASS", await process.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(30)));
         Assert.Throws<InvalidDataException>(() => new BrokerProofContext(Offer.PeerIdentity, new byte[32], BrokerProofOperation.Acquire,
             BrokerProofScope.Speaker, Id, User, Logon, 42, 1, 101, 200, 1,
             new(binding.HostSha256, binding.AuthorityNamespace, binding.EnrollmentId, Logon)));

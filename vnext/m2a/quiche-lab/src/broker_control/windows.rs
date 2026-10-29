@@ -7,7 +7,7 @@ use std::ptr::{null, null_mut};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::{Foundation::*, Globalization::CompareStringOrdinal,
     Security::{Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT}, *},
-    Storage::FileSystem::*, System::{IO::*, Pipes::*, Threading::*}};
+    Storage::FileSystem::*, System::{IO::*, Pipes::*, Threading::*, WindowsProgramming::QueryInterruptTimePrecise}};
 
 fn handle(raw: HANDLE) -> io::Result<OwnedHandle> {
     if raw.is_null() || raw == INVALID_HANDLE_VALUE { Err(io::Error::last_os_error()) }
@@ -111,7 +111,7 @@ impl Control {
         let mut header = [0; 4]; self.exact(&mut header, false, timeout_ms)?;
         let length = u32::from_be_bytes(header) as usize;
         if !(1..=MAX_FRAME).contains(&length) { return Err(invalid()); }
-        let mut body = vec![0; length]; self.exact(&mut body, false, 3000)?;
+        let mut body = vec![0; length]; self.exact(&mut body, false, timeout_ms.min(3000))?;
         Ok((body[0], body[1..].to_vec()))
     }
     fn write(&self, kind: u8, body: &[u8]) -> io::Result<()> {
@@ -151,15 +151,29 @@ unsafe fn require_system(process: HANDLE) -> io::Result<()> {
     Ok(())
 }
 
-/// N1 bootstrap only. Later typed source/delivery operations extend this owner;
-/// the current role never opens an endpoint, DLL, key file or media socket.
+/// N2 authorization projection. N3/N4 supply actual TLS/source observations;
+/// this role still opens no endpoint, DLL, key file or media socket.
 pub fn run(registration: [u8; 16]) -> io::Result<()> {
     let control = Control::connect(registration)?;
     let (kind, hello) = control.read(3000)?;
     if kind != HELLO { return Err(invalid()); }
     require_hello(&hello, &registration, control.server_pid, control.server_created)?;
     control.write(READY, &hello)?;
-    let (kind, body) = control.read(INFINITE)?;
-    if kind != STOP || !body.is_empty() { return Err(invalid()); }
-    Ok(())
+    let mut authority=crate::audio_authority::AudioAuthority::new(hello[17..49].try_into().unwrap(),registration)?;
+    fn now()->u64 {let mut value=0;unsafe{QueryInterruptTimePrecise(&mut value);}value}
+    loop {
+        let timeout=match authority.deadline() {
+            Some(until)=> {
+                let remaining=until.checked_sub(now()).ok_or_else(invalid)?;
+                ((remaining/10000)+u64::from(remaining%10000!=0)).max(1).min(u64::from(u32::MAX-1)) as u32
+            }, None=>INFINITE,
+        };
+        let (kind,body)=control.read(timeout)?;
+        if kind==STOP && body.is_empty() {authority.close();return Ok(());}
+        if kind!=AUTHORITY {return Err(invalid());}
+        let grant=crate::audio_authority::ControlGrant::parse(&body)?;let closed=grant.closed;
+        authority.apply(grant,now())?;
+        control.write(AUTHORITY_OBSERVED,&body)?;
+        if closed {return Ok(());}
+    }
 }

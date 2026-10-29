@@ -153,6 +153,17 @@ pub struct CompleteBlock {
     pub pcm: [u8; PCM_BYTES],
 }
 
+/// A published native slot, valid only until its exact consume operation.
+/// Also used by the lab adapter so both paths share one assembler.
+pub struct BorrowedChunk<'a> {
+    pub device_frame: u64,
+    pub qpc_100ns: u64,
+    pub flags: u32,
+    pub original_packet_offset_frames: u32,
+    pub frames: usize,
+    pub pcm: &'a [u8],
+}
+
 /// The only mechanism that assembles arbitrary engine packet boundaries
 /// into exact 240-frame QUIC blocks. On a discontinuity we discard incomplete
 /// material without fabricating samples, preserving genuine source positions.
@@ -176,7 +187,18 @@ impl Default for Assembler {
 
 impl Assembler {
     pub fn push(&mut self, chunk: &CaptureChunk) -> Option<CompleteBlock> {
-        if chunk.frames == 0 || chunk.frames > FRAMES { return None; }
+        self.push_borrowed(BorrowedChunk {device_frame:chunk.device_frame,qpc_100ns:chunk.qpc_100ns,
+            flags:chunk.flags,original_packet_offset_frames:chunk.original_packet_offset_frames,
+            frames:chunk.frames,pcm:chunk.pcm.get(..chunk.frames.checked_mul(4)?).unwrap_or(&[])})
+    }
+    pub fn reset(&mut self) {self.have=0;self.next_frame=None;}
+    pub fn push_borrowed(&mut self, chunk: BorrowedChunk<'_>) -> Option<CompleteBlock> {
+        if chunk.frames == 0 || chunk.frames > FRAMES || chunk.pcm.len()!=chunk.frames*4 ||
+            chunk.device_frame.checked_add(chunk.frames as u64).is_none() ||
+            chunk.original_packet_offset_frames.checked_add(chunk.frames as u32).is_none() ||
+            chunk.qpc_100ns.checked_add(chunk.frames as u64*10_000_000/48_000).is_none() {
+            self.reset(); return None;
+        }
         if self.next_frame.is_some_and(|n| n != chunk.device_frame)
             || chunk.flags & DATA_DISCONTINUITY != 0
         {
@@ -488,6 +510,30 @@ mod tests {
         assert_eq!(second.first_qpc_100ns, packet_qpc + 50_000);
         assert_eq!(second.original_packet_offset_frames, 240);
         assert_eq!(second.first_device_frame, frame + 240);
+    }
+
+    #[test]
+    fn borrowed_slots_assemble_partial_packets_without_copying_an_input_chunk() {
+        let mut assembler=Assembler::default();
+        let a=[0x31;400]; let b=[0x42;560];
+        assert!(assembler.push_borrowed(BorrowedChunk{device_frame:480,qpc_100ns:1_000_000,
+            flags:DATA_DISCONTINUITY,original_packet_offset_frames:0,frames:100,pcm:&a}).is_none());
+        let complete=assembler.push_borrowed(BorrowedChunk{device_frame:580,qpc_100ns:1_020_833,
+            flags:0,original_packet_offset_frames:0,frames:140,pcm:&b}).unwrap();
+        assert_eq!(complete.first_device_frame,480);assert_eq!(complete.first_qpc_100ns,1_000_000);
+        assert_eq!(&complete.pcm[..400],&a);assert_eq!(&complete.pcm[400..],&b);
+        // Missing frames discard partial material; timestamp-error QPC stays unknown.
+        assert!(assembler.push_borrowed(BorrowedChunk{device_frame:720,qpc_100ns:0,
+            flags:4,original_packet_offset_frames:0,frames:100,pcm:&a}).is_none());
+        let full=[0x55;960];
+        let after_gap=assembler.push_borrowed(BorrowedChunk{device_frame:1000,qpc_100ns:0,
+            flags:4,original_packet_offset_frames:240,frames:240,pcm:&full}).unwrap();
+        assert_eq!(after_gap.first_device_frame,1000);assert_eq!(after_gap.first_qpc_100ns,0);
+        assert_eq!(after_gap.original_packet_offset_frames,240);assert_eq!(after_gap.pcm,full);
+        assert_eq!(assembler.discontinuities,2);
+        // Malformed input clears residue; it cannot contribute to a future block.
+        assert!(assembler.push_borrowed(BorrowedChunk{device_frame:u64::MAX,qpc_100ns:0,
+            flags:0,original_packet_offset_frames:0,frames:240,pcm:&full}).is_none());
     }
 
     #[test]

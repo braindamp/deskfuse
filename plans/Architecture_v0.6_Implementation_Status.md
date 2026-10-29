@@ -381,3 +381,14 @@ remain failures even if other reports passed. Keep the whole evidence directory.
   included in T01. F0b and physical qualification are still open.
 - No driver installation, PnP changes, default-route changes, test-signing changes
   or device/hardware operations are authorized by the build tooling changes.
+
+## Subsequent audio continuation — 29 October
+
+The historical gates above describe that earlier tranche. Current T03/T09 audio
+work is recorded in
+[Audio_N2_Bounded_Request_Implementation_Status.md](Audio_N2_Bounded_Request_Implementation_Status.md).
+N1, the focused N2 request-retention source and independent N5 capture foundations
+are implemented/offline checked. Next is N3 native TLS/control on High, then
+actual source/egress/rundown, N5 wiring and N6 renewal/recovery. Production stays
+disabled; installed and physical gates remain open. This continues the original
+v0.6 programme and does not reopen completed media optimizations.

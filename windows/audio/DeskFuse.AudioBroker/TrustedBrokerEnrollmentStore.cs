@@ -23,6 +23,10 @@ internal sealed class TrustedBrokerEnrollmentStore : IBrokerEnrollments, IDispos
     private readonly Dictionary<(Guid, EnrollmentPrivateRecordKind), IEnrollmentRecordFile> files = [];
     private readonly Dictionary<Guid, EnrollmentCeremony.VerifiedEnrollmentCommit> admitted = [];
     private readonly Dictionary<Guid, byte[]> receiptAttempts = [];
+    private readonly Dictionary<string, IEnrollmentRecordFile> speakerFiles = [];
+    private readonly HashSet<string> speakerQuarantined = [];
+    private readonly Dictionary<string, SpeakerRecord> completedSpeakers = [];
+    private sealed record SpeakerRecord(int Version, Guid Namespace, byte[] Host, byte[] Peer, byte[] Subject, Guid DeviceKey);
     private readonly HashSet<Guid> denied = [], durableRevoked = [], quarantined = [], receiptQuarantined = [];
     private ulong revision = 1;
     private bool unresolvedStaging;
@@ -78,6 +82,84 @@ internal sealed class TrustedBrokerEnrollmentStore : IBrokerEnrollments, IDispos
                 evidence[value.EnrollmentId] = new(value, bytes, SHA256.HashData(bytes));
             }
             catch { Quarantine(value.EnrollmentId); throw; }
+        }
+    }
+
+    // Identifier association only: it grants no source, endpoint or runtime lease.
+    // Reuse the established positive-record completion/custody protocol and the
+    // same cold writer/owner lease. A torn association is never reallocated.
+    internal SpeakerAssociation GetSpeakerAssociation(Guid enrollment)
+    {
+        var activeRecord = ReadActive(enrollment);
+        if (activeRecord.Version != 2 || !activeRecord.Scopes.Contains(BrokerProofScope.Speaker))
+            throw new UnauthorizedAccessException("A committed speaker enrollment is required.");
+        using var identity = new MemoryStream(); identity.Write("DeskFuse.SpeakerAssociation.v1\0"u8);
+        identity.Write(host); identity.Write(storage.NamespaceId.ToByteArray(true)); identity.Write(activeRecord.PeerIdentity);
+        identity.WriteByte(checked((byte)activeRecord.SubjectUserSid!.Length)); identity.Write(activeRecord.SubjectUserSid);
+        var digest = SHA256.HashData(identity.ToArray()); var key = Convert.ToHexString(digest);
+        lock (persistenceGate)
+        {
+            RequireLive(); _ = ReadActive(enrollment);
+            if (speakerQuarantined.Contains(key)) throw new InvalidDataException("Speaker association is quarantined.");
+            try
+            {
+                var created = false;
+                if (!speakerFiles.TryGetValue(key, out var file))
+                {
+                    if (speakerFiles.Count >= 4096) throw new InvalidDataException("Speaker associations exceed the admitted bound.");
+                    try { file = storage.OpenSpeakerAssociation(digest); }
+                    catch (FileNotFoundException) { file = storage.CreateSpeakerAssociation(digest); created = true; }
+                    speakerFiles.Add(key, file);
+                }
+                SpeakerRecord record;
+                byte[] bytes;
+                if (created)
+                {
+                    record = new(1, storage.NamespaceId, host.ToArray(), activeRecord.PeerIdentity.ToArray(), activeRecord.SubjectUserSid.ToArray(), Guid.NewGuid());
+                    bytes = JsonSerializer.SerializeToUtf8Bytes(record, ProtectedBrokerEnrollments.Json);
+                }
+                else
+                {
+                    bytes = file.Read();
+                    record = JsonSerializer.Deserialize<SpeakerRecord>(bytes, ProtectedBrokerEnrollments.Json) ?? throw new InvalidDataException("Missing speaker association.");
+                }
+                if (record.Version != 1 || record.Namespace != storage.NamespaceId || record.DeviceKey == Guid.Empty ||
+                    !record.Host.AsSpan().SequenceEqual(host) || !record.Peer.AsSpan().SequenceEqual(activeRecord.PeerIdentity) ||
+                    !record.Subject.AsSpan().SequenceEqual(activeRecord.SubjectUserSid) ||
+                    !JsonSerializer.SerializeToUtf8Bytes(record, ProtectedBrokerEnrollments.Json).AsSpan().SequenceEqual(bytes))
+                    throw new InvalidDataException("Speaker association changed its protected peer/subject binding.");
+                file.CompletePositive(bytes);
+                completedSpeakers[key] = record;
+            }
+            catch { speakerQuarantined.Add(key); throw; }
+            // Completed identifier history survives enrollment denial/replacement.
+            // Denial still wins before returning; it is not evidence of bad bytes.
+            RequireLive(); _ = ReadActive(enrollment);
+            return SpeakerAssociation.FromCompletedStore(this, key);
+        }
+    }
+
+    internal sealed class SpeakerAssociation
+    {
+        private readonly Guid ns;
+        private readonly byte[] host, peer, subject;
+        internal Guid DeviceKey { get; }
+        private SpeakerAssociation(Guid ns, byte[] host, byte[] peer, byte[] subject, Guid deviceKey)
+        { this.ns = ns; this.host = host.ToArray(); this.peer = peer.ToArray(); this.subject = subject.ToArray(); DeviceKey = deviceKey; }
+        internal void RequireMatch(AudioAuthorityIdentity identity)
+        {
+            if (ns != identity.Namespace || !host.AsSpan().SequenceEqual(identity.Host) || !peer.AsSpan().SequenceEqual(identity.Peer) ||
+                !subject.AsSpan().SequenceEqual(identity.Subject)) throw new UnauthorizedAccessException("Foreign protected speaker association.");
+        }
+        // Closed factory, used only after this store's checked completion.
+        internal static SpeakerAssociation FromCompletedStore(TrustedBrokerEnrollmentStore owner, string key)
+        {
+            lock (owner.persistenceGate)
+            {
+                owner.RequireLive();
+                if (!owner.completedSpeakers.TryGetValue(key, out var record)) throw new UnauthorizedAccessException("No completed speaker association.");
+                return new(record.Namespace, record.Host, record.Peer, record.Subject, record.DeviceKey);
+            }
         }
     }
 
@@ -359,6 +441,8 @@ internal sealed class TrustedBrokerEnrollmentStore : IBrokerEnrollments, IDispos
         {
             if (disposed) return;
             foreach (var file in files.Values) file.Dispose();
+            foreach (var file in speakerFiles.Values) file.Dispose();
+            speakerFiles.Clear();
             files.Clear(); active.Clear();
             storage.Dispose(); // Last: retained owner lease cannot be released during outstanding native I/O.
             disposed = true; // A failed cleanup retains a retryable closing owner, never a false completed dispose.

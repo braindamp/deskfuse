@@ -87,7 +87,7 @@ public sealed class EnrollmentDurabilityTests
         finally { release.Set(); store.Dispose(); }
     }
 
-    private sealed class Fixture : IDisposable
+    internal sealed class Fixture : IDisposable
     {
         private readonly ECDsa host = ECDsa.Create(ECCurve.NamedCurves.nistP256), phone = ECDsa.Create(ECCurve.NamedCurves.nistP256);
         internal readonly Guid Id = Guid.NewGuid(), Namespace = Guid.NewGuid();
@@ -96,12 +96,17 @@ public sealed class EnrollmentDurabilityTests
         internal EnrollmentPrivateRecordKind? Fail;
         internal Action<EnrollmentPrivateRecordKind>? BeforeComplete;
         internal FakeFiles? LastFiles;
+        internal readonly Dictionary<string, byte[]> Associations = [];
+        internal int AssociationCompletions;
+        internal bool FailAssociation;
+        internal Action? BeforeAssociationComplete;
         private readonly EnrollmentTranscript transcript;
         private readonly byte[] evidence;
         private byte[] Host => SHA256.HashData(host.ExportSubjectPublicKeyInfo());
         internal Fixture()
         {
-            var offer = TrustedEnrollmentProtocolTests.Offer with { HostSpki = host.ExportSubjectPublicKeyInfo(), AuthorityNamespace = Namespace, EnrollmentId = Id };
+            var offer = TrustedEnrollmentProtocolTests.Offer with { HostSpki = host.ExportSubjectPublicKeyInfo(), AuthorityNamespace = Namespace, EnrollmentId = Id,
+                PeerIdentity = Enumerable.Repeat((byte)0x23, 32).ToArray() };
             var proposal = new EnrollmentProposal(SHA256.HashData(EnrollmentProtocol.Offer(offer)), phone.ExportSubjectPublicKeyInfo(), new byte[32], [BrokerProofScope.Speaker]);
             transcript = new(offer, proposal, new byte[32]); var binding = EnrollmentProtocol.Binding(transcript);
             var approval = EnrollmentProtocol.PhoneApproval(binding);
@@ -125,6 +130,9 @@ public sealed class EnrollmentDurabilityTests
             Data[(Id, EnrollmentPrivateRecordKind.Receipt)] = signed; return signed;
         }
         internal TrustedBrokerEnrollmentStore Open() => new(LastFiles = new FakeFiles(this), Host);
+        internal byte[] SignPhone(byte[] bytes) => Sign(phone, bytes);
+        internal byte[] SignHost(byte[] bytes) => Sign(host, bytes);
+        internal byte[] HostSpki => host.ExportSubjectPublicKeyInfo();
         internal EnrollmentOutcome Status(TrustedBrokerEnrollmentStore store)
         {
             var request = new EnrollmentStatusRequest(EnrollmentProtocol.Binding(transcript), new byte[32], phone.ExportSubjectPublicKeyInfo());
@@ -142,7 +150,28 @@ public sealed class EnrollmentDurabilityTests
                 => owner.Data.ContainsKey((id, kind)) ? new File(this, owner, id, kind) : throw new FileNotFoundException();
             public IEnrollmentRecordFile Create(Guid id, EnrollmentPrivateRecordKind kind)
             { owner.Data.Add((id, kind), []); return new File(this, owner, id, kind); }
+            public IEnrollmentRecordFile OpenSpeakerAssociation(byte[] identity)
+                => owner.Associations.ContainsKey(Convert.ToHexString(identity)) ? new Association(this, owner, Convert.ToHexString(identity)) : throw new FileNotFoundException();
+            public IEnrollmentRecordFile CreateSpeakerAssociation(byte[] identity)
+            { var key = Convert.ToHexString(identity); owner.Associations.Add(key, []); return new Association(this, owner, key); }
             public void Dispose() => Disposed = true;
+            private sealed class Association(FakeFiles files, Fixture owner, string key) : IEnrollmentRecordFile
+            {
+                private bool completed, failed;
+                public byte[] Read() => owner.Associations[key].ToArray();
+                public void CompletePositive(byte[] bytes)
+                {
+                    Assert.False(files.Disposed);
+                    if (failed) throw new IOException("Latched association completion failure.");
+                    if (completed) { Assert.Equal(Read(), bytes); return; }
+                    if (Read().Length != 0 && !Read().AsSpan().SequenceEqual(bytes)) throw new InvalidDataException();
+                    owner.BeforeAssociationComplete?.Invoke();
+                    if (owner.FailAssociation) { failed = true; throw new IOException("Injected association flush failure."); }
+                    owner.Associations[key] = bytes.ToArray(); owner.AssociationCompletions++; completed = true;
+                }
+                public void CompleteDenial() => throw new InvalidOperationException();
+                public void Dispose() { }
+            }
             private sealed class File(FakeFiles files, Fixture owner, Guid id, EnrollmentPrivateRecordKind kind) : IEnrollmentRecordFile
             {
                 private bool completed, failed;

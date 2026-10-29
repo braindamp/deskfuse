@@ -15,7 +15,7 @@ internal sealed record HostIdentityRecord(int Version, Guid AuthorityNamespace, 
 /// CNG private-at-creation behavior requires installed-SYSTEM qualification before production admission.
 /// </summary>
 [SupportedOSPlatform("windows")]
-internal sealed class BrokerHostIdentity : IDisposable, IEnrollmentHostSigner, IEnrollmentCommitSigner
+internal sealed class BrokerHostIdentity : IDisposable, IEnrollmentHostSigner, IEnrollmentCommitSigner, IAudioGrantSigner
 {
     private const string RecordPath = "bootstrap/host-identity.json", IntentPath = "bootstrap/host-key-intent.json";
     private const string ProviderName = "Microsoft Software Key Storage Provider";
@@ -153,8 +153,35 @@ internal sealed class BrokerHostIdentity : IDisposable, IEnrollmentHostSigner, I
         var bytes = new byte[context.Length + 32]; context.CopyTo(bytes); SHA256.HashData(transcript).CopyTo(bytes, context.Length);
         return Sign(bytes);
     }
+
+    internal byte[] SignIssuedAudioChallenge(IssuedBrokerChallenge challenge)
+    {
+        var parsed = AudioRequestProtocol.ParseProof(challenge.Transcript);
+        RequireOwnAudioIdentity(parsed.Facts.Identity);
+        if (!parsed.Facts.Nonce.AsSpan().SequenceEqual(challenge.Nonce) || parsed.Facts.Expiry != challenge.ExpiresAtMilliseconds)
+            throw new UnauthorizedAccessException("Audio challenge identity changed.");
+        return Sign(AudioRequestProtocol.ChallengeMessage(challenge.Transcript));
+    }
+    internal byte[] SignAudioRequestStatus(BrokerAudioOwner.RequestStatus status)
+    {
+        var snapshot = status.Snapshot;
+        RequireOwnAudioIdentity(snapshot.Identity);
+        return Sign(AudioRequestProtocol.Status(snapshot));
+    }
+    private void RequireOwnAudioIdentity(AudioAuthorityIdentity identity)
+    {
+        if (!identity.Host.AsSpan().SequenceEqual(record.HostSha256) || identity.Namespace != NamespaceId || identity.Enrollment == Guid.Empty)
+            throw new UnauthorizedAccessException("Foreign audio authority identity.");
+    }
     internal byte[] SignStatus(EnrollmentStatus status)
     { RequireOwnBinding(status.Binding); return Sign(EnrollmentProtocol.Status(status)); }
+    byte[] IAudioGrantSigner.SignAudioGrant(BrokerAudioOwner.Committed operation)
+    {
+        var bytes = operation.TakeReceiptBytesForSigning(); var receipt = AudioAuthorityProtocol.ParseReceipt(bytes);
+        if (receipt.Namespace != NamespaceId || !CryptographicOperations.FixedTimeEquals(receipt.Host, record.HostSha256))
+            throw new UnauthorizedAccessException("Foreign audio authority receipt.");
+        return Sign(bytes);
+    }
     private void RequireOwnBinding(EnrollmentBinding binding)
     {
         if (binding.AuthorityNamespace != NamespaceId || !CryptographicOperations.FixedTimeEquals(binding.HostSha256, record.HostSha256))

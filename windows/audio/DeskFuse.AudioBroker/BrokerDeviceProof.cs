@@ -116,7 +116,8 @@ internal sealed class BrokerProofChallenges(Func<long> monotonicMilliseconds)
     private const int MaxPending = 256, MaxPerRegistration = 16;
     internal const int MaxChallengeLifetimeMs = 120000;
 
-    internal IssuedBrokerChallenge Issue(BrokerProofContext context, byte[] protectedEnrolledSpki, int lifetimeMs)
+    internal IssuedBrokerChallenge Issue(BrokerProofContext context, byte[] protectedEnrolledSpki, int lifetimeMs,
+        AudioProofBinding? audio = null, long? absoluteExpiry = null)
     {
         ArgumentNullException.ThrowIfNull(context);
         if (lifetimeMs is < 1 or > MaxChallengeLifetimeMs)
@@ -132,20 +133,25 @@ internal sealed class BrokerProofChallenges(Func<long> monotonicMilliseconds)
                 pending.Remove(key);
             if (pending.Count >= MaxPending || pending.Values.Count(item => item.Registration == context.Registration) >= MaxPerRegistration)
                 throw new InvalidOperationException("Broker challenge capacity is exhausted.");
-            var expiry = checked(now + lifetimeMs);
+            var expiry = absoluteExpiry ?? checked(now + lifetimeMs);
+            if (expiry <= now || expiry > checked(now + MaxChallengeLifetimeMs)) throw new InvalidDataException("Frozen proof expiry is unavailable.");
             var nonce = RandomNumberGenerator.GetBytes(32);
-            var transcript = context.Transcript(nonce, expiry);
+            var core = context.Transcript(nonce, expiry);
+            var transcript = audio is null ? core : audio.Wrap(core);
             pending.Add(Convert.ToHexString(nonce), new(context.Registration, transcript, enrolledKey, now, expiry));
             return new(nonce, transcript.ToArray(), expiry);
         }
     }
+
+    internal void Retire(byte[] nonce) { lock (gate) pending.Remove(Convert.ToHexString(nonce)); }
+    internal int PendingCount { get { lock (gate) return pending.Count; } }
 
     internal bool Consume(byte[] nonce, byte[] signatureDer, BrokerProofContext liveContext, byte[] protectedLiveSpki)
         => Consume(nonce, signatureDer, liveContext, protectedLiveSpki, out _);
 
     // The authority owner uses the verified expiry for the final short admission gate.
     internal bool Consume(byte[] nonce, byte[] signatureDer, BrokerProofContext liveContext, byte[] protectedLiveSpki,
-        out long verifiedExpiry)
+        out long verifiedExpiry, AudioProofBinding? audio = null)
     {
         verifiedExpiry = 0;
         if (nonce is not { Length: 32 }) return false;
@@ -161,9 +167,11 @@ internal sealed class BrokerProofChallenges(Func<long> monotonicMilliseconds)
         var signature = signatureDer.ToArray();
         var liveKey = protectedLiveSpki.ToArray();
         var now = monotonicMilliseconds();
+        var core = liveContext.Transcript(nonceSnapshot, challenge.Expiry);
+        var liveTranscript = audio is null ? core : audio.Wrap(core);
         if (now < challenge.Issued || now >= challenge.Expiry ||
             !CryptographicOperations.FixedTimeEquals(challenge.Spki, liveKey) ||
-            !CryptographicOperations.FixedTimeEquals(challenge.Transcript, liveContext.Transcript(nonceSnapshot, challenge.Expiry)) ||
+            !CryptographicOperations.FixedTimeEquals(challenge.Transcript, liveTranscript) ||
             !ValidSignatureDer(signature)) return false;
         try
         {

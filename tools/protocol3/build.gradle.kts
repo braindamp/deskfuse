@@ -20,6 +20,8 @@ kotlin {
             "com/focuswindow/client/transport/SecureChannel.kt",
             "com/focuswindow/client/transport/SecureRecordWriter.kt",
             "com/focuswindow/client/transport/BrokerDeviceSigner.kt",
+            "com/focuswindow/client/transport/AudioAuthority.kt",
+            "com/focuswindow/client/transport/AudioRequests.kt",
             "com/focuswindow/client/transport/TrustedEnrollmentProtocol.kt",
             "com/focuswindow/client/transport/TrustedEnrollmentState.kt",
         )

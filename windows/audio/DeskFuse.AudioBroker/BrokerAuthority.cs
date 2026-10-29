@@ -23,6 +23,7 @@ internal sealed class BrokerOperationAdmission
     private readonly Func<long> clock;
     private readonly long admittedAt, expiresAt;
     private readonly Func<bool> requireCurrentAuthority;
+    private readonly Func<Action, bool>? commitWhileCurrent;
     private int used;
     internal Guid Registration { get; }
     internal BrokerProofOperation Operation { get; }
@@ -31,12 +32,26 @@ internal sealed class BrokerOperationAdmission
     internal byte[] ResourceIdentity => resource.ToArray();
 
     internal BrokerOperationAdmission(BrokerAuthorityRequest request, Func<long> clock, long admittedAt, long expiresAt,
-        Func<bool> requireCurrentAuthority)
+        Func<bool> requireCurrentAuthority, Func<Action, bool>? commitWhileCurrent = null)
     {
         Registration = request.Registration; Operation = request.Operation; Scope = request.Scope;
         OwnerGeneration = request.ExpectedOwnerGeneration; resource = request.Resource.ToArray();
         this.clock = clock; this.admittedAt = admittedAt; this.expiresAt = expiresAt;
         this.requireCurrentAuthority = requireCurrentAuthority;
+        this.commitWhileCurrent = commitWhileCurrent;
+    }
+
+    // N2 uses this only for a bounded memory-state publication. Native work,
+    // encoding, signatures, persistence and joins must remain outside it.
+    internal T CommitOnce<T>(Func<T> publish)
+    {
+        if (Interlocked.Exchange(ref used, 1) != 0) throw new InvalidOperationException("Broker operation was already consumed.");
+        var now = clock();
+        if (now < admittedAt || now >= expiresAt || commitWhileCurrent is null)
+            throw new InvalidOperationException("Broker operation cannot publish current authority.");
+        T result = default!;
+        if (!commitWhileCurrent(() => result = publish())) throw new UnauthorizedAccessException("Authority changed before publication.");
+        return result;
     }
 
     internal T ExecuteOnce<T>(Func<BrokerOperationAdmission, T> operation)
@@ -67,6 +82,16 @@ internal sealed class BrokerAuthority(IBrokerAuthorityState state, Func<long> mo
     private readonly BrokerProofChallenges challenges = new(monotonicMilliseconds);
 
     internal IssuedBrokerChallenge Issue(BrokerAuthorityRequest request, int lifetimeMs)
+        => IssueCore(request, lifetimeMs, null, null, null);
+
+    internal IssuedBrokerChallenge IssueAudio(BrokerAuthorityRequest request, int lifetimeMs, AudioProofBinding audio,
+        long expiry, Action<IssuedBrokerChallenge> allocated)
+        => IssueCore(request, lifetimeMs, audio, expiry, allocated);
+
+    internal void Retire(byte[] nonce) => challenges.Retire(nonce);
+    internal int PendingCount => challenges.PendingCount;
+    private IssuedBrokerChallenge IssueCore(BrokerAuthorityRequest request, int lifetimeMs, AudioProofBinding? audio,
+        long? expiry, Action<IssuedBrokerChallenge>? allocated)
     {
         var snapshot = SnapshotRequest(request);
         var facts = state.WithAuthorizedFacts(snapshot, (context, spki, _) =>
@@ -76,14 +101,23 @@ internal sealed class BrokerAuthority(IBrokerAuthorityState state, Func<long> mo
                 throw new InvalidOperationException("Production v2 challenges require the installed host signer.");
             return (Context: context, Key: spki.ToArray());
         });
-        var issued = challenges.Issue(facts.Context, facts.Key, lifetimeMs);
-        if (signIssuedChallenge is null) return issued; // Explicit unconnected development v1 only.
-        var signature = signIssuedChallenge(issued); // CNG work does not hold the authority gate.
-        if (signature is not { Length: >= 8 and <= 72 }) throw new CryptographicException("Invalid host challenge signature.");
-        return issued with { HostSignature = signature };
+        var issued = challenges.Issue(facts.Context, facts.Key, lifetimeMs, audio, expiry);
+        try
+        {
+            allocated?.Invoke(issued);
+            if (signIssuedChallenge is null) return issued; // Explicit unconnected development v1 only.
+            var signature = signIssuedChallenge(issued); // CNG work does not hold the authority gate.
+            if (signature is not { Length: >= 8 and <= 72 }) throw new CryptographicException("Invalid host challenge signature.");
+            return issued with { HostSignature = signature };
+        }
+        catch { challenges.Retire(issued.Nonce); throw; }
     }
 
     internal BrokerOperationAdmission? Admit(BrokerAuthorityRequest request, byte[] nonce, byte[] signatureDer)
+        => AdmitCore(request, nonce, signatureDer, null);
+    internal BrokerOperationAdmission? AdmitAudio(BrokerAuthorityRequest request, byte[] nonce, byte[] signatureDer, AudioProofBinding audio)
+        => AdmitCore(request, nonce, signatureDer, audio);
+    private BrokerOperationAdmission? AdmitCore(BrokerAuthorityRequest request, byte[] nonce, byte[] signatureDer, AudioProofBinding? audio)
     {
         var snapshot = SnapshotRequest(request);
         if (nonce is not { Length: 32 }) return null;
@@ -97,23 +131,33 @@ internal sealed class BrokerAuthority(IBrokerAuthorityState state, Func<long> mo
             RequireContextMatchesRequest(context, snapshot);
             return (Context: context, Key: spki.ToArray(), Revision: revision);
         });
-        if (!challenges.Consume(nonceCopy, signatureCopy, before.Context, before.Key, out var expiry)) return null;
-        var expectedContext = before.Context.Transcript(nonceCopy, expiry);
+        if (!challenges.Consume(nonceCopy, signatureCopy, before.Context, before.Key, out var expiry, audio)) return null;
+        byte[] Transcript(BrokerProofContext context)
+        { var core = context.Transcript(nonceCopy, expiry); return audio is null ? core : audio.Wrap(core); }
+        var expectedContext = Transcript(before.Context);
         return state.WithAuthorizedFacts<BrokerOperationAdmission?>(snapshot, (context, spki, revision) =>
         {
             RequireContextMatchesRequest(context, snapshot);
             var now = monotonicMilliseconds();
             if (now < started || now >= expiry || revision != before.Revision ||
                 !CryptographicOperations.FixedTimeEquals(before.Key, spki) ||
-                !CryptographicOperations.FixedTimeEquals(expectedContext, context.Transcript(nonceCopy, expiry))) return null;
+                !CryptographicOperations.FixedTimeEquals(expectedContext, Transcript(context))) return null;
+            bool Current(BrokerProofContext dispatchContext, byte[] dispatchKey, ulong dispatchRevision)
+            {
+                RequireContextMatchesRequest(dispatchContext, snapshot);
+                var dispatchTime = monotonicMilliseconds();
+                return dispatchTime >= now && dispatchTime < expiry && dispatchRevision == before.Revision &&
+                    CryptographicOperations.FixedTimeEquals(before.Key, dispatchKey) &&
+                    CryptographicOperations.FixedTimeEquals(expectedContext, Transcript(dispatchContext));
+            }
             return new BrokerOperationAdmission(snapshot, monotonicMilliseconds, now, expiry, () =>
                 state.WithAuthorizedFacts(snapshot, (dispatchContext, dispatchKey, dispatchRevision) =>
                 {
-                    RequireContextMatchesRequest(dispatchContext, snapshot);
-                    var dispatchTime = monotonicMilliseconds();
-                    return dispatchTime >= now && dispatchTime < expiry && dispatchRevision == before.Revision &&
-                        CryptographicOperations.FixedTimeEquals(before.Key, dispatchKey) &&
-                        CryptographicOperations.FixedTimeEquals(expectedContext, dispatchContext.Transcript(nonceCopy, expiry));
+                    return Current(dispatchContext, dispatchKey, dispatchRevision);
+                }), publish => state.WithAuthorizedFacts(snapshot, (dispatchContext, dispatchKey, dispatchRevision) =>
+                {
+                    if (!Current(dispatchContext, dispatchKey, dispatchRevision)) return false;
+                    publish(); return true;
                 }));
         });
     }

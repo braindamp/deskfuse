@@ -16,6 +16,8 @@ internal interface IEnrollmentRecordFiles : IDisposable
     string[] EnumerateNames();
     IEnrollmentRecordFile Open(Guid id, EnrollmentPrivateRecordKind kind);
     IEnrollmentRecordFile Create(Guid id, EnrollmentPrivateRecordKind kind);
+    IEnrollmentRecordFile OpenSpeakerAssociation(byte[] identity) => throw new NotSupportedException("Speaker association storage unavailable.");
+    IEnrollmentRecordFile CreateSpeakerAssociation(byte[] identity) => throw new NotSupportedException("Speaker association storage unavailable.");
 }
 
 [SupportedOSPlatform("windows")]
@@ -43,6 +45,8 @@ internal sealed class EnrollmentRecordFiles : IEnrollmentRecordFiles
     }
     public IEnrollmentRecordFile Open(Guid id, EnrollmentPrivateRecordKind kind) => new Held(root.OpenEnrollmentRecord(id, kind));
     public IEnrollmentRecordFile Create(Guid id, EnrollmentPrivateRecordKind kind) => new Held(root.CreateEnrollmentRecord(id, kind));
+    public IEnrollmentRecordFile OpenSpeakerAssociation(byte[] identity) => new Held(root.OpenSpeakerAssociation(identity));
+    public IEnrollmentRecordFile CreateSpeakerAssociation(byte[] identity) => new Held(root.CreateSpeakerAssociation(identity));
     private sealed class Held(EnrollmentPrivateRecord record) : IEnrollmentRecordFile
     {
         public byte[] Read() => record.Read();

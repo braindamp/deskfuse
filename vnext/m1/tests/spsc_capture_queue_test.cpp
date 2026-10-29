@@ -17,6 +17,27 @@ struct Packet {
 using Queue = df_wasapi::SpscCaptureQueue<Packet, 8>;
 
 int main() {
+    // Reserve/publish is invisible until committed; a borrow pins its slot
+    // across producer wraparound, and only its exact token releases storage.
+    {
+        Queue q;
+        Packet* slot=nullptr; uint64_t token=0;
+        if (!q.try_reserve(slot,token) || !slot || !token) return 20;
+        slot->frame=42; slot->pcm.fill(77);
+        const Packet* borrowed=nullptr; uint64_t consumer=0;
+        if (q.try_borrow(borrowed,consumer) || q.publish(token+1)) return 21;
+        if (!q.publish(token) || q.publish(token)) return 22;
+        if (!q.try_borrow(borrowed,consumer) || !q.has_borrow() || borrowed->frame!=42) return 23;
+        for (int n=0;n<7;++n) {Packet p{}; if (!q.try_push(p)) return 24;}
+        Packet* unavailable=reinterpret_cast<Packet*>(1); uint64_t none=1;
+        if (q.try_reserve(unavailable,none) || unavailable || none || q.dropped()!=1) return 25;
+        const Packet* second=nullptr; uint64_t second_token=0;
+        if (q.try_borrow(second,second_token) || q.consume(consumer+1) || borrowed->pcm[959]!=77) return 26;
+        q.finish(); // join/terminal does not release an outstanding consumer borrow
+        if (!q.has_borrow() || !q.consume(consumer) || q.consume(consumer)) return 27;
+        for (int n=0;n<7;++n) {Packet p{}; if (!q.pop(p)) return 28;}
+        Packet p{}; if (q.pop(p) || q.has_records()) return 29;
+    }
     // Full means bounded producer drop, not a block or overwritten PCM.
     {
         Queue q;

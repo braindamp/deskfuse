@@ -2,6 +2,8 @@ using System.Runtime.Versioning;
 using System.Security.Cryptography;
 using System.Security.Principal;
 using System.Text.Json;
+using System.Text;
+using System.Buffers.Binary;
 using DeskFuse.WindowsSecurity;
 
 namespace DeskFuse.AudioBroker;
@@ -26,7 +28,9 @@ internal sealed record BrokerDeploymentConfiguration(int Version, Guid Maintenan
 internal sealed class BrokerInstalledDeployment : IDisposable
 {
     private readonly SecureInstalledCodeRoot code;
-    private BrokerInstalledDeployment(SecureInstalledCodeRoot code) => this.code = code;
+    private readonly BrokerDeploymentConfiguration configuration;
+    private BrokerInstalledDeployment(SecureInstalledCodeRoot code, BrokerDeploymentConfiguration configuration)
+    { this.code = code; this.configuration = configuration; }
     internal static string Entrypoint(BrokerInstalledRole role) => role switch
     {
         BrokerInstalledRole.Authority => "DeskFuse.AudioBroker.exe",
@@ -63,17 +67,36 @@ internal sealed class BrokerInstalledDeployment : IDisposable
 
     internal static BrokerInstalledDeployment Open(BrokerDeploymentConfiguration configuration)
     {
-        configuration.Validate(configuration.MaintenanceNamespace, configuration.AuthorityNamespace, configuration.DeploymentId);
-        return new(SecureInstalledCodeRoot.OpenExisting(configuration.DeploymentId, configuration.Files));
+        var snapshot = configuration with { Files = new(configuration.Files, StringComparer.Ordinal) };
+        snapshot.Validate(snapshot.MaintenanceNamespace, snapshot.AuthorityNamespace, snapshot.DeploymentId);
+        return new(SecureInstalledCodeRoot.OpenExisting(snapshot.DeploymentId, snapshot.Files), snapshot);
     }
-    internal IInstalledBrokerWorkerImage Acquire(BrokerInstalledRole role) => new InstalledImage(code.Acquire(Entrypoint(role)), role);
+    internal IInstalledBrokerWorkerImage Acquire(BrokerInstalledRole role)
+    {
+        var profile = ProfileDigest(role);
+        return new InstalledImage(code.Acquire(Entrypoint(role)), role, profile);
+    }
+    private byte[] ProfileDigest(BrokerInstalledRole role)
+    {
+        using var stream = new MemoryStream(); stream.Write("DeskFuse.WorkerProfile.v1\0"u8);
+        Span<byte> scratch = stackalloc byte[16]; configuration.DeploymentId.TryWriteBytes(scratch, true, out _); stream.Write(scratch);
+        stream.WriteByte((byte)role);
+        foreach (var pair in configuration.Files)
+        {
+            var name = Encoding.UTF8.GetBytes(pair.Key);
+            BinaryPrimitives.WriteUInt16BigEndian(scratch, checked((ushort)name.Length)); stream.Write(scratch[..2]); stream.Write(name);
+            stream.Write(Convert.FromHexString(pair.Value));
+        }
+        return SHA256.HashData(stream.ToArray());
+    }
     internal void RequireSignedSetup() => code.RequireSignedEntrypoint(Entrypoint(BrokerInstalledRole.Setup));
     internal string AuthorityExecutablePath
     {
         get { using var lease = code.Acquire(Entrypoint(BrokerInstalledRole.Authority)); return lease.ExecutablePath; }
     }
-    private sealed class InstalledImage(SecureInstalledCodeRoot.CodeLease lease, BrokerInstalledRole role) : IInstalledBrokerWorkerImage
+    private sealed class InstalledImage(SecureInstalledCodeRoot.CodeLease lease, BrokerInstalledRole role, byte[] profile) : IInstalledBrokerWorkerImage
     {
+        public byte[] InstalledProfileSha256 => profile.ToArray();
         public string ExecutablePath => lease.ExecutablePath;
         public string WorkingDirectory => lease.WorkingDirectory;
         public void RevalidateHeldProfile()

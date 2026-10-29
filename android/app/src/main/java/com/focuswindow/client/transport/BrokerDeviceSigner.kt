@@ -133,6 +133,31 @@ internal class BrokerDeviceSigner(private val keys: BrokerSigningKeyStore) {
     }
 
     fun signCommittedProof(active: TrustedCommittedEnrollment, bytes: ByteArray, hostSignature: ByteArray,
+        approval: BrokerProofApproval): ByteArray {
+        require(approval.scope != BrokerScope.SPEAKER) { "Speaker authority requires typed source/delivery approval" }
+        return signCommittedProofCore(active, bytes, hostSignature, approval)
+    }
+    fun signAudioProof(active: TrustedCommittedEnrollment, pending: AudioPendingRequest): ByteArray = pending.signWith(validateCached = {
+        synchronized(gate) {
+            active.requireCurrent(); pending.approval.source.requireActive(active)
+            val enrollment = active.transcript(); val binding = TrustedEnrollmentProtocol.binding(enrollment)
+            existingKey(binding.hostHash, binding.enrollment, TrustedEnrollmentProtocol.hash(enrollment.proposal.phoneSpki))
+            active.requireCurrent()
+        }
+    }) { snapshot, hostSignature, approval ->
+        synchronized(gate) {
+            active.requireCurrent(); approval.requireApproved(active, snapshot)
+            val enrollment = active.transcript(); val binding = TrustedEnrollmentProtocol.binding(enrollment)
+            require(approval.source.host.contentEquals(binding.hostHash) && approval.source.namespace == binding.namespace &&
+                approval.source.enrollment == binding.enrollment && BrokerScope.SPEAKER in enrollment.proposal.scopes)
+            val challenge = "DeskFuse.Audio.Challenge.v1\u0000".toByteArray(Charsets.US_ASCII) + TrustedEnrollmentProtocol.hash(snapshot)
+            require(TrustedEnrollmentProtocol.verify(enrollment.offer.hostSpki, challenge, hostSignature)) { "Untrusted audio challenge" }
+            val key = existingKey(binding.hostHash, binding.enrollment, TrustedEnrollmentProtocol.hash(enrollment.proposal.phoneSpki))
+            val signature = sign(key, snapshot)
+            active.requireCurrent(); signature
+        }
+    }
+    private fun signCommittedProofCore(active: TrustedCommittedEnrollment, bytes: ByteArray, hostSignature: ByteArray,
         approval: BrokerProofApproval): ByteArray = synchronized(gate) {
         active.requireCurrent()
         val transcript = active.transcript(); val binding = TrustedEnrollmentProtocol.binding(transcript)

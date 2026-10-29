@@ -2,7 +2,22 @@
 
 29 October 2026. High continuation under
 `Enrollment_Durable_Completion_High_Handoff.md`; preserve all existing uncommitted
-work at `experiment/vnext-audio-latency`, HEAD `2f181cf2da9c4efdde3013b115108ecac650d1ab`.
+work at `experiment/vnext-audio-latency`, current committed checkpoint
+`09fd7a86b3c674fb1580705b734e64086a5b4e1a`.
+
+**N2 decision selected on Ultra, after the pushed N1 checkpoint `09fd7a8`:**
+[Audio_N2_Bounded_Request_Retention_High_Decision.md](Audio_N2_Bounded_Request_Retention_High_Decision.md)
+selects strict source-scoped request sequencing, a single pending operation,
+eight applied replies, request-bound audio proofs and the connection admission
+rules. Its focused High source implementation and verification are now in
+[Audio_N2_Bounded_Request_Implementation_Status.md](Audio_N2_Bounded_Request_Implementation_Status.md).
+Continue N3 native TLS/control on High; production integration remains blocked.
+[Audio_N2_Request_Retention_Ultra_Stop.md](Audio_N2_Request_Retention_Ultra_Stop.md)
+retains the original uncommitted draft/problem and its verification as background.
+Independent High capture/setup work and its latest verification are recorded in
+[Audio_Independent_High_Continuation_Status.md](Audio_Independent_High_Continuation_Status.md).
+N5's in-process capture foundation is implemented; production integration and
+installed qualification remain open.
 
 **Focused thread-security decision accepted and implemented in source.**
 [Native_Worker_Thread_Launch_High_Decision.md](Native_Worker_Thread_Launch_High_Decision.md)

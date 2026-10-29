@@ -162,6 +162,11 @@ internal interface IBrokerRegisteredWorker
     bool IsAlive();
 }
 
+internal interface IBrokerAudioWorker : IBrokerRegisteredWorker
+{
+    byte[] InstalledProfileSha256 { get; }
+}
+
 internal sealed record BrokerWorkerResource(byte[] Identity, BrokerProofScope Scope, ulong OwnerGeneration);
 
 /// <summary>
@@ -182,6 +187,7 @@ internal sealed class BrokerAuthorityState(IBrokerEnrollments enrollments)
         internal readonly BrokerWorkerResource[] Resources = resources;
         internal ulong Revision = 1;
         internal bool Closed;
+        internal BrokerAudioOwner? Audio;
     }
     private readonly object gate = new();
     private readonly Dictionary<Guid, Registration> registrations = [];
@@ -276,8 +282,9 @@ internal sealed class BrokerAuthorityState(IBrokerEnrollments enrollments)
                 throw new UnauthorizedAccessException("The retained worker registration is not active.");
             var record = ReadEnrolled(registration.Enrollment);
             RequireSubject(record, registration.Logon);
-            var resource = registration.Resources.SingleOrDefault(r => r.Scope == request.Scope &&
-                CryptographicOperations.FixedTimeEquals(r.Identity, request.Resource));
+            var audioFacts = registration.Audio?.ResourceForAuthority(request);
+            var resource = registration.Audio is null ? registration.Resources.SingleOrDefault(r => r.Scope == request.Scope &&
+                CryptographicOperations.FixedTimeEquals(r.Identity, request.Resource)) : audioFacts!.Value.Resource;
             if (resource is null || resource.OwnerGeneration != request.ExpectedOwnerGeneration || !record.Scopes.Contains(request.Scope))
                 throw new UnauthorizedAccessException("The operation is outside the registered resource or generation.");
             var worker = registration.Worker;
@@ -286,8 +293,59 @@ internal sealed class BrokerAuthorityState(IBrokerEnrollments enrollments)
                 worker.Registration, logon.UserSid, logon.LogonSid, logon.AuthenticationId, logon.SessionId,
                 worker.ProcessId, worker.CreationFileTime, resource.OwnerGeneration,
                 record.Version == 2 ? new BrokerProofAuthorityIdentity(record.HostIdentitySha256, record.StorageNamespace, record.EnrollmentId, record.SubjectUserSid!) : null);
-            return commit(context, record.SigningSpki.ToArray(), registration.Revision);
+            if (registration.Audio is not null && record.Version != 2) throw new UnauthorizedAccessException("Audio authority requires committed v2 enrollment.");
+            return commit(context, record.SigningSpki.ToArray(), checked(registration.Revision + (audioFacts?.Revision ?? 0)));
         }
+    }
+
+    internal AudioAuthorityIdentity CaptureAudioIdentity(IBrokerAudioWorker worker, Guid enrollment)
+    {
+        lock (gate)
+        {
+            var record = ReadEnrolled(enrollment); RequireSubject(record, worker.Logon);
+            if (record.Version != 2 || !record.Scopes.Contains(BrokerProofScope.Speaker) || !worker.IsAlive())
+                throw new UnauthorizedAccessException("Audio ownership requires a live v2 speaker enrollment.");
+            var logon = worker.Logon;
+            return new(record.HostIdentitySha256.ToArray(), record.StorageNamespace, record.EnrollmentId, record.PeerIdentity.ToArray(),
+                record.SubjectUserSid!.ToArray(), worker.Registration, logon.LogonSid, logon.AuthenticationId, logon.SessionId, worker.ProcessId, worker.CreationFileTime);
+        }
+    }
+    internal void RequireAudioRegistration(BrokerAudioOwner owner, IBrokerObservedCaller caller)
+    {
+        lock (gate)
+        {
+            var identity = owner.Source.Identity;
+            if (!registrations.TryGetValue(identity.Worker, out var r) || r.Closed || !ReferenceEquals(r.Audio, owner) ||
+                !caller.Matches(r.Worker) || !r.Worker.IsAlive() || r.Worker.ProcessId != r.ProcessId ||
+                r.Worker.CreationFileTime != r.CreationFileTime || !r.Worker.Logon.Matches(r.Logon))
+                throw new UnauthorizedAccessException("Audio worker registration is no longer current.");
+            var enrolled = ReadEnrolled(r.Enrollment); RequireSubject(enrolled, r.Logon);
+            if (enrolled.Version != 2 || !enrolled.Scopes.Contains(BrokerProofScope.Speaker)) throw new UnauthorizedAccessException();
+        }
+    }
+    internal void RegisterAudioOwner(IBrokerAudioWorker worker, Guid enrollment, BrokerAudioOwner owner)
+    {
+        lock (gate)
+        {
+            var current = CaptureAudioIdentity(worker, enrollment);
+            var source = owner.Source;
+            if (!AudioAuthorityProtocol.Source(current, source.Intent).AsSpan().SequenceEqual(source.Bytes) ||
+                !CryptographicOperations.FixedTimeEquals(worker.InstalledProfileSha256, source.Intent.ProfileSha256))
+                throw new UnauthorizedAccessException("Audio source is outside the actual worker/enrollment profile.");
+            RegisterLaunchedWorker(worker, enrollment, [new(source.Digest, BrokerProofScope.Speaker, source.Intent.Generation)]);
+            registrations[worker.Registration].Audio = owner;
+        }
+    }
+    internal T WithAudioCurrent<T>(BrokerAudioOwner owner, IBrokerObservedCaller caller, Func<T> publish)
+    {
+        var source = owner.Source;
+        return WithAuthorizedFacts(caller, new(source.Identity.Worker, source.Digest, BrokerProofOperation.Acquire,
+            BrokerProofScope.Speaker, source.Intent.Generation), (_, _, _) =>
+        {
+            if (!registrations.TryGetValue(source.Identity.Worker, out var registration) || !ReferenceEquals(registration.Audio, owner))
+                throw new UnauthorizedAccessException("Audio owner incarnation changed.");
+            return publish();
+        });
     }
 
     public void RevokeEnrollment(Guid enrollmentId)
@@ -345,6 +403,7 @@ internal sealed class BrokerAuthorityState(IBrokerEnrollments enrollments)
         {
             if (!registrations.TryGetValue(registration, out var current) || current.Closed || !current.Worker.IsAlive())
                 throw new UnauthorizedAccessException("The retained worker is not active.");
+            if (current.Audio is not null) throw new InvalidOperationException("Audio generations belong to the concrete source/delivery owner.");
             var enrollment = ReadEnrolled(current.Enrollment);
             RequireSubject(enrollment, current.Worker.Logon);
             if (!current.Worker.Logon.Matches(current.Logon)) throw new UnauthorizedAccessException("Worker logon changed.");
