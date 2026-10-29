@@ -42,6 +42,7 @@ internal sealed class PhoneSession
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, int> _preferredFrameRates;
     private volatile bool _resync;
     private long _framesSeen;
+    private bool _inputIssueReported;
     // The picture and the sound share one clock, so the phone can measure
     // each path and align them.
     private readonly long _ptsOrigin = Stopwatch.GetTimestamp();
@@ -299,20 +300,30 @@ internal sealed class PhoneSession
     private async Task PumpEncodedGpuVideoAsync(CancellationToken ct)
     {
         var video = _video ?? throw new InvalidOperationException("Video pipeline not started");
-        await foreach (var packet in video.ReadAccessUnitsAsync(ct).ConfigureAwait(false))
+        await using var packets = video.ReadAccessUnitsAsync(ct).GetAsyncEnumerator(ct);
+        while (true)
         {
+            // Do not remove the pending unit from the GPU queue while a previous
+            // unit still owns the transport. This keeps upstream backpressure real.
             await _conn.WaitForVideoCapacityAsync(ct).ConfigureAwait(false);
-            if (_resync && !packet.Keyframe) { video.RequestKeyframe(); continue; }
-            if (packet.Keyframe) _resync = false;
-            if (!_conn.TrySendFrame(packet.AnnexB, packet.Keyframe, NextPtsUs(packet.CaptureQpc),
-                    Interlocked.Read(ref _version)))
+            if (!await packets.MoveNextAsync().ConfigureAwait(false)) break;
+            var packet = packets.Current;
+            GpuVideoPacket? owned = packet;
+            try
             {
-                // Never transmit undecodable P/B frames after packet loss.
-                _resync = true;
-                video.RequestKeyframe();
-                continue;
+                if (_resync && !packet.Keyframe) { video.RequestKeyframe(); continue; }
+                if (packet.Keyframe) _resync = false;
+                if (!_conn.TrySendFrame(packet, NextPtsUs(packet.CaptureQpc), Interlocked.Read(ref _version)))
+                {
+                    // Never transmit undecodable P/B frames after packet loss.
+                    _resync = true;
+                    video.RequestKeyframe();
+                    continue;
+                }
+                owned = null; // the ordered writer owns the accepted packet
+                Interlocked.Increment(ref _framesSeen);
             }
-            Interlocked.Increment(ref _framesSeen);
+            finally { owned?.Dispose(); }
         }
     }
 
@@ -381,10 +392,26 @@ internal sealed class PhoneSession
                 case ClientInput i:
                     try
                     {
-                        if (_video?.TryPrepareInput(i.Event) == true) _input.Handle(i.Event, _geometry);
-                        else _input.ReleaseAll();
+                        if (_video?.TryPrepareInput(i.Event) == true)
+                        {
+                            if (_input.TryHandle(i.Event, _geometry)) _inputIssueReported = false;
+                            else ReportInputIssue(_input.NeedsReconciliation
+                                ? "Input is paused with held keys or buttons. Reconcile them locally, then restart the host before reconnecting."
+                                : "This input action was not sent. Check the selected window and held modifier keys.");
+                        }
+                        else
+                        {
+                            _input.ReleaseAll();
+                            ReportInputIssue(_input.NeedsReconciliation
+                                ? "Input is paused with held keys or buttons. Reconcile them locally, then restart the host before reconnecting."
+                                : "Input is unavailable while the selected window or its geometry is not current.");
+                        }
                     }
-                    catch (Exception ex) { _log.Warn("input injection failed: " + ex.Message); }
+                    catch (Exception ex)
+                    {
+                        _log.Warn("input injection failed: " + ex.Message);
+                        ReportInputIssue("Input paused after an injection failure. If input remains held, reconcile it locally before restarting the host.");
+                    }
                     break;
                 case ClientOccupant o:
                     _log.Info($"phone asked for the '{o.Want}' tier; the selected app source remains authoritative");
@@ -419,6 +446,13 @@ internal sealed class PhoneSession
                     return;
             }
         }
+    }
+
+    private void ReportInputIssue(string detail)
+    {
+        if (_inputIssueReported) return;
+        _inputIssueReported = true;
+        _conn.SendControl(ServerMessages.Stage("Input unavailable", detail));
     }
     private void HandleFiles(ClientFiles request, CancellationToken sessionCt)
     {
@@ -675,7 +709,7 @@ internal sealed class PhoneSession
                 var frames = _conn.FramesSent;
                 _log.Info($"Media measured: {(frames - previousFrames) / seconds:0.0} video fps; " +
                     $"{(bytes - previousBytes) * 8 / seconds / 1000:0.0} kbit/s total encrypted outbound; " +
-                    $"{_conn.FrameBacklog} video records queued/in flight.");
+                    $"{_conn.FrameBacklog} video records queued/in flight; {_conn.VideoHealth}; {_video?.Diagnostics}.");
                 previousBytes = bytes; previousFrames = frames; measuredAt = Stopwatch.GetTimestamp();
                 var report = _guard.Verify(_before);
                 _conn.SendControl(ServerMessages.Invariant(report.Clean, report.Drift));

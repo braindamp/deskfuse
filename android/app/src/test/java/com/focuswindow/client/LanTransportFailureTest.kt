@@ -60,6 +60,6 @@ class LanTransportFailureTest {
         val stage = ServerMessage.Stage("Preparing your display", "Setting up the workspace.")
 
         assertTrue(transport.dispatchControl(stage))
-        assertEquals(stage, received.await())
+        assertEquals(stage, received.await().message)
     }
 }

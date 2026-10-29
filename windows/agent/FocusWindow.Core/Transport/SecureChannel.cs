@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Security.Cryptography;
 namespace FocusWindow.Core.Transport;
 /// <summary>
@@ -36,16 +37,21 @@ public sealed class SecureChannel : IDisposable
     private KeySet? _locked;
     private long _sendCounter;
     private long _recvCounter = -1;
-    private readonly object _gate = new();
+    private readonly object _sendGate = new();
+    private readonly object _recvGate = new();
+    private long _sendLockWaitMaxTicks;
+    private long _recvLockWaitMaxTicks;
     private AesGcm? _sendCipher;
     private byte[]? _sendCipherKey;
     private AesGcm? _recvCipher;
     private bool _disposed;
     private SecureChannel(List<KeySet> candidates) => _candidates = candidates;
     /// <summary>The 6-digit short authentication string the user compares on both screens.</summary>
-    public string VerificationCode => (_locked ?? _candidates[0]).Code;
+    public string VerificationCode => (Volatile.Read(ref _locked) ?? _candidates[0]).Code;
     /// <summary>Only populated after a valid first AES-GCM packet unlocks this credential.</summary>
-    public string? CredentialDeviceId => _locked?.DeviceId;
+    public string? CredentialDeviceId => Volatile.Read(ref _locked)?.DeviceId;
+    public long SendLockWaitMaxUs => Interlocked.Read(ref _sendLockWaitMaxTicks) * 1_000_000 / Stopwatch.Frequency;
+    public long ReceiveLockWaitMaxUs => Interlocked.Read(ref _recvLockWaitMaxTicks) * 1_000_000 / Stopwatch.Frequency;
     public static async Task<SecureChannel> AcceptAsync(
         Stream stream,
         ECDiffieHellman hostKeyPair,
@@ -144,12 +150,14 @@ public sealed class SecureChannel : IDisposable
     {
         if (record.Length != checked(plaintext.Length + RecordOverheadBytes))
             throw new ArgumentException("Destination must fit exactly one sealed record.", nameof(record));
-        lock (_gate)
+        var waitStarted = Stopwatch.GetTimestamp();
+        lock (_sendGate)
         {
+            _sendLockWaitMaxTicks = Math.Max(_sendLockWaitMaxTicks, Stopwatch.GetTimestamp() - waitStarted);
             ObjectDisposedException.ThrowIf(_disposed, this);
             // Before lock-in we send with candidate 0. That is safe because the host only
             // sends AFTER it has opened the client's Hello, which is what locks us in.
-            var keys = _locked ?? _candidates[0];
+            var keys = Volatile.Read(ref _locked) ?? _candidates[0];
             if (!ReferenceEquals(_sendCipherKey, keys.SendKey))
             {
                 _sendCipher?.Dispose();
@@ -169,8 +177,10 @@ public sealed class SecureChannel : IDisposable
         if (packet.Length <= 8 + 16)
             throw new CryptographicException("ciphertext too short");
         var counter = BinaryPrimitives.ReadInt64BigEndian(packet[..8]);
-        lock (_gate)
+        var waitStarted = Stopwatch.GetTimestamp();
+        lock (_recvGate)
         {
+            _recvLockWaitMaxTicks = Math.Max(_recvLockWaitMaxTicks, Stopwatch.GetTimestamp() - waitStarted);
             ObjectDisposedException.ThrowIf(_disposed, this);
             if (_locked is not null)
             {
@@ -183,8 +193,8 @@ public sealed class SecureChannel : IDisposable
                 try
                 {
                     var plain = OpenWith(cipher, packet, counter);
-                    _locked = candidate;
                     _recvCipher = cipher;
+                    Volatile.Write(ref _locked, candidate);
                     return plain;
                 }
                 catch (CryptographicException ex)
@@ -232,7 +242,9 @@ public sealed class SecureChannel : IDisposable
     }
     public void Dispose()
     {
-        lock (_gate)
+        // Only disposal takes both gates. Neither media direction waits for the other.
+        lock (_sendGate)
+        lock (_recvGate)
         {
             if (_disposed) return;
             _disposed = true;

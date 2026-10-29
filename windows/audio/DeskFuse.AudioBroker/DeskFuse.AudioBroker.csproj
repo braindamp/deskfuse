@@ -42,4 +42,7 @@
   <Target Name="PackageSourceControl" AfterTargets="Publish" Condition="'$(OS)' == 'Windows_NT'">
     <Copy SourceFiles="$(SourceControlBuild)\deskfuse-source-control.dll" DestinationFolder="$(PublishDir)" />
   </Target>
+  <ItemGroup>
+    <ProjectReference Include="..\..\security\DeskFuse.WindowsSecurity\DeskFuse.WindowsSecurity.csproj" />
+  </ItemGroup>
 </Project>

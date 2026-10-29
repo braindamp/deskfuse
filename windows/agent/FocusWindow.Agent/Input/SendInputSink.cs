@@ -6,45 +6,77 @@ using FocusWindow.Core.Display;
 using FocusWindow.Core.Input;
 using FocusWindow.Core.Protocol;
 namespace FocusWindow.Agent.Input;
+
+internal interface IInputNative
+{
+    bool GetCursor(out int x, out int y);
+    int Metric(int index);
+    ushort ScanFor(ushort virtualKey);
+    uint Send(Win32Layout.Input[] inputs);
+}
+
+internal sealed class WindowsInputNative : IInputNative
+{
+    [StructLayout(LayoutKind.Sequential)] private struct CursorPoint { public int X, Y; }
+    [DllImport("user32.dll")] private static extern bool GetCursorPos(out CursorPoint point);
+    public bool GetCursor(out int x, out int y)
+    {
+        var success = GetCursorPos(out var point);
+        x = point.X; y = point.Y;
+        return success;
+    }
+    public int Metric(int index) => Native.GetSystemMetrics(index);
+    public ushort ScanFor(ushort virtualKey) => (ushort)Native.MapVirtualKeyW(virtualKey, 0);
+    public uint Send(Win32Layout.Input[] inputs) => Native.SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<Win32Layout.Input>());
+}
 /// <summary>
 /// Injects the phone's touch / pen / keyboard with SendInput.
 ///
 /// What this is and is not:
 ///  * Pointer coordinates are TARGET CLIENT pixels == stream pixels, mapped onto the phone monitor's
-///    rectangle (InputGeometry) and normalised to the VIRTUAL desktop, so a tap lands on the phone
-///    monitor and cannot leak onto a physical one.
+///    rectangle (InputGeometry) and normalised to the VIRTUAL desktop. Foreground and window checks
+///    do not atomically bind SendInput to a recipient; races and local activity can change delivery.
 ///  * Pen pressure/tilt are NOT injected: the pen is delivered as a mouse. Real pressure needs the
 ///    synthetic-pointer-device API (CreateSyntheticPointerDevice), which is not implemented here.
 ///  * SendInput goes to whatever window has the foreground. Clicking on the phone monitor focuses the
 ///    window under it, so this is the "dedicated phone mode" focus policy: while you use the phone,
 ///    your physical keyboard focus follows the phone. That is inherent, and it is documented, not hidden.
-///  * Sticky modifiers from the on-screen bar are applied around the key and released afterwards.
+///  * An unqualified global release is never sent on focus loss or disconnect.
 /// </summary>
 internal sealed class SendInputSink : IInputSink
 {
-    [StructLayout(LayoutKind.Sequential)] private struct CursorPoint { public int X, Y; }
-    [DllImport("user32.dll")] private static extern bool GetCursorPos(out CursorPoint point);
     private const uint MouseMove = 0x0001, MouseLeftDown = 0x0002, MouseLeftUp = 0x0004,
         MouseRightDown = 0x0008, MouseRightUp = 0x0010, MouseMiddleDown = 0x0020, MouseMiddleUp = 0x0040,
         MouseWheel = 0x0800, MouseHWheel = 0x1000, MouseVirtualDesk = 0x4000, MouseAbsolute = 0x8000;
     private const uint KeyExtended = 0x0001, KeyUp = 0x0002, KeyUnicode = 0x0004, KeyScanCode = 0x0008;
     private const int WheelDelta = 120;
     private readonly ILog _log;
-    private readonly object _gate = new();
-    private readonly HashSet<string> _heldButtons = new();
-    private readonly HashSet<ushort> _heldKeys = new();
-    private readonly HashSet<ushort> _modifiersWePressed = new();
-    public SendInputSink(ILog log)
+    private readonly IInputNative _native;
+    private readonly InputSessionArbiter _arbiter;
+    private readonly long _session;
+    private InputLedger _ledger = null!; // Only used while the arbiter lock is held.
+    private bool _eventRejected;
+    public bool NeedsReconciliation => _arbiter.NeedsReconciliation(_session);
+    public SendInputSink(ILog log, InputSessionArbiter arbiter) : this(log, arbiter, new WindowsInputNative()) { }
+    internal SendInputSink(ILog log, InputSessionArbiter arbiter, IInputNative native)
     {
         _log = log;
+        _native = native;
+        _arbiter = arbiter;
+        _session = arbiter.NewSession();
         // SendInput silently rejects any cbSize other than sizeof(INPUT): fail fast if the layout is wrong.
         if (Marshal.SizeOf<Win32Layout.Input>() != 40)
             throw new InvalidOperationException("INPUT layout is not 40 bytes; SendInput would reject every call");
     }
-    public void Handle(InputEventDto e, InputGeometry geometry)
+    public void Handle(InputEventDto e, InputGeometry geometry) => TryHandle(e, geometry);
+
+    public bool TryHandle(InputEventDto e, InputGeometry geometry)
     {
-        lock (_gate)
+        var processed = false;
+        var admitted = _arbiter.TryExecute(_session, ledger =>
         {
+            _ledger = ledger;
+            _eventRejected = false;
             switch (e.Kind)
             {
                 case "pointer": Pointer(e, geometry); break;
@@ -52,19 +84,22 @@ internal sealed class SendInputSink : IInputSink
                 case "scroll": Scroll(e, geometry); break;
                 case "key": Key(e); break;
                 case "text": Text(e.Text); break;
-                default: _log.Warn($"unknown input kind '{e.Kind}'"); break;
+                default: _log.Warn($"unknown input kind '{e.Kind}'"); _eventRejected = true; break;
             }
-        }
+            processed = !_eventRejected;
+        });
+        if (!admitted) _log.Warn("input is suspended or belongs to an old session; reconcile held input locally before restarting the host");
+        return admitted && processed;
     }
     // ---- pointer -----------------------------------------------------------------------------------
     private void Relative(InputEventDto e, InputGeometry geometry)
     {
-        if (!GetCursorPos(out var cursor)) return;
+        if (!_native.GetCursor(out var cursorX, out var cursorY)) { _eventRejected = true; return; }
         var bounds = geometry.MonitorBounds;
-        var x = (int)Math.Clamp((long)cursor.X + e.Dx, bounds.X, (long)bounds.Right - 1);
-        var y = (int)Math.Clamp((long)cursor.Y + e.Dy, bounds.Y, (long)bounds.Bottom - 1);
+        var x = (int)Math.Clamp((long)cursorX + e.Dx, bounds.X, (long)bounds.Right - 1);
+        var y = (int)Math.Clamp((long)cursorY + e.Dy, bounds.Y, (long)bounds.Bottom - 1);
         var (nx, ny) = Normalise(x, y);
-        Send(Mouse(nx, ny, 0, MouseMove | MouseAbsolute | MouseVirtualDesk));
+        Send([Mouse(nx, ny, 0, MouseMove | MouseAbsolute | MouseVirtualDesk)]);
     }
     private static (uint Down, uint Up) ButtonFlags(string button) => button switch
     {
@@ -78,18 +113,18 @@ internal sealed class SendInputSink : IInputSink
         var (nx, ny) = Normalise(dx, dy);
         var move = Mouse(nx, ny, 0, MouseMove | MouseAbsolute | MouseVirtualDesk);
         var (down, up) = ButtonFlags(e.Button);
+        var identity = new InputIdentity("button", (int)down);
         switch (e.Action)
         {
             case "down":
-                Send(move, Mouse(0, 0, 0, down));
-                _heldButtons.Add(e.Button);
+                Send([move, Mouse(0, 0, 0, down)], new InputTransition(identity, true));
                 break;
             case "up":
-                Send(move, Mouse(0, 0, 0, up));
-                _heldButtons.Remove(e.Button);
+                if (!_ledger.IsHeld(identity)) { _log.Warn("unmatched remote button release was dropped"); _eventRejected = true; break; }
+                Send([move, Mouse(0, 0, 0, up)], new InputTransition(identity, false));
                 break;
             default: // move, hover
-                Send(move);
+                Send([move]);
                 break;
         }
     }
@@ -104,12 +139,12 @@ internal sealed class SendInputSink : IInputSink
         Send(inputs.ToArray());
     }
     /// <summary>Normalises a physical desktop pixel to SendInput's 0..65535 over the VIRTUAL screen.</summary>
-    private static (int X, int Y) Normalise(int x, int y)
+    private (int X, int Y) Normalise(int x, int y)
     {
-        var vx = Native.GetSystemMetrics(Native.SmXVirtualScreen);
-        var vy = Native.GetSystemMetrics(Native.SmYVirtualScreen);
-        var vw = Math.Max(2, Native.GetSystemMetrics(Native.SmCxVirtualScreen));
-        var vh = Math.Max(2, Native.GetSystemMetrics(Native.SmCyVirtualScreen));
+        var vx = _native.Metric(Native.SmXVirtualScreen);
+        var vy = _native.Metric(Native.SmYVirtualScreen);
+        var vw = Math.Max(2, _native.Metric(Native.SmCxVirtualScreen));
+        var vh = Math.Max(2, _native.Metric(Native.SmCyVirtualScreen));
         var nx = (int)Math.Round((x - vx) * 65535.0 / (vw - 1));
         var ny = (int)Math.Round((y - vy) * 65535.0 / (vh - 1));
         return (Math.Clamp(nx, 0, 65535), Math.Clamp(ny, 0, 65535));
@@ -122,60 +157,62 @@ internal sealed class SendInputSink : IInputSink
             // The Linux scancodes for the main block equal PS/2 set-1, so they are a usable fallback.
             if (e.Scancode is > 0 and <= 0x58)
             {
-                Send(Keyboard(0, (ushort)e.Scancode, KeyScanCode | (e.Down ? 0u : KeyUp)));
+                var scanIdentity = new InputIdentity("scan", 0, e.Scancode);
+                if (!e.Down && !_ledger.IsHeld(scanIdentity)) { _log.Warn("unmatched remote scan release was dropped"); _eventRejected = true; return; }
+                Send([Keyboard(0, (ushort)e.Scancode, KeyScanCode | (e.Down ? 0u : KeyUp))], new InputTransition(scanIdentity, e.Down));
                 return;
             }
             _log.Warn($"no mapping for Android key {e.AndroidKeyCode} (scancode {e.Scancode}); dropped, not guessed");
+            _eventRejected = true;
             return;
         }
+        var scan = ScanFor(key.VirtualKey);
+        var identity = new InputIdentity("key", key.VirtualKey, scan, key.Extended);
+        if (!e.Down && !_ledger.IsHeld(identity)) { _log.Warn("unmatched remote key release was dropped"); _eventRejected = true; return; }
         if (KeyMap.IsModifier(key.VirtualKey))
         {
             // A physical modifier arriving on its own: pass it through, track it, and do not also
             // synthesise the sticky-modifier bits around it.
-            Send(KeyInput(key, e.Down));
-            if (e.Down) _heldKeys.Add(key.VirtualKey); else _heldKeys.Remove(key.VirtualKey);
+            Send([KeyInput(key, scan, e.Down)], new InputTransition(identity, e.Down));
             return;
         }
         if (e.Down)
         {
             foreach (var mod in KeyMap.ModifierKeys(e.Modifiers))
             {
-                if (_heldKeys.Contains(mod.VirtualKey)) continue;
-                Send(KeyInput(mod, down: true));
-                _modifiersWePressed.Add(mod.VirtualKey);
+                var right = mod.VirtualKey switch { 0xA0 => 0xA1, 0xA2 => 0xA3, 0xA4 => 0xA5, 0x5B => 0x5C, _ => 0 };
+                var heldModifier = _ledger.IsVirtualKeyHeld(mod.VirtualKey, right);
+                if (!heldModifier)
+                {
+                    _log.Warn("implicit modifier rejected until physical-input attribution and safe cleanup are available");
+                    _eventRejected = true;
+                    return;
+                }
             }
-            Send(KeyInput(key, down: true));
-            _heldKeys.Add(key.VirtualKey);
+            Send([KeyInput(key, scan, down: true)], new InputTransition(identity, true));
         }
         else
         {
-            Send(KeyInput(key, down: false));
-            _heldKeys.Remove(key.VirtualKey);
-            ReleaseModifiersWePressed();
+            Send([KeyInput(key, scan, down: false)], new InputTransition(identity, false));
         }
     }
-    private void ReleaseModifiersWePressed()
-    {
-        foreach (var vk in _modifiersWePressed.ToArray())
-        {
-            Send(Keyboard(vk, ScanFor(vk), KeyUp | (NeedsExtended(vk) ? KeyExtended : 0)));
-            _modifiersWePressed.Remove(vk);
-        }
-    }
-    private static bool NeedsExtended(ushort vk) => vk is 0xA3 or 0xA5 or 0x5B or 0x5C;
-    private static ushort ScanFor(ushort vk) => (ushort)Native.MapVirtualKeyW(vk, 0 /* MAPVK_VK_TO_VSC */);
-    private static Win32Layout.Input KeyInput(KeyMap.Key key, bool down) =>
-        Keyboard(key.VirtualKey, ScanFor(key.VirtualKey), (key.Extended ? KeyExtended : 0) | (down ? 0u : KeyUp));
+    private ushort ScanFor(ushort vk) => _native.ScanFor(vk);
+    private static Win32Layout.Input KeyInput(KeyMap.Key key, ushort scan, bool down) =>
+        Keyboard(key.VirtualKey, scan, (key.Extended ? KeyExtended : 0) | (down ? 0u : KeyUp));
     private void Text(string? text)
     {
         if (string.IsNullOrEmpty(text)) return;
         var inputs = new List<Win32Layout.Input>(text.Length * 2);
+        var transitions = new List<InputTransition>(text.Length * 2);
         foreach (var ch in text)
         {
             inputs.Add(Keyboard(0, ch, KeyUnicode));
             inputs.Add(Keyboard(0, ch, KeyUnicode | KeyUp));
+            var identity = new InputIdentity("unicode", ch);
+            transitions.Add(new(identity, true));
+            transitions.Add(new(identity, false));
         }
-        Send(inputs.ToArray());
+        Send(inputs.ToArray(), transitions.ToArray());
     }
     // ---- plumbing ----------------------------------------------------------------------------------
     private static Win32Layout.Input Mouse(int dx, int dy, uint data, uint flags) => new()
@@ -188,9 +225,14 @@ internal sealed class SendInputSink : IInputSink
         Type = Win32Layout.InputKeyboard,
         U = new Win32Layout.InputUnion { Keyboard = new Win32Layout.KeybdInput { Vk = vk, Scan = scan, Flags = flags } },
     };
-    private void Send(params Win32Layout.Input[] inputs)
+    private void Send(Win32Layout.Input[] inputs, params InputTransition[] transitions)
     {
-        var sent = Native.SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<Win32Layout.Input>());
+        _ledger.Begin(transitions);
+        uint sent;
+        try { sent = _native.Send(inputs); }
+        catch { _ledger.AbandonUncertain(); throw; }
+        if (sent > inputs.Length) { _ledger.AbandonUncertain(); throw new InvalidOperationException("Invalid SendInput result."); }
+        _ledger.Complete((int)sent, inputs.Length);
         if (sent != inputs.Length)
         {
             // Typically UIPI: the foreground window is elevated and this agent is not.
@@ -201,26 +243,7 @@ internal sealed class SendInputSink : IInputSink
     }
     public void ReleaseAll()
     {
-        lock (_gate)
-        {
-            try
-            {
-                foreach (var button in _heldButtons.ToArray())
-                {
-                    Send(Mouse(0, 0, 0, ButtonFlags(button).Up));
-                    _heldButtons.Remove(button);
-                }
-                foreach (var vk in _heldKeys.ToArray())
-                {
-                    Send(Keyboard(vk, ScanFor(vk), KeyUp | (NeedsExtended(vk) ? KeyExtended : 0)));
-                    _heldKeys.Remove(vk);
-                }
-                ReleaseModifiersWePressed();
-            }
-            catch (Win32Exception ex)
-            {
-                _log.Warn("releasing held input: " + ex.Message);
-            }
-        }
+        if (_arbiter.Suspend(_session))
+            _log.Warn("remote held input remains uncertain; no automatic global key or button release was sent");
     }
 }

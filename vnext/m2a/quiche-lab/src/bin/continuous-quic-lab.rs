@@ -14,7 +14,7 @@ use std::sync::mpsc::TryRecvError;
 use deskfuse_quiche_lab::wasapi_pipe::{self, Assembler, CaptureEvent};
 use deskfuse_quiche_lab::android_audio::{Admission, AndroidAudio};
 use deskfuse_quiche_lab::source_age::{self, AgeDecision};
-use deskfuse_quiche_lab::plaintext_expiry::{PlaintextExpiry, QueueAdmission};
+use deskfuse_quiche_lab::plaintext_expiry::{PlaintextExpiry, QueueAdmission, PcmTiming};
 use deskfuse_quiche_lab::receive_frontier::{ReceiveFrontier, ContinuityWatch, Context as SourceContext, Reject as SourceReject};
 use deskfuse_quiche_lab::deferred_trace::{WindowsTrace, Event as TraceEvent, FilterStage, AndroidTrace, AndroidFault, AndroidPeriodic};
 use deskfuse_quiche_lab::android_audio::{AudioStats, PlayoutState};
@@ -75,17 +75,14 @@ fn packet(sequence: u32) -> Vec<u8> {
     bytes
 }
 
-fn captured_packet(sequence: u32, device_frame: u64, pcm: &[u8; 960]) -> Vec<u8> {
-    let h = Header {
+fn captured_header(sequence: u32, device_frame: u64) -> Header {
+    Header {
         version: VERSION, kind: KIND_AUDIO, flags: 0,
         header_bytes: HEADER_BYTES as u16, frame_count: AUDIO_FRAMES as u16,
         media_epoch: 1, source_stream_id: 1, format_config_id: 1,
         packet_sequence: sequence, first_source_frame: device_frame,
         payload_bytes: PAYLOAD_BYTES as u32, clock_anchor_id: 17,
-    };
-    let mut wire = encode(&h).to_vec();
-    wire.extend_from_slice(pcm);
-    wire
+    }
 }
 
 fn verified(conn: &quiche::Connection) -> Result<()> {
@@ -113,10 +110,10 @@ fn deadline(dates: &[Option<Instant>]) -> Option<Instant> {
 }
 
 fn source_egress(
-    egress: &mut Egress, udp: &UdpSocket, conn: &mut quiche::Connection,
+    egress: &mut Egress, udp: &UdpSocket, local: SocketAddr, conn: &mut quiche::Connection,
     writable: bool, outstanding: &mut PlaintextExpiry, physical_capture: bool,
 ) -> Result<()> {
-    egress.service_with_hook(udp, conn, writable, |c| {
+    egress.service_with_hook_at(udp, local, conn, writable, |c| {
         if physical_capture {
             let now = source_age::local_qpc_100ns()?;
             outstanding.purge(c, now);
@@ -454,10 +451,10 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                                 }
                                 let assigned_sequence=next_sequence as u32;
                                 trace.record(TraceEvent::Sequence { sequence: assigned_sequence, frame: block.first_device_frame, frames: (AUDIO_FRAMES) as u64, qpc: block.first_qpc_100ns });
-                                let pcm = captured_packet(assigned_sequence, block.first_device_frame, &block.pcm);
+                                let header = captured_header(assigned_sequence, block.first_device_frame);
                                 next_sequence += 1;
                                 last_capture_qpc = block.first_qpc_100ns;
-                                if c.dgram_max_writable_len().unwrap_or(0) < pcm.len() {
+                                if c.dgram_max_writable_len().unwrap_or(0) < APP_BYTES {
                                     return Err("QUIC DATAGRAM cannot fit 1000-byte captured PCM".into());
                                 }
                                 // The 240-frame WASAPI blocks can be delivered
@@ -467,7 +464,7 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                                 // owner gets a chance to seal available packets.
                                 // Egress retains a paced/blocked sealed packet,
                                 // and we never overwrite it or add a send timer.
-                                source_egress(&mut egress, &udp, c, false, &mut outstanding, capture.is_some())?;
+                                source_egress(&mut egress, &udp, local, c, false, &mut outstanding, capture.is_some())?;
                                 // A prior packet can remain in quiche's
                                 // plaintext queue across a long cwnd/pacing
                                 // stall: this original QPC check is the last
@@ -482,19 +479,20 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
                                     trace.record(TraceEvent::Filter { stage: FilterStage::AfterSequence, reason: offer_age, sequence: Some(assigned_sequence), frame: block.first_device_frame, frames: (AUDIO_FRAMES) as u64, qpc: block.first_qpc_100ns, now: offer_qpc_now, count: expired_source_qpc });
                                     continue;
                                 }
-                                let admit_now_qpc = source_age::local_qpc_100ns()?;
-                                match outstanding.admit(
-                                    c, &pcm, block.first_qpc_100ns,
-                                    block.original_packet_offset_frames, admit_now_qpc
+                                match outstanding.admit_pcm(
+                                    c, &header, &block.pcm, PcmTiming::Wasapi {
+                                        source_qpc: block.first_qpc_100ns,
+                                        original_packet_offset_frames: block.original_packet_offset_frames }
                                 ) {
                                     Ok(QueueAdmission::Queued) => {
                                         offered += 1;
                                         deskfuse_quiche_lab::session_control::pcm_admitted(offered);
                                         trace.record(TraceEvent::Admitted { sequence: assigned_sequence, frame: block.first_device_frame, qpc: block.first_qpc_100ns, count: offered });
-                                        source_egress(&mut egress, &udp, c, false, &mut outstanding, capture.is_some())?;
+                                        source_egress(&mut egress, &udp, local, c, false, &mut outstanding, capture.is_some())?;
                                     }
                                     Ok(QueueAdmission::Expired) => {
                                         expired_source_qpc += 1;
+                                        let admit_now_qpc = outstanding.last_offer_qpc;
                                         trace.record(TraceEvent::Filter { stage: FilterStage::AdmitExpired, reason: source_age::classify_wasapi(admit_now_qpc,block.first_qpc_100ns,
                                                     block.original_packet_offset_frames), sequence: Some(assigned_sequence), frame: block.first_device_frame, frames: (AUDIO_FRAMES) as u64, qpc: block.first_qpc_100ns, now: admit_now_qpc, count: expired_source_qpc });
                                     }
@@ -554,7 +552,7 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
             }
             // Completed acquisition retains its lease until the cleanup barrier below.
             // QUIC and this kernel socket have exactly one egress owner.
-            source_egress(&mut egress, &udp, c, false, &mut outstanding, capture.is_some())?;
+            source_egress(&mut egress, &udp, local, c, false, &mut outstanding, capture.is_some())?;
             if let Some(start) = if capture.is_some() { capture_started } else { origin } {
                 // Stop source production at run_for, but leave the authenticated
                 // QUIC socket open long enough for final sealed packets and
@@ -618,7 +616,7 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
         let ready = wait_udp(&udp, writable, wake)?;
         if ready.writable {
             if let Some(c) = conn.as_mut() {
-                source_egress(&mut egress, &udp, c, true, &mut outstanding, capture.is_some())?;
+                source_egress(&mut egress, &udp, local, c, true, &mut outstanding, capture.is_some())?;
             }
         }
     }
@@ -635,6 +633,9 @@ fn server(bind: SocketAddr, allow_ip: IpAddr, ca: &str, cert: &str, key: &str, s
             offered,not_queued,expired_source_qpc,invalid_source_qpc,future_source_qpc,
             capture_source_gaps,capture_source_missing_frames,reader_summary.is_some() as u8,cleanup_result.is_ok() as u8);
     }
+    eprintln!("PCM_EGRESS built={} build_max_ns={} maintenance={} service={} pending_max_us={} pacing_max_us={} blocked_max_us={}",
+        outstanding.pcm_built, outstanding.build_max_ns, egress.maintenance_calls, egress.service_calls,
+        egress.pending_max_us, egress.pacing_max_us, egress.blocked_max_us);
     outstanding.clear();drop(egress);drop(conn);
     drop(source.take()); // endpoint lease is last, after acquisition and QUIC
     let flush_result = (|| -> io::Result<()> {

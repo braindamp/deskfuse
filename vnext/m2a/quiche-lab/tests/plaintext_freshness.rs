@@ -1,7 +1,7 @@
 //! In-memory authenticated quiche fixture. No flaky UDP or clock sleeps:
 //! exercises the real outgoing DATAGRAM queue/purge/seal API.
 mod common;
-use deskfuse_quiche_lab::plaintext_expiry::{PlaintextExpiry,Identity,QueueAdmission};
+use deskfuse_quiche_lab::plaintext_expiry::{PlaintextExpiry,Identity,QueueAdmission,PcmTiming};
 use deskfuse_quiche_lab::reactor::Egress;
 use deskfuse_quiche_lab::{encode,Header,HEADER_BYTES,VERSION,KIND_AUDIO};
 use std::io;
@@ -85,6 +85,35 @@ fn block(sequence:u32)->(Identity,Vec<u8>){
     let mut w=encode(&h).to_vec();
     w.extend([0u8;960]);
     (Identity{epoch:9,stream:3,format:1,sequence,source_frame:h.first_source_frame},w)
+}
+
+#[cfg(windows)]
+#[test]
+fn owned_pcm_preserves_wire_bytes_and_control_queue_pressure_without_extra_builds()->Result<()> {
+    let (mut sender, mut receiver) = established_pair()?;
+    let mut ledger = PlaintextExpiry::default();
+    let mut header = Header { version:VERSION,kind:KIND_AUDIO,flags:0,header_bytes:40,
+        frame_count:240,media_epoch:9,source_stream_id:3,format_config_id:1,
+        packet_sequence:5,first_source_frame:49200,payload_bytes:960,clock_anchor_id:17 };
+    let pcm = [0x5a;960];
+    let now = deskfuse_quiche_lab::source_age::local_qpc_100ns()?;
+    let timing = PcmTiming::Committed(deskfuse_quiche_lab::source_age::CommitTiming {
+        commit_qpc:now,presentation_qpc:now });
+    assert_eq!(ledger.admit_pcm(&mut sender,&header,&pcm,timing)?,QueueAdmission::Queued);
+    assert_eq!(sender.dgram_send_queue_byte_size(),1000);
+    let mut expected = encode(&header).to_vec(); expected.extend_from_slice(&pcm);
+    for _ in 0..3 { sender.dgram_send(b"anchor")?; }
+    let queued_bytes = sender.dgram_send_queue_byte_size();
+    header.packet_sequence += 1; header.first_source_frame += 240;
+    assert_eq!(ledger.admit_pcm(&mut sender,&header,&pcm,timing)?,QueueAdmission::Full);
+    assert_eq!(ledger.pcm_built,1);
+    assert_eq!(ledger.len(),1);
+    assert_eq!(sender.dgram_send_queue_byte_size(),queued_bytes);
+    pump(&mut sender,&mut receiver)?;
+    let mut received = [0u8;1000];
+    let n = receiver.dgram_recv(&mut received)?;
+    assert_eq!(&received[..n],expected.as_slice());
+    Ok(())
 }
 #[test]
 fn receive_fifo_loses_burst_without_interleaving_but_draining_each_udp_preserves_pcm()->Result<()>{

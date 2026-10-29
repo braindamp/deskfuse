@@ -1,0 +1,369 @@
+using System.Runtime.Versioning;
+using System.Security.Cryptography;
+using System.Security.Principal;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using DeskFuse.WindowsSecurity;
+
+namespace DeskFuse.AudioBroker;
+
+internal sealed record BrokerEnrollmentRecord(int Version, Guid StorageNamespace, Guid EnrollmentId,
+    byte[] HostIdentitySha256, byte[] PeerIdentity, byte[] SigningSpki, BrokerProofScope[] Scopes,
+    byte[] ApprovedTranscriptSha256, string RecordedByWindowsSid)
+{
+    internal byte[]? SubjectUserSid { get; init; }
+    internal byte[]? SigningSpkiSha256 { get; init; }
+    internal byte[]? ImmutableRecordSha256 { get; init; }
+    internal byte[]? ApproverUserSid { get; init; }
+    internal void Validate(Guid storageNamespace, ReadOnlySpan<byte> host)
+    {
+        if (Version is not (1 or 2) || StorageNamespace == Guid.Empty || StorageNamespace != storageNamespace || EnrollmentId == Guid.Empty ||
+            HostIdentitySha256 is not { Length: 32 } || !CryptographicOperations.FixedTimeEquals(HostIdentitySha256, host) ||
+            PeerIdentity is not { Length: 32 } || SigningSpki is not { Length: 91 } || ApprovedTranscriptSha256 is not { Length: 32 } ||
+            Scopes is not { Length: >= 1 and <= 8 } || Scopes.Any(s => !Enum.IsDefined(s)) || Scopes.Distinct().Count() != Scopes.Length ||
+            RecordedByWindowsSid != "S-1-5-18")
+            throw new InvalidDataException("Invalid protected broker enrollment.");
+        if (Version == 2)
+        {
+            if (SubjectUserSid is null || ApproverUserSid is null || SigningSpkiSha256 is not { Length: 32 } ||
+                ImmutableRecordSha256 is not { Length: 32 } || !CryptographicOperations.FixedTimeEquals(SHA256.HashData(SigningSpki), SigningSpkiSha256))
+                throw new InvalidDataException("Incomplete committed v2 enrollment.");
+            EnrollmentProtocol.ValidateSid(SubjectUserSid); EnrollmentProtocol.ValidateSid(ApproverUserSid);
+        }
+        using var key = ECDsa.Create();
+        key.ImportSubjectPublicKeyInfo(SigningSpki, out var read);
+        if (read != SigningSpki.Length || key.KeySize != 256 ||
+            !key.ExportSubjectPublicKeyInfo().AsSpan().SequenceEqual(SigningSpki) ||
+            key.ExportParameters(false).Curve.Oid.Value != "1.2.840.10045.3.1.7")
+            throw new InvalidDataException("Broker enrollment must contain a canonical P-256 verification key.");
+    }
+}
+
+internal interface IBrokerEnrollments
+{
+    BrokerEnrollmentRecord ReadActive(Guid enrollmentId);
+    void Revoke(Guid enrollmentId);
+}
+
+/// <summary>
+/// Durable product enrollment store. Its capability is created by the SYSTEM
+/// installer under the fixed BrokerAuthority profile; arbitrary paths, legacy
+/// pairing files and candidate-supplied keys cannot nominate this store.
+/// </summary>
+[SupportedOSPlatform("windows")]
+internal sealed class ProtectedBrokerEnrollments : IBrokerEnrollments, IDisposable
+{
+    private sealed record Revocation(int Version, Guid Namespace, Guid EnrollmentId);
+    private readonly SecurePrivateStorageRoot root;
+    private readonly byte[] host;
+    private readonly IDisposable ownerLease;
+    private bool disposed;
+    internal static readonly JsonSerializerOptions Json = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow,
+        Converters = { new JsonStringEnumConverter(allowIntegerValues: false) }
+    };
+
+    internal ProtectedBrokerEnrollments(SecurePrivateStorageRoot root, byte[] protectedHostIdentity)
+    {
+        if (root.Profile != PrivateStorageProfile.BrokerAuthority || protectedHostIdentity is not { Length: 32 })
+            throw new InvalidDataException("The broker requires its own protected authority namespace and host identity.");
+        this.root = root;
+        host = protectedHostIdentity.ToArray();
+        root.ValidateHeldIdentity();
+        ownerLease = root.AcquireBrokerOwnerLease();
+    }
+
+    // Called exclusively by trusted local setup AFTER the independent key
+    // approval ceremony. SYSTEM identity proves the writer, not human consent;
+    // the ceremony and its digest must not be supplied by the network protocol.
+    // This method is intentionally not connected to the legacy broker pipe.
+    private BrokerEnrollmentRecord AddFromTrustedSetup(Guid enrollmentId, byte[] peerIdentity, byte[] signingSpki,
+        BrokerProofScope[] scopes, byte[] approvedTranscriptSha256)
+    {
+        ObjectDisposedException.ThrowIf(disposed, this);
+        if (enrollmentId == Guid.Empty || peerIdentity is not { Length: 32 } || signingSpki is not { Length: 91 } ||
+            scopes is not { Length: >= 1 and <= 8 } || approvedTranscriptSha256 is not { Length: 32 })
+            throw new InvalidDataException("Invalid bounded broker enrollment approval.");
+        root.ValidateHeldIdentity();
+        using var identity = WindowsIdentity.GetCurrent();
+        var record = new BrokerEnrollmentRecord(1, root.NamespaceId, enrollmentId, host.ToArray(), peerIdentity.ToArray(),
+            signingSpki.ToArray(), scopes.Order().ToArray(), approvedTranscriptSha256.ToArray(), identity.User?.Value ?? "");
+        record.Validate(root.NamespaceId, host);
+        using var directory = root.OpenDirectory("enrollments");
+        RequireNotRevoked(enrollmentId);
+        var bytes = JsonSerializer.SerializeToUtf8Bytes(record, Json);
+        using var file = root.CopyProtectedFile(RecordPath(enrollmentId), new MemoryStream(bytes, writable: false), Hash(bytes), 4096);
+        return record;
+    }
+
+    public BrokerEnrollmentRecord ReadActive(Guid enrollmentId)
+    {
+        ObjectDisposedException.ThrowIf(disposed, this);
+        RequireId(enrollmentId);
+        root.ValidateHeldIdentity();
+        using var directory = root.OpenDirectory("enrollments");
+        RequireNotRevoked(enrollmentId);
+        using var file = root.OpenProtectedRead(RecordPath(enrollmentId));
+        var bytes = SecurePrivateStorageRoot.ReadBounded(file, 4096);
+        var record = JsonSerializer.Deserialize<BrokerEnrollmentRecord>(bytes, Json)
+            ?? throw new InvalidDataException("Missing protected enrollment.");
+        if (!JsonSerializer.SerializeToUtf8Bytes(record, Json).AsSpan().SequenceEqual(bytes) || record.EnrollmentId != enrollmentId)
+            throw new InvalidDataException("Ambiguous broker enrollment record.");
+        record.Validate(root.NamespaceId, host);
+        // Revocation is serialized by the owner; checking again also catches a
+        // different trusted instance persisting denial while this read occurred.
+        RequireNotRevoked(enrollmentId);
+        return record;
+    }
+
+    public void Revoke(Guid enrollmentId)
+    {
+        ObjectDisposedException.ThrowIf(disposed, this);
+        RequireId(enrollmentId);
+        root.ValidateHeldIdentity();
+        using var directory = root.OpenDirectory("enrollments");
+        if (HasRevocation(enrollmentId)) return;
+        var bytes = JsonSerializer.SerializeToUtf8Bytes(new Revocation(1, root.NamespaceId, enrollmentId), Json);
+        // Create-new and Flush(true) happen inside the protected copy API. Any
+        // torn/present marker denies later admission; it never restores a grant.
+        using var marker = root.CopyProtectedFile(RevokedPath(enrollmentId), new MemoryStream(bytes, writable: false), Hash(bytes), 4096);
+    }
+
+    private void RequireNotRevoked(Guid id)
+    {
+        if (HasRevocation(id)) throw new UnauthorizedAccessException("Broker enrollment is revoked.");
+    }
+    private bool HasRevocation(Guid id)
+    {
+        try { using var marker = root.OpenProtectedRead(RevokedPath(id)); return true; }
+        catch (FileNotFoundException) { return false; }
+        // Access, sharing, malformed/reparse and directory errors are denials.
+    }
+    private static void RequireId(Guid id) { if (id == Guid.Empty) throw new InvalidDataException("Missing enrollment identity."); }
+    private static string RecordPath(Guid id) => $"enrollments/{id:N}.json";
+    private static string RevokedPath(Guid id) => $"enrollments/{id:N}.revoked.json";
+    private static string Hash(byte[] bytes) => Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
+    public void Dispose()
+    {
+        if (disposed) return;
+        disposed = true;
+        ownerLease.Dispose();
+    }
+}
+
+internal interface IBrokerRegisteredWorker
+{
+    Guid Registration { get; }
+    BrokerLogonIdentity Logon { get; }
+    uint ProcessId { get; }
+    ulong CreationFileTime { get; }
+    bool IsAlive();
+}
+
+internal sealed record BrokerWorkerResource(byte[] Identity, BrokerProofScope Scope, ulong OwnerGeneration);
+
+/// <summary>
+/// Concrete service-owned registry. Only trusted launch can supply retained
+/// worker facts; resources are delegated by trusted setup/owner policy. Pipe
+/// requests may refer to a registration but cannot register a PID or public key.
+/// The native resource owner separately serializes/rundowns admitted native work.
+/// </summary>
+internal sealed class BrokerAuthorityState(IBrokerEnrollments enrollments)
+{
+    private sealed class Registration(IBrokerRegisteredWorker worker, Guid enrollment, BrokerWorkerResource[] resources)
+    {
+        internal readonly IBrokerRegisteredWorker Worker = worker;
+        internal readonly uint ProcessId = worker.ProcessId;
+        internal readonly ulong CreationFileTime = worker.CreationFileTime;
+        internal readonly BrokerLogonIdentity Logon = worker.Logon;
+        internal readonly Guid Enrollment = enrollment;
+        internal readonly BrokerWorkerResource[] Resources = resources;
+        internal ulong Revision = 1;
+        internal bool Closed;
+    }
+    private readonly object gate = new();
+    private readonly Dictionary<Guid, Registration> registrations = [];
+    private readonly HashSet<Guid> deniedEnrollments = [];
+
+    [SupportedOSPlatform("windows")]
+    internal BrokerRegisteredWorker LaunchAndRegister(BrokerWorkerLauncher launcher, IInstalledBrokerWorkerImage image,
+        BrokerLogonIdentity approvedLogon, Guid enrollmentId, BrokerWorkerResource[] resources)
+    {
+        ArgumentNullException.ThrowIfNull(resources);
+        if (resources.Length is < 1 or > 16 || resources.Any(r => r is null || r.Identity is not { Length: 32 } || !Enum.IsDefined(r.Scope)))
+            throw new InvalidDataException("Invalid bounded worker delegation.");
+        // Snapshot before launch; RegisterLaunchedWorker performs the fresh
+        // protected enrollment/scope checks after the launch returns too.
+        var snapshot = resources.Select(r => r is not null && r.Identity is not null
+            ? r with { Identity = r.Identity.ToArray() } : throw new InvalidDataException("Invalid worker delegation.")).ToArray();
+        lock (gate)
+        {
+            var enrollment = ReadEnrolled(enrollmentId);
+            RequireSubject(enrollment, approvedLogon);
+            if (snapshot.Any(r => !enrollment.Scopes.Contains(r.Scope)))
+                throw new UnauthorizedAccessException("Worker resource scope is not enrolled.");
+        }
+        var worker = launcher.Launch(image, approvedLogon);
+        try
+        {
+            RegisterLaunchedWorker(worker, enrollmentId, snapshot);
+            return worker;
+        }
+        catch (Exception failure)
+        {
+            try { worker.StopAndJoin(); worker.Dispose(); }
+            catch (Exception cleanup) { throw new BrokerWorkerLaunchIncompleteException(worker, failure, cleanup); }
+            throw;
+        }
+    }
+
+    // A production authority session can only be obtained from a service-observed
+    // connected pipe caller. The registration GUID is never a bearer credential.
+    internal IBrokerAuthorityState BindCaller(IBrokerObservedCaller caller)
+    {
+        ArgumentNullException.ThrowIfNull(caller);
+        return new CallerState(this, caller);
+    }
+
+    private sealed class CallerState(BrokerAuthorityState owner, IBrokerObservedCaller caller) : IBrokerAuthorityState
+    {
+        public T WithAuthorizedFacts<T>(BrokerAuthorityRequest request, Func<BrokerProofContext, byte[], ulong, T> commit)
+            => owner.WithAuthorizedFacts(caller, request, commit);
+        public void RevokeEnrollment(Guid id)
+        {
+            lock (owner.gate)
+            {
+                if (!owner.registrations.Values.Any(r => r.Enrollment == id && caller.Matches(r.Worker)))
+                    throw new UnauthorizedAccessException("This caller cannot revoke another enrollment.");
+                owner.DenyEnrollmentLocked(id);
+            }
+            owner.PersistRevocation(id); // Flush outside the short caller/resource gate.
+        }
+    }
+
+    internal void RegisterLaunchedWorker(IBrokerRegisteredWorker worker, Guid enrollmentId, BrokerWorkerResource[] resources)
+    {
+        if (OperatingSystem.IsWindows() && worker is BrokerRegisteredWorker launched && launched.Kind != BrokerWorkerKind.NativeResource)
+            throw new UnauthorizedAccessException("Setup/transport roles cannot acquire native resource authority.");
+        ArgumentNullException.ThrowIfNull(worker);
+        if (worker.Registration == Guid.Empty || worker.ProcessId == 0 || worker.CreationFileTime == 0 ||
+            resources is not { Length: >= 1 and <= 16 } || resources.Any(r => r is null || r.Identity is not { Length: 32 } || !Enum.IsDefined(r.Scope)))
+            throw new InvalidDataException("Invalid trusted worker delegation.");
+        var snapshot = resources.Select(r => r with { Identity = r.Identity.ToArray() }).ToArray();
+        if (snapshot.Select(r => (Convert.ToHexString(r.Identity), r.Scope)).Distinct().Count() != snapshot.Length)
+            throw new InvalidDataException("Duplicate worker resource delegation.");
+        lock (gate)
+        {
+            var enrollment = ReadEnrolled(enrollmentId);
+            RequireSubject(enrollment, worker.Logon);
+            if (registrations.Count >= 128 || registrations.ContainsKey(worker.Registration) || !worker.IsAlive() ||
+                snapshot.Any(r => !enrollment.Scopes.Contains(r.Scope)))
+                throw new UnauthorizedAccessException("Worker registration is unavailable or out of enrollment scope.");
+            registrations.Add(worker.Registration, new(worker, enrollmentId, snapshot));
+        }
+    }
+
+    private T WithAuthorizedFacts<T>(IBrokerObservedCaller caller, BrokerAuthorityRequest request, Func<BrokerProofContext, byte[], ulong, T> commit)
+    {
+        lock (gate)
+        {
+            if (!registrations.TryGetValue(request.Registration, out var registration) || registration.Closed ||
+                !caller.Matches(registration.Worker) || !registration.Worker.IsAlive() ||
+                registration.Worker.ProcessId != registration.ProcessId || registration.Worker.CreationFileTime != registration.CreationFileTime ||
+                registration.Worker.Registration != request.Registration || !registration.Worker.Logon.Matches(registration.Logon))
+                throw new UnauthorizedAccessException("The retained worker registration is not active.");
+            var record = ReadEnrolled(registration.Enrollment);
+            RequireSubject(record, registration.Logon);
+            var resource = registration.Resources.SingleOrDefault(r => r.Scope == request.Scope &&
+                CryptographicOperations.FixedTimeEquals(r.Identity, request.Resource));
+            if (resource is null || resource.OwnerGeneration != request.ExpectedOwnerGeneration || !record.Scopes.Contains(request.Scope))
+                throw new UnauthorizedAccessException("The operation is outside the registered resource or generation.");
+            var worker = registration.Worker;
+            var logon = registration.Logon;
+            var context = new BrokerProofContext(record.PeerIdentity, resource.Identity, request.Operation, request.Scope,
+                worker.Registration, logon.UserSid, logon.LogonSid, logon.AuthenticationId, logon.SessionId,
+                worker.ProcessId, worker.CreationFileTime, resource.OwnerGeneration,
+                record.Version == 2 ? new BrokerProofAuthorityIdentity(record.HostIdentitySha256, record.StorageNamespace, record.EnrollmentId, record.SubjectUserSid!) : null);
+            return commit(context, record.SigningSpki.ToArray(), registration.Revision);
+        }
+    }
+
+    public void RevokeEnrollment(Guid enrollmentId)
+    {
+        if (enrollmentId == Guid.Empty) throw new InvalidDataException("Missing enrollment identity.");
+        lock (gate) DenyEnrollmentLocked(enrollmentId);
+        enrollments.Revoke(enrollmentId); // Admission stays closed even if durable persistence fails.
+    }
+
+    internal IBrokerRegisteredWorker[] CloseEnrollmentAdmission(Guid enrollmentId)
+    {
+        lock (gate)
+        {
+            DenyEnrollmentLocked(enrollmentId);
+            return registrations.Values.Where(r => r.Enrollment == enrollmentId).Select(r => r.Worker).ToArray();
+        }
+    }
+    internal bool OwnsRegistration(Guid enrollmentId, IBrokerRegisteredWorker worker)
+    {
+        lock (gate) return registrations.TryGetValue(worker.Registration, out var current) && !current.Closed &&
+            current.Enrollment == enrollmentId && ReferenceEquals(current.Worker, worker);
+    }
+    internal Guid[] EnrollmentsWithWorkers()
+    { lock (gate) return registrations.Values.Select(r => r.Enrollment).Distinct().ToArray(); }
+
+    private void DenyEnrollmentLocked(Guid enrollmentId)
+    {
+        if (enrollmentId == Guid.Empty) throw new InvalidDataException("Missing enrollment identity.");
+        deniedEnrollments.Add(enrollmentId);
+        foreach (var registration in registrations.Values.Where(r => r.Enrollment == enrollmentId)) registration.Closed = true;
+    }
+    private void PersistRevocation(Guid enrollmentId) => enrollments.Revoke(enrollmentId);
+    private BrokerEnrollmentRecord ReadEnrolled(Guid id)
+    {
+        if (deniedEnrollments.Contains(id)) throw new UnauthorizedAccessException("Enrollment admission is closed.");
+        return enrollments.ReadActive(id);
+    }
+    private static void RequireSubject(BrokerEnrollmentRecord enrollment, BrokerLogonIdentity actual)
+    {
+        if (enrollment.Version == 2 && (enrollment.SubjectUserSid is null ||
+            !CryptographicOperations.FixedTimeEquals(enrollment.SubjectUserSid, actual.UserSid)))
+            throw new UnauthorizedAccessException("The actual Windows worker user is outside the enrolled subject.");
+    }
+
+    internal void CloseRegistration(Guid registration)
+    {
+        lock (gate)
+            if (registrations.TryGetValue(registration, out var current)) current.Closed = true;
+    }
+
+    internal void AdvanceOwnerGeneration(Guid registration, byte[] resource, BrokerProofScope scope, ulong expected, ulong replacement)
+    {
+        if (resource is not { Length: 32 } || replacement <= expected) throw new InvalidDataException("Invalid resource generation transition.");
+        lock (gate)
+        {
+            if (!registrations.TryGetValue(registration, out var current) || current.Closed || !current.Worker.IsAlive())
+                throw new UnauthorizedAccessException("The retained worker is not active.");
+            var enrollment = ReadEnrolled(current.Enrollment);
+            RequireSubject(enrollment, current.Worker.Logon);
+            if (!current.Worker.Logon.Matches(current.Logon)) throw new UnauthorizedAccessException("Worker logon changed.");
+            var index = Array.FindIndex(current.Resources, r => r.Scope == scope && CryptographicOperations.FixedTimeEquals(r.Identity, resource));
+            if (index < 0 || current.Resources[index].OwnerGeneration != expected)
+                throw new UnauthorizedAccessException("The resource owner generation changed.");
+            var revision = checked(current.Revision + 1);
+            current.Resources[index] = current.Resources[index] with { OwnerGeneration = replacement };
+            current.Revision = revision;
+        }
+    }
+
+    internal void ForgetStoppedRegistration(Guid registration)
+    {
+        lock (gate)
+        {
+            if (!registrations.TryGetValue(registration, out var current)) return;
+            if (!current.Closed || current.Worker.IsAlive()) throw new InvalidOperationException("Close and stop the exact worker before forgetting registration.");
+            registrations.Remove(registration);
+        }
+    }
+}

@@ -92,17 +92,17 @@ pub fn run(bind:SocketAddr,allow_ip:IpAddr,ca:&str,cert:&str,key:&str,seconds:u6
                             }
                         }
                         if sequence>u32::MAX as u64{return Err("native audio sequence exhausted".into())}
-                        let wire=captured_packet(sequence as u32,block.first_frame,&block.pcm);sequence+=1;
-                        source_egress(&mut egress,&udp,c,false,&mut pending,true)?;
-                        match pending.admit_committed(c,&wire,block.timing,source_age::local_qpc_100ns()?)? {
+                        let header=captured_header(sequence as u32,block.first_frame);sequence+=1;
+                        source_egress(&mut egress,&udp,local,c,false,&mut pending,true)?;
+                        match pending.admit_pcm(c,&header,&block.pcm,PcmTiming::Committed(block.timing))? {
                             QueueAdmission::Queued=>{sent+=1;deskfuse_quiche_lab::session_control::pcm_admitted(sent);},QueueAdmission::Expired=>expired+=1,QueueAdmission::Full=>dropped+=1,
                         }
-                        source_egress(&mut egress,&udp,c,false,&mut pending,true)?;
+                        source_egress(&mut egress,&udp,local,c,false,&mut pending,true)?;
                     }
                     current.arm()?;
                 }
             }
-            source_egress(&mut egress,&udp,c,false,&mut pending,true)?;
+            source_egress(&mut egress,&udp,local,c,false,&mut pending,true)?;
         }
         let expiry=if pending.len()!=0 {
             let at=Instant::now();pending.next_expiry_wait(source_age::local_qpc_100ns()?).and_then(|d|at.checked_add(d))
@@ -113,7 +113,7 @@ pub fn run(bind:SocketAddr,allow_ip:IpAddr,ca:&str,cert:&str,key:&str,seconds:u6
             if source.is_none(){authenticated.map(|t|t+CONNECT_LIMIT)}else{None}]);
         let (ready,period)=events.wait(egress.needs_write_readiness(),source.as_ref().map(|s|s.event),source.as_ref().map(|s|s.period_event()),wake)?;
         if period {if let Some(ref current)=source{current.service_period()?;}}
-        if ready.writable {if let Some(c)=connection.as_mut(){source_egress(&mut egress,&udp,c,true,&mut pending,true)?;}}
+        if ready.writable {if let Some(c)=connection.as_mut(){source_egress(&mut egress,&udp,local,c,true,&mut pending,true)?;}}
     }})();
     // Acquire any completed setup before cleanup; no setup-owned acquisition
     // may outlive transport termination and endpoint release.
@@ -124,6 +124,9 @@ pub fn run(bind:SocketAddr,allow_ip:IpAddr,ca:&str,cert:&str,key:&str,seconds:u6
             c.accepted_commit,c.accepted_end_frame,c.dropped_frames,c.generation,c.published,c.acknowledged);}
         current.stop();
     }
+    eprintln!("PCM_EGRESS built={} build_max_ns={} maintenance={} service={} pending_max_us={} pacing_max_us={} blocked_max_us={}",
+        pending.pcm_built, pending.build_max_ns, egress.maintenance_calls, egress.service_calls,
+        egress.pending_max_us, egress.pacing_max_us, egress.blocked_max_us);
     pending.clear();drop(egress);drop(connection); // transport retires before endpoint lease
     drop(source);
     eprintln!("DONE committed source queued={sent} expired={expired} dropped={dropped}");

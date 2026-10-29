@@ -29,17 +29,26 @@ internal sealed class NativeGpuPipeline(string? executable = null, string? argum
     [DllImport(Library, CallingConvention = CallingConvention.Cdecl, EntryPoint = "fwgpu_open")]
     private static extern nint Open(nint hwnd, uint width, uint height, uint fps, uint bitrate);
     [DllImport(Library, CallingConvention = CallingConvention.Cdecl, EntryPoint = "fwgpu_read")]
-    private static extern int Read(nint session, uint timeoutMs, [Out] byte[] bytes,
+    private static extern int Read(nint session, uint timeoutMs, nint bytes,
         uint capacity, out uint written, out ulong qpc, out byte keyframe);
     [DllImport(Library, CallingConvention = CallingConvention.Cdecl, EntryPoint = "fwgpu_force_idr")]
     private static extern void ForceIdr(nint session);
     [DllImport(Library, CallingConvention = CallingConvention.Cdecl, EntryPoint = "fwgpu_last_error", CharSet = CharSet.Unicode)]
     private static extern int LastError(nint session, [Out] char[] dest, uint capacity);
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NativeMetrics
+    {
+        public uint Size, Version;
+        public ulong Frames, CaptureArrivalFallbackAus, QpcFrequency, SourceWaitMaxUs;
+        public ulong EncodeSubmitMaxUs, BitstreamLockMaxUs, InspectCopyMaxUs;
+    }
+    [DllImport(Library, CallingConvention = CallingConvention.Cdecl, EntryPoint = "fwgpu_get_metrics")]
+    private static extern int GetMetrics(nint session, out NativeMetrics metrics, uint capacity);
     [DllImport(Library, CallingConvention = CallingConvention.Cdecl, EntryPoint = "fwgpu_close")]
     private static extern void Close(nint session);
 
     private readonly Channel<GpuVideoPacket> _packets = Channel.CreateBounded<GpuVideoPacket>(
-        new BoundedChannelOptions(1) { SingleReader = true, SingleWriter = true, FullMode = BoundedChannelFullMode.Wait });
+        new BoundedChannelOptions(1) { SingleReader = false, SingleWriter = true, FullMode = BoundedChannelFullMode.Wait });
     private readonly CancellationTokenSource _stop = new();
     private readonly TaskCompletionSource _finished = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private WorkspaceApplicationSource? _source;
@@ -49,6 +58,8 @@ internal sealed class NativeGpuPipeline(string? executable = null, string? argum
     private int _started;
     private int _disposed;
     public VideoPipelineInfo Info { get; private set; } = null!;
+    private string _diagnostics = "nativeMetrics=not-sampled";
+    public string Diagnostics => Volatile.Read(ref _diagnostics);
 
     private static string Error(nint handle)
     {
@@ -90,10 +101,11 @@ internal sealed class NativeGpuPipeline(string? executable = null, string? argum
         }
     }
 
-    private void Run(nint hwnd, VideoPipelineSettings settings, TaskCompletionSource ready)
+    private unsafe void Run(nint hwnd, VideoPipelineSettings settings, TaskCompletionSource ready)
     {
         nint native = nint.Zero;
         Exception? failure = null;
+        GpuVideoPacket? packet = null;
         try
         {
             native = Open(hwnd, (uint)settings.Width, (uint)settings.Height, (uint)settings.Fps,
@@ -101,10 +113,17 @@ internal sealed class NativeGpuPipeline(string? executable = null, string? argum
             if (native == nint.Zero) throw new DisplayException("gpu", Error(nint.Zero),
                 "This backend requires Windows Graphics Capture and an NVENC-capable NVIDIA adapter/driver.");
             ready.TrySetResult();
-            var packet = new byte[1024 * 1024];
+            var capacity = 1024 * 1024 - GpuVideoPacket.TotalOverheadBytes;
             var lastGeometryCheck = Environment.TickCount64;
+            var lastMetricsCheck = lastGeometryCheck;
+            var metricsAvailable = true;
+            long nativeReadMaxUs = 0;
             while (!_stop.IsCancellationRequested)
             {
+                // Do not encode a second pending access unit while the channel
+                // is occupied; WGC retains the latest source frame upstream.
+                if (!_packets.Writer.WaitToWriteAsync(_stop.Token).AsTask().GetAwaiter().GetResult())
+                    break;
                 if (Environment.TickCount64 - lastGeometryCheck >= 100)
                 {
                     if (_source?.IsCurrent() != true)
@@ -113,25 +132,51 @@ internal sealed class NativeGpuPipeline(string? executable = null, string? argum
                     lastGeometryCheck = Environment.TickCount64;
                 }
                 if (Interlocked.Exchange(ref _wantIdr, 0) != 0) ForceIdr(native);
-                var status = Read(native, 25, packet, (uint)packet.Length, out var size, out var qpc, out var keyframe);
+                packet ??= GpuVideoPacket.Rent(capacity);
+                int status;
+                uint size;
+                ulong qpc;
+                byte keyframe;
+                var readStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+                fixed (byte* output = packet.WritablePayload.Span)
+                    status = Read(native, 25, (nint)output, (uint)packet.Capacity, out size, out qpc, out keyframe);
+                nativeReadMaxUs = Math.Max(nativeReadMaxUs,
+                    (long)(System.Diagnostics.Stopwatch.GetElapsedTime(readStarted).TotalMilliseconds * 1000));
+                if (metricsAvailable && Environment.TickCount64 - lastMetricsCheck >= 1000)
+                {
+                    lastMetricsCheck = Environment.TickCount64;
+                    try
+                    {
+                        if (GetMetrics(native, out var metrics, 64) == 1 && metrics.Size == 64 && metrics.Version == 1)
+                            Volatile.Write(ref _diagnostics, $"nativeMetricsV=1 nativeAus={metrics.Frames} qpcHz={metrics.QpcFrequency} " +
+                                $"captureArrivalFallbackAus={metrics.CaptureArrivalFallbackAus} sourceWaitMaxUs={metrics.SourceWaitMaxUs} " +
+                                $"encodeSubmitMaxUs={metrics.EncodeSubmitMaxUs} bitstreamLockMaxUs={metrics.BitstreamLockMaxUs} " +
+                                $"inspectCopyMaxUs={metrics.InspectCopyMaxUs} readApiMaxUs={nativeReadMaxUs} gpuCopyCompletion=unmeasured");
+                    }
+                    catch (EntryPointNotFoundException) { metricsAvailable = false; }
+                }
                 if (status == -2)
                 {
-                    if (size <= packet.Length || size > 8 * 1024 * 1024) throw new IOException("Invalid GPU access-unit size");
-                    packet = new byte[size];
+                    if (size <= packet.Capacity || size > 8 * 1024 * 1024) throw new IOException("Invalid GPU access-unit size");
+                    capacity = checked((int)size);
+                    packet.Dispose();
+                    packet = null;
                     continue;
                 }
                 if (status < 0) throw new DisplayException("gpu", Error(native));
                 if (status == 0) continue;
-                if (status != 1 || size == 0 || size > packet.Length) throw new IOException("Invalid native GPU packet contract");
-                var encoded = packet.AsSpan(0, checked((int)size)).ToArray();
-                _packets.Writer.WriteAsync(new GpuVideoPacket(encoded, keyframe != 0, qpc), _stop.Token)
+                if (status != 1 || size == 0 || size > packet.Capacity) throw new IOException("Invalid native GPU packet contract");
+                packet.Complete(checked((int)size), keyframe != 0, qpc);
+                _packets.Writer.WriteAsync(packet, _stop.Token)
                     .AsTask().GetAwaiter().GetResult();
+                packet = null; // ownership passed to the channel
             }
         }
         catch (OperationCanceledException) when (_stop.IsCancellationRequested) { ready.TrySetCanceled(); }
         catch (Exception ex) { failure = ex; ready.TrySetException(ex); }
         finally
         {
+            packet?.Dispose();
             try { if (native != nint.Zero) Close(native); }
             catch (Exception ex) { failure ??= ex; }
             finally
@@ -151,6 +196,7 @@ internal sealed class NativeGpuPipeline(string? executable = null, string? argum
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
         _stop.Cancel();
         if (_workerStarted) await _finished.Task.ConfigureAwait(false);
+        while (_packets.Reader.TryRead(out var packet)) packet.Dispose();
         if (_source is not null)
         {
             if (catalog is null) await _source.DisposeAsync().ConfigureAwait(false);

@@ -23,5 +23,18 @@ try {
     $result = Join-Path $outdir 'contract.windows.txt'
     $lines | Set-Content $result -Encoding ascii
     Write-Host "PASS: MSVC x64 native ABI contract: $result"
+    $driverTestSource = Join-Path $root 'tools\driver-test-abi.cpp'
+    $driverTestExe = Join-Path $outdir 'driver-test-abi.exe'
+    & cl.exe /nologo /std:c++17 /W4 /WX /EHsc $driverTestSource "/Fe:$driverTestExe"
+    if ($LASTEXITCODE -ne 0) { throw 'Native driver-test SetupAPI ABI build failed.' }
+    $driverTestLines = & $driverTestExe
+    if ($LASTEXITCODE -ne 0) { throw 'Native driver-test ABI executable failed.' }
+    $driverTestResult = Join-Path $outdir 'driver-test-abi.json'
+    $driverTestLines | Set-Content -LiteralPath $driverTestResult -Encoding ascii
+    if (($driverTestLines -join "`n" | ConvertFrom-Json).pointer_size -ne 8) {
+        throw 'Native driver-test ABI was not compiled for x64.'
+    }
+    Write-Host "PASS: MSVC x64 driver-test ABI: $driverTestResult"
+    $env:DESKFUSE_DRIVER_TEST_ABI_FILE = $driverTestResult
 }
 finally { Pop-Location }

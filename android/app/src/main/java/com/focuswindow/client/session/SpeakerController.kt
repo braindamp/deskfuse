@@ -106,6 +106,7 @@ class SpeakerController(
 
     private suspend fun pumpEvents() {
         transport.events.collect { event ->
+            if (!transport.isLatestGeneration(event.generation)) return@collect
             when (event) {
                 is LanTransport.TransportEvent.Connecting -> {
                     // Repeated attempts are not presented as new sessions.
@@ -209,7 +210,9 @@ class SpeakerController(
     }
 
     private suspend fun pumpControl() {
-        transport.control.collect { message ->
+        transport.control.collect { envelope ->
+            if (!transport.isCurrentGeneration(envelope.connectionGeneration)) return@collect
+            val message = envelope.message
             try { when (message) {
                 is ServerMessage.NativeAudioChallenge -> {
                     val native = nativeAudio ?: error("Native receiver unavailable")

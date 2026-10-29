@@ -1,4 +1,5 @@
 #include "nvenc_encoder.h"
+#include "encoded_access_unit.h"
 
 #include <filesystem>
 
@@ -47,7 +48,9 @@ bool NvEncoder::Initialize(ID3D11Device* device, ID3D11Texture2D* const* slotTex
     height_ = config.height;
     lastError_.clear();
 
-    dll_ = LoadLibraryW(L"nvEncodeAPI64.dll");
+    // The NVIDIA driver owns this DLL. Do not search an application's current
+    // directory or PATH for code loaded into the capture/encoder owner.
+    dll_ = LoadLibraryExW(L"nvEncodeAPI64.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!dll_)
     {
         error = L"ENCODER_BLOCKED: nvEncodeAPI64.dll could not be loaded (";
@@ -289,9 +292,10 @@ bool NvEncoder::Initialize(ID3D11Device* device, ID3D11Texture2D* const* slotTex
 
 bool NvEncoder::Encode(int slot, uint64_t timestamp, uint32_t frameIndex, uint32_t& bitstreamBytes,
     double& submitMs, double& lockMs, std::wstring& error,
-    std::vector<uint8_t>& accessUnit, bool forceIdr)
+    uint8_t* output, uint32_t capacity, std::vector<uint8_t>& retry, bool& isIdr, bool forceIdr)
 {
-    accessUnit.clear();
+    retry.clear();
+    isIdr = false;
     bitstreamBytes = 0;
     submitMs = 0;
     lockMs = 0;
@@ -340,6 +344,7 @@ bool NvEncoder::Encode(int slot, uint64_t timestamp, uint32_t frameIndex, uint32
 
     status = functions_->nvEncEncodePicture(session_, &picture);
     submitMs = QpcDeltaMs(submitStart, QpcNow());
+    submitMaxUs_ = std::max(submitMaxUs_, static_cast<uint64_t>(submitMs * 1000));
     if (status != NV_ENC_SUCCESS)
     {
         error = L"ENCODER_BLOCKED: " + StatusText(L"NvEncEncodePicture", status);
@@ -354,6 +359,7 @@ bool NvEncoder::Encode(int slot, uint64_t timestamp, uint32_t frameIndex, uint32
     lock.doNotWait = 0;
     status = functions_->nvEncLockBitstream(session_, &lock);
     lockMs = QpcDeltaMs(lockStart, QpcNow());
+    lockMaxUs_ = std::max(lockMaxUs_, static_cast<uint64_t>(lockMs * 1000));
     if (status == NV_ENC_SUCCESS)
     {
         struct BitstreamScope {
@@ -365,7 +371,31 @@ bool NvEncoder::Encode(int slot, uint64_t timestamp, uint32_t frameIndex, uint32
         if (lock.bitstreamSizeInBytes > 0 && lock.bitstreamBufferPtr)
         {
             const auto* ptr = static_cast<const uint8_t*>(lock.bitstreamBufferPtr);
-            accessUnit.assign(ptr, ptr + lock.bitstreamSizeInBytes);
+            if (lock.bitstreamSizeInBytes > 8u * 1024u * 1024u)
+            {
+                error = L"Encoded access unit exceeds budget";
+                return Fail(error);
+            }
+            // This synchronous no-reorder profile may never attribute a
+            // delayed/different output to the newest captured frame.
+            if (lock.outputTimeStamp != timestamp)
+            {
+                error = L"NVENC output timestamp differs from the submitted source frame";
+                return Fail(error);
+            }
+            const std::span<const uint8_t> encoded(ptr, lock.bitstreamSizeInBytes);
+            const auto inspectStarted = QpcNow();
+            const auto kind = lock.pictureType == NV_ENC_PIC_TYPE_IDR ? H264PictureKind::Idr :
+                (lock.pictureType == NV_ENC_PIC_TYPE_P || lock.pictureType == NV_ENC_PIC_TYPE_I) ?
+                    H264PictureKind::NonIdr : H264PictureKind::Unknown;
+            if (!ClassifyH264Output(encoded, kind, forceIdr, isIdr))
+            {
+                error = L"NVENC did not provide SPS/PPS/IDR for recovery";
+                return Fail(error);
+            }
+            CopyEncodedAccessUnit(encoded, output, capacity, retry);
+            inspectCopyMaxUs_ = std::max(inspectCopyMaxUs_,
+                static_cast<uint64_t>(QpcDeltaMs(inspectStarted, QpcNow()) * 1000));
             bitstreamBytes = lock.bitstreamSizeInBytes;
             bytesWritten_ += bitstreamBytes;
             ++framesEncoded_;

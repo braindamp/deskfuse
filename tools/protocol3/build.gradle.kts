@@ -15,10 +15,13 @@ kotlin {
     sourceSets.main {
         kotlin.setSrcDirs(listOf(projectDir, rootProject.file("app/src/main/java")))
         kotlin.include(
-            "ProtocolV3KotlinCheck.kt", "SecureRecordWriterCheck.kt", "jvm-stubs/**/*.kt",
+            "ProtocolV3KotlinCheck.kt", "SecureRecordWriterCheck.kt", "BrokerProofKotlinCheck.kt", "TrustedEnrollmentKotlinCheck.kt", "jvm-stubs/**/*.kt",
             "com/focuswindow/client/transport/PairingPayload.kt",
             "com/focuswindow/client/transport/SecureChannel.kt",
             "com/focuswindow/client/transport/SecureRecordWriter.kt",
+            "com/focuswindow/client/transport/BrokerDeviceSigner.kt",
+            "com/focuswindow/client/transport/TrustedEnrollmentProtocol.kt",
+            "com/focuswindow/client/transport/TrustedEnrollmentState.kt",
         )
     }
 }
@@ -34,6 +37,12 @@ val checkRecordWriter by tasks.registering(JavaExec::class) {
     args(rootProject.file("../tests/protocol3/protocol-v3-vectors.properties"))
 }
 tasks.named("check") { dependsOn(checkVectors, checkRecordWriter) }
+
+val checkBrokerProof by tasks.registering(JavaExec::class) {
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("com.focuswindow.client.transport.BrokerProofKotlinCheck")
+}
+tasks.named("check") { dependsOn(checkBrokerProof) }
 
 // The C# test launches this runnable classpath to exercise a live TCP handshake.
 tasks.register<Jar>("interopJar") {

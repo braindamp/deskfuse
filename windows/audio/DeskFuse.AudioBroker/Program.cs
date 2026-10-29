@@ -29,6 +29,12 @@ internal static class Program
 {
     private static async Task<int> Main(string[] args)
     {
+        if (args.Any(a => a.StartsWith("--authority", StringComparison.Ordinal) || a.StartsWith("--maintenance=", StringComparison.Ordinal) ||
+            a.StartsWith("--deployment=", StringComparison.Ordinal)))
+        {
+            Console.Error.WriteLine("The production authority service role is not yet fully integrated/qualified. Legacy broker fallback is refused.");
+            return 2;
+        }
         if (args.Contains("--help") || args.Contains("-h"))
         {
             Console.WriteLine("DeskFuse.AudioBroker");
@@ -136,9 +142,10 @@ internal sealed class EndpointBroker
         public required PhoneDevice Device { get; init; }
         public required CaptureJob Capture { get; init; }
         public PcmGrant? Pcm { get; set; }
-        public required string EndpointId { get; init; }
+        public required string EndpointId { get; set; }
         public required string FriendlyName { get; init; }
         public string? InstancePath { get; init; }
+        public EndpointRetirement Retirement { get; } = new(startActive: false);
     }
 
     private readonly Dictionary<string, Instance> _instances = new(StringComparer.Ordinal);
@@ -212,14 +219,15 @@ internal sealed class EndpointBroker
             using (server)
             {
                 using var reader = new StreamReader(server, Encoding.UTF8);
+                var requests = new BrokerRequestReader(reader);
                 while (!cancellationToken.IsCancellationRequested)
                 {
                     string? line;
                     try
                     {
-                        line = await reader.ReadLineAsync(cancellationToken).ConfigureAwait(false);
+                        line = await requests.ReadAsync(cancellationToken).ConfigureAwait(false);
                     }
-                    catch (Exception ex) when (ex is IOException or ObjectDisposedException)
+                    catch (Exception ex) when (ex is IOException or ObjectDisposedException or InvalidDataException)
                     {
                         break;
                     }
@@ -267,7 +275,7 @@ internal sealed class EndpointBroker
                 try {
                     Instance? instance;
                     lock (_gate) instance=request.PeerId is null?null:_instances.GetValueOrDefault(request.PeerId.ToLowerInvariant());
-                    if (instance is null || !owned.Contains((instance.PeerId,instance.Generation)) ||
+                    if (instance is null || !instance.Retirement.CanGrant || !owned.Contains((instance.PeerId,instance.Generation)) ||
                         instance.Pcm is not null || request.ClientLeaseNonce!=clientNonce ||
                         !Guid.TryParse(request.SourceInstance,out var source))
                         return new BrokerResponse(false,"Direct PCM requires this live endpoint lease.");
@@ -282,7 +290,7 @@ internal sealed class EndpointBroker
                 try {
                     Instance? instance;
                     lock (_gate) instance = request.PeerId is null ? null : _instances.GetValueOrDefault(request.PeerId.ToLowerInvariant());
-                    if (instance is null || !owned.Contains((instance.PeerId, instance.Generation)) ||
+                    if (instance is null || !instance.Retirement.CanGrant || !owned.Contains((instance.PeerId, instance.Generation)) ||
                         request.ClientLeaseNonce!=clientNonce || request.ChildProcessId is not uint pid || pid == 0)
                         return new BrokerResponse(false, "Capture registration requires this connection's live endpoint lease.");
                     try { instance.Capture.Add(pid, clientPid); }
@@ -320,37 +328,12 @@ internal sealed class EndpointBroker
         lock (_gate) existing = _instances.GetValueOrDefault(peerId);
         if (existing is not null)
         {
-            // The phone reconnected while its endpoint was still alive.
-            // Reuse it; the newer connection takes ownership of the lease.
-            // The endpoint id is resolved again: Windows gives an endpoint a
-            // new id when the device is re-enumerated, and a stale id would
-            // point at a device that no longer exists.
-            // Native old owner may be gone without running Drop. Kill and join
-            // its capture before transferring ownership of the stable endpoint.
-            existing.Pcm?.Dispose();
-            existing.Capture.Dispose();
-            long existingLease;
-            var refreshed = await ResolveAsync(existing, cancellationToken)
-                .ConfigureAwait(false);
-            if (refreshed is null)
-                return new BrokerResponse(false, "The phone's playback endpoint is not active.");
-            lock (_gate)
-            {
-                existingLease = ++_generation;
-                _instances[peerId] = new Instance
-                {
-                    PeerId = peerId,
-                    Generation = existingLease,
-                    Device = existing.Device,
-                    Capture = new CaptureJob(),
-                    EndpointId = refreshed,
-                    FriendlyName = existing.FriendlyName,
-                    InstancePath = existing.InstancePath,
-                };
-            }
-            owned.Add((peerId, existingLease));
-            return new BrokerResponse(true, PeerId: peerId, EndpointId: refreshed,
-                DeviceFriendlyName: existing.FriendlyName, DeviceInstanceId: existing.Device.InstancePath);
+            // The current protocol has no independently authenticated supersede
+            // proof. Never transfer an incumbent lease to a different pipe.
+            if (existing.Retirement.CanGrant && owned.Contains((peerId, existing.Generation)))
+                return new BrokerResponse(true, PeerId: peerId, EndpointId: existing.EndpointId,
+                    DeviceFriendlyName: existing.FriendlyName, DeviceInstanceId: existing.Device.InstancePath);
+            return new BrokerResponse(false, "The prior phone endpoint has not been safely retired.", PeerId: peerId);
         }
 
         var captureJob = new CaptureJob();
@@ -359,7 +342,36 @@ internal sealed class EndpointBroker
         {
             device = DeviceInstance.Create(
                 PhoneEndpointContract.InstancePath(peerId), PhoneEndpointContract.HardwareId,
-                friendlyName, "DeskFuse " + peerId);
+                friendlyName, "DeskFuse " + peerId, allowExisting: false);
+        }
+        catch (DeviceCreationIncompleteException ex)
+        {
+            long incompleteLease;
+            Instance incomplete;
+            lock (_gate)
+            {
+                incompleteLease = ++_generation;
+                incomplete = new Instance
+                {
+                    PeerId = peerId, Generation = incompleteLease, Device = ex.Device,
+                    Capture = captureJob, EndpointId = "", FriendlyName = friendlyName,
+                    InstancePath = ex.Device.InstancePath,
+                };
+                _instances.Add(peerId, incomplete);
+            }
+            owned.Add((peerId, incompleteLease));
+            try
+            {
+                await RemoveReleasedDeviceAsync(incomplete).ConfigureAwait(false);
+                lock (_gate)
+                    if (_instances.TryGetValue(peerId, out var current) && current.Generation == incompleteLease)
+                        _instances.Remove(peerId);
+            }
+            catch (Exception cleanup)
+            {
+                Console.Error.WriteLine($"speaker incomplete creation quarantined: {cleanup.Message}");
+            }
+            return new BrokerResponse(false, ex.Message, PeerId: peerId);
         }
         catch (Exception ex) when (ex is InvalidOperationException or UnauthorizedAccessException)
         {
@@ -367,55 +379,52 @@ internal sealed class EndpointBroker
             return new BrokerResponse(false, ex.Message);
         }
 
+        long lease;
+        Instance pending;
+        lock (_gate)
+        {
+            lease = ++_generation;
+            pending = new Instance
+            {
+                PeerId = peerId, Generation = lease, Device = device, Capture = captureJob,
+                EndpointId = "", FriendlyName = friendlyName, InstancePath = device.InstancePath,
+            };
+            _instances.Add(peerId, pending);
+        }
+        // Keep the exact identity reachable for retry even if resolution or
+        // removal fails. No grants are admitted while it is Preparing.
+        owned.Add((peerId, lease));
         string? endpointId;
         try
         {
             endpointId = await EndpointResolver.ResolveAsync(device.InstancePath, TimeSpan.FromSeconds(20),
                 cancellationToken).ConfigureAwait(false);
-        }
-        catch
-        {
-            captureJob.Dispose();
-            await DeviceInstance.RemoveAsync(device.InstancePath).ConfigureAwait(false);
-            throw;
-        }
-        if (endpointId is null)
-        {
-            captureJob.Dispose();
-            await DeviceInstance.RemoveAsync(device.InstancePath).ConfigureAwait(false);
-            return new BrokerResponse(false,
-                "Windows created the phone speaker device but no audio endpoint appeared for it. " +
-                "Check the DeskFuse Audio driver in Device Manager.");
-        }
-
-        long lease;
-        lock (_gate)
-        {
-            lease = ++_generation;
-            _instances[peerId] = new Instance
+            if (endpointId is null)
+                throw new InvalidOperationException("Windows created the phone speaker device but no audio endpoint appeared for it.");
+            lock (_gate)
             {
-                PeerId = peerId,
-                Generation = lease,
-                Device = device,
-                Capture = captureJob,
-                EndpointId = endpointId,
-                FriendlyName = friendlyName,
-                InstancePath = device.InstancePath,
-            };
+                pending.EndpointId = endpointId;
+                pending.Retirement.Activate();
+            }
         }
-        owned.Add((peerId, lease));
+        catch (Exception ex)
+        {
+            try
+            {
+                await RemoveReleasedDeviceAsync(pending).ConfigureAwait(false);
+                lock (_gate)
+                    if (_instances.TryGetValue(peerId, out var current) && current.Generation == lease)
+                        _instances.Remove(peerId);
+            }
+            catch (Exception cleanup)
+            {
+                Console.Error.WriteLine($"speaker endpoint cleanup quarantined: {cleanup.Message}");
+            }
+            if (ex is OperationCanceledException) throw;
+            return new BrokerResponse(false, "Could not prepare phone speaker endpoint: " + ex.Message, PeerId: peerId);
+        }
         return new BrokerResponse(true, PeerId: peerId, EndpointId: endpointId,
             DeviceFriendlyName: friendlyName, DeviceInstanceId: device.InstancePath);
-    }
-
-    /// <summary>
-    /// Finds the endpoint of an existing instance again, so a reconnected
-    /// phone never receives the id of an endpoint that has been replaced.
-    /// </summary>
-    private async Task<string?> ResolveAsync(Instance instance, CancellationToken cancellationToken)
-    {
-        return await EndpointResolver.ResolveAsync(instance.Device.InstancePath,
-            TimeSpan.FromSeconds(5), cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -548,10 +557,10 @@ internal sealed class EndpointBroker
     /// </summary>
     private static async Task RemoveReleasedDeviceAsync(Instance removed)
     {
-        removed.Pcm?.Dispose();
-        removed.Capture.Dispose(); // must confirm acquisition exit before PnP removal
-
-        await DeviceInstance.RemoveAsync(removed.Device.InstancePath).ConfigureAwait(false);
+        await removed.Retirement.RetireAsync(
+            () => removed.Pcm?.Dispose(),
+            () => removed.Capture.Dispose(), // confirm acquisition exit before PnP removal
+            () => DeviceInstance.RemoveAsync(removed.Device.InstancePath)).ConfigureAwait(false);
         Console.WriteLine($"speaker-endpoint-removed=True instance={removed.Device.InstancePath}");
     }
 
@@ -559,7 +568,7 @@ internal sealed class EndpointBroker
     {
         lock (_gate)
         {
-            return _instances.Values
+            return _instances.Values.Where(i => i.Retirement.CanGrant)
                 .Select(i => new BrokerResponse(true, PeerId: i.PeerId, EndpointId: i.EndpointId,
                     DeviceFriendlyName: i.FriendlyName, DeviceInstanceId: i.Device.InstancePath))
                 .ToArray();

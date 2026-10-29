@@ -39,6 +39,8 @@ PnpLockDown=1
 ;==========================================================================
 [DeskFuseAudio_Device.NT]
 CopyFiles=DeskFuseAudio_CopyFiles
+
+[DeskFuseAudio_Device.NT.Interfaces]
 AddInterface=%KSCATEGORY_AUDIO%,%KSNAME_WaveSpeaker%,DeskFuseAudio.I.WaveSpeaker
 AddInterface=%KSCATEGORY_RENDER%,%KSNAME_WaveSpeaker%,DeskFuseAudio.I.WaveSpeaker
 AddInterface=%KSCATEGORY_REALTIME%,%KSNAME_WaveSpeaker%,DeskFuseAudio.I.WaveSpeaker
@@ -74,12 +76,11 @@ ServiceBinary=%12%\DeskFuseAudio.sys
 ; WDF
 ;==========================================================================
 [DeskFuseAudio_Device.NT.Wdf]
-KmdfService=DeskFuseAudio,DeskFuseAudio_Service_Install
+KmdfService=DeskFuseAudio,DeskFuseAudio_Service_Install.Wdf
 
 [DeskFuseAudio_Service_Install.Wdf]
-; 1.27 is the newest KMDF contract that is present on the supported
-; Windows 10 19045 baseline and still shipped in the WDK. A driver built
-; against 1.27 runs unchanged on the 1.29 runtime that 19045 ships.
+; Keep the existing 1.27 contract, supported on Windows 10 1809 and later.
+; This target is compatible with the supported Windows 10 19045 baseline.
 KmdfLibraryVersion=1.27
 
 ;==========================================================================

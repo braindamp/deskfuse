@@ -99,7 +99,10 @@ class SessionController(
     private var phoneMicStreamId = 0
     private var phoneMicJob: Job? = null
     private val transport = LanTransport(scope)
-    private lateinit var decoder: VideoDecoder
+    @Volatile private var decoder: VideoDecoder? = null
+    private var decoderStartJob: Job? = null
+    @Volatile private var targetConnectionGeneration = 0L
+    private var admittedConnectionGeneration = 0L
 
     private var surfaceView: PhoneSurfaceView? = null
     private var surface: Surface? = null
@@ -334,6 +337,7 @@ class SessionController(
             },
             onLost = {
                 surface = null
+                decoderStartJob?.cancel()
                 decoderOrNull()?.stop()
             },
         )
@@ -377,16 +381,26 @@ class SessionController(
             return
         }
 
-        decoder = VideoDecoder(
+        decoderOrNull()?.stop()
+        decoderStartJob?.cancel()
+        targetConnectionGeneration = 0
+        admittedConnectionGeneration = 0
+        decoder = decoder ?: VideoDecoder(
             onStats = { s ->
-                stats = s
-                refreshStreamingState()
+                if (transport.isCurrentGeneration(targetConnectionGeneration)) {
+                    stats = s
+                    refreshStreamingState()
+                }
             },
             onFatal = { stage, detail, remediation ->
-                _state.value = SessionState.Failed(stage, detail, remediation, recoverable = true)
+                if (transport.isCurrentGeneration(targetConnectionGeneration))
+                    _state.value = SessionState.Failed(stage, detail, remediation, recoverable = true)
             },
             requestKeyframe = {
-                scope.launch { transport.send(ClientMessage.RequestKeyframe) }
+                val generation = targetConnectionGeneration
+                scope.launch {
+                    if (transport.isCurrentGeneration(generation)) transport.send(ClientMessage.RequestKeyframe)
+                }
             },
         )
 
@@ -413,6 +427,8 @@ class SessionController(
 
     private suspend fun pumpEvents() {
         transport.events.collect { event ->
+            if (!transport.isLatestGeneration(event.generation)) return@collect
+            if (transport.isCurrentGeneration(event.generation)) admitConnection(event.generation)
             when (event) {
                 is LanTransport.TransportEvent.Connecting -> {
                     if (!recovering && networkAvailable)
@@ -440,6 +456,8 @@ class SessionController(
                 }
 
                 is LanTransport.TransportEvent.Failed -> {
+                    targetConnectionGeneration = 0
+                    decoderOrNull()?.stop()
                     if (event.terminal) {
                         sessionActive = false
                         recovering = false
@@ -470,6 +488,8 @@ class SessionController(
                 }
 
                 is LanTransport.TransportEvent.Closed -> {
+                    targetConnectionGeneration = 0
+                    decoderOrNull()?.stop()
                     hostMicAvailable = false
                     phoneMicFailed = false
                     stopPhoneMicrophoneLocal()
@@ -486,7 +506,10 @@ class SessionController(
     }
 
     private suspend fun pumpControl() {
-        transport.control.collect { msg ->
+        transport.control.collect { envelope ->
+            if (!transport.isCurrentGeneration(envelope.connectionGeneration)) return@collect
+            admitConnection(envelope.connectionGeneration)
+            val msg = envelope.message
             when (msg) {
                 is ServerMessage.NativeAudioChallenge, is ServerMessage.NativeAudioGrant, is ServerMessage.NativeAudioVolume, is ServerMessage.NativeAudioObservationRequest -> Unit // accessory speaker session only
                 is ServerMessage.Hello -> {
@@ -618,6 +641,7 @@ class SessionController(
     private fun onTarget(incoming: TargetRecord) {
         val p = profile ?: return
         record = incoming
+        targetConnectionGeneration = admittedConnectionGeneration
         hasPresentedTarget = true
         attempt = 0
         recovering = false
@@ -657,32 +681,52 @@ class SessionController(
     }
 
     private fun startDecoder(target: TargetRecord) {
+        if (!transport.isCurrentGeneration(targetConnectionGeneration)) return
         val view = surfaceView ?: return
         val s = surface ?: return
         val p = profile ?: return
         val dec = decoderOrNull() ?: return
 
-        // Configure the surface BEFORE the decoder so the buffer is already
-        // the right size when the first frame lands (NFR-PIX-01).
-        view.configureFor(target, p)
-        dec.stop()
-        dec.start(
-            surface = s,
-            mimeType = mimeFor(target.codec),
-            widthPx = target.widthPx,
-            heightPx = target.heightPx,
-            targetVersion = target.version,
-            colorRange = target.colorRange,
-            framesPerSecond = target.refreshHz,
-        )
+        decoderStartJob?.cancel()
+        val generation = targetConnectionGeneration
+        val retired = dec.stop() // admission closes synchronously; native release stays on its owner
+        decoderStartJob = scope.launch {
+            try {
+                retired.await()
+                if (surface !== s || record !== target || targetConnectionGeneration != generation ||
+                    !transport.isCurrentGeneration(generation)) return@launch
+                // Retire old output BEFORE resizing the Surface; configure new output afterward.
+                view.configureFor(target, p)
+                dec.start(s, mimeFor(target.codec), target.widthPx, target.heightPx, target.version,
+                    target.colorRange, target.refreshHz, generation)
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (failure: Exception) {
+                if (transport.isCurrentGeneration(generation))
+                    _state.value = SessionState.Failed("decoder", "Could not retire the previous decoder.",
+                        "Reconnect to retry cleanup.", recoverable = true)
+            }
+        }
     }
 
-    private suspend fun pumpFrames() {
+    private suspend fun pumpFrames(): Unit = withContext(Dispatchers.Default) {
         transport.frames.collect { frame ->
+            if (!transport.isCurrentGeneration(frame.connectionGeneration) ||
+                targetConnectionGeneration != frame.connectionGeneration) return@collect
             lastFrameAtMs = System.currentTimeMillis()
-            if (_state.value is SessionState.Stale) refreshStreamingState()
+            if (_state.value is SessionState.Stale) withContext(Dispatchers.Main.immediate) {
+                if (transport.isCurrentGeneration(frame.connectionGeneration)) refreshStreamingState()
+            }
             decoderOrNull()?.submit(frame)
         }
+    }
+
+    /** Called on Main from both control and lifecycle, whose collectors may run in either order. */
+    private fun admitConnection(generation: Long) {
+        if (admittedConnectionGeneration == generation) return
+        admittedConnectionGeneration = generation
+        decoderStartJob?.cancel()
+        targetConnectionGeneration = 0
+        decoderOrNull()?.stop()
     }
 
     /**
@@ -759,6 +803,8 @@ class SessionController(
         attempt = 0
         recovering = true
         transport.disconnectNow()
+        targetConnectionGeneration = 0
+        decoderOrNull()?.stop()
         hostPcAudioAvailable = false
         stopPcAudioLocal()
         stopPhoneMicrophoneLocal()
@@ -963,6 +1009,8 @@ class SessionController(
 
     fun stop(reason: String = "user ended the session") {
         sessionActive = false
+        targetConnectionGeneration = 0
+        decoderStartJob?.cancel()
         recovering = false
         stopPhoneMicrophoneLocal()
         hostMicAvailable = false
@@ -981,7 +1029,13 @@ class SessionController(
         _advisories.value = emptyList()
     }
 
-    private fun decoderOrNull(): VideoDecoder? = if (::decoder.isInitialized) decoder else null
+    private fun decoderOrNull(): VideoDecoder? = decoder
+
+    fun dispose() {
+        stop("activity destroyed")
+        decoderOrNull()?.close()
+        transport.disconnectNow()
+    }
 
     private fun addAdvisory(advisory: SessionAdvisory) {
         _advisories.update { current ->

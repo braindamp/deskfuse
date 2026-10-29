@@ -24,9 +24,26 @@ import java.util.concurrent.atomic.AtomicBoolean
 /** A decoded-but-not-yet-rendered frame, straight off the wire. */
 class WireFrame(
     val header: FrameHeader,
-    val payload: ByteArray,
+    private val payload: ByteArray,
     val arrivedAtNanos: Long = System.nanoTime(),
-)
+    private val payloadOffset: Int = 0,
+    val recordReadyAtNanos: Long = arrivedAtNanos,
+    val decryptStartedAtNanos: Long = recordReadyAtNanos,
+    val decryptedAtNanos: Long = arrivedAtNanos,
+    val connectionGeneration: Long = 0,
+) {
+    val payloadLength: Int get() = header.payloadLength
+
+    init {
+        require(payloadOffset >= 0 && payloadOffset <= payload.size &&
+            payloadLength > 0 && payloadLength == payload.size - payloadOffset) { "invalid frame payload bounds" }
+    }
+
+    /** The authenticated record remains owned by this frame until codec submission. */
+    fun copyPayloadTo(destination: java.nio.ByteBuffer) {
+        destination.put(payload, payloadOffset, payloadLength)
+    }
+}
 
 /** Audio PCM payloads are independent and may be dropped to avoid old sound. */
 data class PcmAudioChunk(
@@ -59,13 +76,14 @@ class LanTransport(
         classDiscriminator = "type"
     },
 ) {
+    data class ReceivedControl(val message: ServerMessage, val connectionGeneration: Long)
 
-    private val _control = MutableSharedFlow<ServerMessage>(
+    private val _control = MutableSharedFlow<ReceivedControl>(
         replay = 0,
         extraBufferCapacity = 64,
         onBufferOverflow = BufferOverflow.SUSPEND, // never discard approval/target/control state
     )
-    val control: SharedFlow<ServerMessage> = _control.asSharedFlow()
+    val control: SharedFlow<ReceivedControl> = _control.asSharedFlow()
     private val _audio = MutableSharedFlow<PcmAudioChunk>(
         extraBufferCapacity = 8,
         onBufferOverflow = BufferOverflow.DROP_OLDEST,
@@ -109,11 +127,14 @@ class LanTransport(
     private fun isCurrent(generation: Long): Boolean = synchronized(socketGate) {
         socketGeneration == generation && running.get()
     }
+    fun isCurrentGeneration(generation: Long): Boolean = isCurrent(generation)
+    fun isLatestGeneration(generation: Long): Boolean = synchronized(socketGate) {
+        socketGeneration == generation
+    }
 
     private fun closeCurrent(generation: Long): Boolean = synchronized(socketGate) {
         if (socketGeneration != generation || !running.get()) false
         else {
-            socketGeneration++
             running.set(false)
             closeQuietly()
             true
@@ -121,13 +142,14 @@ class LanTransport(
     }
 
     sealed interface TransportEvent {
-        data class Connecting(val host: String, val port: Int) : TransportEvent
-        data class Verified(val code: String, val hostName: String) : TransportEvent
-        data object Ready : TransportEvent
-        data class Closed(val reason: String, val recoverable: Boolean) : TransportEvent
+        val generation: Long
+        data class Connecting(val host: String, val port: Int, override val generation: Long = 0) : TransportEvent
+        data class Verified(val code: String, val hostName: String, override val generation: Long = 0) : TransportEvent
+        data class Ready(override val generation: Long) : TransportEvent
+        data class Closed(val reason: String, val recoverable: Boolean, override val generation: Long = 0) : TransportEvent
         data class Failed(val stage: String, val detail: String, val remediation: String?,
                           val terminal: Boolean = false,
-                          val retryable: Boolean = false) :
+                          val retryable: Boolean = false, override val generation: Long = 0) :
             TransportEvent
     }
 
@@ -149,7 +171,7 @@ class LanTransport(
             return@withContext
         }
         android.util.Log.i("DeskFuseSession", "connecting to ${payload.host}:${payload.port}")
-        _events.emit(TransportEvent.Connecting(payload.host, payload.port))
+        _events.emit(TransportEvent.Connecting(payload.host, payload.port, generation))
 
         var attemptedSocket: Socket? = null
         try {
@@ -201,9 +223,9 @@ class LanTransport(
                 return@withContext
             }
             if (!isCurrent(generation)) return@withContext
-            _events.emit(TransportEvent.Verified(secure.verificationCode, payload.hostName))
+            _events.emit(TransportEvent.Verified(secure.verificationCode, payload.hostName, generation))
             if (!isCurrent(generation)) return@withContext
-            _events.emit(TransportEvent.Ready)
+            _events.emit(TransportEvent.Ready(generation))
             scope.launch(Dispatchers.IO) { readLoop(inStream, secure, generation) }
         } catch (t: Throwable) {
             runCatching { attemptedSocket?.close() }
@@ -211,7 +233,7 @@ class LanTransport(
                 // Low-level socket diagnostics belong in developer logs.
                 android.util.Log.i("DeskFuseTransport",
                     "connection attempt failed: ${t.javaClass.simpleName}: ${t.message}")
-                _events.emit(diagnose(t, payload))
+                _events.emit(diagnose(t, payload).copy(generation = generation))
             }
         }
     }
@@ -248,8 +270,11 @@ class LanTransport(
                         val len = inStream.readInt()
                         require(len in 1..MAX_FRAME_BYTES) { "video frame too large: $len" }
                         val sealed = ByteArray(len).also { inStream.readFully(it) }
+                        val recordReady = System.nanoTime()
                         val plain = secure.open(sealed)
-                        _frames.emit(parseFrame(plain))
+                        val decrypted = System.nanoTime()
+                        if (!isCurrent(generation)) return
+                        _frames.emit(parseFrame(plain, recordReady, decrypted, generation))
                     }
 
                     KIND_AUDIO -> {
@@ -284,7 +309,7 @@ class LanTransport(
             // Clear running BEFORE notifying the session controller. Otherwise its
             // reconnect attempts see running=true and return without connecting.
             if (closeCurrent(generation)) {
-                _events.emit(TransportEvent.Closed(t.message ?: "connection lost", recoverable = true))
+                _events.emit(TransportEvent.Closed(t.message ?: "connection lost", recoverable = true, generation))
             }
         }
     }
@@ -303,16 +328,17 @@ class LanTransport(
                 true
             } else closeCurrent(generation)
             if (ended) {
-                _events.emit(TransportEvent.Failed(msg.stage, msg.detail, msg.remediation, terminal = true))
+                _events.emit(TransportEvent.Failed(msg.stage, msg.detail, msg.remediation,
+                    terminal = true, generation = generation ?: synchronized(socketGate) { socketGeneration }))
             }
             return false
         }
         if (generation != null && !isCurrent(generation)) return false
-        _control.emit(msg)
+        _control.emit(ReceivedControl(msg, generation ?: synchronized(socketGate) { socketGeneration }))
         return true
     }
 
-    private fun parseFrame(plain: ByteArray): WireFrame {
+    private fun parseFrame(plain: ByteArray, recordReady: Long, decrypted: Long, generation: Long): WireFrame {
         require(plain.size >= FrameHeader.SIZE_BYTES) { "truncated frame header" }
         var i = 0
         fun u16(): Int = ((plain[i++].toInt() and 0xFF) shl 8) or (plain[i++].toInt() and 0xFF)
@@ -342,7 +368,12 @@ class LanTransport(
                 ptsUs = ptsUs,
                 payloadLength = len,
             ),
-            payload = plain.copyOfRange(i, i + len),
+            payload = plain,
+            payloadOffset = i,
+            recordReadyAtNanos = recordReady,
+            decryptStartedAtNanos = recordReady,
+            decryptedAtNanos = decrypted,
+            connectionGeneration = generation,
         )
     }
 
@@ -353,10 +384,10 @@ class LanTransport(
         val bytes = json.encodeToString(ClientMessage.serializer(), message).toByteArray()
         try {
             sender.control(bytes)
-        } catch (t: java.io.IOException) {
+        } catch (t: Exception) {
             // Never silently swallow a failed Hello or keyframe request.
             if (closeCurrent(generation)) {
-                _events.emit(TransportEvent.Closed(t.message ?: "send failed", recoverable = true))
+                _events.emit(TransportEvent.Closed(t.message ?: "send failed", recoverable = true, generation))
             }
         }
     }
@@ -373,18 +404,19 @@ class LanTransport(
             try {
                 sender.microphone(streamId, pcm16le)
                 true
-            } catch (ex: java.io.IOException) {
+            } catch (ex: Exception) {
                 if (closeCurrent(generation)) _events.emit(TransportEvent.Closed(
-                    ex.message ?: "microphone send failed", recoverable = true))
+                    ex.message ?: "microphone send failed", recoverable = true, generation))
                 false
             }
         }
 
     suspend fun close(reason: String) {
         if (!running.get()) return
+        val generation = synchronized(socketGate) { socketGeneration }
         runCatching { send(ClientMessage.Bye(reason)) }
-        disconnectNow()
-        _events.emit(TransportEvent.Closed(reason, recoverable = false))
+        if (closeCurrent(generation))
+            _events.emit(TransportEvent.Closed(reason, recoverable = false, generation))
     }
 
     /**

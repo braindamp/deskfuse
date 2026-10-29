@@ -6,6 +6,7 @@ using FocusWindow.Agent.Media;
 using FocusWindow.Agent.Interop;
 using FocusWindow.Core;
 using FocusWindow.Core.Display;
+using FocusWindow.Core.Input;
 using FocusWindow.Core.Protocol;
 using FocusWindow.Core.Session;
 namespace FocusWindow.Agent;
@@ -215,11 +216,12 @@ internal static class Program
         if (lab is not null) ct=lab.Token;
         var guards = new List<PhysicalDisplayGuard>();
         using var sources = new WorkspaceApplicationCatalog();
+        var inputArbiter = new InputSessionArbiter();
         WindowsDisplayBackend? backend = null;
         var brokerClient = new DeskFuse.Audio.PhoneEndpointBrokerClient();
         var services = new HostServices(
             CreateBackend: () => backend = new WindowsDisplayBackend(log),
-            CreateInput: () => new SendInputSink(log),
+            CreateInput: () => new SendInputSink(log, inputArbiter),
             CreateGuard: () =>
             {
                 var g = new PhysicalDisplayGuard(() => backend?.PhoneGdiName);
@@ -422,6 +424,19 @@ internal static class Program
     /// </summary>
     private static async Task<int> DensityProbeAsync(string[] args, CancellationToken ct)
     {
+        // The coordinated maintenance runner parks here before opening the
+        // driver. Only its watchdog may release the exact registered process.
+        var ownerGate = Opt(args, "--owner-start-gate");
+        var ownerRun = Opt(args, "--owner-run");
+        var ownerNonce = Opt(args, "--owner-nonce");
+        if (args.Any(a => a is "--owner-start-gate" or "--owner-run" or "--owner-nonce"))
+        {
+            if (string.IsNullOrWhiteSpace(ownerGate) || !Guid.TryParseExact(ownerRun, "N", out var runId) ||
+                runId == Guid.Empty || !Guid.TryParseExact(ownerNonce, "N", out var nonce) || nonce == Guid.Empty)
+                throw new ArgumentException("Guarded probe requires the complete owner start binding.");
+            await DeskFuse.DriverTestOwner.Core.ProbeStartAuthorization.WaitForCurrentProcessAsync(
+                ownerGate, runId, nonce, ct).ConfigureAwait(false);
+        }
         var width = Int(args, "--width", 1440);
         var height = Int(args, "--height", 3120);
         var dpr = (float)Dbl(args, "--dpr", 3.5);

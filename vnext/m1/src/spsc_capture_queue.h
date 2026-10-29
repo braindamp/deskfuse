@@ -1,7 +1,9 @@
 #pragma once
 // One WASAPI capture producer, one blocking pipe writer. Producer never owns
 // a mutex, waits for space, allocates, or performs file I/O.
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 
 #include <array>

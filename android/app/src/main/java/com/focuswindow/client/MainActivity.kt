@@ -68,6 +68,7 @@ import com.focuswindow.client.transport.DiscoveredPc
 import com.focuswindow.client.transport.EnrollmentMessages
 import com.focuswindow.client.ui.SessionChrome
 import com.focuswindow.client.ui.StateScreen
+import com.focuswindow.client.ui.TrustedEnrollmentDialog
 
 /**
  * The single activity.
@@ -112,6 +113,7 @@ class MainActivity : ComponentActivity() {
     private var pcPairingCode by mutableStateOf<String?>(null)
     private var pcPairingError by mutableStateOf<String?>(null)
     private var manualPc by mutableStateOf("")
+    private var trustedSetupVisible by mutableStateOf(false)
 
     private val savePcFile = registerForActivityResult(ActivityResultContracts.CreateDocument(
         "application/octet-stream")) { uri ->
@@ -280,6 +282,9 @@ class MainActivity : ComponentActivity() {
                                     }
                                 }
                                 pcPairingError?.let { Text(it) }
+                                if (!pcPairingBusy) TextButton(onClick = {
+                                    pcPickerVisible = false; trustedSetupVisible = true; appDialogVisible = true
+                                }) { Text("Trusted phone setup") }
                             }
                         },
                         confirmButton = {
@@ -293,6 +298,10 @@ class MainActivity : ComponentActivity() {
                             }, enabled = !pcPairingBusy) { Text("Close") }
                         },
                     )
+                }
+
+                if (trustedSetupVisible) TrustedEnrollmentDialog(lifecycle) {
+                    trustedSetupVisible = false; appDialogVisible = false
                 }
 
                 sharedDocumentUri?.let { sharedUri ->
@@ -783,7 +792,7 @@ class MainActivity : ComponentActivity() {
         if (displayOwnsSpeaker) SpeakerService.stop(this)
         displayOwnsSpeaker = false
         displaySpeakerObserved = false
-        controller.stop("activity destroyed")
+        controller.dispose()
         super.onDestroy()
     }
 

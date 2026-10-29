@@ -1,13 +1,7 @@
-# Compatibility entry point. Installation ALWAYS goes through the independent watchdog.
+# Compatibility entrypoint: no automatic package approval or privileged bootstrap.
 [CmdletBinding()]
-param(
-    [Parameter(Mandatory=$true)][string]$InfPath,
-    [switch]$TestMachine,
-    [switch]$IUnderstandDisplayDriverRisk
-)
+param([Parameter(Mandatory=$true)][Guid]$NamespaceId, [Parameter(Mandatory=$true)][Guid]$RunId,
+    [switch]$TestMachine, [switch]$IUnderstandDisplayDriverRisk)
 $ErrorActionPreference='Stop'
-if (-not ($TestMachine -and $IUnderstandDisplayDriverRisk)) {
-    throw 'Requires -TestMachine -IUnderstandDisplayDriverRisk, and the interactive safety confirmation.'
-}
-& (Join-Path $PSScriptRoot 'safe-driver-proof.ps1') -InfPath $InfPath -IUnderstandDriverRisk
-if ($LASTEXITCODE -ne 0) { exit 1 }
+if (-not ($TestMachine -and $IUnderstandDisplayDriverRisk)) { throw 'Requires -TestMachine -IUnderstandDisplayDriverRisk and the interactive prepared-run confirmation.' }
+& (Join-Path $PSScriptRoot 'safe-driver-proof.ps1') -NamespaceId $NamespaceId -RunId $RunId -IUnderstandDriverRisk

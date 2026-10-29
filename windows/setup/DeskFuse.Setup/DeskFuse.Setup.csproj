@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <SupportedOSPlatformVersion>10.0.19041.0</SupportedOSPlatformVersion>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <PlatformTarget>x64</PlatformTarget>
+    <PublishSingleFile>false</PublishSingleFile>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\security\DeskFuse.WindowsSecurity\DeskFuse.WindowsSecurity.csproj" />
+    <PackageReference Include="QRCoder" Version="1.6.0" />
+    <Compile Include="..\..\audio\DeskFuse.AudioBroker\EnrollmentProtocol.cs" Link="Protocol\EnrollmentProtocol.cs" />
+    <Compile Include="..\..\audio\DeskFuse.AudioBroker\EnrollmentFraming.cs" Link="Protocol\EnrollmentFraming.cs" />
+    <Compile Include="..\..\audio\DeskFuse.AudioBroker\EnrollmentSetupSelection.cs" Link="Protocol\EnrollmentSetupSelection.cs" />
+    <Compile Include="..\..\audio\DeskFuse.AudioBroker\BrokerProofKinds.cs" Link="Protocol\BrokerProofKinds.cs" />
+  </ItemGroup>
+</Project>

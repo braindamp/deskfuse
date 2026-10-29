@@ -20,15 +20,23 @@ impl Pending {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueAdmission { Queued, Expired, Full }
+#[derive(Clone, Copy)]
+pub enum PcmTiming {
+    Wasapi { source_qpc: u64, original_packet_offset_frames: u32 },
+    Committed(crate::source_age::CommitTiming),
+}
 pub struct PlaintextExpiry {
     entries: Vec<Pending>,
     pub expired: u64, pub orphaned: u64, pub absent: u64,
     pub high_water: usize,
+    pub pcm_built: u64,
+    pub build_max_ns: u64,
+    pub last_offer_qpc: u64,
 }
 impl Default for PlaintextExpiry {
     fn default() -> Self {
         Self { entries: Vec::with_capacity(CAPACITY), expired: 0,
-               orphaned: 0, absent: 0, high_water: 0 }
+               orphaned: 0, absent: 0, high_water: 0, pcm_built: 0, build_max_ns: 0, last_offer_qpc: 0 }
     }
 }
 impl Identity {
@@ -43,6 +51,70 @@ impl Identity {
     }
 }
 impl PlaintextExpiry {
+    /// Move one final PCM allocation into quiche, retaining original source timing.
+    /// All non-Done enqueue errors are terminal: quiche can fail AFTER enqueue.
+    pub fn admit_pcm(
+        &mut self, conn: &mut Connection, header: &crate::Header,
+        pcm: &[u8; 960], timing: PcmTiming,
+    ) -> Result<QueueAdmission, Box<dyn std::error::Error>> {
+        self.admit_pcm_with_clock(conn, header, pcm, timing, crate::source_age::local_qpc_100ns)
+    }
+
+    fn admit_pcm_with_clock(
+        &mut self, conn: &mut Connection, header: &crate::Header,
+        pcm: &[u8; 960], timing: PcmTiming,
+        mut clock: impl FnMut() -> std::io::Result<u64>,
+    ) -> Result<QueueAdmission, Box<dyn std::error::Error>> {
+        if header.version != crate::VERSION || header.kind != crate::KIND_AUDIO ||
+            header.header_bytes as usize != crate::HEADER_BYTES || header.frame_count != 240 ||
+            header.payload_bytes != 960 {
+            return Err(quiche::Error::InvalidState.into());
+        }
+        let id = Identity { epoch: header.media_epoch, stream: header.source_stream_id,
+            format: header.format_config_id, sequence: header.packet_sequence,
+            source_frame: header.first_source_frame };
+        let offer = match timing {
+            PcmTiming::Wasapi { source_qpc, original_packet_offset_frames } => Pending {
+                id, source_qpc, original_packet_offset_frames, committed: None },
+            PcmTiming::Committed(timing) => Pending { id, source_qpc: timing.presentation_qpc,
+                original_packet_offset_frames: 0, committed: Some(timing) },
+        };
+        let now = clock()?;
+        self.last_offer_qpc = now;
+        self.purge(conn, now);
+        if !matches!(offer.decision(now), AgeDecision::Fresh { .. }) {
+            return Ok(QueueAdmission::Expired);
+        }
+        if self.entries.iter().any(|entry| entry.id == id) {
+            return Err(quiche::Error::InvalidState.into());
+        }
+        if self.entries.len() >= CAPACITY || conn.is_dgram_send_queue_full() {
+            return Ok(QueueAdmission::Full);
+        }
+        let started = std::time::Instant::now();
+        let mut wire = Vec::with_capacity(crate::HEADER_BYTES + pcm.len());
+        wire.extend_from_slice(&crate::encode(header));
+        wire.extend_from_slice(pcm);
+        self.pcm_built += 1;
+        self.build_max_ns = self.build_max_ns.max(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        // Never cache admission age across allocation/packet construction.
+        let final_now = clock()?;
+        self.last_offer_qpc = final_now;
+        if !matches!(offer.decision(final_now), AgeDecision::Fresh { .. }) {
+            return Ok(QueueAdmission::Expired);
+        }
+        self.entries.push(offer);
+        self.high_water = self.high_water.max(self.entries.len());
+        match conn.dgram_send_buf(wire) {
+            Ok(()) => Ok(QueueAdmission::Queued),
+            Err(error) => {
+                self.entries.retain(|entry| entry.id != id);
+                if error == quiche::Error::Done { Ok(QueueAdmission::Full) }
+                else { Err(error.into()) } // caller MUST retire without another conn.send
+            }
+        }
+    }
+
     /// Reconcile even when ciphertext is pending, then reserve metadata BEFORE
     /// quiche takes a plaintext copy. Queue pressure is a controlled source
     /// drop; a failed enqueue never leaves a reservation behind.
@@ -167,6 +239,39 @@ impl PlaintextExpiry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn owned_pcm_checks_age_before_allocation_and_again_before_transfer() {
+        let local = "127.0.0.1:49001".parse().unwrap();
+        let remote = "127.0.0.1:49002".parse().unwrap();
+        let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+        config.set_application_protos(&[b"df-owned-pcm-test"]).unwrap();
+        config.enable_dgram(true, 4, 4);
+        let id = quiche::ConnectionId::from_ref(&[0x53; 16]);
+        let mut conn = quiche::connect(None, &id, local, remote, &mut config).unwrap();
+        let header = crate::Header { version: 1, kind: 1, flags: 0, header_bytes: 40,
+            frame_count: 240, media_epoch: 1, source_stream_id: 1, format_config_id: 1,
+            packet_sequence: 7, first_source_frame: 48000, payload_bytes: 960, clock_anchor_id: 17 };
+        let pcm = [0x5a; 960];
+        let timing = PcmTiming::Committed(crate::source_age::CommitTiming {
+            commit_qpc: 1_000_000, presentation_qpc: 1_100_000 });
+        let mut ledger = PlaintextExpiry::default();
+        assert_eq!(ledger.admit_pcm_with_clock(&mut conn, &header, &pcm, timing,
+            || Ok(1_600_001)).unwrap(), QueueAdmission::Expired);
+        assert_eq!(ledger.pcm_built, 0, "expired commit must not allocate, even with fresh presentation");
+        let mut observations = [1_600_000, 1_600_001].into_iter();
+        assert_eq!(ledger.admit_pcm_with_clock(&mut conn, &header, &pcm, timing,
+            || Ok(observations.next().unwrap())).unwrap(), QueueAdmission::Expired);
+        assert_eq!(ledger.pcm_built, 1);
+        assert_eq!(ledger.len(), 0);
+        assert_eq!(conn.dgram_send_queue_byte_size(), 0);
+        // Exactly 60 ms passes age admission, reaching the real unestablished-peer error.
+        assert!(ledger.admit_pcm_with_clock(&mut conn, &header, &pcm, timing,
+            || Ok(1_600_000)).is_err());
+        assert_eq!(ledger.pcm_built, 2);
+        assert_eq!(ledger.len(), 0, "fatal enqueue must remove its reservation");
+        // No conn.send follows the fatal error: the fixture drops the connection.
+    }
+
     #[test]
     fn exact_identity_and_bound() {
         let mut w=[0u8;1000];w[0]=1;w[1]=1;

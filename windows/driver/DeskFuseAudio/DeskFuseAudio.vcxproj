@@ -13,10 +13,9 @@
   WaveRT miniport headers and the KMDF framework libraries ship only in the
   WDK.
 
-  KMDF contract: 1.27. That is the newest contract that is both present in
-  this WDK and available on the supported Windows 10 19045 baseline (which
-  ships the 1.29 runtime). Do not raise this without raising the supported
-  Windows baseline too.
+  KMDF contract: retain 1.27, supported on Windows 10 1809 and later and
+  compatible with the Windows 10 19045 baseline. Any target change needs
+  explicit compatibility qualification; this packaging fix does not raise it.
 -->
 <Project DefaultTargets="Build" ToolsVersion="12.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">

@@ -91,6 +91,60 @@ public class SecureChannelTests
         Assert.NotEqual(attacker.VerificationCode, host.VerificationCode);
         Assert.ThrowsAny<CryptographicException>(() => host.Open(attacker.Seal(Encoding.UTF8.GetBytes("let me in"))));
     }
+
+    [Fact]
+    public async Task Receive_crypto_does_not_wait_for_the_opposite_direction_gate()
+    {
+        var (hs, cs, cleanup) = await Pair();
+        using var lifetime = cleanup;
+        using var key = ECDiffieHellman.Create(ECCurve.NamedCurves.nistP256);
+        var secret = RandomNumberGenerator.GetBytes(32);
+        var accepting = SecureChannel.AcceptAsync(hs, key, secret, CancellationToken.None);
+        using var client = await SecureChannel.ConnectAsync(cs, key.ExportSubjectPublicKeyInfo(), secret, CancellationToken.None);
+        using var host = await accepting;
+        host.Open(client.Seal(new byte[] { 0 }));
+        var gate = typeof(SecureChannel).GetField("_sendGate", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.GetValue(host)!;
+        using var held = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        var holder = Task.Run(() => { lock (gate) { held.Set(); release.Wait(); } });
+        Assert.True(held.Wait(TimeSpan.FromSeconds(5)));
+        try
+        {
+            var incoming = client.Seal(new byte[] { 1, 2, 3 });
+            Assert.Equal(new byte[] { 1, 2, 3 }, await Task.Run(() => host.Open(incoming)).WaitAsync(TimeSpan.FromSeconds(5)));
+        }
+        finally { release.Set(); await holder; }
+        await Task.WhenAll(Task.Run(() => {
+            for (var i = 0; i < 128; i++) Assert.Equal(new byte[8192], client.Open(host.Seal(new byte[8192])));
+        }), Task.Run(() => {
+            for (var i = 0; i < 128; i++) Assert.Equal(new byte[] { 42 }, host.Open(client.Seal(new byte[] { 42 })));
+        }));
+    }
+
+    [Fact]
+    public async Task Exact_alias_video_record_encrypts_on_the_deployed_backend_without_touching_pool_tail()
+    {
+        var (hs, cs, cleanup) = await Pair();
+        using var lifetime = cleanup;
+        using var key = ECDiffieHellman.Create(ECCurve.NamedCurves.nistP256);
+        var secret = RandomNumberGenerator.GetBytes(32);
+        var accepting = SecureChannel.AcceptAsync(hs, key, secret, CancellationToken.None);
+        using var client = await SecureChannel.ConnectAsync(cs, key.ExportSubjectPublicKeyInfo(), secret, CancellationToken.None);
+        using var host = await accepting;
+        host.Open(client.Seal(new byte[] { 0 }));
+        foreach (var size in new[] { 1, 20, 262144, 1048576 })
+        {
+            var plaintext = RandomNumberGenerator.GetBytes(size);
+            var wire = Enumerable.Repeat((byte)0xe7, 5 + 24 + size + 17).ToArray();
+            plaintext.CopyTo(wire, 13);
+            host.Seal(wire.AsSpan(13, size), wire.AsSpan(5, size + 24));
+            var forged = wire.AsSpan(5, size + 24).ToArray();
+            forged[^1] ^= 1;
+            Assert.ThrowsAny<CryptographicException>(() => client.Open(forged));
+            Assert.Equal(plaintext, client.Open(wire.AsSpan(5, size + 24)));
+            Assert.All(wire.Take(5).Concat(wire.TakeLast(17)), value => Assert.Equal((byte)0xe7, value));
+        }
+    }
     [Fact]
     public async Task A_client_rejects_a_host_presenting_a_different_key_than_the_qr()
     {

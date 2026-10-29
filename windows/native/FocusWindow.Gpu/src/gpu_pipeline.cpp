@@ -20,6 +20,7 @@ struct fwgpu_session {
     std::mutex gate;
     std::wstring error;
     uint64_t packetQpc = 0;
+    uint64_t captureArrivalFallbackAus = 0, sourceWaitMaxUs = 0;
     std::chrono::steady_clock::time_point nextEncodeAt = std::chrono::steady_clock::time_point::min();
     int64_t lastSourceTime = 0;
     CapturedFrame cached;
@@ -41,15 +42,6 @@ struct fwgpu_session {
     }
 };
 static thread_local std::wstring openError;
-static bool HasNal(const std::vector<uint8_t>& v, uint8_t type) {
-    for (size_t i=0;i+4<v.size();++i) {
-        size_t n=0;
-        if(v[i]==0&&v[i+1]==0&&v[i+2]==1) n=3;
-        else if(v[i]==0&&v[i+1]==0&&v[i+2]==0&&v[i+3]==1) n=4;
-        if(n && i+n<v.size() && (v[i+n]&31)==type) return true;
-    }
-    return false;
-}
 static uint64_t SourceQpc(const CapturedFrame& frame) {
     // SystemRelativeTime is compositor QPC expressed in 100 ns, not the time
     // at which the network writer happened to drain the frame. Avoid overflow.
@@ -59,6 +51,14 @@ static uint64_t SourceQpc(const CapturedFrame& frame) {
     return ticks / 10000000 * frequency + ticks % 10000000 * frequency / 10000000;
 }
 FWGPU_EXPORT uint32_t __cdecl fwgpu_abi_version(){return 1;}
+FWGPU_EXPORT int32_t __cdecl fwgpu_get_metrics(fwgpu_session* s, fwgpu_metrics* output, uint32_t capacity) {
+    if (!s || !output || capacity != sizeof(fwgpu_metrics)) return -1;
+    std::lock_guard<std::mutex> lock(s->gate);
+    *output = {sizeof(fwgpu_metrics), 1, s->encoder->FramesEncoded(), s->captureArrivalFallbackAus,
+        static_cast<uint64_t>(QpcFrequency()), s->sourceWaitMaxUs, s->encoder->SubmitMaxUs(),
+        s->encoder->LockMaxUs(), s->encoder->InspectCopyMaxUs()};
+    return 1;
+}
 FWGPU_EXPORT fwgpu_session* __cdecl fwgpu_open(void* hwnd,uint32_t w,uint32_t h,uint32_t fps,uint32_t bitrate){
     openError.clear();
     if(!hwnd||w<2||h<2||(w&1)||(h&1)||w>8192||h>8192||
@@ -129,8 +129,11 @@ FWGPU_EXPORT int32_t __cdecl fwgpu_read(fwgpu_session* s,uint32_t timeoutMs,
         CapturedFrame frame;
         const bool forceIdr = s->wantIdr.exchange(false);
         const auto earliest = forceIdr ? std::chrono::steady_clock::time_point::min() : s->nextEncodeAt;
+        const auto waitStarted = QpcNow();
         const bool fresh = s->capture->WaitFrame(frame,(int)std::min(timeoutMs,1000u),
             earliest, s->lastSourceTime);
+        s->sourceWaitMaxUs = std::max(s->sourceWaitMaxUs,
+            static_cast<uint64_t>(QpcDeltaMs(waitStarted, QpcNow()) * 1000));
         if(!fresh){
             if(!s->capture->Error().empty()){s->error=s->capture->Error();return -1;}
             if (!forceIdr || !s->haveCached) {
@@ -150,29 +153,30 @@ FWGPU_EXPORT int32_t __cdecl fwgpu_read(fwgpu_session* s,uint32_t timeoutMs,
         uint32_t bytes=0;double submit=0,lock=0;
         const auto encodeStarted = std::chrono::steady_clock::now();
         const bool ok=s->encoder->Encode(frame.slot,(uint64_t)frame.systemRelativeTime,
-           s->frameNo++,bytes,submit,lock,s->error,s->packet,forceIdr);
+           s->frameNo++,bytes,submit,lock,s->error,output,cap,s->packet,s->packetIsIdr,forceIdr);
         if(!ok)return -1;
-        if(s->packet.empty())return 0;
-        if(s->packet.size()>8u*1024u*1024u){
-            s->packet.clear();s->error=L"Encoded access unit exceeds budget";return -1;
-        }
-        s->packetIsIdr=HasNal(s->packet,5);
-        if ((forceIdr && !s->packetIsIdr) ||
-            (s->packetIsIdr && (!HasNal(s->packet,7) || !HasNal(s->packet,8)))) {
-            s->packet.clear();s->error=L"NVENC did not provide SPS/PPS/IDR for recovery";return -1;
-        }
+        if(bytes==0)return 0;
         s->packetQpc=SourceQpc(frame);
+        if (frame.systemRelativeTime <= 0) ++s->captureArrivalFallbackAus;
         s->nextEncodeAt = encodeStarted + std::chrono::nanoseconds((1000000000ull + s->fps - 1) / s->fps);
         if(fresh){
             if(s->haveCached)s->capture->ReleaseFrame(s->cached);
             s->cached=frame;s->haveCached=true;scope.release=false;
             s->lastSourceTime=frame.systemRelativeTime;
         }
+        *written=bytes;
+        if(s->packet.empty()){
+            // NVENC already copied directly into the caller's owned buffer.
+            // No native access-unit vector or second memcpy on this path.
+            *qpc=s->packetQpc;*idr=s->packetIsIdr?1:0;return 1;
+        }
     }
     *written=(uint32_t)s->packet.size();
     if(!output||cap<s->packet.size())return -2;
     std::memcpy(output,s->packet.data(),s->packet.size());
-    *qpc=s->packetQpc;*idr=s->packetIsIdr?1:0;s->packet.clear();return 1;
+    *qpc=s->packetQpc;*idr=s->packetIsIdr?1:0;
+    std::vector<uint8_t>{}.swap(s->packet); // release exceptional retry storage after complete delivery
+    return 1;
     }catch(const std::exception& ex){s->error=Widen(ex.what());return -1;}
     catch(...){s->error=L"GPU frame processing failed";return -1;}
 }

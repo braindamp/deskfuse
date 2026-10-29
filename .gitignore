@@ -1,5 +1,9 @@
 # build outputs
 bin/
+# Fixed Rust product entrypoint is source, despite its conventional bin folder.
+!/vnext/m2a/quiche-lab/src/bin/
+/vnext/m2a/quiche-lab/src/bin/*
+!/vnext/m2a/quiche-lab/src/bin/deskfuse-audio-worker.rs
 obj/
 build/
 out/

@@ -2,11 +2,13 @@ name: vNext M2b Android AAudio native build
 
 on:
   pull_request:
-    branches: [feature/vnext-wp001-native-lab]
     paths: ['vnext/m2b/android-native/**', '.github/workflows/vnext-m2b-aaudio.yml']
   push:
     branches:
       - feature/vnext-wp001-native-lab
+      - main
+      - 'integration/**'
+      - experiment/vnext-audio-latency
     paths:
       - 'vnext/m2b/android-native/**'
       - '.github/workflows/vnext-m2b-aaudio.yml'

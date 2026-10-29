@@ -3,6 +3,7 @@
 //! by the surrounding QUIC connection**; this parser does not authenticate it.
 //! No heap allocation is needed in encode/decode.
 pub mod deferred_trace;
+pub mod broker_control;
 pub mod reactor;
 pub mod wasapi_pipe;
 pub mod endpoint_lease;

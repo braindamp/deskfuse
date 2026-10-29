@@ -253,9 +253,14 @@ private fun DiagnosticsPanel(state: SessionState.Streaming) {
         state.stats?.let {
             add("decoder" to "${it.codecName}${if (it.hardwareAccelerated) " (hw)" else " (sw)"}")
             add("frames" to "${it.framesDecoded} ok · ${it.framesDropped} drop · ${it.framesStale} stale")
-            add("decode" to "${"%.1f".format(it.decodeLatencyMs)} ms")
+            if (it.timingSamples > 0) {
+                add("parsed → release" to "${"%.1f".format(it.decodeLatencyMs)} ms mean")
+                add("record → release v${it.metricsVersion}" to "${"%.1f".format(it.recordToReleaseMs)} ms mean (${it.timingSamples} samples)")
+                add("decrypt / admission / copy" to "${"%.2f".format(it.decryptMs)} / ${"%.2f".format(it.admissionMs)} / ${"%.2f".format(it.inputCopyMs)} ms mean")
+            } else add("video timing" to "unmeasured")
+            it.recordToSurfaceMs?.let { value -> add("record → Surface" to "${"%.1f".format(value)} ms mean") }
         }
-        add("glass" to "${"%.0f".format(state.glassToGlassMs)} ms p50")
+        add("link RTT" to "${"%.1f".format(state.linkRttMs)} ms")
         add("source" to if (state.invariantClean) "unchanged ✓" else "DRIFT: ${state.invariantDrift}")
     }
 

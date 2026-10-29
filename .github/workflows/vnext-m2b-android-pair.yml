@@ -2,10 +2,9 @@ name: vNext CP-001 Android ABI v7 pair
 
 on:
   pull_request:
-    branches: [feature/vnext-wp001-native-lab]
     paths: ['vnext/m2a/quiche-lab/**', 'vnext/m2b/android-native/**', 'vnext/qualification/*android-presentation.py', '.github/workflows/vnext-m2b-android-pair.yml']
   push:
-    branches: [feature/vnext-wp001-native-lab]
+    branches: [main, 'integration/**', feature/vnext-wp001-native-lab, experiment/vnext-audio-latency]
     paths:
       - 'vnext/m2a/quiche-lab/**'
       - 'vnext/m2b/android-native/**'

@@ -12,18 +12,35 @@ pub const MAX_QUIC_UDP_BYTES: usize = 1350;
 const MAX_BURST: usize = 128;
 
 struct Pending {
-    bytes: Vec<u8>,
+    len: usize,
     to: SocketAddr,
     at: Instant,
+    created: Instant,
+    blocked_since: Option<Instant>,
 }
 
 /// A single egress owner. \`blocked\` requires an OS writable notification.
-#[derive(Default)]
 pub struct Egress {
+    // quiche seals directly into this one owned slot. While pending, neither
+    // pacing nor WouldBlock may overwrite it or construct another packet.
+    bytes: [u8; MAX_QUIC_UDP_BYTES],
     pending: Option<Pending>,
     blocked: bool,
     pub udp_packets_sent: u64,
     pub would_block_count: u64,
+    pub service_calls: u64,
+    pub maintenance_calls: u64,
+    pub pending_max_us: u64,
+    pub pacing_max_us: u64,
+    pub blocked_max_us: u64,
+}
+
+impl Default for Egress {
+    fn default() -> Self {
+        Self { bytes: [0; MAX_QUIC_UDP_BYTES], pending: None, blocked: false,
+               udp_packets_sent: 0, would_block_count: 0, service_calls: 0,
+               maintenance_calls: 0, pending_max_us: 0, pacing_max_us: 0, blocked_max_us: 0 }
+    }
 }
 
 impl Egress {
@@ -63,8 +80,17 @@ impl Egress {
         before_construct: impl FnMut(&mut quiche::Connection)
             -> Result<(), Box<dyn std::error::Error>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        self.service_with_io(socket.local_addr()?, conn, writable,
-                             before_construct, |bytes, to| socket.send_to(bytes, to))
+        self.service_with_hook_at(socket, socket.local_addr()?, conn, writable, before_construct)
+    }
+
+    /// The connection/socket owner supplies its bound address, refreshed on socket replacement.
+    pub fn service_with_hook_at(
+        &mut self, socket: &UdpSocket, local: SocketAddr, conn: &mut quiche::Connection,
+        writable: bool, before_construct: impl FnMut(&mut quiche::Connection)
+            -> Result<(), Box<dyn std::error::Error>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.service_with_io(local, conn, writable, before_construct,
+                             |bytes, to| socket.send_to(bytes, to))
     }
 
     /// Same reactor path with an explicit nonblocking datagram sender. The
@@ -77,15 +103,16 @@ impl Egress {
             -> Result<(), Box<dyn std::error::Error>>,
         mut send: impl FnMut(&[u8], SocketAddr) -> io::Result<usize>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        maintain(conn)?;
+        self.service_calls += 1;
+        if self.pending.is_some() { self.maintenance_calls += 1; maintain(conn)?; }
         if self.blocked && !writable {
             return Ok(());
         }
         for _ in 0..MAX_BURST {
             if self.pending.is_none() {
+                self.maintenance_calls += 1;
                 maintain(conn)?;
-                let mut buf = [0u8; MAX_QUIC_UDP_BYTES];
-                let (len, info) = match conn.send(&mut buf) {
+                let (len, info) = match conn.send(&mut self.bytes) {
                     Ok(packet) => packet,
                     Err(quiche::Error::Done) => return Ok(()),
                     Err(e) => return Err(format!("QUIC egress send: {e:?}").into()),
@@ -96,7 +123,9 @@ impl Egress {
                 if len == 0 || len > MAX_QUIC_UDP_BYTES {
                     return Err("QUIC output exceeded bounded UDP packet slot".into());
                 }
-                self.pending = Some(Pending { bytes: buf[..len].to_vec(), to: info.to, at: info.at });
+                let created = Instant::now();
+                self.pacing_max_us = self.pacing_max_us.max(info.at.saturating_duration_since(created).as_micros() as u64);
+                self.pending = Some(Pending { len, to: info.to, at: info.at, created, blocked_since: None });
                 self.blocked = false;
             }
 
@@ -112,10 +141,14 @@ impl Egress {
     fn flush_owned_slot(
         &mut self, mut send: impl FnMut(&[u8], SocketAddr)->io::Result<usize>
     ) -> Result<bool, Box<dyn std::error::Error>> {
-        let Some(pending)=self.pending.as_ref() else{return Ok(false)};
+        let Some(pending)=self.pending.as_mut() else{return Ok(false)};
         if Instant::now() < pending.at {return Ok(false)}
-        match send(&pending.bytes,pending.to) {
-            Ok(n) if n==pending.bytes.len() => {
+        match send(&self.bytes[..pending.len],pending.to) {
+            Ok(n) if n==pending.len => {
+                self.pending_max_us = self.pending_max_us.max(pending.created.elapsed().as_micros() as u64);
+                if let Some(started) = pending.blocked_since {
+                    self.blocked_max_us = self.blocked_max_us.max(started.elapsed().as_micros() as u64);
+                }
                 self.pending=None;
                 self.blocked=false;
                 self.udp_packets_sent+=1;
@@ -123,6 +156,7 @@ impl Egress {
             }
             Ok(_)=>Err("UDP partial send".into()),
             Err(e) if e.kind()==io::ErrorKind::WouldBlock=>{
+                pending.blocked_since.get_or_insert_with(Instant::now);
                 self.blocked=true;
                 self.would_block_count+=1;
                 Ok(false)
@@ -147,7 +181,8 @@ mod ciphertext_slot_tests {
         let mut conn=quiche::connect(None,&cid,local,remote,&mut cfg).unwrap();
         let sealed=vec![0x64u8;1200];
         let mut e=Egress::default();
-        e.pending=Some(Pending{bytes:sealed.clone(),to:remote,at:Instant::now()});
+        e.bytes[..sealed.len()].copy_from_slice(&sealed);
+        e.pending=Some(Pending{len:sealed.len(),to:remote,at:Instant::now(),created:Instant::now(),blocked_since:None});
         e.blocked=true;
         let mut hooks=0;
         let constructed = conn.stats().sent;
@@ -157,7 +192,7 @@ mod ciphertext_slot_tests {
             }).unwrap();
             assert_eq!(hooks,1 + attempt,"maintenance runs behind occupied sealed slot");
             assert_eq!(conn.stats().sent,constructed,"no conn.send behind occupied sealed slot");
-            assert_eq!(e.pending.as_ref().unwrap().bytes,sealed);
+            assert_eq!(&e.bytes[..e.pending.as_ref().unwrap().len],sealed.as_slice());
         }
         e.service_with_hook(&udp,&mut conn,true, |_|{
             hooks+=1;Ok(())
@@ -172,7 +207,8 @@ mod ciphertext_slot_tests {
         let target:SocketAddr="127.0.0.1:443".parse().unwrap();
         let original=vec![0x4au8;1200];
         let mut e=Egress::default();
-        e.pending=Some(Pending{bytes:original.clone(),to:target,at:Instant::now()});
+        e.bytes[..original.len()].copy_from_slice(&original);
+        e.pending=Some(Pending{len:original.len(),to:target,at:Instant::now(),created:Instant::now(),blocked_since:None});
         for _ in 0..12 {
             let mut called=0;
             assert!(!e.flush_owned_slot(|bytes,to|{
@@ -184,7 +220,7 @@ mod ciphertext_slot_tests {
             assert_eq!(called,1);
             assert!(e.has_pending_ciphertext());
             assert!(e.needs_write_readiness());
-            assert_eq!(e.pending.as_ref().unwrap().bytes,original);
+            assert_eq!(&e.bytes[..e.pending.as_ref().unwrap().len],original.as_slice());
             assert_eq!(e.udp_packets_sent,0);
         }
         assert!(e.flush_owned_slot(|bytes,_| {

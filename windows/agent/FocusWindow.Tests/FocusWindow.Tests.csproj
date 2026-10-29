@@ -16,13 +16,48 @@
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\FocusWindow.Core\FocusWindow.Core.csproj" />
+    <ProjectReference Include="..\..\tools\DeskFuse.DriverTestOwner.Core\DeskFuse.DriverTestOwner.Core.csproj" />
+    <ProjectReference Include="..\..\tools\DeskFuse.DriverTestOwner\DeskFuse.DriverTestOwner.csproj" />
     <!-- Exercise the production pipe/identity code without Windows audio APIs. -->
     <Compile Include="..\..\audio\DeskFuse.Audio\PhoneEndpointBrokerClient.cs" Link="Audio\PhoneEndpointBrokerClient.cs" />
     <Compile Include="..\..\audio\DeskFuse.Audio\PhoneEndpointContract.cs" Link="Audio\PhoneEndpointContract.cs" />
+    <Compile Include="..\..\audio\DeskFuse.AudioBroker\EndpointRetirement.cs" Link="Audio\EndpointRetirement.cs" />
+    <Compile Include="..\..\audio\DeskFuse.AudioBroker\BrokerRequestReader.cs" Link="Audio\BrokerRequestReader.cs" />
+    <!-- Exercise the real input sender with a fake native backend, without injecting OS input. -->
+    <Compile Include="..\FocusWindow.Agent\Input\SendInputSink.cs" Link="Input\SendInputSink.cs" />
+    <Compile Include="..\FocusWindow.Agent\Interop\Native.cs" Link="Input\Native.cs" />
+    <Compile Include="..\..\audio\DeskFuse.AudioBroker\BrokerDeviceProof.cs" Link="Audio\BrokerDeviceProof.cs" />
+    <Compile Include="..\..\audio\DeskFuse.AudioBroker\BrokerProofKinds.cs" Link="Audio\BrokerProofKinds.cs" />
+    <Compile Include="..\..\audio\DeskFuse.AudioBroker\EnrollmentProtocol.cs" Link="Audio\EnrollmentProtocol.cs" />
+    <Compile Include="..\..\audio\DeskFuse.AudioBroker\EnrollmentFraming.cs" Link="Audio\EnrollmentFraming.cs" />
+    <Compile Include="..\..\audio\DeskFuse.AudioBroker\EnrollmentCeremony.cs" Link="Audio\EnrollmentCeremony.cs" />
+    <Compile Include="..\..\audio\DeskFuse.AudioBroker\EnrollmentRecordFiles.cs" Link="Audio\EnrollmentRecordFiles.cs" />
+    <Compile Include="..\..\audio\DeskFuse.AudioBroker\EnrollmentSetupSelection.cs" Link="Audio\EnrollmentSetupSelection.cs" />
+    <Compile Include="..\..\audio\DeskFuse.AudioBroker\TrustedBrokerEnrollmentStore.cs" Link="Audio\TrustedBrokerEnrollmentStore.cs" />
+    <Compile Include="..\..\audio\DeskFuse.AudioBroker\BrokerAuthority.cs" Link="Audio\BrokerAuthority.cs" />
+    <Compile Include="..\..\audio\DeskFuse.AudioBroker\BrokerWorkerLauncher.cs" Link="Audio\BrokerWorkerLauncher.cs" />
+    <Compile Include="..\..\audio\DeskFuse.AudioBroker\BrokerWorkerToken.cs" Link="Audio\BrokerWorkerToken.cs" />
+    <Compile Include="..\..\audio\DeskFuse.AudioBroker\AudioWorkerControl.cs" Link="Audio\AudioWorkerControl.cs" />
+    <None Include="..\..\..\tools\protocol3\audio-worker-control-v1.json" Link="Fixtures\audio-worker-control-v1.json" CopyToOutputDirectory="PreserveNewest" />
+    <Compile Include="..\..\audio\DeskFuse.AudioBroker\BrokerEnrollmentState.cs" Link="Audio\BrokerEnrollmentState.cs" />
+    <Compile Include="..\..\audio\DeskFuse.AudioBroker\BrokerLaunchContract.cs" Link="Audio\BrokerLaunchContract.cs" />
+    <Compile Include="..\..\audio\DeskFuse.AudioBroker\BrokerLocalPipe.cs" Link="Audio\BrokerLocalPipe.cs" />
+    <Compile Include="..\..\audio\DeskFuse.AudioBroker\BrokerCallerBinding.cs" Link="Audio\BrokerCallerBinding.cs" />
+    <Compile Include="..\..\audio\DeskFuse.AudioBroker\BrokerSetupActivation.cs" Link="Audio\BrokerSetupActivation.cs" />
   </ItemGroup>
   <ItemGroup>
     <!-- The independent phone-side client (follows SecureChannel.kt/LanTransport.kt, not our C#). -->
     <Content Include="..\tests\interop\phone-client.mjs" Link="interop\phone-client.mjs" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="..\..\..\tests\protocol3\protocol-v3-vectors.properties" Link="protocol-v3-vectors.properties" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\..\tools\driver-test-policy.json" Link="driver-test-policy.json" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\..\tools\maintenance-runner.psm1" Link="maintenance\maintenance-runner.psm1" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\..\tools\test-maintenance-runner.ps1" Link="maintenance\test-maintenance-runner.ps1" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\..\tools\test-maintenance-entrypoints.ps1" Link="maintenance\test-maintenance-entrypoints.ps1" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\..\tools\safe-driver-proof.ps1" Link="maintenance\safe-driver-proof.ps1" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\..\tools\safety-watchdog.ps1" Link="maintenance\safety-watchdog.ps1" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\..\tools\safety-boot-recovery.ps1" Link="maintenance\safety-boot-recovery.ps1" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\..\tools\rollback-focusidd.ps1" Link="maintenance\rollback-focusidd.ps1" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\..\tools\run-proof.ps1" Link="maintenance\run-proof.ps1" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\..\tools\driver-install-testpc.ps1" Link="maintenance\driver-install-testpc.ps1" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

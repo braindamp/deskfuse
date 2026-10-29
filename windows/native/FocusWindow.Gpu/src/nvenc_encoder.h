@@ -31,7 +31,8 @@ public:
         const EncoderConfig& config, std::wstring& error);
     bool Encode(int slot, uint64_t timestamp, uint32_t frameIndex, uint32_t& bitstreamBytes,
         double& submitMs, double& lockMs, std::wstring& error,
-        std::vector<uint8_t>& accessUnit, bool forceIdr = false);
+        uint8_t* output, uint32_t capacity, std::vector<uint8_t>& retry,
+        bool& isIdr, bool forceIdr = false);
     bool Flush(std::wstring& error);
     void Shutdown();
 
@@ -41,6 +42,9 @@ public:
     uint32_t MaxApiVersion() const { return maxApiVersion_; }
     uint64_t FramesEncoded() const { return framesEncoded_; }
     uint64_t BytesWritten() const { return bytesWritten_; }
+    uint64_t SubmitMaxUs() const { return submitMaxUs_; }
+    uint64_t LockMaxUs() const { return lockMaxUs_; }
+    uint64_t InspectCopyMaxUs() const { return inspectCopyMaxUs_; }
     const std::wstring& LastError() const { return lastError_; }
 
 private:
@@ -60,6 +64,7 @@ private:
     uint64_t framesEncoded_ = 0;
     uint64_t framesSubmitted_ = 0;
     uint64_t bytesWritten_ = 0;
+    uint64_t submitMaxUs_ = 0, lockMaxUs_ = 0, inspectCopyMaxUs_ = 0;
     uint32_t frameIndex_ = 0;
     std::wstring lastError_;
 };

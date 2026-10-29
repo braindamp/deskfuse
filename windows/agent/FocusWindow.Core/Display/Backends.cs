@@ -116,7 +116,9 @@ public static class PhysicalSize
 public interface IInputSink
 {
     void Handle(InputEventDto e, InputGeometry geometry);
-    /// <summary>Releases any key or button this sink is holding down (called at session end).</summary>
+    bool TryHandle(InputEventDto e, InputGeometry geometry) { Handle(e, geometry); return true; }
+    bool NeedsReconciliation => false;
+    /// <summary>Ends/suspends the input context. It must not blindly release global input.</summary>
     void ReleaseAll();
 }
 /// <summary>Maps stream pixels to desktop pixels. In the native path both are the same size.</summary>

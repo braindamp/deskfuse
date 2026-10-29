@@ -83,7 +83,8 @@ internal static class DeviceInstance
             throw new ArgumentException("A full enrollment-derived DeskFuse audio instance path is required.");
     }
 
-    internal static PhoneDevice Create(string instanceId, string hardwareId, string friendlyName, string manufacturer)
+    internal static PhoneDevice Create(string instanceId, string hardwareId, string friendlyName, string manufacturer,
+        bool allowExisting = true)
     {
         // Service and manufacturer are assigned by the installed INF.
         _ = manufacturer;
@@ -101,6 +102,8 @@ internal static class DeviceInstance
             {
                 if (Marshal.GetLastWin32Error() != ErrorDevinstAlreadyExists)
                     throw Error("SetupApi.SetupDiCreateDeviceInfoW");
+                if (!allowExisting)
+                    throw new InvalidOperationException("An unowned phone endpoint already exists; explicit recovery is required.");
                 info = SetupApi.SpDevInfoData.Empty;
                 if (!SetupApi.SetupDiOpenDeviceInfoW(set, instanceId, nint.Zero, 0, ref info))
                     throw Error("SetupApi.SetupDiOpenDeviceInfoW");
@@ -137,10 +140,16 @@ internal static class DeviceInstance
             SetFriendlyNameIfChanged(set, ref info, friendlyName);
             return new PhoneDevice(actual, friendlyName, inf);
         }
-        catch
+        catch (Exception ex)
         {
-            if (created && !SetupApi.SetupDiRemoveDevice(set, ref info))
-                Console.Error.WriteLine($"Device rollback: 0x{unchecked((uint)Marshal.GetLastWin32Error()):X8}");
+            if (created)
+            {
+                if (!SetupApi.SetupDiRemoveDevice(set, ref info))
+                    Console.Error.WriteLine($"Device rollback: 0x{unchecked((uint)Marshal.GetLastWin32Error()):X8}");
+                // A successful remove call is not proof of absence. Preserve the
+                // exact created identity for confirmed cleanup or quarantine.
+                throw new DeviceCreationIncompleteException(new PhoneDevice(instanceId, friendlyName, inf), ex);
+            }
             throw;
         }
         finally { SetupApi.SetupDiDestroyDeviceInfoList(set); }
@@ -334,6 +343,12 @@ internal static class DeviceInstance
         return Directory.EnumerateDirectories(repository, "deskfuseaudio.inf_*")
             .Select(folder => Path.Combine(folder, "DeskFuseAudio.inf")).FirstOrDefault(File.Exists);
     }
+}
+
+internal sealed class DeviceCreationIncompleteException(PhoneDevice device, Exception cause)
+    : Exception("Audio device creation did not complete; cleanup must be confirmed.", cause)
+{
+    public PhoneDevice Device { get; } = device;
 }
 
 internal sealed class PhoneDevice(string instancePath, string friendlyName, string driverInf)

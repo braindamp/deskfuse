@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "promptAtMs": [60000, 180000, 300000],
+  "ackDeadlineMs": [85000, 205000, 325000],
+  "proofReadyDeadlineMs": 60000,
+  "closeAtMs": 325000,
+  "cleanupObservationDeadlineMs": 350000,
+  "heartbeatTimeoutMs": 10000,
+  "automaticRetryWindowMs": 1200000
+}

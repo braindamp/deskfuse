@@ -2,13 +2,18 @@ name: vNext M2a quiche Rust lab
 
 on:
   pull_request:
-    branches: [feature/vnext-wp001-native-lab]
-    paths: ['vnext/m2a/quiche-lab/**', '.github/workflows/vnext-m2a-quiche.yml']
+    paths: ['vnext/m2a/quiche-lab/**', 'vnext/m1/**', 'windows/shared/**', 'windows/driver/DeskFuseAudio/**', '.github/workflows/vnext-m2a-quiche.yml']
   push:
     branches:
       - feature/vnext-wp001-native-lab
+      - main
+      - 'integration/**'
+      - experiment/vnext-audio-latency
     paths:
       - 'vnext/m2a/quiche-lab/**'
+      - 'vnext/m1/**'
+      - 'windows/shared/**'
+      - 'windows/driver/DeskFuseAudio/**'
       - '.github/workflows/vnext-m2a-quiche.yml'
   workflow_dispatch:
 

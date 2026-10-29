@@ -42,6 +42,8 @@ class SecureChannel private constructor(
 
     private var sendCounter: Long = 0
     private var recvCounter: Long = -1
+    private val sendGate = Any()
+    private val recvGate = Any()
 
     /** Nonce = 4 zero bytes || counter. Never reused: the counter is monotonic. */
     private fun nonce(counter: Long): ByteArray =
@@ -51,18 +53,20 @@ class SecureChannel private constructor(
             }
         }
 
-    @Synchronized
-    fun seal(plaintext: ByteArray): ByteArray {
+    fun seal(plaintext: ByteArray): ByteArray = synchronized(sendGate) {
         check(sendCounter >= 0 && sendCounter != Long.MAX_VALUE) { "outbound nonce sequence exhausted" }
         val counter = sendCounter++
         sendCipher.init(Cipher.ENCRYPT_MODE, sendKeySpec, GCMParameterSpec(TAG_BITS, nonce(counter)))
-        val body = sendCipher.doFinal(plaintext)
-        // Counter travels in the clear; it is not secret, only unique.
-        return ByteArray(8) { i -> ((counter shr (8 * (7 - i))) and 0xFF).toByte() } + body
+        val bodyLength = Math.addExact(plaintext.size, TAG_BITS / 8)
+        check(sendCipher.getOutputSize(plaintext.size) == bodyLength) { "unexpected GCM record size" }
+        val record = ByteArray(Math.addExact(8, bodyLength))
+        for (i in 0 until 8) record[i] = ((counter ushr (8 * (7 - i))) and 0xFF).toByte()
+        val written = sendCipher.doFinal(plaintext, 0, plaintext.size, record, 8)
+        check(written == bodyLength) { "incomplete GCM record" }
+        record
     }
 
-    @Synchronized
-    fun open(packet: ByteArray): ByteArray {
+    fun open(packet: ByteArray): ByteArray = synchronized(recvGate) {
         require(packet.size > 8 + TAG_BITS / 8) { "ciphertext too short" }
         var counter = 0L
         for (i in 0 until 8) counter = (counter shl 8) or (packet[i].toLong() and 0xFF)
@@ -73,7 +77,7 @@ class SecureChannel private constructor(
         recvCipher.init(Cipher.DECRYPT_MODE, recvKeySpec, GCMParameterSpec(TAG_BITS, nonce(counter)))
         val plain = recvCipher.doFinal(packet, 8, packet.size - 8)
         recvCounter = counter
-        return plain
+        plain
     }
 
     companion object {

@@ -420,7 +420,7 @@ bool WgcCapture::MaterializeFrame(CapturedFrame& frame, std::wstring& error)
 
         frame.slot = slotIndex;
         frame.format = sourceDesc.Format;
-        frame.qpcCopyDone = QpcNow();
+        frame.qpcCopyDone = QpcNow(); // CPU submission observation, not completed GPU-copy timing
         frame.gpuCopyMs = -1.0;
         frame.gpuDisjoint = false;
         {

@@ -69,8 +69,6 @@ sealed interface SessionState {
         val oneToOne: Boolean
             get() = presentation.mode == PhoneSurfaceView.Presentation.Mode.ONE_TO_ONE
 
-        /** NFR-LAT-01 — the number the user actually feels. */
-        val glassToGlassMs: Double get() = linkRttMs / 2 + (stats?.decodeLatencyMs ?: 0.0)
     }
 
     /**
