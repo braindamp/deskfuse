@@ -13,9 +13,31 @@ pub const STATUS: u8 = 5;
 pub const OUTPUT: u8 = 6;
 pub const DETACH: u8 = 7;
 pub const STOP: u8 = 8;
+pub const SIGNED_SOURCE_STOP: u8 = 9;
+pub const SOURCE_STOP_STATUS: u8 = 10;
+pub const APPLIED_RESULT: u8 = 11;
 pub const NOTICE: u8 = 128;
 pub const ERROR: u8 = 255;
 pub const MAX_PENDING: usize = 8;
+/// Setup-only selection. Canonical Source.v1 always denotes Game.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum DeliveryMode {
+    Game = 1,
+    Interactive = 2,
+    Streaming = 3,
+}
+impl DeliveryMode {
+    pub fn require_supported(mode: u8) -> io::Result<Self> {
+        if mode != Self::Game as u8 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Unsupported audio delivery mode",
+            ));
+        }
+        Ok(Self::Game)
+    }
+}
 pub(crate) fn invalid() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "Invalid audio control record")
 }
@@ -42,7 +64,10 @@ impl Record {
     }
 }
 fn valid_kind(k: u8) -> bool {
-    (INFO..=STOP).contains(&k) || (129..=136).contains(&k) || k == NOTICE || k == ERROR
+    (INFO..=APPLIED_RESULT).contains(&k) || (129..=139).contains(&k) || k == NOTICE || k == ERROR
+}
+pub(crate) fn negative(k: u8) -> bool {
+    matches!(k, STOP | SIGNED_SOURCE_STOP | 136 | 137)
 }
 /// One partial record, not another transport/PCM queue. The caller gives each
 /// complete record a bounded work budget and checks control fences between turns.
@@ -132,6 +157,7 @@ pub struct SourceScope {
     pub worker: [u8; 16],
     pub source: [u8; 16],
     pub generation: u64,
+    pub device_key: [u8; 16],
     pub digest: [u8; 32],
     pub wire: [u32; 3],
     pub grace100ns: u64,
@@ -156,7 +182,7 @@ impl SourceScope {
         r.nonzero_u64()?;
         let source = r.nonzero()?;
         let generation = r.nonzero_u64()?;
-        r.nonzero::<16>()?;
+        let device_key = r.nonzero::<16>()?;
         if !matches!(r.byte()?, 1 | 2) {
             return Err(invalid());
         }
@@ -179,6 +205,7 @@ impl SourceScope {
             worker,
             source,
             generation,
+            device_key,
             digest: boring::sha::sha256(b),
             wire,
             grace100ns: u64::from(grace) * 10000,

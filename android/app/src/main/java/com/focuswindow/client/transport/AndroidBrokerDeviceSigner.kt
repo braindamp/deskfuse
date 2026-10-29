@@ -28,6 +28,8 @@ class AndroidBrokerDeviceSigner {
 
     internal fun signCommittedProof(active: TrustedCommittedEnrollment, transcript: ByteArray, hostSignature: ByteArray,
         approval: BrokerProofApproval): ByteArray = signer.signCommittedProof(active, transcript, hostSignature, approval)
+    internal fun signAudioSourceStop(active: TrustedCommittedEnrollment, attempt: AudioStopAttempt): ByteArray =
+        signer.signAudioSourceStop(active, attempt)
 
     fun signExisting(hostIdentitySha256: ByteArray, enrollmentId: UUID, approvedSpkiSha256: ByteArray,
         transcript: ByteArray, approval: BrokerProofApproval): ByteArray =

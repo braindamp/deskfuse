@@ -46,6 +46,14 @@ internal sealed class BrokerLogonIdentity(byte[] userSid, byte[] logonSid, ulong
 [SupportedOSPlatform("windows")]
 internal sealed class BrokerWorkerLauncher
 {
+    internal BrokerRegisteredWorker LaunchAudio(IInstalledBrokerWorkerImage image, BrokerLogonIdentity approvedLogon,
+        AudioDeliveryMode mode)
+    {
+        AudioDeliveryModes.RequireSupported(mode);
+        if (Path.GetFileName(image.ExecutablePath) != "DeskFuse.AudioWorker.exe")
+            throw new InvalidDataException("Audio requires its fixed installed worker role.");
+        return Launch(image, approvedLogon);
+    }
     internal BrokerRegisteredWorker Launch(IInstalledBrokerWorkerImage image, BrokerLogonIdentity approvedLogon)
         => LaunchMedium(image, approvedLogon, BrokerWorkerKind.NativeResource);
 

@@ -1,5 +1,10 @@
 # N3 native TLS/control — foundation checkpoint
 
+**Subsequent High work, 30 October:**
+[Stop/Game/handover implementation status](Audio_Control_Handover_Implementation_Status.md)
+records the checked control/negative/recovery increment and remaining integration.
+The foundation evidence below remains historical.
+
 29 October 2026, High. **N3 is partial, production authority disabled.**
 The focused [Ultra design](Audio_Stop_Game_And_Handover_High_Handoff.md) now
 selects negative-only source Stop, Game-only current mode admission and the

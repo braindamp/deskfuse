@@ -50,6 +50,7 @@ internal class AudioFrozenProof(bytes: ByteArray) {
     fun boot() = bootBytes.copyOf()
     fun sourceDigest() = digest.copyOf()
     fun requestId() = request.copyOf()
+    fun brokerNonce(): ByteArray = AudioReader.proof(coreBytes).hash()
 }
 
 /** Exactly one original send anchor and one real signing completion per request.
@@ -80,6 +81,20 @@ internal class AudioPendingRequest internal constructor(
     fun isRetired() = retired
     fun retire() { retired = true }
     fun hasVerifiedProof() = verified
+    fun appliedResultRequest(): ByteArray = synchronized(signingGate) {
+        requireCurrent(); require(!retired && verified)
+        val exact = signature ?: error("No completed phone signature")
+        val frozen = AudioFrozenProof(proof!!)
+        frozen.requestId() + frozen.brokerNonce() + byteArrayOf(exact.size.toByte()) + exact.copyOf()
+    }
+    internal fun matchesAppliedSupersede(observedBoot: ByteArray, generation: ULong, digest: ByteArray,
+        revision: ULong, until: ULong): Boolean {
+        if (retired || !verified || approval.operation != AudioOperation.SUPERSEDE_DELIVERY) return false
+        val frozen = AudioFrozenProof(proofBytes())
+        return frozen.boot().contentEquals(observedBoot) && approval.generation == generation &&
+            approval.resource().contentEquals(digest) && frozen.revision != ULong.MAX_VALUE &&
+            revision >= frozen.revision + 1uL && until >= frozen.until
+    }
     fun setChallenge(bytes: ByteArray, hostSignature: ByteArray) = synchronized(signingGate) {
         requireCurrent(); require(!retired)
         val snapshot = bytes.copyOf(); val root = hostSignature.copyOf()
@@ -129,6 +144,8 @@ internal class AudioPhoneRequests(private val source: AudioSourceApproval, priva
     private var terminal = false
     private var lastNow = 0L
     private var query: ByteArray? = null
+    private var stopIntent: AudioSourceStopIntent? = null
+    private var stopBoot: ByteArray? = null
     private fun now(): Long {
         val now = clock()
         if (terminal || now < lastNow || now < 0) { terminal = true; error("Phone audio owner is terminal") }
@@ -183,6 +200,19 @@ internal class AudioPhoneRequests(private val source: AudioSourceApproval, priva
         pending?.let { it.retire(); if (!it.isSigning()) pending = null }
     }
     fun close() = synchronized(gate) { terminal = true; retirePending() }
+    fun beginStop(active: TrustedCommittedEnrollment, observedBoot: ByteArray): AudioSourceStopIntent {
+        val snapshot = observedBoot.copyOf()
+        synchronized(gate) {
+            close() // Local playback/renewal denial cannot wait for key or network work.
+            require(boot == null || boot!!.contentEquals(snapshot))
+            stopIntent?.let { require(stopBoot!!.contentEquals(snapshot)); return it }
+        }
+        val created = AudioSourceStopIntent.forSource(active, source, snapshot)
+        return synchronized(gate) {
+            stopIntent?.also { require(stopBoot!!.contentEquals(snapshot)) }
+                ?: created.also { stopIntent = it; stopBoot = snapshot }
+        }
+    }
     fun beginResync(): ByteArray = synchronized(gate) {
         now(); query?.let { return@synchronized it.copyOf() }; ByteArray(32).also { SecureRandom().nextBytes(it); query = it.copyOf() }
     }
@@ -213,7 +243,9 @@ internal class AudioPhoneRequests(private val source: AudioSourceApproval, priva
             pending?.let {
                 // An unreserved proposal is retried exactly; an active identity
                 // is not abandoned just because its issuance response was lost.
-                if (it.sequence <= floor && (stage == 6 || !activeId.contentEquals(it.approval.nonce()))) {
+                val recoverApplied = phase == 2 && it.sequence <= floor &&
+                    it.matchesAppliedSupersede(observedBoot, generation, delivery, revision, until)
+                if (!recoverApplied && it.sequence <= floor && (stage == 6 || !activeId.contentEquals(it.approval.nonce()))) {
                     it.retire(); if (!it.isSigning()) pending = null
                 }
             }

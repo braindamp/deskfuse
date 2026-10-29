@@ -88,8 +88,9 @@ internal sealed class TrustedBrokerEnrollmentStore : IBrokerEnrollments, IDispos
     // Identifier association only: it grants no source, endpoint or runtime lease.
     // Reuse the established positive-record completion/custody protocol and the
     // same cold writer/owner lease. A torn association is never reallocated.
-    internal SpeakerAssociation GetSpeakerAssociation(Guid enrollment)
+    internal SpeakerAssociation GetSpeakerAssociation(Guid enrollment, AudioDeliveryMode mode = AudioDeliveryMode.Game)
     {
+        AudioDeliveryModes.RequireSupported(mode);
         var activeRecord = ReadActive(enrollment);
         if (activeRecord.Version != 2 || !activeRecord.Scopes.Contains(BrokerProofScope.Speaker))
             throw new UnauthorizedAccessException("A committed speaker enrollment is required.");

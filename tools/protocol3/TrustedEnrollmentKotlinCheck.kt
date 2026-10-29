@@ -13,7 +13,8 @@ object TrustedEnrollmentKotlinCheck {
         check(offerBytes.contentEquals(TrustedEnrollmentProtocol.offer(offer)))
         val keys = object : BrokerSigningKeyStore {
             val values = mutableMapOf<String, BrokerSigningKey>()
-            override fun find(alias: String) = values[alias]
+            @Volatile var beforeFind: (() -> Unit)? = null
+            override fun find(alias: String): BrokerSigningKey? { beforeFind?.invoke(); return values[alias] }
             override fun create(alias: String): BrokerSigningKey {
                 check(!values.containsKey(alias))
                 val pair = KeyPairGenerator.getInstance("EC").apply { initialize(ECGenParameterSpec("secp256r1")) }.generateKeyPair()
@@ -76,6 +77,8 @@ object TrustedEnrollmentKotlinCheck {
         val audioSourceBytes = hex.parseHex(readln()); val audioNonce = hex.parseHex(readln())
         val audioChallenge = hex.parseHex(readln()); val audioHostSignature = hex.parseHex(readln())
         val audioSource = AudioSourceApproval(audioSourceBytes)
+        check(audioSource.mode == AudioDeliveryMode.GAME)
+        for (mode in listOf(0, 2, 3, 255)) check(runCatching { AudioDeliveryMode.requireSupported(mode) }.isFailure)
         val audioApproval = AudioProofApproval.acquire(audioSource, audioNonce)
         check(runCatching { signer.signCommittedProof(active, audioChallenge, audioHostSignature, audioApproval.brokerApproval()) }.isFailure)
         var audioNow = 1000000000L
@@ -167,6 +170,65 @@ object TrustedEnrollmentKotlinCheck {
         check(blocked.isSigning() && runCatching { blockedOwner.begin(AudioProofApproval.acquire(audioSource, audioNonce)) }.isFailure)
         release.countDown(); task.join(5000); check(!task.isAlive && !blocked.isSigning())
         check(blockedOwner.begin(AudioProofApproval.acquire(audioSource, blockedOwner.nextRequestId())) !== blocked)
+        // A committed Supersede can have an empty remote pending slot and a
+        // lost receipt. Its exact phone operation must survive signed resync.
+        val replacementBytes = hex.parseHex(readln())
+        val replacementChallenge = hex.parseHex(readln()); val replacementRoot = hex.parseHex(readln())
+        val replacementId = AudioFrozenProof(replacementChallenge).requestId()
+        val replacementApproval = AudioProofApproval.delivery(audioSource, audioBinding, replacementBytes,
+            AudioOperation.SUPERSEDE_DELIVERY, ByteArray(32) { 10 }, ByteArray(32) { 11 }, replacementId)
+        val replacement = audioOwner.begin(replacementApproval)
+        replacement.setChallenge(replacementChallenge, replacementRoot)
+        val replacementSignature = signer.signAudioProof(active, replacement); audioOwner.confirmProof(replacement)
+        println(hex.formatHex(replacementSignature)); println(hex.formatHex(audioOwner.beginResync()))
+        audioOwner.resync(active, hex.parseHex(readln()))
+        check(!replacement.isRetired() && audioOwner.begin(replacementApproval) === replacement)
+        check(audioOwner.nextRequestId().contentEquals(replacementId) && replacement.firstSendNanos == 1150000000L)
+        println(hex.formatHex(replacement.appliedResultRequest()))
+        val replacementReceipt = hex.parseHex(readln()); audioNow = 1200000000L
+        val replacementWindow = audioOwner.accept(active, replacement, replacementReceipt, 1000)
+        check(replacementWindow.deadlineNanos == 1549600000L)
+        audioNow = 1250000000L
+        check(replacementWindow === audioOwner.accept(active, replacement, replacementReceipt, 1000))
+        check(runCatching { replacement.appliedResultRequest() }.isFailure) // No longer a pending recovery.
+        println("AUDIO_HANDOVER_RESULT_PASS")
+        val stopIntent = audioOwner.beginStop(active, AudioFrozenProof(replacementChallenge).boot())
+        check(stopIntent === audioOwner.beginStop(active, AudioFrozenProof(replacementChallenge).boot()))
+        check(runCatching { audioOwner.nextRequestId() }.isFailure)
+        val stopObservation = AudioStopObservation(java.util.UUID.fromString("99998888-7777-6666-5555-444433332222"),
+            ByteArray(32) { 10 }, ByteArray(32) { 11 }, ByteArray(32) { 13 })
+        val stopAttempt = stopIntent.prepare(stopObservation)
+        val stopSignature = signer.signAudioSourceStop(active, stopAttempt)
+        check(stopSignature.contentEquals(signer.signAudioSourceStop(active, stopAttempt)))
+        keys.values.clear(); check(runCatching { signer.signAudioSourceStop(active, stopAttempt) }.isFailure)
+        keys.values.putAll(savedKeys); check(stopSignature.contentEquals(signer.signAudioSourceStop(active, stopAttempt)))
+        check(stopAttempt === stopIntent.prepare(stopObservation))
+        check(stopAttempt.transcript().contentEquals(AudioSourceStopCodec.canonicalStop(stopAttempt.transcript())))
+        println(hex.formatHex(stopAttempt.envelope())); println(hex.formatHex(stopIntent.statusRequest()))
+        val stopStatus = hex.parseHex(readln())
+        check(runCatching { stopIntent.acceptStatus(active, stopStatus.copyOf().also { it[it.lastIndex] = (it.last().toInt() xor 1).toByte() }) }.isFailure)
+        check(stopIntent.acceptStatus(active, stopStatus) == AudioSourceStopState.DENIED)
+        check(runCatching { stopIntent.acceptStatus(active, stopStatus) }.isFailure)
+        println("AUDIO_SOURCE_STOP_PASS")
+        val positiveOwner = AudioPhoneRequests(audioSource) { 1150000000L }
+        val positive = positiveOwner.begin(AudioProofApproval.acquire(audioSource, audioNonce))
+        positive.setChallenge(audioChallenge, audioHostSignature)
+        val positiveEntered = java.util.concurrent.CountDownLatch(1); val positiveRelease = java.util.concurrent.CountDownLatch(1)
+        val blockFirstLookup = java.util.concurrent.atomic.AtomicBoolean(true)
+        keys.beforeFind = { if (blockFirstLookup.compareAndSet(true, false)) { positiveEntered.countDown(); check(positiveRelease.await(5, java.util.concurrent.TimeUnit.SECONDS)) } }
+        val positiveWork = Thread { runCatching { signer.signAudioProof(active, positive) } }
+        val negativeDone = java.util.concurrent.CountDownLatch(1)
+        val negativeSignature = java.util.concurrent.atomic.AtomicReference<ByteArray?>()
+        val freshStop = stopIntent.prepare(AudioStopObservation(java.util.UUID.randomUUID(), ByteArray(32) { 10 }, ByteArray(32) { 11 }, ByteArray(32) { 14 }))
+        val negativeWork = Thread { try { negativeSignature.set(signer.signAudioSourceStop(active, freshStop)) } finally { negativeDone.countDown() } }
+        positiveWork.start()
+        try {
+            check(positiveEntered.await(5, java.util.concurrent.TimeUnit.SECONDS)); negativeWork.start()
+            check(negativeDone.await(3, java.util.concurrent.TimeUnit.SECONDS) && negativeSignature.get() != null)
+        } finally {
+            positiveRelease.countDown(); keys.beforeFind = null; positiveWork.join(5000); negativeWork.join(5000)
+        }
+        check(!positiveWork.isAlive && !negativeWork.isAlive)
         audioNow = window.deadlineNanos
         check(runCatching { audioOwner.accept(active, deliveryPending, deliveryReceipt, 1000) }.isFailure)
         check(runCatching { audioOwner.nextRequestId() }.isFailure)
@@ -176,6 +238,7 @@ object TrustedEnrollmentKotlinCheck {
         denialPending.setChallenge(audioChallenge, audioHostSignature)
         signer.signAudioProof(active, denialPending)
         repository.remove(host, offer.enrollment)
+        check(runCatching { signer.signAudioSourceStop(active, freshStop) }.isFailure)
         check(runCatching { signer.signAudioProof(active, denialPending) }.isFailure)
         check(runCatching { active.requireCurrent() }.isFailure)
         check(runCatching { signer.signCommittedProof(active, challenge, hostChallengeSignature, proofContext) }.isFailure)

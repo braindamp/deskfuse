@@ -1,5 +1,10 @@
 # Audio Stop, Game mode and handover — focused Ultra design
 
+**High execution update, 30 October:** shared control, negative source admission
+and exact recovery primitives are implemented/offline checked; integration is
+ongoing. See [current implementation status](Audio_Control_Handover_Implementation_Status.md).
+The design-pass scope below is historical; it does not claim feature completion.
+
 29 October 2026. **Design only; all three decisions selected for High.**
 Checkout `experiment/vnext-audio-latency`. Stop/Game design baseline `7859ad6`;
 subsequent Arena handover review baseline `7df5216`. No runtime source was

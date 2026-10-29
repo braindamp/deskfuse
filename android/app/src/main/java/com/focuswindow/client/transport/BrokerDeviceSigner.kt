@@ -6,6 +6,7 @@ import java.security.MessageDigest
 import java.security.PrivateKey
 import java.security.Signature
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 
 enum class BrokerOperation(val wire: Int) { ACQUIRE(1), RENEW(2), SUPERSEDE(3), RELEASE(4) }
 enum class BrokerScope(val wire: Int) {
@@ -96,6 +97,7 @@ internal interface BrokerSigningKeyStore {
 
 /** Separate ECDSA identity; transport ECDH keys and pairing secrets are never signing keys. */
 internal class BrokerDeviceSigner(private val keys: BrokerSigningKeyStore) {
+    private val negativeSigning = AtomicBoolean(false)
     private val proofSignatures = linkedMapOf<String, ByteArray>()
     fun prepareEnrollment(hostIdentitySha256: ByteArray, enrollmentId: UUID): BrokerSigningIdentity = synchronized(gate) {
         val alias = alias(hostIdentitySha256, enrollmentId)
@@ -156,6 +158,22 @@ internal class BrokerDeviceSigner(private val keys: BrokerSigningKeyStore) {
             val signature = sign(key, snapshot)
             active.requireCurrent(); signature
         }
+    }
+    fun signAudioSourceStop(active: TrustedCommittedEnrollment, attempt: AudioStopAttempt): ByteArray {
+        check(negativeSigning.compareAndSet(false, true)) { "Source Stop signing is in progress" }
+        fun currentKey(): BrokerSigningKey {
+            active.requireCurrent(); attempt.intent.source.requireActive(active)
+            val enrollment = active.transcript(); val binding = TrustedEnrollmentProtocol.binding(enrollment)
+            return existingKey(binding.hostHash, binding.enrollment, TrustedEnrollmentProtocol.hash(enrollment.proposal.phoneSpki))
+        }
+        try {
+            // No positive-signing gate is held here. Android's provider may
+            // serialize hardware work; the software lifecycle never waits on it.
+            var key: BrokerSigningKey? = null
+            return attempt.signWith(validate = { key = currentKey(); active.requireCurrent() }) { bytes ->
+                val result = sign(key ?: error("No current Stop key"), bytes); active.requireCurrent(); result
+            }
+        } finally { negativeSigning.set(false) }
     }
     private fun signCommittedProofCore(active: TrustedCommittedEnrollment, bytes: ByteArray, hostSignature: ByteArray,
         approval: BrokerProofApproval): ByteArray = synchronized(gate) {

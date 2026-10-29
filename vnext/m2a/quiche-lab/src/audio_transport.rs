@@ -40,6 +40,10 @@ pub struct DeliveryTls {
     role: Role,
 }
 impl DeliveryTls {
+    pub fn generate_for_mode(role: Role, mode: u8) -> io::Result<Self> {
+        wire::DeliveryMode::require_supported(mode)?;
+        Self::generate(role)
+    }
     pub fn generate(role: Role) -> io::Result<Self> {
         Ok(Self {
             identity: Identity::generate(role)?,
@@ -114,6 +118,11 @@ struct Approved {
     revision: u64,
     until: u64,
 }
+struct QueuedControl {
+    bytes: Vec<u8>,
+    offset: usize,
+    negative: bool,
+}
 pub struct ControlConnection {
     conn: quiche::Connection,
     role: Role,
@@ -131,7 +140,7 @@ pub struct ControlConnection {
     approved: Option<Approved>,
     decoder: Decoder,
     read_backlog: VecDeque<Record>,
-    writes: VecDeque<(Vec<u8>, usize)>,
+    writes: VecDeque<QueuedControl>,
     pending: HashMap<u64, u8>,
     last_request: u64,
     egress: Egress,
@@ -199,15 +208,16 @@ impl ControlConnection {
                     phone: hash,
                     nonce: self.nonce,
                 };
-                self.writes.push_back((
-                    Record {
+                self.writes.push_back(QueuedControl {
+                    bytes: Record {
                         kind: wire::NOTICE,
                         request: 0,
                         body: observation.encode()?,
                     }
                     .encode()?,
-                    0,
-                ));
+                    offset: 0,
+                    negative: false,
+                });
                 self.observation = Some(observation);
             }
         }
@@ -316,10 +326,10 @@ impl ControlConnection {
     }
     fn check_record(&mut self, r: &Record) -> io::Result<()> {
         if self.role == Role::Native {
-            if !(wire::INFO..=wire::STOP).contains(&r.kind)
+            if !(wire::INFO..=wire::APPLIED_RESULT).contains(&r.kind)
                 || self.last_request == u64::MAX
                 || r.request != self.last_request + 1
-                || self.pending.len() >= MAX_PENDING
+                || !self.pending_capacity(r.kind)
             {
                 return Err(wire::invalid());
             }
@@ -331,7 +341,29 @@ impl ControlConnection {
                 wire::PROOF => n >= 41 && n <= 105 && usize::from(r.body[32]) + 33 == n,
                 wire::STATUS => n == 32,
                 wire::OUTPUT => n == 49,
-                wire::DETACH | wire::STOP => n == 40,
+                wire::DETACH => n == 40,
+                wire::STOP => {
+                    crate::audio_source_stop::FastSourceStop::parse(&r.body).is_ok_and(|v| {
+                        self.approved.as_ref().is_some_and(|a| {
+                            v.source == a.binding.source
+                                && v.generation == a.binding.source_generation
+                                && v.digest == a.binding.source_digest
+                        })
+                    })
+                }
+                wire::SIGNED_SOURCE_STOP => {
+                    crate::audio_source_stop::SignedSourceStop::parse(&r.body).is_ok_and(|v| {
+                        self.observation
+                            .as_ref()
+                            .is_some_and(|o| v.proof.matches_observation(o))
+                    })
+                }
+                wire::SOURCE_STOP_STATUS => {
+                    crate::audio_source_stop::StopStatusQuery::parse(&r.body).is_ok()
+                }
+                wire::APPLIED_RESULT => {
+                    crate::audio_source_stop::AppliedResultQuery::parse(&r.body).is_ok()
+                }
                 _ => false,
             };
             if !valid
@@ -365,17 +397,43 @@ impl ControlConnection {
         self.pending.remove(&r.request);
         Ok(())
     }
+    fn pending_capacity(&self, kind: u8) -> bool {
+        if wire::negative(kind) {
+            !self.pending.values().any(|k| wire::negative(*k))
+        } else {
+            self.pending
+                .values()
+                .filter(|k| !wire::negative(**k))
+                .count()
+                < MAX_PENDING
+        }
+    }
+    fn write_capacity(&self, is_negative: bool) -> bool {
+        let negative = self.writes.iter().filter(|v| v.negative).count();
+        if is_negative {
+            negative == 0
+        } else {
+            self.writes.len() - negative < MAX_PENDING
+        }
+    }
     pub fn queue_control(&mut self, record: Record, now: u64) -> io::Result<()> {
         self.advance(now)?;
-        if self.facts.is_none() || self.writes.len() >= MAX_PENDING {
+        let negative = if self.role == Role::Native {
+            self.pending
+                .get(&record.request)
+                .is_some_and(|k| wire::negative(*k))
+        } else {
+            wire::negative(record.kind)
+        };
+        if self.facts.is_none() || !self.write_capacity(negative) {
             return Err(io::Error::from(io::ErrorKind::WouldBlock));
         }
         let bytes = record.encode()?;
         if self.role == Role::Phone {
-            if !(wire::INFO..=wire::STOP).contains(&record.kind)
+            if !(wire::INFO..=wire::APPLIED_RESULT).contains(&record.kind)
                 || self.last_request == u64::MAX
                 || record.request != self.last_request + 1
-                || self.pending.len() >= MAX_PENDING
+                || !self.pending_capacity(record.kind)
             {
                 return Err(wire::invalid());
             }
@@ -384,12 +442,26 @@ impl ControlConnection {
             {
                 return Err(denied());
             }
+            if record.kind == wire::SIGNED_SOURCE_STOP {
+                let stop = crate::audio_source_stop::SignedSourceStop::parse(&record.body)?;
+                if !self
+                    .observation
+                    .as_ref()
+                    .is_some_and(|o| stop.proof.matches_observation(o))
+                {
+                    return Err(denied());
+                }
+            }
             self.last_request = record.request;
             self.pending.insert(record.request, record.kind);
         } else {
             self.complete_pending(&record)?;
         }
-        self.writes.push_back((bytes, 0));
+        self.writes.push_back(QueuedControl {
+            bytes,
+            offset: 0,
+            negative,
+        });
         Ok(())
     }
     pub fn service_egress(
@@ -405,8 +477,11 @@ impl ControlConnection {
             .map_err(|_| denied())
     }
     fn flush_stream(&mut self) -> io::Result<()> {
-        for _ in 0..MAX_PENDING {
-            let Some((bytes, at)) = self.writes.front_mut() else {
+        for _ in 0..=MAX_PENDING {
+            let Some(QueuedControl {
+                bytes, offset: at, ..
+            }) = self.writes.front_mut()
+            else {
                 break;
             };
             match self.conn.stream_send(0, &bytes[*at..], false) {
@@ -713,6 +788,71 @@ mod tests {
                 100
             )
             .is_err());
+        let vector: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../tools/protocol3/audio-source-stop-v1.json"
+        ))
+        .unwrap();
+        let hex = vector["signedStopHex"].as_str().unwrap();
+        let mut stop = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect::<Vec<_>>();
+        let observed = native.observation(100).unwrap().unwrap();
+        for (old, new) in [
+            (vec![19; 16], observed.connection.to_vec()),
+            (vec![15; 32], observed.native.to_vec()),
+            (vec![16; 32], observed.phone.to_vec()),
+            (vec![17; 32], observed.nonce.to_vec()),
+        ] {
+            let at = stop.windows(old.len()).position(|v| v == old).unwrap();
+            stop[at..at + old.len()].copy_from_slice(&new);
+        }
+        phone
+            .queue_control(
+                Record {
+                    kind: wire::SIGNED_SOURCE_STOP,
+                    request: 10,
+                    body: stop,
+                },
+                100,
+            )
+            .unwrap();
+        assert_eq!(phone.pending.len(), MAX_PENDING + 1);
+        assert_eq!(phone.writes.len(), MAX_PENDING + 1);
+        pump(&mut phone, &mut native);
+        let mut requests = native.read_control(100).unwrap();
+        requests.extend(native.read_control(100).unwrap());
+        assert_eq!(requests.len(), MAX_PENDING + 1);
+        assert_eq!(requests.last().unwrap().kind, wire::SIGNED_SOURCE_STOP);
+        for request in 2..=9 {
+            native
+                .queue_control(
+                    Record {
+                        kind: 129,
+                        request,
+                        body: vec![],
+                    },
+                    100,
+                )
+                .unwrap();
+        }
+        native
+            .queue_control(
+                Record {
+                    kind: wire::ERROR,
+                    request: 10,
+                    body: vec![],
+                },
+                100,
+            )
+            .unwrap();
+        assert_eq!(native.writes.len(), MAX_PENDING + 1);
+        pump(&mut native, &mut phone);
+        let mut replies = phone.read_control(100).unwrap();
+        replies.extend(phone.read_control(100).unwrap());
+        assert_eq!(replies.len(), MAX_PENDING + 1);
+        assert!(phone.pending.is_empty());
+        assert!(!native.is_approved() && !phone.is_approved()); // Envelope parsing confers no authority.
         assert!(!native
             .receive(
                 &mut [0u8; 1],

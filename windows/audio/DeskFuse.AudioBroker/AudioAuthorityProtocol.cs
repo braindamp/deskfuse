@@ -5,6 +5,14 @@ using System.Text;
 namespace DeskFuse.AudioBroker;
 
 internal enum AudioSourceBackend : byte { Committed = 1, OwnedLoopback = 2 }
+internal enum AudioDeliveryMode : byte { Game = 1, Interactive = 2, Streaming = 3 }
+internal static class AudioDeliveryModes
+{
+    internal static void RequireSupported(AudioDeliveryMode mode)
+    {
+        if (mode != AudioDeliveryMode.Game) throw new NotSupportedException("Unsupported audio delivery mode.");
+    }
+}
 internal enum AudioOperationKind : byte { AcquireSource = 1, AttachDelivery = 2, Renew = 3, SupersedeDelivery = 4 }
 internal sealed record AudioLeasePolicy(uint DurationMilliseconds, uint ReconnectGraceMilliseconds)
 {
@@ -32,6 +40,8 @@ internal sealed record AudioDeliveryIntent(ulong Generation, byte[] NativeCertif
 /// <summary>Immutable canonical resource, encoded before entering authority locks.</summary>
 internal sealed class AudioSourceDescriptor
 {
+    // Canonical Source.v1 is Game-only; mode selection never enters the media path.
+    internal AudioDeliveryMode Mode => AudioDeliveryMode.Game;
     private readonly byte[] bytes, digest;
     private readonly AudioAuthorityIdentity identity;
     private readonly AudioSourceIntent intent;

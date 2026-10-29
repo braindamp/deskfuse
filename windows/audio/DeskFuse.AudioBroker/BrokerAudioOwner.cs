@@ -62,6 +62,11 @@ internal sealed class BrokerAudioOwner
     private readonly Dictionary<Guid, Connection> connections = [];
     private Connection? deliveryOrigin;
     private bool statusSigning;
+    private StopVerification? stopVerification;
+    private AudioSourceStopState stopState;
+    private ulong terminationRevision;
+    private StopStatus? stopStatus;
+    private sealed record StopVerification(Connection Origin, byte[] Transcript, byte[] Signature);
     private readonly Queue<string> replyOrder = new();
     private readonly Dictionary<string, Applied> applied = [];
     private AudioAuthorityPhase phase;
@@ -76,8 +81,10 @@ internal sealed class BrokerAudioOwner
     internal BrokerAudioOwner(BrokerAuthorityState registry, IBrokerAudioWorker worker, IBrokerObservedCaller caller,
         Guid enrollment, TrustedBrokerEnrollmentStore.SpeakerAssociation association, AudioSourceBackend backend,
         AudioLeasePolicy policy, bool minimumPeriod, AudioWireContext wire, byte[] serviceBoot,
-        Func<ulong> suspendInclusive100ns, Func<IssuedBrokerChallenge, byte[]> signChallenge)
+        Func<ulong> suspendInclusive100ns, Func<IssuedBrokerChallenge, byte[]> signChallenge,
+        AudioDeliveryMode mode = AudioDeliveryMode.Game)
     {
+        AudioDeliveryModes.RequireSupported(mode);
         if (serviceBoot is not { Length: 32 } || serviceBoot.All(b => b == 0)) throw new InvalidDataException("Missing service boot identity.");
         this.registry = registry; this.caller = caller; this.worker = worker; clock = suspendInclusive100ns; boot = serviceBoot.ToArray();
         var identity = registry.CaptureAudioIdentity(worker, enrollment); association.RequireMatch(identity);
@@ -139,6 +146,8 @@ internal sealed class BrokerAudioOwner
         { Owner = owner; Incarnation = incarnation; this.native = native.ToArray(); this.phone = phone.ToArray(); this.nonce = nonce.ToArray(); }
         internal bool Matches(AudioDeliveryIntent intent) => native.AsSpan().SequenceEqual(intent.NativeCertificate) &&
             phone.AsSpan().SequenceEqual(intent.PhoneCertificate) && nonce.AsSpan().SequenceEqual(intent.NativeNonce);
+        internal bool Matches(AudioSourceStop stop) => Incarnation == stop.Connection && native.AsSpan().SequenceEqual(stop.NativeCertificate) &&
+            phone.AsSpan().SequenceEqual(stop.PhoneCertificate) && nonce.AsSpan().SequenceEqual(stop.NativeNonce);
     }
     // Called by the registered worker's bound control observer, never from a
     // network-supplied authenticated flag. N3 supplies actual TLS observations.
@@ -151,7 +160,8 @@ internal sealed class BrokerAudioOwner
         lock (gate)
         {
             registry.RequireAudioRegistration(this, caller); RequireLive(Now());
-            if (connections.ContainsKey(incarnation) || connections.Count >= 16) throw new InvalidOperationException("Connection observation capacity/conflict.");
+            var pinnedClosed = stopVerification is { Origin.Closed: true } ? 1 : 0;
+            if (connections.ContainsKey(incarnation) || connections.Count + pinnedClosed >= 16) throw new InvalidOperationException("Connection observation capacity/conflict.");
             var origin = new Connection(this, incarnation, native, phone, nonce); connections.Add(incarnation, origin); return origin;
         }
     }
@@ -333,6 +343,70 @@ internal sealed class BrokerAudioOwner
         }
     }
 
+    // Read-only result lookup. A cache miss must never become authorization
+    // dispatch, reserve a sequence or manufacture a replacement signature.
+    internal Committed? GetAppliedResult(Connection origin, byte[] requestId, byte[] nonce, byte[] signature)
+    {
+        var request = new AudioRequestId(requestId).Bytes;
+        if (nonce is not { Length: 32 } || signature is not { Length: >= 8 and <= 72 }) return null;
+        var nonceCopy = nonce.ToArray(); var proof = signature.ToArray();
+        lock (gate)
+        {
+            RequireLive(Now()); RequireOrigin(origin);
+            if (!applied.TryGetValue(Convert.ToHexString(nonceCopy), out var record) ||
+                !record.Pending.PhoneNonce.AsSpan().SequenceEqual(request) || !record.Signature.AsSpan().SequenceEqual(proof)) return null;
+            var result = Committed.FromRecord(this, record); _ = result.RequireReplyCurrent(); return result;
+        }
+    }
+
+    internal void StopCurrentDelivery(Connection origin, Guid source, ulong generation, byte[] digest, byte[] intent)
+    {
+        if (digest is not { Length: 32 } || intent is not { Length: 32 }) throw new InvalidDataException("Invalid Stop context.");
+        digest = digest.ToArray(); intent = intent.ToArray();
+        if (intent is not { Length: 32 } || intent.All(b => b == 0)) throw new InvalidDataException("Missing Stop intent.");
+        lock (gate)
+        {
+            RequireOrigin(origin);
+            if (delivery is null || !ReferenceEquals(origin, deliveryOrigin) || source != Source.Intent.Grant ||
+                generation != Source.Intent.Generation || !digest.AsSpan().SequenceEqual(Source.Digest))
+                throw new UnauthorizedAccessException("Stop does not name the current delivery's source.");
+            CloseAdmission();
+        }
+    }
+    internal bool StopSignedSource(Connection origin, byte[] envelope)
+    {
+        if (envelope.Length > AudioSourceStopProtocol.MaxRecord + 75) throw new InvalidDataException("Oversized Stop.");
+        var (bytes, signature) = AudioSourceStopProtocol.ParseSignedStop(envelope.ToArray());
+        var stop = AudioSourceStopProtocol.ParseStop(bytes);
+        var target = AudioSourceStopProtocol.Target(Source, boot);
+        if (!AudioSourceStopProtocol.SameTarget(stop.Target, target)) throw new UnauthorizedAccessException("Foreign source Stop.");
+        (byte[] Key, byte[] Record, ulong Revision) facts; StopVerification job;
+        lock (gate)
+        {
+            RequireObserved(origin);
+            if (!origin.Matches(stop)) throw new UnauthorizedAccessException("Stop connection facts do not match trusted ingress.");
+            if (stopVerification is not null) throw new InvalidOperationException("Source Stop verification is in progress.");
+            facts = registry.WithAudioStopFacts(this, caller, (key, record, rev) => (key, record, rev));
+            job = new(origin, bytes, signature); stopVerification = job;
+        }
+        try
+        {
+            if (!EnrollmentProtocol.Verify(facts.Key, bytes, signature)) return false;
+            lock (gate)
+            {
+                // The observation stays pinned by job even if connection closure
+                // removes it from the live map. It grants only this exact denial.
+                return registry.WithAudioStopFacts(this, caller, (key, record, rev) =>
+                {
+                    if (rev != facts.Revision || !key.AsSpan().SequenceEqual(facts.Key) || !record.AsSpan().SequenceEqual(facts.Record))
+                        throw new UnauthorizedAccessException("Source enrollment changed while verifying Stop.");
+                    CloseAdmission(); return true;
+                });
+            }
+        }
+        finally { lock (gate) { if (ReferenceEquals(stopVerification, job)) stopVerification = null; } }
+    }
+
     internal void RequirePreparation(Committed acquisition)
     {
         lock (gate)
@@ -403,12 +477,52 @@ internal sealed class BrokerAudioOwner
     {
         lock (gate)
         {
+            if (stopState == AudioSourceStopState.Unknown) { stopState = AudioSourceStopState.Denied; terminationRevision = 1; }
             if (phase == AudioAuthorityPhase.Closed) return;
             phase = AudioAuthorityPhase.Closed; ready = false;
             if (revision != ulong.MaxValue) revision++;
             if (active is { Result: null } p) Retire(p);
             Publish(); // Restrictive local fence; this does not assert physical cleanup.
         }
+    }
+
+    internal sealed class StopStatus
+    {
+        private readonly byte[] bytes;
+        private StopStatus(byte[] bytes) => this.bytes = bytes;
+        internal bool Signing, Attempted;
+        internal byte[]? Reply;
+        internal AudioSourceStopStatus Snapshot => AudioSourceStopProtocol.ParseStatus(bytes);
+        internal static StopStatus FromOwner(BrokerAudioOwner owner, byte[] query) => new(AudioSourceStopProtocol.Status(
+            new(query, AudioSourceStopProtocol.Target(owner.Source, owner.boot), owner.terminationRevision, owner.stopState)));
+    }
+    // Public read-only terminal metadata can outlive the exact worker. It
+    // neither restores registration nor claims physical cleanup from a fence.
+    internal byte[] SignedStopStatus(byte[] query, Func<StopStatus, byte[]> signer)
+    {
+        if (query is not { Length: 32 }) throw new InvalidDataException("Missing Stop status query.");
+        query = query.ToArray();
+        if (query is not { Length: 32 } || query.All(b => b == 0)) throw new InvalidDataException("Missing Stop status query.");
+        StopStatus value;
+        lock (gate)
+        {
+            if (stopStatus is { Signing: true }) throw new InvalidOperationException("Stop status signing is in progress.");
+            if (stopStatus is not null && stopStatus.Snapshot.Query.AsSpan().SequenceEqual(query))
+            {
+                if (stopStatus.Reply is not null) return stopStatus.Reply.ToArray();
+                if (stopStatus.Attempted) throw new IOException("Stop status signing is unconfirmed.");
+            }
+            else stopStatus = StopStatus.FromOwner(this, query);
+            value = stopStatus; value.Signing = value.Attempted = true;
+        }
+        try
+        {
+            var signature = signer(value);
+            if (signature is not { Length: >= 8 and <= 72 }) throw new InvalidDataException("Invalid Stop status signature.");
+            var reply = EnrollmentFraming.Signed(AudioSourceStopProtocol.Status(value.Snapshot), signature);
+            lock (gate) { value.Reply = reply; return reply.ToArray(); }
+        }
+        finally { lock (gate) value.Signing = false; }
     }
     internal AudioOwnerSnapshot Snapshot()
     {

@@ -11,8 +11,19 @@ internal enum class AudioOperation(val wire: Int, val broker: BrokerOperation) {
     RENEW(3, BrokerOperation.RENEW), SUPERSEDE_DELIVERY(4, BrokerOperation.SUPERSEDE),
 }
 
+/** Setup only. Source.v1 has exactly the Game contract, with no per-packet selector. */
+internal enum class AudioDeliveryMode(val wire: Int) {
+    GAME(1), INTERACTIVE(2), STREAMING(3);
+    companion object {
+        fun requireSupported(wire: Int): AudioDeliveryMode {
+            require(wire == GAME.wire) { "Unsupported audio delivery mode" }; return GAME
+        }
+    }
+}
+
 /** Frozen descriptor. Its Windows endpoint/association is vouched for by the root challenge. */
 internal class AudioSourceApproval(bytes: ByteArray) {
+    val mode: AudioDeliveryMode get() = AudioDeliveryMode.GAME
     private val canonical = bytes.copyOf()
     private val digest = TrustedEnrollmentProtocol.hash(canonical)
     private val input = AudioReader(canonical, "Source")

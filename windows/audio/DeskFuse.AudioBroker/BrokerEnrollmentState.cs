@@ -336,6 +336,25 @@ internal sealed class BrokerAuthorityState(IBrokerEnrollments enrollments)
             registrations[worker.Registration].Audio = owner;
         }
     }
+    // Negative admission deliberately excludes positive audio revision/deadline
+    // checks. Enrollment, key and real worker/subject custody remain mandatory.
+    internal T WithAudioStopFacts<T>(BrokerAudioOwner owner, IBrokerObservedCaller caller,
+        Func<byte[], byte[], ulong, T> action)
+    {
+        lock (gate)
+        {
+            RequireAudioRegistration(owner, caller);
+            var registration = registrations[owner.Source.Identity.Worker];
+            var enrolled = ReadEnrolled(registration.Enrollment);
+            var identity = owner.Source.Identity;
+            if (enrolled.EnrollmentId != identity.Enrollment || enrolled.StorageNamespace != identity.Namespace ||
+                !enrolled.HostIdentitySha256.AsSpan().SequenceEqual(identity.Host) ||
+                !enrolled.PeerIdentity.AsSpan().SequenceEqual(identity.Peer) ||
+                !enrolled.SubjectUserSid!.AsSpan().SequenceEqual(identity.Subject))
+                throw new UnauthorizedAccessException("Source Stop is outside its protected enrollment.");
+            return action(enrolled.SigningSpki.ToArray(), enrolled.ImmutableRecordSha256!.ToArray(), registration.Revision);
+        }
+    }
     internal T WithAudioCurrent<T>(BrokerAudioOwner owner, IBrokerObservedCaller caller, Func<T> publish)
     {
         var source = owner.Source;

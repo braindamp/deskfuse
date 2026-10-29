@@ -165,6 +165,39 @@ public sealed class TrustedEnrollmentProtocolTests
         var queryThree = Convert.FromHexString((await process.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(30)))!);
         await SendRequestStatus(RequestStatus(queryThree, 3) with { ActiveRequest = retiredRequest, Stage = AudioRequestStage.Retiring,
             ActiveKind = AudioOperationKind.Renew, ProofExpiryMilliseconds = 11000 });
+        var replacement = new AudioDeliveryDescriptor(audioSource, SHA256.HashData(audioBinding), new(2,
+            Enumerable.Repeat((byte)10, 32).ToArray(), Enumerable.Repeat((byte)11, 32).ToArray(),
+            Request(4), Enumerable.Repeat((byte)13, 32).ToArray()));
+        var replacementContext = new BrokerProofContext(Offer.PeerIdentity, replacement.Digest, BrokerProofOperation.Supersede, BrokerProofScope.Speaker,
+            Id, User, Logon, 42, 1, 101, 200, 2, new(binding.HostSha256, binding.AuthorityNamespace, binding.EnrollmentId, User));
+        var replacementBinding = new AudioProofBinding(audioBoot, audioSource.Intent.Grant, 1, audioSource.Digest,
+            AudioOperationKind.SupersedeDelivery, Request(4), 3, 112000000);
+        var replacementChallenge = challenges.Issue(replacementContext, parsed.PhoneSpki, 1000, replacementBinding, 11000);
+        foreach (var value in new[] { replacement.Bytes, replacementChallenge.Transcript, SignChallenge(replacementChallenge) })
+            await process.StandardInput.WriteLineAsync(Convert.ToHexString(value));
+        var replacementProof = Convert.FromHexString((await process.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(30)))!);
+        Assert.True(challenges.Consume(replacementChallenge.Nonce, replacementProof, replacementContext, parsed.PhoneSpki, out _, replacementBinding));
+        var replacementQuery = Convert.FromHexString((await process.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(30)))!);
+        await SendRequestStatus(RequestStatus(replacementQuery, 4) with { DeliveryGeneration = 2, DeliveryDigest = replacement.Digest, Revision = 4, Until = 112000000 });
+        var lookup = Convert.FromHexString((await process.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(30)))!);
+        Assert.Equal(Request(4), lookup[..32]); Assert.Equal(replacementChallenge.Nonce, lookup[32..64]);
+        Assert.Equal(replacementProof.Length, lookup[64]); Assert.Equal(replacementProof, lookup[65..]);
+        var replacementReceipt = AudioAuthorityProtocol.Receipt(new(AudioOperationKind.SupersedeDelivery, binding.HostSha256, binding.AuthorityNamespace,
+            binding.EnrollmentId, audioBoot, Id, audioSource.Intent.Grant, 1, audioSource.Digest, replacement.Digest, 2, 4, 112000000,
+            SHA256.HashData(replacementChallenge.Transcript), Request(4), 4000000));
+        await process.StandardInput.WriteLineAsync(Convert.ToHexString(EnrollmentFraming.Signed(replacementReceipt, SignRoot(replacementReceipt))));
+        Assert.Equal("AUDIO_HANDOVER_RESULT_PASS", await process.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(30)));
+        var sourceStop = AudioSourceStopProtocol.ParseSignedStop(Convert.FromHexString((await process.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(30)))!));
+        var stopValue = AudioSourceStopProtocol.ParseStop(sourceStop.Transcript);
+        Assert.True(AudioSourceStopProtocol.SameTarget(AudioSourceStopProtocol.Target(audioSource, audioBoot), stopValue.Target));
+        Assert.Equal(Guid.Parse("99998888-7777-6666-5555-444433332222"), stopValue.Connection);
+        Assert.Equal(Enumerable.Repeat((byte)10, 32).ToArray(), stopValue.NativeCertificate);
+        Assert.True(EnrollmentProtocol.Verify(parsed.PhoneSpki, sourceStop.Transcript, sourceStop.Signature));
+        var stopQuery = AudioSourceStopProtocol.ParseStatusQuery(Convert.FromHexString((await process.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(30)))!));
+        Assert.True(AudioSourceStopProtocol.SameTarget(stopValue.Target, stopQuery.Target));
+        var stopStatus = AudioSourceStopProtocol.Status(new(stopQuery.Query, stopQuery.Target, 1, AudioSourceStopState.Denied));
+        await process.StandardInput.WriteLineAsync(Convert.ToHexString(EnrollmentFraming.Signed(stopStatus, SignRoot(stopStatus))));
+        Assert.Equal("AUDIO_SOURCE_STOP_PASS", await process.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(30)));
         Assert.Equal("AUDIO_STATUS_PASS", await process.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(30)));
         Assert.Throws<InvalidDataException>(() => new BrokerProofContext(Offer.PeerIdentity, new byte[32], BrokerProofOperation.Acquire,
             BrokerProofScope.Speaker, Id, User, Logon, 42, 1, 101, 200, 1,

@@ -11,6 +11,156 @@ namespace FocusWindow.Tests;
 public sealed class AudioAuthorityTests
 {
     [Fact]
+    public void Source_Stop_vector_is_canonical_bounded_and_independent_of_grant_receipts()
+    {
+        using var f = JsonDocument.Parse(File.ReadAllBytes(Path.Combine(AppContext.BaseDirectory, "Fixtures", "audio-source-stop-v1.json")));
+        byte[] Bytes(string key) => Convert.FromHexString(f.RootElement.GetProperty(key).GetString()!);
+        var bytes = Bytes("stopHex"); var value = AudioSourceStopProtocol.ParseStop(bytes);
+        Assert.Equal(bytes, AudioSourceStopProtocol.Stop(value)); Assert.Equal(7UL, value.Target.SourceGeneration);
+        var status = AudioSourceStopProtocol.ParseStatus(Bytes("statusHex")); Assert.Equal(AudioSourceStopState.Denied, status.State);
+        Assert.Equal(Bytes("statusHex"), AudioSourceStopProtocol.Status(status));
+        Assert.Throws<InvalidDataException>(() => AudioAuthorityProtocol.ParseReceipt(Bytes("statusHex")));
+        var query = AudioSourceStopProtocol.ParseStatusQuery(Bytes("statusQueryHex"));
+        Assert.Equal(Bytes("statusQueryHex"), AudioSourceStopProtocol.StatusQuery(query.Query, query.Target));
+        var signed = AudioSourceStopProtocol.ParseSignedStop(Bytes("signedStopHex"));
+        Assert.Equal(bytes, signed.Transcript); Assert.Equal(Bytes("signedStopHex"), AudioSourceStopProtocol.SignedStop(signed.Transcript, signed.Signature));
+        for (var n = 0; n < bytes.Length; n++) Assert.Throws<InvalidDataException>(() => AudioSourceStopProtocol.ParseStop(bytes[..n]));
+        Assert.Throws<InvalidDataException>(() => AudioSourceStopProtocol.ParseStop(bytes.Concat(new byte[] { 0 }).ToArray()));
+        Assert.Throws<InvalidDataException>(() => AudioSourceStopProtocol.Status(status with { Revision = 0 }));
+        Assert.Throws<InvalidDataException>(() => AudioSourceStopProtocol.SignedStop(bytes, new byte[73]));
+    }
+    private static byte[] StopEnvelope(Fixture f, AudioSourceStop? stop = null)
+    {
+        stop ??= new(AudioSourceStopProtocol.Target(f.Owner.Source, Nonce(3)), Nonce(90), f.Origin.Incarnation, Nonce(4), Nonce(5), Nonce(6));
+        var bytes = AudioSourceStopProtocol.Stop(stop); return AudioSourceStopProtocol.SignedStop(bytes, f.Persistence.SignPhone(bytes));
+    }
+    [Fact]
+    public void Signed_Stop_before_Acquire_and_after_lost_Acquire_receipt_is_negative_only()
+    {
+        using (var f = new Fixture())
+        {
+            Assert.True(f.Owner.StopSignedSource(f.Origin, StopEnvelope(f)));
+            Assert.Equal(AudioAuthorityPhase.Closed, f.Owner.Snapshot().Phase);
+            Assert.Equal((0UL, 0, 0, 0), f.Owner.RequestCounts);
+            Assert.Throws<UnauthorizedAccessException>(() => f.Acquire());
+        }
+        using var admitted = new Fixture(); var operation = admitted.Acquire(false);
+        Assert.True(admitted.Owner.StopSignedSource(admitted.Origin, StopEnvelope(admitted)));
+        Assert.Throws<UnauthorizedAccessException>(() => operation.SignedReceipt(new Signer(admitted)));
+        Assert.Throws<UnauthorizedAccessException>(() => admitted.Owner.ClaimPreparation(operation));
+        var reply = admitted.Owner.SignedStopStatus(Nonce(91), s => admitted.Persistence.SignHost(AudioSourceStopProtocol.Status(s.Snapshot)));
+        var status = AudioSourceStopProtocol.ParseStatus(EnrollmentFraming.ParseSigned(reply).Message);
+        Assert.Equal(AudioSourceStopState.Denied, status.State); Assert.Equal(1UL, status.Revision);
+        Assert.Equal(Nonce(91), status.Query); // Denial does not pretend actual native rundown completed.
+    }
+    [Fact]
+    public async Task Source_Stop_does_not_wait_for_a_positive_challenge_signer()
+    {
+        using var f = new Fixture(); using var entered = new ManualResetEventSlim(); using var release = new ManualResetEventSlim();
+        f.BeforeChallengeSign = () => { entered.Set(); Assert.True(release.Wait(10000)); };
+        var issuance = Task.Run(() => Record.Exception(() => f.Owner.Issue(f.Origin, AudioOperationKind.AcquireSource, Request(1), 1000)));
+        try
+        {
+            Assert.True(entered.Wait(10000));
+            Assert.True(await Task.Run(() => f.Owner.StopSignedSource(f.Origin, StopEnvelope(f))).WaitAsync(TimeSpan.FromSeconds(5)));
+            Assert.Equal(AudioAuthorityPhase.Closed, f.Owner.Snapshot().Phase); release.Set();
+            Assert.IsType<UnauthorizedAccessException>(await issuance.WaitAsync(TimeSpan.FromSeconds(10)));
+            Assert.Equal(0, f.Owner.RequestCounts.BrokerNonces);
+        }
+        finally { release.Set(); }
+    }
+    [Fact]
+    public void Captured_negative_observation_survives_connection_closure_at_final_admission()
+    {
+        using var f = new Fixture(); f.Acquire(); var calls = 0;
+        f.BeforeCallerMatch = () => { if (++calls == 2) f.Owner.ConnectionClosed(f.Origin); };
+        Assert.True(f.Owner.StopSignedSource(f.Origin, StopEnvelope(f)));
+        Assert.True(f.Origin.Closed); Assert.Equal(AudioAuthorityPhase.Closed, f.Owner.Snapshot().Phase);
+    }
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)] [InlineData(4)] [InlineData(5)] [InlineData(6)]
+    public void Enrolled_signature_cannot_stop_a_foreign_source_or_connection(int change)
+    {
+        using var f = new Fixture(); f.Attach();
+        var stop = AudioSourceStopProtocol.ParseStop(AudioSourceStopProtocol.ParseSignedStop(StopEnvelope(f)).Transcript);
+        stop = change switch {
+            0 => stop with { Target = stop.Target with { DeviceKey = Guid.NewGuid() } },
+            1 => stop with { Target = stop.Target with { SourceGeneration = 2 } },
+            2 => stop with { Target = stop.Target with { Boot = Nonce(50) } },
+            3 => stop with { Connection = Guid.NewGuid() },
+            4 => stop with { NativeCertificate = Nonce(50) },
+            5 => stop with { PhoneCertificate = Nonce(50) },
+            _ => stop with { NativeNonce = Nonce(50) }
+        };
+        Assert.Throws<UnauthorizedAccessException>(() => f.Owner.StopSignedSource(f.Origin, StopEnvelope(f, stop)));
+        Assert.NotEqual(AudioAuthorityPhase.Closed, f.Owner.Snapshot().Phase);
+    }
+    [Fact]
+    public void Invalid_Stop_signature_does_not_deny_and_fast_Stop_requires_current_delivery()
+    {
+        using var f = new Fixture(); f.Attach(); var bytes = AudioSourceStopProtocol.ParseSignedStop(StopEnvelope(f)).Transcript;
+        using var wrong = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        Assert.False(f.Owner.StopSignedSource(f.Origin, AudioSourceStopProtocol.SignedStop(bytes,
+            wrong.SignData(bytes, HashAlgorithmName.SHA256, DSASignatureFormat.Rfc3279DerSequence))));
+        var candidate = f.NewConnection(8, 9, 10);
+        Assert.Throws<UnauthorizedAccessException>(() => f.Owner.StopCurrentDelivery(candidate, f.Owner.Source.Intent.Grant, 1, f.Owner.Source.Digest, Nonce(90)));
+        f.Owner.OutputChanged(1, 1, true); // A benign revision must not defeat source Stop.
+        f.Owner.StopCurrentDelivery(f.Origin, f.Owner.Source.Intent.Grant, 1, f.Owner.Source.Digest, Nonce(90));
+        Assert.Equal(AudioAuthorityPhase.Closed, f.Owner.Snapshot().Phase);
+    }
+    [Fact]
+    public void Stop_status_has_exact_query_retries_and_no_cleanup_success_from_a_fence()
+    {
+        using var f = new Fixture(); f.Acquire(); var calls = 0;
+        byte[] Sign(BrokerAudioOwner.StopStatus status) { calls++; return f.Persistence.SignHost(AudioSourceStopProtocol.Status(status.Snapshot)); }
+        var unknown = f.Owner.SignedStopStatus(Nonce(91), Sign);
+        Assert.Equal(AudioSourceStopState.Unknown, AudioSourceStopProtocol.ParseStatus(EnrollmentFraming.ParseSigned(unknown).Message).State);
+        f.Owner.CloseAdmission();
+        Assert.Equal(unknown, f.Owner.SignedStopStatus(Nonce(91), Sign)); Assert.Equal(1, calls);
+        var denied = f.Owner.SignedStopStatus(Nonce(92), Sign);
+        Assert.Equal(AudioSourceStopState.Denied, AudioSourceStopProtocol.ParseStatus(EnrollmentFraming.ParseSigned(denied).Message).State);
+        Assert.Equal(2, calls);
+        Assert.Throws<IOException>(() => f.Owner.SignedStopStatus(Nonce(93), _ => throw new IOException("Uncertain signer")));
+        Assert.Throws<IOException>(() => f.Owner.SignedStopStatus(Nonce(93), Sign)); Assert.Equal(2, calls);
+    }
+    [Theory]
+    [InlineData(0)] [InlineData(2)] [InlineData(3)] [InlineData(255)]
+    public void Unsupported_modes_cannot_reach_storage_or_native_launch(byte mode)
+    {
+        using var persistence = new EnrollmentDurabilityTests.Fixture(); using var store = persistence.Open();
+        Assert.Throws<NotSupportedException>(() => store.GetSpeakerAssociation(persistence.Id, (AudioDeliveryMode)mode));
+        Assert.Empty(persistence.Associations);
+        Assert.Throws<NotSupportedException>(() => new BrokerWorkerLauncher().LaunchAudio(null!, null!, (AudioDeliveryMode)mode));
+    }
+
+    [Fact]
+    public void Applied_result_recovery_is_read_only_exact_and_current_target_bound()
+    {
+        using var f = new Fixture(); f.Attach(); var old = f.Origin;
+        var target = f.Owner.PrepareDelivery(new(2, Nonce(10), Nonce(11), Request(3), Nonce(13)), f.NewConnection(10, 11, 13));
+        var challenge = f.Owner.Issue(old, AudioOperationKind.SupersedeDelivery, Request(3), 1000, target);
+        var proof = f.Persistence.SignPhone(challenge.Transcript); var before = f.Owner.RequestCounts;
+        Assert.Null(f.Owner.GetAppliedResult(old, Request(3), challenge.Nonce, proof));
+        Assert.Throws<UnauthorizedAccessException>(() => f.Owner.GetAppliedResult(target.Connection!, Request(3), challenge.Nonce, proof));
+        Assert.Equal(before, f.Owner.RequestCounts);
+        var committed = f.Owner.Admit(old, challenge.Nonce, proof)!; // Its normal acknowledgement is lost.
+        Assert.Throws<UnauthorizedAccessException>(() => f.Owner.GetAppliedResult(old, Request(3), challenge.Nonce, proof));
+        var appliedCounts = f.Owner.RequestCounts;
+        Assert.Null(f.Owner.GetAppliedResult(target.Connection!, Request(3, 9), challenge.Nonce, proof));
+        Assert.Null(f.Owner.GetAppliedResult(target.Connection!, Request(3), Nonce(99), proof));
+        Assert.Null(f.Owner.GetAppliedResult(target.Connection!, Request(3), challenge.Nonce, proof[..^1]));
+        Assert.Equal(appliedCounts, f.Owner.RequestCounts);
+        Assert.Same(committed, f.Owner.GetAppliedResult(target.Connection!, Request(3), challenge.Nonce, proof));
+        var signer = new Signer(f); var receipt = committed.SignedReceipt(signer);
+        f.Owner.ConnectionClosed(old); f.Now += 10000;
+        Assert.Equal(receipt, f.Owner.GetAppliedResult(target.Connection!, Request(3), challenge.Nonce, proof)!.SignedReceipt(signer));
+        Assert.Equal(1, signer.Calls); Assert.Equal(2UL, f.Owner.Snapshot().DeliveryGeneration);
+        Assert.Equal(3UL, f.Owner.RequestCounts.IssuedThrough);
+        f.Owner.CloseAdmission();
+        Assert.Throws<UnauthorizedAccessException>(() => f.Owner.GetAppliedResult(target.Connection!, Request(3), challenge.Nonce, proof));
+    }
+
+    [Fact]
     public void Native_transport_vector_uses_the_actual_canonical_source_binding_and_delivery()
     {
         using var fixture = JsonDocument.Parse(File.ReadAllBytes(Path.Combine(AppContext.BaseDirectory, "Fixtures", "audio-transport-v1.json")));
@@ -361,8 +511,8 @@ public sealed class AudioAuthorityTests
         public byte[] InstalledProfileSha256 => Nonce(7);
         public bool IsAlive() => true;
     }
-    private sealed class Caller(IBrokerRegisteredWorker worker) : IBrokerObservedCaller
-    { public bool Matches(IBrokerRegisteredWorker actual) => ReferenceEquals(worker, actual); }
+    private sealed class Caller(IBrokerRegisteredWorker worker, Action? before = null) : IBrokerObservedCaller
+    { public bool Matches(IBrokerRegisteredWorker actual) { before?.Invoke(); return ReferenceEquals(worker, actual); } }
     private sealed class Signer(Fixture fixture, Action? before = null) : IAudioGrantSigner
     {
         internal int Calls;
@@ -381,12 +531,13 @@ public sealed class AudioAuthorityTests
         internal byte[]? LastProof;
         internal Action? BeforeClockRead;
         internal Action? BeforeChallengeSign;
+        internal Action? BeforeCallerMatch;
         internal BrokerAudioOwner.Committed? Acquisition;
         internal AudioObservedSource Observed => new(Owner.Source.Intent.DeviceKey, "owned-endpoint", Guid.NewGuid(), 2, 0x2026102502, 1, 7);
         internal Fixture()
         {
             store = Persistence.Open(); Registry = new(store); worker = new Worker();
-            Owner = new(Registry, worker, new Caller(worker), Persistence.Id, store.GetSpeakerAssociation(Persistence.Id), AudioSourceBackend.Committed,
+            Owner = new(Registry, worker, new Caller(worker, () => BeforeCallerMatch?.Invoke()), Persistence.Id, store.GetSpeakerAssociation(Persistence.Id), AudioSourceBackend.Committed,
                 new(1000, 200), false, new(2, 3, 4), Nonce(3), () => { var hook = BeforeClockRead; BeforeClockRead = null; hook?.Invoke(); return Now; },
                 challenge => { BeforeChallengeSign?.Invoke(); return Persistence.SignHost(AudioRequestProtocol.ChallengeMessage(challenge.Transcript)); });
             Origin = NewConnection(4, 5, 6);

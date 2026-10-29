@@ -168,6 +168,13 @@ internal sealed class BrokerHostIdentity : IDisposable, IEnrollmentHostSigner, I
         RequireOwnAudioIdentity(snapshot.Identity);
         return Sign(AudioRequestProtocol.Status(snapshot));
     }
+    internal byte[] SignAudioSourceStopStatus(BrokerAudioOwner.StopStatus status)
+    {
+        var value = status.Snapshot;
+        if (value.Target.Namespace != NamespaceId || !value.Target.Host.AsSpan().SequenceEqual(record.HostSha256))
+            throw new UnauthorizedAccessException("Foreign source Stop status.");
+        return Sign(AudioSourceStopProtocol.Status(value));
+    }
     private void RequireOwnAudioIdentity(AudioAuthorityIdentity identity)
     {
         if (!identity.Host.AsSpan().SequenceEqual(record.HostSha256) || identity.Namespace != NamespaceId || identity.Enrollment == Guid.Empty)
