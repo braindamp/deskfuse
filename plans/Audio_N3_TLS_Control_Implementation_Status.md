@@ -2,9 +2,10 @@
 
 29 October 2026, High. **N3 is partial, production authority disabled.**
 The focused [Ultra design](Audio_Stop_Game_And_Handover_High_Handoff.md) now
-selects negative-only source Stop and Game-only current mode admission. These
-remain design only; its handover topic awaits Arena research before the full
-three-topic handoff is complete. The original v0.6 programme, native ownership
+selects negative-only source Stop, Game-only current mode admission and the
+[reviewed cellular handover](Audio_Handover_Reviewed_High_Decision.md). All three
+designs are selected for High; their implementation remains open. The original
+v0.6 programme, native ownership
 handoff and accepted N2 retention decision remain authoritative.
 
 ## Completed this iteration

@@ -2,8 +2,9 @@
 
 **Subsequent Ultra design, 29 October:** the negative-only source Stop decision
 is selected in [the focused High handoff](Audio_Stop_Game_And_Handover_High_Handoff.md).
-It is not implemented. That handoff also defines Game-only current mode semantics;
-its handover topic awaits the user's Arena review. The unresolved wording below
+It is not implemented. That handoff also defines Game-only current mode semantics
+and now includes [reviewed handover](Audio_Handover_Reviewed_High_Decision.md).
+The unresolved wording below
 records the historical High stop, not a second open Stop decision.
 
 29 October 2026. **Decision required; no release protocol selected on High.**

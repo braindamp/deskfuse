@@ -15,7 +15,9 @@ timing/retention contracts explicitly before implementation.
 with setup admission reserving the two future mode names and rejecting them
 until supported. Future buffered modes require a new authenticated source
 version and separately selected owner. No buffering/runtime implementation was
-performed. Handover remains pending [Arena research](Audio_Handover_Arena_Research_Question.md).
+performed. The [reviewed initial handover](Audio_Handover_Reviewed_High_Decision.md)
+now selects one warmed control-only candidate and just-in-time Supersede for
+Game; implementation and physical qualification remain open.
 Let the user choose whether a session prioritizes staying live, preserving
 content while idle, or steady buffered playback. These are delivery/playback
 policies, independent of focused-app versus extended-display mode and of which
@@ -74,8 +76,10 @@ delivery is not guaranteed by the existence of two network types. A reachable
 WAN/relay path remains a separate connectivity prerequisite.
 
 The current N3 foundation uses fixed observed destinations and fresh approved
-replacement deliveries. Seamless overlap/migration, content recovery and any
-retention across delivery changes remain future decisions. Old connection keys,
+replacement deliveries. The reviewed design prepares transport in parallel and
+switches one authorized media delivery at a native retirement barrier. QUIC
+migration, content recovery and buffered retention across delivery changes remain
+future work. Old connection keys,
 queued ciphertext, receipts or IP addresses never authorize the replacement.
 All modes retain explicit Stop/revoke/expiry, bounded reconnect authority and
 actual rundown rules. Buffered playback does not authorize indefinite disconnected
@@ -83,8 +87,8 @@ capture; define revocation's effect on retained content before enabling it.
 
 ### Next design work and evidence
 
-Keep the focused [N3 source-release decision](Audio_N3_Source_Release_Ultra_Stop.md)
-separate so it can finish without a broad playback redesign. Before implementing
+The focused [N3 source-release decision](Audio_Stop_Game_And_Handover_High_Handoff.md)
+and initial Game handover are selected for High. Before implementing
 DI-001, use a focused design pass to choose retention location/format, recovery
 transport, limits, input catch-up rules, accelerated A/V playout and mode changes.
 Extend the accepted freshness contract explicitly for delayed playback; keep

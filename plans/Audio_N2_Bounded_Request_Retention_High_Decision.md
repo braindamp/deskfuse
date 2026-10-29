@@ -1,5 +1,14 @@
 # N2 bounded request retention — Ultra decision and High handoff
 
+**Subsequent handover review:**
+[Audio_Handover_Reviewed_High_Decision.md](Audio_Handover_Reviewed_High_Decision.md)
+preserves this positive protocol and clarifies exact applied-result recovery on
+the newly current target. A surviving Supersede Pending matching authenticated
+current target/source/boot must reach exact cached receipt recovery before generic
+resync retirement on an empty active slot. The status itself grants no window;
+original identity/signature/first-send anchor and ingress rules remain mandatory.
+This is selected source work for High, not an implemented N2 result.
+
 **High execution update, 29 October:** the focused protocol is implemented and
 offline checked. See [Audio_N2_Bounded_Request_Implementation_Status.md](Audio_N2_Bounded_Request_Implementation_Status.md).
 Continue N3 on High. The decision-pass scope/evidence below is historical and

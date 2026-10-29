@@ -88,7 +88,8 @@ The current port 48235 is an **implementation setting for the local physical lab
 The requested Game / Interactive / Streaming policies, mouse-triggered catch-up
 and accelerated audio/video Live button are recorded as
 [DI-001 in the design improvements backlog](../plans/Design_Improvements_Backlog.md).
-That proposal also requires automatic Wi-Fi/cellular handover and explicit
-content-retention/recovery limits. WAN reachability, path overlap and authenticated
-replacement delivery still need design and implementation; this historical LAN
+The [reviewed initial Game handover](../plans/Audio_Handover_Reviewed_High_Decision.md)
+selects one prepared control-only candidate and a fresh authorized replacement.
+Its implementation/qualification remain open. Broader WAN/relay reachability and
+future buffered content recovery remain separate work; this historical LAN
 runbook does not establish them.

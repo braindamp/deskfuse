@@ -1,10 +1,12 @@
 # Arena research: lean Wi-Fi/cellular handover
 
-29 October 2026. **Research request; handover selection pending external review.**
-The user requested an Arena.ai review before finalizing topic 1 of this Ultra
-design pass. No implementation, build, test or device/network operation is
-authorized by this document. Topics 2 and 3 are selected separately in
-[the focused High handoff](Audio_Stop_Game_And_Handover_High_Handoff.md).
+29 October 2026. **Historical research request; review complete.** The user
+provided the [returned candidate](Audio_Handover_Arena_Candidate_2026-10-29.md).
+The [reviewed Ultra decision](Audio_Handover_Reviewed_High_Decision.md) now selects
+topic 1 and is incorporated in [the focused High handoff](Audio_Stop_Game_And_Handover_High_Handoff.md).
+The question/provisional baseline below records the inputs to that review.
+No implementation, build, test or device/network operation was run by this
+design pass.
 
 ## Question to paste into Arena.ai
 

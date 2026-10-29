@@ -402,6 +402,7 @@ This preserves the original implementation path; production stays disabled.
 
 The subsequent [focused Ultra design](Audio_Stop_Game_And_Handover_High_Handoff.md)
 selects negative-only source Stop and Game-only current source semantics. It is
-documentation only, with no source/build/test change. Wi-Fi/cellular handover
-selection awaits the user's [Arena research](Audio_Handover_Arena_Research_Question.md)
-before the three-topic High handoff is complete.
+documentation only, with no source/build/test change. The returned Arena candidate
+has now been [reviewed and merged into the High plan](Audio_Handover_Reviewed_High_Decision.md).
+All three decisions are selected; return to High for source implementation,
+then the existing separately authorized qualification gates.

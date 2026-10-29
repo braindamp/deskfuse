@@ -1,21 +1,24 @@
 # Audio Stop, Game mode and handover — focused Ultra design
 
-29 October 2026. **Design only.** Checkout `experiment/vnext-audio-latency`, source
-baseline `7859ad6`. No runtime source was changed, built or tested in this pass.
+29 October 2026. **Design only; all three decisions selected for High.**
+Checkout `experiment/vnext-audio-latency`. Stop/Game design baseline `7859ad6`;
+subsequent Arena handover review baseline `7df5216`. No runtime source was
+changed, built or tested in these design passes.
 Architecture v0.6, native ownership, N2 positive request retention and original
 media timing remain in force. Production authority stays disabled.
 
 | Topic | Decision / readiness |
 | --- | --- |
-| 1. Wi-Fi/cellular preparation | Research requested by the user; **pending Arena review**. [Question, verified prerequisites and provisional baseline](Audio_Handover_Arena_Research_Question.md). Final switch/readiness protocol and High handover steps follow that review. |
+| 1. Wi-Fi/cellular preparation | **Selected:** one active media delivery, one bounded control-only candidate and just-in-time Supersede. [Reviewed Arena decision and High steps](Audio_Handover_Reviewed_High_Decision.md) resolve lease transfer, exact outcome recovery and the native switch barrier. |
 | 2. Source Stop before Attach / after loss | **Selected below:** separate negative-only admission, direct current-delivery Stop and a connection-bound enrolled signature for recovery. Ready for focused High implementation after the design pass. |
 | 3. DI-001 modes | **Selected below:** existing source v1 means Game; setup-only mode admission prepares a versioned future buffered path. Interactive/Streaming remain unsupported. |
 
 This resolves the decision in
 [Audio_N3_Source_Release_Ultra_Stop.md](Audio_N3_Source_Release_Ultra_Stop.md).
 Its factual implementation stop remains historical until High implements this
-handoff. Topic 1 remains deliberately provisional; it must not hold up documenting
-the two settled decisions or silently rewrite N2 to park a standby proof.
+handoff. The [original Arena question](Audio_Handover_Arena_Research_Question.md)
+and [returned candidate](Audio_Handover_Arena_Candidate_2026-10-29.md) remain
+provenance. The reviewed decision controls implementation; no parked standby proof.
 
 ## 1. Source Stop is separate negative authority
 
@@ -216,7 +219,22 @@ tracks with pitch-preserving audio. Storage, recovery transport, retention limit
 input catch-up and time-stretch DSP remain that later design/implementation slice.
 Neither mode is advertised or implemented by this High handoff.
 
-## 3. Ordered High implementation
+## 3. Reviewed handover decision
+
+Follow [Audio_Handover_Reviewed_High_Decision.md](Audio_Handover_Reviewed_High_Decision.md)
+for the complete state/owner protocol and H1–H5 source order. Warm only network,
+TLS and public observations. Keep renewal free of a standby reservation. At a
+warranted switch, nominate the actual candidate through the current approved
+delivery, use one fresh N2 Supersede and preserve the same source/renderer.
+
+The reviewed design adds bounded applied-result lookup and corrects phone
+Pending retirement for a lost commit receipt. It explicitly pins/promotes the
+cellular lease, retires old native Egress before new media, and rebinds receiver
+readiness after exact receipt verification. Fresh admitted Supersede retains its
+existing policy-bounded renewal semantics; preparation/status do not extend
+cutoff/grace. QUIC migration and future buffered modes remain deferred.
+
+## 4. Ordered High implementation
 
 1. Add Game-only setup admission and distinct source-Stop/status codecs in
    C#/Kotlin/Rust. Preserve existing canonical vectors byte-for-byte; add shared
@@ -242,11 +260,12 @@ Neither mode is advertised or implemented by this High handoff.
    exact cached attempts, cold cleanup selection and status verification. Actual
    native teardown is N4/N5/N6 integration; expose no false Complete result while
    only an N3 fence/authorization acknowledgement exists.
-7. Implement handover only after topic 1's reviewed selection is appended here.
-   Preserve source wire position, packet/accepted/presented floors and the healthy
-   AAudio/ASRC owner across delivery replacement. `ReceiveFrontier` is currently
-   connection-scoped; moving to a new TLS connection must not rewind its source
-   floor. Rebind receiver readiness to the new delivery/output context.
+7. Implement the reviewed H1–H4 handover steps after the shared control/authority
+   prerequisites above, reusing the same owners. Preserve source wire position,
+   packet/accepted/presented floors and the healthy AAudio/ASRC owner across
+   delivery replacement. `ReceiveFrontier` is currently connection-scoped;
+   moving to new TLS must not rewind source floors. Rebind new delivery readiness.
+   H5 installed/device/performance qualification retains its separate authorization.
 
 Meaningful acceptance cases: Stop before/after Acquire admission with a lost
 receipt; pending renewal/output/handover; blocked positive/root/phone signing;
@@ -255,7 +274,8 @@ adoption; connection closure during verification; fresh-connection retry; revoke
 during verification; late native completion, failed revoke/join and Quarantined;
 query/substitution rejection and Unknown after history retirement. Unsupported
 modes allocate no source/job/request, and Game's original timing/wire behavior
-remains unchanged. Handover cases/measurements are finalized with Arena input.
+remains unchanged. Handover cases/measurements are specified in the reviewed
+decision; SourceStop preempts every handover state and unknown positive outcome.
 
 ## Evidence and scope of this pass
 
@@ -266,5 +286,6 @@ authority/freshness boundaries. Independent read-only reviews covered Stop,
 handover platform facts and mode compatibility. Official Android/quiche sources
 and unresolved handover limits are linked in the research question. No runtime
 source edits, builds/tests, key/service/deployment/device operations or physical
-performance claims were made. Finish Arena review on Ultra before treating the
-three-topic handoff as complete, then return to High implementation.
+performance claims were made. The returned Arena candidate has now been reviewed
+against actual source and incorporated in the linked decision. **The three-topic
+design is complete. Return to High for implementation; production remains disabled.**

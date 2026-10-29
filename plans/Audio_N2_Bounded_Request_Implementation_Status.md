@@ -109,9 +109,10 @@ performance gates remain their existing independent qualification work.
 
 The N2/N5 foundation checkpoint was committed and pushed as `d57d734`.
 N3 TLS/control foundations are now implemented/offline checked; see
-[current N3 status](Audio_N3_TLS_Control_Implementation_Status.md). A focused
-[source-release Ultra decision](Audio_N3_Source_Release_Ultra_Stop.md) is required
-before completing dispatch. The next-step description below remains its overall
+[current N3 status](Audio_N3_TLS_Control_Implementation_Status.md). The focused
+[Stop/Game/handover design](Audio_Stop_Game_And_Handover_High_Handoff.md) is now
+selected for High, including the reviewed Arena recovery corrections. The
+next-step description below remains its overall
 integration scope, not a claim that N3 is complete.
 
 ## Next integration scope
