@@ -138,6 +138,7 @@ pub struct ControlConnection {
     last_now: u64,
     retired: bool,
     approved: Option<Approved>,
+    pinned_request: Option<[u8; 32]>,
     decoder: Decoder,
     read_backlog: VecDeque<Record>,
     writes: VecDeque<QueuedControl>,
@@ -173,6 +174,7 @@ impl ControlConnection {
             last_now: 0,
             retired: false,
             approved: None,
+            pinned_request: None,
             decoder: Decoder::default(),
             read_backlog: VecDeque::new(),
             writes: VecDeque::new(),
@@ -231,6 +233,145 @@ impl ControlConnection {
         self.advance(now)?;
         Ok(self.observation.clone())
     }
+    // Routing hint only; receive() still verifies the fixed path and QUIC/TLS.
+    // The single listener reader uses this before dispatching a borrowed active
+    // packet or a bounded copied candidate packet. No second UDP reader.
+    pub fn routes(&self, destination: &[u8], info: quiche::RecvInfo) -> bool {
+        !self.retired
+            && info.from == self.peer
+            && info.to == self.local
+            && self.conn.source_ids().any(|id| id.as_ref() == destination)
+    }
+    pub(crate) fn native_unapproved(&self) -> bool {
+        self.role == Role::Native && !self.retired && self.approved.is_none()
+    }
+    pub(crate) fn control_work_pending(&self) -> bool {
+        !self.read_backlog.is_empty() || self.conn.readable().next().is_some()
+    }
+    pub(crate) fn reply_capacity(&self, negative: bool) -> bool {
+        self.role == Role::Native
+            && !self.retired
+            && self.facts.is_some()
+            && self.write_capacity(negative)
+    }
+    /// Candidate-only bounded egress. Reuses the existing immutable sealed
+    /// slot without changing the active media reactor's service path.
+    pub(crate) fn service_candidate_egress(
+        &mut self,
+        socket: &UdpSocket,
+        writable: bool,
+        now: u64,
+        remaining_bytes: u64,
+        remaining_packets: u32,
+        work_limit: usize,
+    ) -> io::Result<(u64, u32, bool)> {
+        self.advance(now)?;
+        if !self.native_unapproved() || work_limit == 0 || work_limit > MAX_PENDING {
+            return Err(denied());
+        }
+        self.flush_stream()?;
+        let mut work = 0usize;
+        let mut yielded = false;
+        let mut sent_bytes = 0u64;
+        let mut sent_packets = 0u32;
+        let result = self.egress.service_with_io(
+            self.local,
+            &mut self.conn,
+            writable,
+            |_| {
+                if work >= work_limit {
+                    yielded = true;
+                    return Err(io::Error::from(io::ErrorKind::WouldBlock).into());
+                }
+                work += 1;
+                Ok(())
+            },
+            |bytes, to| {
+                if sent_packets >= remaining_packets
+                    || bytes.len() as u64 > remaining_bytes.saturating_sub(sent_bytes)
+                {
+                    return Err(denied());
+                }
+                let n = socket.send_to(bytes, to)?;
+                if n == bytes.len() {
+                    sent_bytes += n as u64;
+                    sent_packets += 1;
+                }
+                Ok(n)
+            },
+        );
+        if let Err(error) = result {
+            if !yielded {
+                return Err(io::Error::other(error.to_string()));
+            }
+        }
+        Ok((sent_bytes, sent_packets, yielded))
+    }
+    /// Custody only. The source owner supplies its actually current broker
+    /// projection before forwarding a possibly committing Issue. This cannot
+    /// admit PCM, create a positive reservation, or extend parent authority.
+    pub fn pin_candidate(
+        &mut self,
+        scope: &SourceScope,
+        parent: &ControlGrant,
+        request: [u8; 32],
+        now: u64,
+    ) -> io::Result<()> {
+        self.advance(now)?;
+        if !self.native_unapproved()
+            || self.observation.is_none()
+            || !scope.matches(parent)
+            || parent.closed
+            || parent.binding == [0; 32]
+            || now >= parent.until
+            || u64::from_be_bytes(request[..8].try_into().unwrap()) == 0
+            || request[8..].iter().all(|b| *b == 0)
+            || self.pinned_request.is_some_and(|old| old != request)
+        {
+            return Err(denied());
+        }
+        if self.pinned_request.is_some() {
+            return Ok(());
+        } // Retry never re-anchors/extends custody.
+          // Warm TTL cannot free a route while its positive outcome is uncertain.
+          // Source expiry/Stop still dominate and can never be revived by pinning.
+        self.deadline = parent.until;
+        self.pinned_request = Some(request);
+        Ok(())
+    }
+    pub fn discard_quarantined_datagrams(&mut self, now: u64, budget: usize) -> io::Result<usize> {
+        self.advance(now)?;
+        if !self.native_unapproved() || budget == 0 || budget > MAX_PENDING {
+            return Err(denied());
+        }
+        self.discard_staged_datagrams(now, budget)
+    }
+    // Negative-only cleanup for packets captured while quarantined but moved
+    // with an approved connection. Staged input must never become PCM/recovery
+    // data merely because transfer completed before it was decrypted.
+    pub(crate) fn discard_staged_datagrams(
+        &mut self,
+        now: u64,
+        budget: usize,
+    ) -> io::Result<usize> {
+        self.advance(now)?;
+        if self.role != Role::Native || budget == 0 || budget > MAX_PENDING {
+            return Err(denied());
+        }
+        let mut scratch = [0u8; 1350];
+        let mut dropped = 0;
+        for _ in 0..budget {
+            match self.conn.dgram_recv(&mut scratch) {
+                Ok(_) => dropped += 1,
+                Err(quiche::Error::Done) => break,
+                Err(_) => {
+                    self.retire();
+                    return Err(denied());
+                }
+            }
+        }
+        Ok(dropped)
+    }
     pub fn receive(
         &mut self,
         packet: &mut [u8],
@@ -258,12 +399,22 @@ impl ControlConnection {
         Ok(true)
     }
     pub fn read_control(&mut self, now: u64) -> io::Result<Vec<Record>> {
+        self.read_control_limited(now, MAX_PENDING)
+    }
+    pub(crate) fn read_control_limited(
+        &mut self,
+        now: u64,
+        limit: usize,
+    ) -> io::Result<Vec<Record>> {
+        if limit == 0 || limit > MAX_PENDING {
+            return Err(wire::invalid());
+        }
         self.advance(now)?;
         if self.facts.is_none() {
             return Ok(vec![]);
         }
         let mut result = Vec::with_capacity(MAX_PENDING);
-        while result.len() < MAX_PENDING {
+        while result.len() < limit {
             if let Some(record) = self.read_backlog.pop_front() {
                 result.push(record);
                 continue;
@@ -308,7 +459,7 @@ impl ControlConnection {
                         self.retire();
                         return Err(e);
                     }
-                    if result.len() < MAX_PENDING {
+                    if result.len() < limit {
                         result.push(record)
                     } else if self.read_backlog.len() < MAX_PENDING {
                         self.read_backlog.push_back(record)
@@ -531,6 +682,9 @@ impl ControlConnection {
             || grant.closed
             || grant.boot != expected_boot
             || now >= grant.until
+            || self
+                .pinned_request
+                .is_some_and(|request| request != binding.request)
             || !binding.matches(scope, self.observation.as_ref().ok_or_else(denied)?, grant)
         {
             return Err(denied());
@@ -551,11 +705,13 @@ impl ControlConnection {
             revision: grant.revision,
             until: grant.until,
         });
+        self.pinned_request = None;
         Ok(())
     }
     pub fn retire(&mut self) {
         self.retired = true;
         self.approved = None;
+        self.pinned_request = None;
         self.writes.clear();
         self.pending.clear();
         self.read_backlog.clear();
@@ -584,7 +740,7 @@ impl ControlConnection {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     fn fixture() -> (Vec<u8>, Vec<u8>, ControlGrant) {
         let f: serde_json::Value = serde_json::from_str(include_str!(
@@ -651,7 +807,7 @@ mod tests {
         bad.push(0);
         assert!(DeliveryBinding::parse(&bad).is_err());
     }
-    fn pump(from: &mut ControlConnection, to: &mut ControlConnection) {
+    pub(crate) fn pump(from: &mut ControlConnection, to: &mut ControlConnection) {
         from.advance(100).unwrap();
         from.flush_stream().unwrap();
         let mut buf = [0u8; 1350];
@@ -673,8 +829,7 @@ mod tests {
             }
         }
     }
-    #[test]
-    fn actual_tls_control_is_quarantined_bounded_and_fixed_route() {
+    pub(crate) fn pair() -> (ControlConnection, ControlConnection) {
         let a = "127.0.0.1:44001".parse().unwrap();
         let b = "127.0.0.1:44002".parse().unwrap();
         let mut phone = DeliveryTls::generate(Role::Phone)
@@ -702,6 +857,76 @@ mod tests {
                 break;
             }
         }
+        assert!(native.facts(100).unwrap().is_some() && phone.facts(100).unwrap().is_some());
+        (phone, native)
+    }
+    #[test]
+    fn candidate_pin_retains_actual_tls_past_warm_ttl_without_admitting_media_or_extending_on_retry(
+    ) {
+        let (mut phone, mut native) = pair();
+        let (source, mut bytes, mut grant) = fixture();
+        let scope = SourceScope::parse(&source).unwrap();
+        let observed = native.observation(100).unwrap().unwrap();
+        for (old, new) in [
+            (15, observed.native),
+            (16, observed.phone),
+            (17, observed.nonce),
+        ] {
+            let at = bytes.windows(32).position(|b| b == [old; 32]).unwrap();
+            bytes[at..at + 32].copy_from_slice(&new);
+        }
+        let binding = DeliveryBinding::parse(&bytes).unwrap();
+        grant.delivery_digest = binding.digest;
+        // Unauthorized media is dropped without parsing PCM or moving any source floor.
+        phone.conn.dgram_send(&[99; 800]).unwrap();
+        pump(&mut phone, &mut native);
+        assert_eq!(native.discard_quarantined_datagrams(100, 8).unwrap(), 1);
+        let target = phone.conn.destination_id();
+        assert!(native.routes(
+            target.as_ref(),
+            quiche::RecvInfo {
+                from: phone.local,
+                to: native.local
+            }
+        ));
+        assert!(!native.routes(
+            target.as_ref(),
+            quiche::RecvInfo {
+                from: "127.0.0.1:45000".parse().unwrap(),
+                to: native.local
+            }
+        ));
+        native
+            .pin_candidate(&scope, &grant, binding.request, 100)
+            .unwrap();
+        assert_eq!(native.deadline(), 20000);
+        assert!(!native.is_approved());
+        let mut renewed = grant.clone();
+        renewed.until = 30000;
+        renewed.revision += 1;
+        native
+            .pin_candidate(&scope, &renewed, binding.request, 101)
+            .unwrap();
+        assert_eq!(native.deadline(), 20000);
+        let mut other = binding.request;
+        other[8] ^= 1;
+        assert!(native.pin_candidate(&scope, &grant, other, 102).is_err());
+        assert!(!native.is_approved());
+        assert!(native.observation(10001).unwrap().is_some()); // Original warm TTL was 10000.
+        native
+            .install_native(&scope, grant.boot, binding.clone(), &grant, 10001)
+            .unwrap();
+        assert!(native.is_approved());
+        assert_eq!(native.deadline(), 20000);
+        assert!(native.observation(20000).is_err());
+        assert!(native
+            .install_native(&scope, grant.boot, binding, &grant, 20001)
+            .is_err());
+    }
+    #[test]
+    fn actual_tls_control_is_quarantined_bounded_and_fixed_route() {
+        let (mut phone, mut native) = pair();
+        let b = native.local;
         assert!(!native.is_approved() && !phone.is_approved());
         assert!(native.read_control(100).unwrap().is_empty());
         assert!(phone.read_control(100).unwrap().is_empty());

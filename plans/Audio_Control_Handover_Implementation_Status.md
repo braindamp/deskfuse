@@ -146,6 +146,36 @@ cases, dead-registration signed metadata, replacement blocked after denial and
 quarantine, Unknown caching/failure latching, and registry access while a status
 signer is held. `out/control-handover-checks/control-termination.trx`.
 
+## Iteration 5 — quarantined native candidate component
+
+Added the single cold candidate owner with bounded candidate-only ciphertext,
+control/event mailboxes, explicit input policy, lower Windows CPU priority,
+event/timer-driven work, strict bidirectional traffic/message limits and joined
+completion. The listener remains the sole UDP reader; the component never reads
+the shared socket, parses PCM or adds active-media storage. Fixed route/CID
+screening occurs before candidate mailbox/budget use.
+
+Added a source-window-bounded exact-request pin with independently retained
+bootstrap boot checking, no media admission and no duplicate re-anchoring. The
+same TLS value moves once after actual thread completion; setup transfer/drop
+leaves the listener and the separately moved connection live. Final captured
+events must be consumed before transfer. Failed/retired pinned outcomes retain
+operation identity and owned transport for source-owner reconciliation.
+The full caller and integration obligations are recorded in
+[Audio_Native_Candidate_Owner.md](Audio_Native_Candidate_Owner.md).
+
+**18 focused native checks passed**, including actual threaded loopback TLS,
+metadata request/reply, pin and exact ownership transfer, wrong service boot,
+warm-TTL pin/cutoff stability, datagram discard, pre-send budget failure,
+control-limit retirement, eight regular requests with an independent negative
+ERROR response, late ciphertext/reply transfer and actual cancellation/join.
+Windows x64 Release worker/DLL staging passed. Android ARM64 native rebuild and shipping Kotlin
+compile passed; the six existing lab/conditional warnings remain unchanged.
+The actual shipping Kotlin/P-256 interoperability check also passed after the
+broker custody/index changes (`phone-termination-interop.trx`, one exchange).
+The configured listener, old-egress barrier and source/native media-owner
+composition are still open; the component tests do not qualify those actions.
+
 ## Continue on High
 
 The single broker-pipe reader/demultiplexer and bounded broker observation/request
@@ -153,8 +183,9 @@ routing are implemented. Finish concrete native handlers and resource-owner
 composition, including listener configuration and real source preparation. Wire
 the retained termination path/index to that actual owner and public-metadata
 relay; its broker primitives are implemented but physical integration remains.
-Then implement native
-candidate setup/transfer/old-egress barrier and phone receipt-based approval,
+The native candidate component is implemented. Connect its single-reader
+listener routing, pin/transfer, actual old-egress barrier and source ownership,
+then implement phone receipt-based approval,
 followed by the Network-handle-aware coordinator and cellular lease lifecycle
 (reviewed H2–H4), preserving source/renderer/floors. H1 broker/phone primitives
 are source checked; native request routing remains part of that integration.

@@ -9,6 +9,7 @@ pub mod audio_tls;
 pub mod audio_control;
 pub mod audio_source_stop;
 pub mod audio_rpc;
+pub mod audio_candidate;
 pub mod audio_transport;
 pub mod reactor;
 pub mod wasapi_pipe;
