@@ -119,12 +119,41 @@ shared malformed vectors and worker-wide regular/negative forwarding capacity.
 Broker/native DLL build passed with zero warnings/errors. Evidence:
 `out/control-handover-checks/control-dispatch.trx`. No physical operations ran.
 
+## Iteration 4 — terminal lookup and actual rundown capability
+
+Added a broker-owned source-custody index and read-only exact-target Stop lookup
+which survives closed worker registrations. It retains the currently owned
+source and latest completed source per speaker association. A missing/retired
+target produces only a query-bound Unknown status, with bounded signing,
+exact-current-query retry and uncertain-signature latching. Root signing occurs
+outside the authority registry gate. Source registration and a pre-launch setup
+check reject replacement while the previous association still owns custody;
+Denied/Quarantined alone never release it.
+
+The existing enrollment rundown now serializes retirement per exact retained
+resource owner. Source Stop queues a separately retained cleanup operation, not
+an operation awaited by a control job which cleanup itself must join. Normal
+resource-owner return and exact worker/job join are both required before a
+closed-factory Completed capability exists. Only that capability can publish
+RundownComplete and release the source-custody index. Failures retain the owner
+and latch Quarantined; retry does not repeat confirmed retirement steps. A
+dispatcher dependency requests this real cleanup after denial. Native resource
+owner implementation/composition remains open; no physical Complete result was
+generated or qualified by these source checks.
+
+**59 focused C# checks passed**, including existing enrollment persistence owner
+cases, dead-registration signed metadata, replacement blocked after denial and
+quarantine, Unknown caching/failure latching, and registry access while a status
+signer is held. `out/control-handover-checks/control-termination.trx`.
+
 ## Continue on High
 
 The single broker-pipe reader/demultiplexer and bounded broker observation/request
 routing are implemented. Finish concrete native handlers and resource-owner
 composition, including listener configuration and real source preparation. Wire
-negative control and real termination custody/lookup. Then implement native
+the retained termination path/index to that actual owner and public-metadata
+relay; its broker primitives are implemented but physical integration remains.
+Then implement native
 candidate setup/transfer/old-egress barrier and phone receipt-based approval,
 followed by the Network-handle-aware coordinator and cellular lease lifecycle
 (reviewed H2–H4), preserving source/renderer/floors. H1 broker/phone primitives

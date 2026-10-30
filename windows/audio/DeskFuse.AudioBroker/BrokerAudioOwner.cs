@@ -541,6 +541,27 @@ internal sealed class BrokerAudioOwner
             Publish(); // Restrictive local fence; this does not assert physical cleanup.
         }
     }
+    internal void QuarantineRundown()
+    {
+        lock (gate)
+        {
+            CloseAdmission();
+            if (stopState is AudioSourceStopState.Quarantined or AudioSourceStopState.RundownComplete) return;
+            terminationRevision = checked(terminationRevision + 1); stopState = AudioSourceStopState.Quarantined;
+        }
+    }
+    [SupportedOSPlatform("windows")]
+    internal void ConfirmRundown(BrokerEnrollmentRundown.Completed completed)
+    {
+        if (!completed.Matches(worker)) throw new UnauthorizedAccessException("Foreign native rundown completion.");
+        lock (gate)
+        {
+            CloseAdmission();
+            if (stopState == AudioSourceStopState.RundownComplete) return;
+            terminationRevision = checked(terminationRevision + 1); stopState = AudioSourceStopState.RundownComplete;
+        }
+    }
+    internal bool MatchesStopTarget(AudioStopTarget target) => AudioSourceStopProtocol.SameTarget(target, AudioSourceStopProtocol.Target(Source, boot));
 
     internal sealed class StopStatus
     {
@@ -551,6 +572,7 @@ internal sealed class BrokerAudioOwner
         internal AudioSourceStopStatus Snapshot => AudioSourceStopProtocol.ParseStatus(bytes);
         internal static StopStatus FromOwner(BrokerAudioOwner owner, byte[] query) => new(AudioSourceStopProtocol.Status(
             new(query, AudioSourceStopProtocol.Target(owner.Source, owner.boot), owner.terminationRevision, owner.stopState)));
+        internal static StopStatus Unknown(byte[] query, AudioStopTarget target) => new(AudioSourceStopProtocol.Status(new(query, target, 0, AudioSourceStopState.Unknown)));
     }
     // Public read-only terminal metadata can outlive the exact worker. It
     // neither restores registration nor claims physical cleanup from a fence.

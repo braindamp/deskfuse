@@ -11,6 +11,61 @@ namespace FocusWindow.Tests;
 public sealed class AudioAuthorityTests
 {
     [Fact]
+    public void Denial_and_quarantine_keep_replacement_blocked_and_terminal_metadata_survives_dead_registration()
+    {
+        using var f = new Fixture(); var target = AudioSourceStopProtocol.Target(f.Owner.Source, Nonce(3));
+        Assert.Throws<InvalidOperationException>(() => f.Registry.RequireSpeakerSourceAvailable(target.DeviceKey));
+        f.Owner.CloseAdmission(); f.Registry.CloseRegistration(f.Owner.Source.Identity.Worker);
+        Assert.Throws<InvalidOperationException>(() => f.Registry.RequireSpeakerSourceAvailable(target.DeviceKey));
+        byte[] Sign(BrokerAudioOwner.StopStatus s) => f.Persistence.SignHost(AudioSourceStopProtocol.Status(s.Snapshot));
+        var denied = f.Registry.QueryAudioStopStatus(AudioSourceStopProtocol.StatusQuery(Nonce(91), target), Sign);
+        var signed = EnrollmentFraming.ParseSigned(denied);
+        Assert.True(EnrollmentProtocol.Verify(f.Persistence.HostSpki, signed.Message, signed.Signature));
+        Assert.Equal(AudioSourceStopState.Denied, AudioSourceStopProtocol.ParseStatus(signed.Message).State);
+        Assert.Equal(denied, f.Registry.QueryAudioStopStatus(AudioSourceStopProtocol.StatusQuery(Nonce(91), target), Sign));
+        f.Owner.QuarantineRundown(); f.Owner.QuarantineRundown();
+        var status = AudioSourceStopProtocol.ParseStatus(EnrollmentFraming.ParseSigned(
+            f.Registry.QueryAudioStopStatus(AudioSourceStopProtocol.StatusQuery(Nonce(92), target), Sign)).Message);
+        Assert.Equal(AudioSourceStopState.Quarantined, status.State); Assert.Equal(2UL, status.Revision);
+        Assert.Throws<InvalidOperationException>(() => f.Registry.RequireSpeakerSourceAvailable(target.DeviceKey));
+        var replacement = new Worker();
+        Assert.Throws<InvalidOperationException>(() => f.ReplacementOwner(replacement));
+        Assert.False(f.Registry.OwnsRegistration(f.Persistence.Id, replacement));
+    }
+    [Fact]
+    public void Unknown_terminal_lookup_never_invents_success_or_replaces_an_uncertain_signature()
+    {
+        using var f = new Fixture(); var target = AudioSourceStopProtocol.Target(f.Owner.Source, Nonce(3)) with { SourceGrant = Guid.NewGuid() };
+        var query = AudioSourceStopProtocol.StatusQuery(Nonce(91), target); var calls = 0;
+        byte[] Sign(BrokerAudioOwner.StopStatus s) { calls++; return f.Persistence.SignHost(AudioSourceStopProtocol.Status(s.Snapshot)); }
+        var first = f.Registry.QueryAudioStopStatus(query, Sign);
+        Assert.Equal(first, f.Registry.QueryAudioStopStatus(query, Sign)); Assert.Equal(1, calls);
+        var status = AudioSourceStopProtocol.ParseStatus(EnrollmentFraming.ParseSigned(first).Message);
+        Assert.Equal(AudioSourceStopState.Unknown, status.State); Assert.Equal(0UL, status.Revision);
+        var next = AudioSourceStopProtocol.StatusQuery(Nonce(92), target);
+        Assert.Throws<IOException>(() => f.Registry.QueryAudioStopStatus(next, _ => throw new IOException("Unknown signature outcome")));
+        Assert.Throws<IOException>(() => f.Registry.QueryAudioStopStatus(next, Sign)); Assert.Equal(1, calls);
+        Assert.Equal((0UL, 0, 0, 0), f.Owner.RequestCounts);
+    }
+    [Fact]
+    public async Task Unknown_terminal_status_signing_does_not_hold_the_authority_registry_gate()
+    {
+        using var f = new Fixture(); using var entered = new ManualResetEventSlim(); using var release = new ManualResetEventSlim();
+        var target = AudioSourceStopProtocol.Target(f.Owner.Source, Nonce(3)) with { SourceGrant = Guid.NewGuid() };
+        var query = AudioSourceStopProtocol.StatusQuery(Nonce(91), target);
+        var pending = Task.Run(() => f.Registry.QueryAudioStopStatus(query, s => {
+            entered.Set(); Assert.True(release.Wait(10000)); return f.Persistence.SignHost(AudioSourceStopProtocol.Status(s.Snapshot));
+        }));
+        try
+        {
+            Assert.True(entered.Wait(10000));
+            await Task.Run(() => f.Registry.CloseRegistration(f.Owner.Source.Identity.Worker)).WaitAsync(TimeSpan.FromSeconds(3));
+            Assert.Throws<InvalidOperationException>(() => f.Registry.QueryAudioStopStatus(query, _ => throw new Exception("Must not re-sign")));
+            Assert.False(pending.IsCompleted);
+        }
+        finally { release.Set(); _ = await pending.WaitAsync(TimeSpan.FromSeconds(10)); }
+    }
+    [Fact]
     public void Captured_negative_ingress_survives_queued_connection_closure_and_keeps_its_capacity()
     {
         using var f = new Fixture(); var job = f.Owner.CaptureSignedStop(f.Origin, StopEnvelope(f));
@@ -105,6 +160,7 @@ public sealed class AudioAuthorityTests
                 s => f.Persistence.SignHost(AudioRequestProtocol.Status(s.Snapshot)),
                 s => f.Persistence.SignHost(AudioSourceStopProtocol.Status(s.Snapshot)),
                 c => { f.Owner.ClaimPreparation(c); Assert.True(f.Owner.CompletePreparation(c, f.Observed)); return Task.CompletedTask; },
+                () => { }, // Actual resource rundown has its own separately retained owner.
                 () => Task.FromResult(true), // Unit authority routing, not native I/O or physical qualification.
                 send ?? ((bytes, _) => replies.Writer.WriteAsync(AudioWorkerNetworkProtocol.Parse(bytes, reply: true)).AsTask()),
                 fail ?? (_ => { }));
@@ -632,6 +688,9 @@ public sealed class AudioAuthorityTests
         internal readonly BrokerAudioOwner Owner;
         private readonly Worker worker;
         internal IBrokerAudioWorker AudioWorker => worker;
+        internal BrokerAudioOwner ReplacementOwner(Worker replacement) => new(Registry, replacement, new Caller(replacement), Persistence.Id,
+            store.GetSpeakerAssociation(Persistence.Id), AudioSourceBackend.Committed, new(1000, 200), false, new(2, 3, 4), Nonce(3), () => Now,
+            challenge => Persistence.SignHost(AudioRequestProtocol.ChallengeMessage(challenge.Transcript)));
         internal BrokerAudioOwner.Connection Origin;
         internal ulong Now = 10000000;
         internal byte[]? LastProof;

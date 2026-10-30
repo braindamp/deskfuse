@@ -192,6 +192,8 @@ internal sealed class BrokerAuthorityState(IBrokerEnrollments enrollments)
     private readonly object gate = new();
     private readonly Dictionary<Guid, Registration> registrations = [];
     private readonly HashSet<Guid> deniedEnrollments = [];
+    private readonly Dictionary<Guid, BrokerAudioOwner> audioSources = [], completedAudioSources = [];
+    private BrokerAudioOwner.StopStatus? unknownAudioStatus;
 
     [SupportedOSPlatform("windows")]
     internal BrokerRegisteredWorker LaunchAndRegister(BrokerWorkerLauncher launcher, IInstalledBrokerWorkerImage image,
@@ -329,12 +331,83 @@ internal sealed class BrokerAuthorityState(IBrokerEnrollments enrollments)
         {
             var current = CaptureAudioIdentity(worker, enrollment);
             var source = owner.Source;
+            if (audioSources.ContainsKey(source.Intent.DeviceKey))
+                throw new InvalidOperationException("Previous speaker source still owns native rundown custody.");
             if (!AudioAuthorityProtocol.Source(current, source.Intent).AsSpan().SequenceEqual(source.Bytes) ||
                 !CryptographicOperations.FixedTimeEquals(worker.InstalledProfileSha256, source.Intent.ProfileSha256))
                 throw new UnauthorizedAccessException("Audio source is outside the actual worker/enrollment profile.");
             RegisterLaunchedWorker(worker, enrollment, [new(source.Digest, BrokerProofScope.Speaker, source.Intent.Generation)]);
             registrations[worker.Registration].Audio = owner;
+            audioSources.Add(source.Intent.DeviceKey, owner);
         }
+    }
+    // Setup calls this before launching/acquiring a replacement source. Final
+    // registration repeats it atomically; neither a phone receipt nor denial
+    // alone can release this actual resource-custody fence.
+    internal void RequireSpeakerSourceAvailable(Guid deviceKey)
+    {
+        if (deviceKey == Guid.Empty) throw new InvalidDataException("Missing speaker association.");
+        lock (gate)
+            if (audioSources.ContainsKey(deviceKey)) throw new InvalidOperationException("Speaker source rundown is unconfirmed.");
+    }
+    [SupportedOSPlatform("windows")]
+    internal void ConfirmAudioRundown(BrokerEnrollmentRundown.Completed completed)
+    {
+        BrokerAudioOwner? audio;
+        lock (gate)
+        {
+            if (!registrations.TryGetValue(completed.Worker.Registration, out var registration) || !completed.Matches(registration.Worker))
+                throw new UnauthorizedAccessException("Native rundown has no exact retained registration.");
+            audio = registration.Audio;
+        }
+        if (audio is null) return;
+        audio.ConfirmRundown(completed);
+        lock (gate)
+        {
+            var key = audio.Source.Intent.DeviceKey;
+            if (audioSources.TryGetValue(key, out var current) && ReferenceEquals(current, audio))
+            { audioSources.Remove(key); completedAudioSources[key] = audio; }
+        }
+    }
+    internal void QuarantineAudioRundown(IBrokerRegisteredWorker worker)
+    {
+        BrokerAudioOwner? audio;
+        lock (gate) audio = registrations.TryGetValue(worker.Registration, out var r) && ReferenceEquals(r.Worker, worker) ? r.Audio : null;
+        audio?.QuarantineRundown();
+    }
+    // Public read-only metadata. Does not restore a dead registration, launch a
+    // source or consult positive admission. Retain only the latest completed
+    // source per speaker, alongside any currently owned source/actual jobs.
+    internal byte[] QueryAudioStopStatus(byte[] body, Func<BrokerAudioOwner.StopStatus, byte[]> signer)
+    {
+        var (query, target) = AudioSourceStopProtocol.ParseStatusQuery(body);
+        BrokerAudioOwner? audio; BrokerAudioOwner.StopStatus frozen;
+        lock (gate)
+        {
+            audioSources.TryGetValue(target.DeviceKey, out var current); completedAudioSources.TryGetValue(target.DeviceKey, out var completed);
+            audio = current?.MatchesStopTarget(target) == true ? current : completed?.MatchesStopTarget(target) == true ? completed : null;
+            if (audio is null)
+            {
+                if (unknownAudioStatus is { Signing: true }) throw new InvalidOperationException("Unknown source status signing is occupied.");
+                if (unknownAudioStatus is null || !unknownAudioStatus.Snapshot.Query.AsSpan().SequenceEqual(query) ||
+                    !AudioSourceStopProtocol.SameTarget(unknownAudioStatus.Snapshot.Target, target))
+                    unknownAudioStatus = BrokerAudioOwner.StopStatus.Unknown(query, target);
+                frozen = unknownAudioStatus;
+                if (frozen.Reply is not null) return frozen.Reply.ToArray();
+                if (frozen.Attempted) throw new IOException("Unknown source status signing is unconfirmed.");
+                frozen.Signing = frozen.Attempted = true;
+            }
+            else frozen = null!;
+        }
+        if (audio is not null) return audio.SignedStopStatus(query, signer);
+        try
+        {
+            var signature = signer(frozen);
+            if (signature is not { Length: >= 8 and <= 72 }) throw new InvalidDataException("Invalid source status signature.");
+            var reply = EnrollmentFraming.Signed(AudioSourceStopProtocol.Status(frozen.Snapshot), signature);
+            lock (gate) { frozen.Reply = reply; return reply.ToArray(); }
+        }
+        finally { lock (gate) frozen.Signing = false; }
     }
     // Negative admission deliberately excludes positive audio revision/deadline
     // checks. Enrollment, key and real worker/subject custody remain mandatory.

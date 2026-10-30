@@ -31,6 +31,8 @@ internal sealed class BrokerAudioControlDispatcher : IAudioWorkerEventOwner
     private readonly Func<Task<bool>> publish;
     private readonly Func<byte[], bool, Task> send;
     private readonly Action<Exception> fail;
+    private readonly Action requestRundown;
+    private int rundownRequested;
     private readonly Dictionary<Guid, Route> routes = [];
     private readonly HashSet<Job> jobs = [];
     private readonly SemaphoreSlim positive = new(1, 1);
@@ -41,12 +43,13 @@ internal sealed class BrokerAudioControlDispatcher : IAudioWorkerEventOwner
     private bool lifecycleDirty;
     internal BrokerAudioControlDispatcher(BrokerAudioOwner owner, IBrokerAudioWorker worker, IAudioGrantSigner grants,
         Func<BrokerAudioOwner.RequestStatus, byte[]> signStatus, Func<BrokerAudioOwner.StopStatus, byte[]> signStopStatus,
-        Func<BrokerAudioOwner.Committed, Task> prepareSource, Func<Task<bool>> publish,
+        Func<BrokerAudioOwner.Committed, Task> prepareSource, Action requestRundown, Func<Task<bool>> publish,
         Func<byte[], bool, Task> send, Action<Exception> fail)
     {
         if (!owner.IsWorker(worker)) throw new UnauthorizedAccessException("Foreign control worker.");
         this.owner = owner; this.worker = worker; this.grants = grants; this.signStatus = signStatus; this.signStopStatus = signStopStatus;
         this.prepareSource = prepareSource; this.publish = publish; this.send = send; this.fail = fail;
+        this.requestRundown = requestRundown;
     }
     public bool TryPost(AudioWorkerFrame frame)
     {
@@ -119,10 +122,11 @@ internal sealed class BrokerAudioControlDispatcher : IAudioWorkerEventOwner
         if (m.Kind == (byte)AudioNetworkKind.SignedSourceStop)
         {
             if (!job.Stop!.Complete()) throw new UnauthorizedAccessException("Invalid source Stop signature.");
+            RequestRundown();
             await Publish().ConfigureAwait(false); return [(byte)AudioSourceStopState.Denied];
         }
         if (m.Kind == (byte)AudioNetworkKind.Stop)
-        { await Publish().ConfigureAwait(false); return [(byte)AudioSourceStopState.Denied]; }
+        { RequestRundown(); await Publish().ConfigureAwait(false); return [(byte)AudioSourceStopState.Denied]; }
         if (m.Kind == (byte)AudioNetworkKind.Info) return b.Length == 0 ? owner.Source.Bytes : owner.BindingDescriptor();
         if (m.Kind == (byte)AudioNetworkKind.Status) return owner.SignedRequestStatus(origin, b, signStatus);
         if (m.Kind == (byte)AudioNetworkKind.SourceStopStatus) return owner.QueryStopStatus(b, signStopStatus);
@@ -174,6 +178,14 @@ internal sealed class BrokerAudioControlDispatcher : IAudioWorkerEventOwner
     {
         try { _ = await publish().ConfigureAwait(false); }
         catch (Exception error) { owner.CloseAdmission(); fail(error); throw; }
+    }
+    private void RequestRundown()
+    {
+        if (Interlocked.Exchange(ref rundownRequested, 1) != 0) return;
+        // Composition queues the actual retained resource-owner operation here;
+        // that operation joins this dispatcher, so this job must not await it.
+        try { requestRundown(); }
+        catch (Exception error) { owner.QuarantineRundown(); fail(error); }
     }
     private async Task PublishLifecycle()
     {
