@@ -6,6 +6,22 @@ namespace FocusWindow.Tests;
 
 public sealed class AudioWorkerControlTests
 {
+    [Fact]
+    public async Task Pipe_replies_keep_a_negative_slot_when_eight_regular_writes_are_retained()
+    {
+        var (local, peer) = Duplex.Pair(); var remote = new AudioWorkerControl(peer);
+        var barrier = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously); local.WriteCompletion = barrier.Task;
+        var pump = new AudioWorkerControlPump(new(local), _ => false, _ => { });
+        byte[] Reply(ulong request, byte kind) => AudioWorkerNetworkProtocol.Encode(new(request, Guid.Parse("11111111-1111-1111-1111-111111111111"), kind, [1]), reply: true);
+        var work = Enumerable.Range(1, 8).Select(i => pump.SendReplyAsync(Reply((ulong)i, 129), false)).ToList();
+        _ = await remote.ReadAsync(CancellationToken.None);
+        Assert.Throws<InvalidOperationException>(() => { _ = pump.SendReplyAsync(Reply(9, 129), false); });
+        work.Add(pump.SendReplyAsync(Reply(9, 255), true));
+        Assert.Throws<InvalidOperationException>(() => { _ = pump.SendReplyAsync(Reply(10, 255), true); });
+        barrier.SetResult(true);
+        for (var i = 0; i < 8; i++) Assert.Equal(AudioWorkerFrameKind.NetworkReply, (await remote.ReadAsync(CancellationToken.None)).Kind);
+        await Task.WhenAll(work).WaitAsync(TimeSpan.FromSeconds(3)); await pump.StopAndJoinAsync();
+    }
     private static AudioControlGrant Grant()
     {
         using var f = JsonDocument.Parse(File.ReadAllBytes(Path.Combine(AppContext.BaseDirectory, "Fixtures", "audio-authority-v1.json")));

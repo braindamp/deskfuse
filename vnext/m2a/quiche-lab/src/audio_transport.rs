@@ -333,15 +333,8 @@ impl ControlConnection {
             {
                 return Err(wire::invalid());
             }
-            let n = r.body.len();
+            crate::audio_rpc::validate_request(r.kind, &r.body)?;
             let valid = match r.kind {
-                wire::INFO => n == 0,
-                wire::PREPARE => n == 49,
-                wire::ISSUE => n == 53,
-                wire::PROOF => n >= 41 && n <= 105 && usize::from(r.body[32]) + 33 == n,
-                wire::STATUS => n == 32,
-                wire::OUTPUT => n == 49,
-                wire::DETACH => n == 40,
                 wire::STOP => {
                     crate::audio_source_stop::FastSourceStop::parse(&r.body).is_ok_and(|v| {
                         self.approved.as_ref().is_some_and(|a| {
@@ -364,7 +357,7 @@ impl ControlConnection {
                 wire::APPLIED_RESULT => {
                     crate::audio_source_stop::AppliedResultQuery::parse(&r.body).is_ok()
                 }
-                _ => false,
+                _ => true,
             };
             if !valid
                 || self.approved.is_none()
@@ -430,6 +423,7 @@ impl ControlConnection {
         }
         let bytes = record.encode()?;
         if self.role == Role::Phone {
+            crate::audio_rpc::validate_request(record.kind, &record.body)?;
             if !(wire::INFO..=wire::APPLIED_RESULT).contains(&record.kind)
                 || self.last_request == u64::MAX
                 || record.request != self.last_request + 1

@@ -66,13 +66,44 @@ internal sealed class BrokerAudioOwner
     private AudioSourceStopState stopState;
     private ulong terminationRevision;
     private StopStatus? stopStatus;
-    private sealed record StopVerification(Connection Origin, byte[] Transcript, byte[] Signature);
+    internal sealed class StopVerification
+    {
+        private readonly BrokerAudioOwner owner;
+        internal readonly Connection Origin;
+        private readonly byte[] transcript, signature, key, record;
+        private readonly ulong registrationRevision;
+        private int started;
+        internal StopVerification(BrokerAudioOwner owner, Connection origin, byte[] transcript, byte[] signature,
+            byte[] key, byte[] record, ulong registrationRevision)
+        { this.owner = owner; Origin = origin; this.transcript = transcript; this.signature = signature;
+          this.key = key; this.record = record; this.registrationRevision = registrationRevision; }
+        // Trusted ingress owns this one actual verification through completion.
+        // Cancellation of a transport waiter never disposes/replaces the job.
+        internal bool Complete()
+        {
+            if (Interlocked.Exchange(ref started, 1) != 0) throw new InvalidOperationException("Stop verification is already owned.");
+            try
+            {
+                if (!EnrollmentProtocol.Verify(key, transcript, signature)) return false;
+                lock (owner.gate)
+                {
+                    return owner.registry.WithAudioStopFacts(owner, owner.caller, (currentKey, currentRecord, rev) =>
+                    {
+                        if (rev != registrationRevision || !currentKey.AsSpan().SequenceEqual(key) || !currentRecord.AsSpan().SequenceEqual(record))
+                            throw new UnauthorizedAccessException("Source enrollment changed while verifying Stop.");
+                        owner.CloseAdmission(); return true;
+                    });
+                }
+            }
+            finally { lock (owner.gate) { if (ReferenceEquals(owner.stopVerification, this)) owner.stopVerification = null; } }
+        }
+    }
     private readonly Queue<string> replyOrder = new();
     private readonly Dictionary<string, Applied> applied = [];
     private AudioAuthorityPhase phase;
     private ulong revision, until, lastDeliveryGeneration, outputGeneration, lastClock;
     private bool ready, outputStopped, clockFailed;
-    private byte[]? binding;
+    private byte[]? binding, bindingBytes;
     private AudioDeliveryDescriptor? delivery;
     private View published = new(AudioAuthorityPhase.Idle, 0, 0, null, 0, []);
     internal AudioSourceDescriptor Source { get; }
@@ -148,11 +179,15 @@ internal sealed class BrokerAudioOwner
             phone.AsSpan().SequenceEqual(intent.PhoneCertificate) && nonce.AsSpan().SequenceEqual(intent.NativeNonce);
         internal bool Matches(AudioSourceStop stop) => Incarnation == stop.Connection && native.AsSpan().SequenceEqual(stop.NativeCertificate) &&
             phone.AsSpan().SequenceEqual(stop.PhoneCertificate) && nonce.AsSpan().SequenceEqual(stop.NativeNonce);
+        internal AudioDeliveryIntent DeliveryIntent(ulong generation, byte[] requestId) =>
+            new(generation, native.ToArray(), phone.ToArray(), new AudioRequestId(requestId).Bytes, nonce.ToArray());
     }
     // Called by the registered worker's bound control observer, never from a
     // network-supplied authenticated flag. N3 supplies actual TLS observations.
     internal Connection ObserveConnection(IBrokerAudioWorker observedWorker, Guid incarnation, byte[] native, byte[] phone, byte[] nonce)
     {
+        if (new[] { native, phone, nonce }.Any(v => v is not { Length: 32 }))
+            throw new UnauthorizedAccessException("Invalid worker connection observation.");
         native = native.ToArray(); phone = phone.ToArray(); nonce = nonce.ToArray();
         if (!ReferenceEquals(observedWorker, worker) || incarnation == Guid.Empty ||
             new[] { native, phone, nonce }.Any(v => v is not { Length: 32 } || v.All(b => b == 0)))
@@ -185,7 +220,7 @@ internal sealed class BrokerAudioOwner
             if (origin.Closed) return;
             RequireObserved(origin);
             origin.Closed = true; connections.Remove(origin.Incarnation);
-            if (delivery is not null && ReferenceEquals(origin, deliveryOrigin)) Detach(delivery.Intent.Generation);
+            if (phase != AudioAuthorityPhase.Closed && delivery is not null && ReferenceEquals(origin, deliveryOrigin)) Detach(delivery.Intent.Generation);
             if (active is { Result: null } p && (ReferenceEquals(p.Origin, origin) || ReferenceEquals(p.Delivery?.Connection, origin))) Retire(p);
         }
     }
@@ -374,37 +409,25 @@ internal sealed class BrokerAudioOwner
         }
     }
     internal bool StopSignedSource(Connection origin, byte[] envelope)
+        => CaptureSignedStop(origin, envelope).Complete();
+
+    // Capture on the sole trusted ingress reader, before asynchronous dispatch
+    // can race connection closure. This reserves the independent negative job.
+    internal StopVerification CaptureSignedStop(Connection origin, byte[] envelope)
     {
         if (envelope.Length > AudioSourceStopProtocol.MaxRecord + 75) throw new InvalidDataException("Oversized Stop.");
         var (bytes, signature) = AudioSourceStopProtocol.ParseSignedStop(envelope.ToArray());
         var stop = AudioSourceStopProtocol.ParseStop(bytes);
         var target = AudioSourceStopProtocol.Target(Source, boot);
         if (!AudioSourceStopProtocol.SameTarget(stop.Target, target)) throw new UnauthorizedAccessException("Foreign source Stop.");
-        (byte[] Key, byte[] Record, ulong Revision) facts; StopVerification job;
         lock (gate)
         {
             RequireObserved(origin);
             if (!origin.Matches(stop)) throw new UnauthorizedAccessException("Stop connection facts do not match trusted ingress.");
             if (stopVerification is not null) throw new InvalidOperationException("Source Stop verification is in progress.");
-            facts = registry.WithAudioStopFacts(this, caller, (key, record, rev) => (key, record, rev));
-            job = new(origin, bytes, signature); stopVerification = job;
+            var facts = registry.WithAudioStopFacts(this, caller, (key, record, rev) => (Key: key, Record: record, Revision: rev));
+            return stopVerification = new(this, origin, bytes, signature, facts.Key, facts.Record, facts.Revision);
         }
-        try
-        {
-            if (!EnrollmentProtocol.Verify(facts.Key, bytes, signature)) return false;
-            lock (gate)
-            {
-                // The observation stays pinned by job even if connection closure
-                // removes it from the live map. It grants only this exact denial.
-                return registry.WithAudioStopFacts(this, caller, (key, record, rev) =>
-                {
-                    if (rev != facts.Revision || !key.AsSpan().SequenceEqual(facts.Key) || !record.AsSpan().SequenceEqual(facts.Record))
-                        throw new UnauthorizedAccessException("Source enrollment changed while verifying Stop.");
-                    CloseAdmission(); return true;
-                });
-            }
-        }
-        finally { lock (gate) { if (ReferenceEquals(stopVerification, job)) stopVerification = null; } }
     }
 
     internal void RequirePreparation(Committed acquisition)
@@ -429,19 +452,52 @@ internal sealed class BrokerAudioOwner
             if (phase != AudioAuthorityPhase.Preparing) return false;
             acquisition.RequirePreparationClaimed(this);
             return registry.WithAudioCurrent(this, caller, () =>
-            { var next = NextRevision(); binding = digest; phase = AudioAuthorityPhase.Prepared; revision = next; Publish(); return true; });
+            { var next = NextRevision(); binding = digest; bindingBytes = encoded; phase = AudioAuthorityPhase.Prepared; revision = next; Publish(); return true; });
         }
     }
     internal AudioDeliveryDescriptor PrepareDelivery(AudioDeliveryIntent intent, Connection observed)
     {
-        byte[] bindingSnapshot;
-        lock (gate) { RequireLive(Now()); bindingSnapshot = binding?.ToArray() ?? throw new InvalidOperationException("Source binding is not prepared."); }
         lock (gate)
         {
+            RequireLive(Now());
+            var bindingSnapshot = binding?.ToArray() ?? throw new InvalidOperationException("Source binding is not prepared.");
             RequireObserved(observed);
             if (!observed.Matches(intent)) throw new UnauthorizedAccessException("Unobserved delivery candidate.");
             return new(Source, bindingSnapshot, intent, observed);
         }
+    }
+    internal AudioDeliveryDescriptor NominateDelivery(Connection origin, Connection target, ulong generation, byte[] requestId)
+    {
+        lock (gate) { RequireOrigin(origin); return PrepareDelivery(target.DeliveryIntent(generation, requestId), target); }
+    }
+    internal byte[] BindingDescriptor()
+    { lock (gate) return bindingBytes?.ToArray() ?? throw new InvalidOperationException("Source binding is not prepared."); }
+    internal void ObserveOutput(Connection origin, byte[] digest, ulong deliveryGeneration, ulong outputGeneration, bool outputReady)
+    {
+        lock (gate)
+        {
+            RequireOrigin(origin);
+            if (delivery is null || !ReferenceEquals(deliveryOrigin, origin) || !delivery.Digest.AsSpan().SequenceEqual(digest))
+                throw new UnauthorizedAccessException("Output observation is outside the current delivery.");
+            OutputChanged(deliveryGeneration, outputGeneration, outputReady);
+        }
+    }
+    internal void ObserveDetach(Connection origin, byte[] digest, ulong deliveryGeneration)
+    {
+        lock (gate)
+        {
+            RequireOrigin(origin);
+            if (delivery is null || !ReferenceEquals(deliveryOrigin, origin) || !delivery.Digest.AsSpan().SequenceEqual(digest))
+                throw new UnauthorizedAccessException("Detach observation is outside the current delivery.");
+            Detach(deliveryGeneration);
+        }
+    }
+    internal byte[] QueryStopStatus(byte[] body, Func<StopStatus, byte[]> signer)
+    {
+        var (query, target) = AudioSourceStopProtocol.ParseStatusQuery(body);
+        if (!AudioSourceStopProtocol.SameTarget(target, AudioSourceStopProtocol.Target(Source, boot)))
+            throw new UnauthorizedAccessException("Foreign source status query.");
+        return SignedStopStatus(query, signer);
     }
     internal void OutputChanged(ulong deliveryGeneration, ulong newOutputGeneration, bool outputReady)
     {
@@ -601,6 +657,7 @@ internal sealed class BrokerAudioOwner
         private readonly BrokerAudioOwner owner;
         private readonly Applied record;
         private readonly string key;
+        internal AudioOperationKind Kind => record.Pending.Kind;
         private Committed(BrokerAudioOwner owner, string key, Applied record) { this.owner = owner; this.key = key; this.record = record; }
         internal static Committed FromOwner(BrokerAudioOwner owner, string key)
         {

@@ -41,11 +41,14 @@
     <Compile Include="..\..\audio\DeskFuse.AudioBroker\BrokerWorkerToken.cs" Link="Audio\BrokerWorkerToken.cs" />
     <Compile Include="..\..\audio\DeskFuse.AudioBroker\AudioWorkerControl.cs" Link="Audio\AudioWorkerControl.cs" />
     <Compile Include="..\..\audio\DeskFuse.AudioBroker\AudioWorkerControlPump.cs" Link="Audio\AudioWorkerControlPump.cs" />
+    <Compile Include="..\..\audio\DeskFuse.AudioBroker\AudioWorkerNetworkProtocol.cs" Link="Audio\AudioWorkerNetworkProtocol.cs" />
+    <Compile Include="..\..\audio\DeskFuse.AudioBroker\BrokerAudioControlDispatcher.cs" Link="Audio\BrokerAudioControlDispatcher.cs" />
     <Compile Include="..\..\audio\DeskFuse.AudioBroker\AudioAuthorityProtocol.cs" Link="Audio\AudioAuthorityProtocol.cs" />
     <Compile Include="..\..\audio\DeskFuse.AudioBroker\AudioRequestProtocol.cs" Link="Audio\AudioRequestProtocol.cs" />
     <Compile Include="..\..\audio\DeskFuse.AudioBroker\AudioSourceStopProtocol.cs" Link="Audio\AudioSourceStopProtocol.cs" />
     <Compile Include="..\..\audio\DeskFuse.AudioBroker\BrokerAudioOwner.cs" Link="Audio\BrokerAudioOwner.cs" />
     <None Include="..\..\..\tools\protocol3\audio-worker-control-v1.json" Link="Fixtures\audio-worker-control-v1.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\..\tools\protocol3\audio-worker-network-v1.json" Link="Fixtures\audio-worker-network-v1.json" CopyToOutputDirectory="PreserveNewest" />
     <None Include="..\..\..\tools\protocol3\audio-authority-v1.json" Link="Fixtures\audio-authority-v1.json" CopyToOutputDirectory="PreserveNewest" />
     <None Include="..\..\..\tools\protocol3\audio-transport-v1.json" Link="Fixtures\audio-transport-v1.json" CopyToOutputDirectory="PreserveNewest" />
     <None Include="..\..\..\tools\protocol3\audio-source-stop-v1.json" Link="Fixtures\audio-source-stop-v1.json" CopyToOutputDirectory="PreserveNewest" />

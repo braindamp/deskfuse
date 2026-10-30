@@ -26,6 +26,12 @@ internal sealed class AudioWorkerControlPump
     private bool stopRequested;
     private Task? stopWrite;
     private Task? join;
+    private sealed class Reply(bool negative)
+    {
+        internal readonly bool Negative = negative;
+        internal readonly TaskCompletionSource<bool> Done = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    }
+    private readonly HashSet<Reply> replies = [];
     internal AudioWorkerControlPump(AudioWorkerControl control, Func<AudioWorkerFrame, bool> tryPost, Action<Exception> onFailure)
     { this.control = control; post = tryPost; this.onFailure = onFailure; reader = ReadLoop(); }
 
@@ -116,6 +122,36 @@ internal sealed class AudioWorkerControlPump
         }
         catch (Exception error) { Fail(error); throw; }
     }
+    internal Task SendReplyAsync(byte[] body, bool negative)
+    {
+        if (body.Length >= AudioWorkerControl.MaxFrame) throw new InvalidDataException("Oversized native reply.");
+        var snapshot = body.ToArray(); _ = AudioWorkerNetworkProtocol.Parse(snapshot, reply: true);
+        Reply value;
+        lock (gate)
+        {
+            RequireLive();
+            if (replies.Count(p => p.Negative == negative) >= (negative ? 1 : 8))
+                throw new InvalidOperationException("Native reply capacity is occupied.");
+            value = new(negative); replies.Add(value);
+        }
+        _ = WriteReply(value, snapshot); return value.Done.Task;
+    }
+    private async Task WriteReply(Reply value, byte[] body)
+    {
+        Exception? failure = null;
+        try
+        {
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
+            deadline.CancelAfter(TimeSpan.FromSeconds(3));
+            await control.WriteAsync(AudioWorkerFrameKind.NetworkReply, body, deadline.Token).ConfigureAwait(false);
+        }
+        catch (Exception error) { failure = error; Fail(error); }
+        finally
+        {
+            lock (gate) replies.Remove(value);
+            if (failure is null) value.Done.TrySetResult(true); else value.Done.TrySetException(failure);
+        }
+    }
     internal Task StopAndJoinAsync()
     {
         lock (gate)
@@ -123,6 +159,7 @@ internal sealed class AudioWorkerControlPump
             if (join is not null) return join;
             stopping = true;
             var work = pending.Values.Select(p => p.Done.Task).Cast<Task>().Append(reader).ToList();
+            work.AddRange(replies.Select(p => p.Done.Task));
             if (stopWrite is not null) work.Add(stopWrite);
             if (!lifetime.IsCancellationRequested) lifetime.Cancel();
             foreach (var p in pending.Values) p.Ack.TrySetException(new IOException("Native control retired."));

@@ -84,7 +84,7 @@ internal sealed class BrokerAudioWorkerSession
     private readonly BrokerCallerBinding caller;
     private readonly byte[] boot;
     private readonly object publicationGate = new();
-    private Task? publication;
+    private Task<bool>? publication;
     private Task<bool>? terminalPublication;
     private IAudioWorkerEventOwner? eventOwner;
     private Task? stopOperation;
@@ -117,6 +117,7 @@ internal sealed class BrokerAudioWorkerSession
         if (!owner.IsWorker(Worker) || audioOwner is not null && !ReferenceEquals(audioOwner, owner))
             throw new UnauthorizedAccessException("Audio publication is outside its retained source/worker owner.");
     }
+    internal Task SendReplyAsync(byte[] bytes, bool negative) => pump.SendReplyAsync(bytes, negative);
 
     internal static async Task<BrokerAudioWorkerSession> ConnectAsync(BrokerRegisteredWorker worker, byte[] serviceBoot, CancellationToken ct)
     {
@@ -171,8 +172,9 @@ internal sealed class BrokerAudioWorkerSession
             else
             {
                 if (stopping) throw new InvalidOperationException("Native owner is stopping.");
-                if (publication is { IsCompleted: false }) throw new InvalidOperationException("A native authority operation is already retained.");
-                operation = PublishCore(owner, snapshot); publication = operation;
+                // Coalesce newer source observations into this one retained
+                // writer operation rather than allocating competing publishers.
+                operation = publication is { IsCompleted: false } pending ? pending : StartPublication(owner);
             }
         }
         return AwaitCaller(owner, operation, ct);
@@ -214,6 +216,30 @@ internal sealed class BrokerAudioWorkerSession
         }
         catch { owner.CloseAdmission(); throw; }
     }
+    private Task<bool> StartPublication(BrokerAudioOwner owner)
+    {
+        var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        publication = completion.Task; _ = PublishLatest(owner, completion); return completion.Task;
+    }
+    private async Task PublishLatest(BrokerAudioOwner owner, TaskCompletionSource<bool> completion)
+    {
+        try
+        {
+            while (true)
+            {
+                var snapshot = owner.ControlSnapshot();
+                var current = snapshot.Closed ? await QueueTerminal(owner).ConfigureAwait(false) : await PublishCore(owner, snapshot).ConfigureAwait(false);
+                lock (publicationGate)
+                {
+                    // Publish task completion while holding the same admission
+                    // gate used by coalescing callers: no completion-gap update
+                    // can join a task which already stopped checking revisions.
+                    if (current && owner.IsControlCurrent(snapshot)) { completion.TrySetResult(true); return; }
+                }
+            }
+        }
+        catch (Exception error) { owner.CloseAdmission(); completion.TrySetException(error); }
+    }
 
     // Must be called by the serialized resource owner after native-resource
     // retirement, not under an authority lock. Failure retains this owner.
@@ -234,8 +260,8 @@ internal sealed class BrokerAudioWorkerSession
         try { await pump.SendStopAsync().ConfigureAwait(false); }
         catch (Exception error) when (error is IOException or OperationCanceledException or ObjectDisposedException) { }
         Worker.StopAndJoin(); // Actual retained job/process completion, regardless of cooperative reply.
-        await pump.StopAndJoinAsync().ConfigureAwait(false);
         if (eventOwner is not null) await eventOwner.StopAndJoinAsync().ConfigureAwait(false);
+        await pump.StopAndJoinAsync().ConfigureAwait(false);
         try { await Task.WhenAll(pending).ConfigureAwait(false); } catch { /* Actual retained I/O has completed. */ }
         caller.Dispose(); lock (publicationGate) stopped = true;
     }

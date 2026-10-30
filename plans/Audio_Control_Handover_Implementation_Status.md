@@ -86,10 +86,44 @@ actual write completion after cancellation). Broker/native DLL build passed
 with zero warnings/errors after loading the Visual Studio build environment.
 The three native broker-control checks also passed. No media processing changed.
 
+## Iteration 3 — bounded broker request routing and captured negative ingress
+
+Implemented a typed dispatcher for actual-worker connection observations,
+source/binding metadata, current-ingress delivery nomination, challenge/proof,
+exact applied-result lookup, output/detach, Stop and query-bound status. It owns
+eight regular jobs, a separate negative job, one bounded nomination and actual
+job/reply completion across TLS closure. Source preparation/publication are
+mandatory resource-owner dependencies; fixtures do not stand in for production
+native composition. The exact unpublished encoding is recorded in
+[Audio_Native_Control_RPC.md](Audio_Native_Control_RPC.md).
+
+Signed Stop is captured/pinned on trusted ingress before asynchronous dispatch;
+it survives queued connection closure and rechecks protected registration and
+enrollment after crypto. Fast Stop fences at ingress without crypto. Actual
+pipe completions are retained even when their TLS route closes. The pump has
+eight regular reply writes and a separate negative reply slot. Ordinary source
+projections coalesce through exact ACKs, with publication completion serialized
+against new coalescing callers; restrictive projection remains independent.
+
+Added matching strict C#/Rust RPC codecs/shared vectors and native worker-wide
+forwarding credits. Native TLS validates the same bodies on send and receive.
+The forwarding component is source checked; connecting it to the configured
+listener/one-reader native runtime is still open. No active PCM queue/copy,
+capture behavior, sample timeline, freshness policy or renderer was changed.
+
+**54 focused C# checks passed**, including real-signature routed Acquire/Attach,
+exact read-only recovery, negative Stop with eight retained regular jobs and a
+blocked positive signer, pinned-ingress capacity, revoked registration, and the
+reserved negative pipe reply. **12 native checks passed**, including real TLS,
+shared malformed vectors and worker-wide regular/negative forwarding capacity.
+Broker/native DLL build passed with zero warnings/errors. Evidence:
+`out/control-handover-checks/control-dispatch.trx`. No physical operations ran.
+
 ## Continue on High
 
-The single broker-pipe reader/demultiplexer is implemented. Finish bounded actual
-observation/request/fence routing and concrete native handlers. Wire
+The single broker-pipe reader/demultiplexer and bounded broker observation/request
+routing are implemented. Finish concrete native handlers and resource-owner
+composition, including listener configuration and real source preparation. Wire
 negative control and real termination custody/lookup. Then implement native
 candidate setup/transfer/old-egress barrier and phone receipt-based approval,
 followed by the Network-handle-aware coordinator and cellular lease lifecycle
