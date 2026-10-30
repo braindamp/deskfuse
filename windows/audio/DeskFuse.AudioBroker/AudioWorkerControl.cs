@@ -5,7 +5,11 @@ using System.Security.Principal;
 
 namespace DeskFuse.AudioBroker;
 
-internal enum AudioWorkerFrameKind : byte { Hello = 1, Ready = 2, Stop = 3, Authority = 4, AuthorityObserved = 5 }
+internal enum AudioWorkerFrameKind : byte {
+    Hello = 1, Ready = 2, Stop = 3, Authority = 4, AuthorityObserved = 5,
+    ConfigureListener = 6, ListenerConfigured = 7, ConnectionObserved = 8, ConnectionClosed = 9,
+    NetworkRequest = 10, NetworkReply = 11, RundownObserved = 12,
+}
 internal sealed record AudioWorkerFrame(AudioWorkerFrameKind Kind, byte[] Body);
 
 /// <summary>Bounded local native control, distinct from enrollment/network framing.</summary>
@@ -66,15 +70,23 @@ internal sealed class AudioWorkerControl(IEnrollmentChannel channel)
     }
 }
 
-/// <summary>N1 only: actual worker/process-bound bootstrap. This grants no audio resource.</summary>
+/// <summary>Bounded event owner whose actual work is joined before caller handles retire.</summary>
+internal interface IAudioWorkerEventOwner
+{
+    bool TryPost(AudioWorkerFrame frame);
+    Task StopAndJoinAsync();
+}
+/// <summary>Process-bound bootstrap and serialized native control; grants no resource by itself.</summary>
 [SupportedOSPlatform("windows")]
 internal sealed class BrokerAudioWorkerSession
 {
-    private readonly AudioWorkerControl control;
+    private readonly AudioWorkerControlPump pump;
     private readonly BrokerCallerBinding caller;
     private readonly byte[] boot;
     private readonly object publicationGate = new();
     private Task? publication;
+    private Task<bool>? terminalPublication;
+    private IAudioWorkerEventOwner? eventOwner;
     private Task? stopOperation;
     private BrokerAudioOwner? audioOwner;
     private bool stopping;
@@ -82,7 +94,29 @@ internal sealed class BrokerAudioWorkerSession
     internal BrokerRegisteredWorker Worker { get; }
     internal IBrokerObservedCaller Caller => caller;
     private BrokerAudioWorkerSession(BrokerRegisteredWorker worker, BrokerCallerBinding caller, AudioWorkerControl control, byte[] boot)
-    { Worker = worker; this.caller = caller; this.control = control; this.boot = boot; }
+    {
+        Worker = worker; this.caller = caller; this.boot = boot;
+        pump = new(control, frame => {
+            if (!caller.Matches(worker)) throw new UnauthorizedAccessException("Native event caller changed.");
+            return Volatile.Read(ref eventOwner)?.TryPost(frame) == true;
+        }, _ => Volatile.Read(ref audioOwner)?.CloseAdmission());
+    }
+
+    internal void BindEvents(BrokerAudioOwner owner, IAudioWorkerEventOwner events)
+    {
+        ArgumentNullException.ThrowIfNull(events);
+        lock (publicationGate)
+        {
+            RequireOwner(owner);
+            if (stopping || eventOwner is not null) throw new InvalidOperationException("Native event owner is already bound or stopping.");
+            audioOwner = owner; Volatile.Write(ref eventOwner, events);
+        }
+    }
+    private void RequireOwner(BrokerAudioOwner owner)
+    {
+        if (!owner.IsWorker(Worker) || audioOwner is not null && !ReferenceEquals(audioOwner, owner))
+            throw new UnauthorizedAccessException("Audio publication is outside its retained source/worker owner.");
+    }
 
     internal static async Task<BrokerAudioWorkerSession> ConnectAsync(BrokerRegisteredWorker worker, byte[] serviceBoot, CancellationToken ct)
     {
@@ -126,28 +160,50 @@ internal sealed class BrokerAudioWorkerSession
 
     internal Task<bool> PublishAuthorityAsync(BrokerAudioOwner owner, CancellationToken ct)
     {
-        ct.ThrowIfCancellationRequested();
+        Task<bool> operation;
         lock (publicationGate)
         {
-            if (stopping || !owner.IsWorker(Worker) || audioOwner is not null && !ReferenceEquals(audioOwner, owner))
-                throw new UnauthorizedAccessException("Audio publication is outside its retained source/worker owner.");
-            if (publication is { IsCompleted: false }) throw new InvalidOperationException("A native authority operation is already retained.");
+            RequireOwner(owner);
             audioOwner = owner;
-            var operation = PublishCore(owner, ct); publication = operation; return operation;
+            if (ct.IsCancellationRequested) { QueueTerminal(owner); return Task.FromCanceled<bool>(ct); }
+            var snapshot = owner.ControlSnapshot();
+            if (snapshot.Closed) operation = QueueTerminal(owner);
+            else
+            {
+                if (stopping) throw new InvalidOperationException("Native owner is stopping.");
+                if (publication is { IsCompleted: false }) throw new InvalidOperationException("A native authority operation is already retained.");
+                operation = PublishCore(owner, snapshot); publication = operation;
+            }
+        }
+        return AwaitCaller(owner, operation, ct);
+    }
+    private Task<bool> QueueTerminal(BrokerAudioOwner owner)
+    {
+        lock (publicationGate)
+        {
+            RequireOwner(owner); owner.CloseAdmission(); stopping = true;
+            return terminalPublication ??= PublishCore(owner, owner.ControlSnapshot());
         }
     }
-    private async Task<bool> PublishCore(BrokerAudioOwner owner, CancellationToken ct)
+    private async Task<bool> AwaitCaller(BrokerAudioOwner owner, Task<bool> operation, CancellationToken ct)
     {
         try
         {
-            var snapshot = owner.ControlSnapshot();
+            var result = await operation.WaitAsync(ct).ConfigureAwait(false);
+            ct.ThrowIfCancellationRequested();
+            return result;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { _ = QueueTerminal(owner); throw; }
+    }
+    private async Task<bool> PublishCore(BrokerAudioOwner owner, AudioControlGrant snapshot)
+    {
+        try
+        {
             if (!snapshot.Boot.AsSpan().SequenceEqual(boot)) throw new UnauthorizedAccessException("Native service boot changed.");
             var bytes = AudioAuthorityProtocol.Control(snapshot);
-            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct); timeout.CancelAfter(TimeSpan.FromSeconds(3));
             if (!owner.IsControlCurrent(snapshot)) return false;
-            await control.WriteAsync(AudioWorkerFrameKind.Authority, bytes, timeout.Token).ConfigureAwait(false);
-            var observed = await control.ReadAsync(timeout.Token).ConfigureAwait(false);
-            if (observed.Kind != AudioWorkerFrameKind.AuthorityObserved || !observed.Body.AsSpan().SequenceEqual(bytes) || !caller.Matches(Worker))
+            await pump.PublishAsync(bytes).ConfigureAwait(false);
+            if (!caller.Matches(Worker))
                 throw new UnauthorizedAccessException("Native authority acknowledgement changed context.");
             var current = owner.IsControlCurrent(snapshot);
             // This confirms only native authorization-state observation. N4
@@ -167,20 +223,20 @@ internal sealed class BrokerAudioWorkerSession
         {
             if (stopped) return Task.CompletedTask;
             if (stopOperation is { IsFaulted: false }) return stopOperation;
-            stopping = true; audioOwner?.CloseAdmission(); var pending = publication;
+            stopping = true; audioOwner?.CloseAdmission(); var pending = new[] { publication, terminalPublication }.OfType<Task>().Distinct().ToArray();
             // One retained cold operation, shared by cancellation/shutdown.
             // No process wait or pipe I/O occurs under publicationGate.
             return stopOperation = Task.Run(() => StopCore(pending));
         }
     }
-    private async Task StopCore(Task? pending)
+    private async Task StopCore(Task[] pending)
     {
-        if (pending is not null)
-            try { await pending.ConfigureAwait(false); } catch { /* Retain/finish actual I/O before worker join. */ }
-        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(3));
-        try { await control.WriteAsync(AudioWorkerFrameKind.Stop, ReadOnlyMemory<byte>.Empty, deadline.Token).ConfigureAwait(false); }
+        try { await pump.SendStopAsync().ConfigureAwait(false); }
         catch (Exception error) when (error is IOException or OperationCanceledException or ObjectDisposedException) { }
         Worker.StopAndJoin(); // Actual retained job/process completion, regardless of cooperative reply.
+        await pump.StopAndJoinAsync().ConfigureAwait(false);
+        if (eventOwner is not null) await eventOwner.StopAndJoinAsync().ConfigureAwait(false);
+        try { await Task.WhenAll(pending).ConfigureAwait(false); } catch { /* Actual retained I/O has completed. */ }
         caller.Dispose(); lock (publicationGate) stopped = true;
     }
 }

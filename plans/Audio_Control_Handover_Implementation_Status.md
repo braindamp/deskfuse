@@ -67,10 +67,29 @@ timelines, PCM storage/assembly and AAudio/ASRC processing were not changed.
   deployment or physical audio/network operation was run. No latency/power
   improvement or gapless handover is claimed by offline checks.
 
+## Iteration 2 — sole pipe reader and retained shutdown
+
+Implemented the post-bootstrap control pump with one reader, exact correlated
+authority acknowledgements, one regular projection and a separate restrictive
+projection. Unsolicited native events are demultiplexed without a competing
+reader. Stop submission does not wait for a positive acknowledgement. Invalid
+acknowledgements fail the retained channel; it never reconnects in place.
+
+Caller cancellation fences authority but retains actual I/O. Shutdown joins the
+reader, outstanding writes/projections and typed event-owner work before releasing
+the process-bound caller handles. Native event frame kinds are reserved on both
+sides; listener/request/rundown handlers remain the next integration step.
+
+Seven focused control-pump checks passed (including interleaved events, exact
+and conflicting acknowledgements, separate restrictive capacity, and delayed
+actual write completion after cancellation). Broker/native DLL build passed
+with zero warnings/errors after loading the Visual Studio build environment.
+The three native broker-control checks also passed. No media processing changed.
+
 ## Continue on High
 
-Finish the single broker-pipe reader/demultiplexer and bounded actual observation/
-request/fence routing; replace direct competing acknowledgement reads. Wire
+The single broker-pipe reader/demultiplexer is implemented. Finish bounded actual
+observation/request/fence routing and concrete native handlers. Wire
 negative control and real termination custody/lookup. Then implement native
 candidate setup/transfer/old-egress barrier and phone receipt-based approval,
 followed by the Network-handle-aware coordinator and cellular lease lifecycle

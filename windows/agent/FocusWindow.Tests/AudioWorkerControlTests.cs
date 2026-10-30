@@ -6,6 +6,87 @@ namespace FocusWindow.Tests;
 
 public sealed class AudioWorkerControlTests
 {
+    private static AudioControlGrant Grant()
+    {
+        using var f = JsonDocument.Parse(File.ReadAllBytes(Path.Combine(AppContext.BaseDirectory, "Fixtures", "audio-authority-v1.json")));
+        return AudioAuthorityProtocol.ParseControl(Convert.FromHexString(f.RootElement.GetProperty("controlHex").GetString()!));
+    }
+    [Fact]
+    public async Task Caller_cancellation_keeps_actual_projection_owned_until_its_ack()
+    {
+        var (local, peer) = Duplex.Pair(); var remote = new AudioWorkerControl(peer);
+        var pump = new AudioWorkerControlPump(new(local), _ => false, _ => { });
+        var operation = pump.PublishAsync(AudioAuthorityProtocol.Control(Grant()));
+        var frame = await remote.ReadAsync(CancellationToken.None);
+        using var caller = new CancellationTokenSource(); caller.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => operation.WaitAsync(caller.Token));
+        Assert.False(operation.IsCompleted);
+        await remote.WriteAsync(AudioWorkerFrameKind.AuthorityObserved, frame.Body, CancellationToken.None);
+        Assert.True(await operation.WaitAsync(TimeSpan.FromSeconds(3))); await pump.StopAndJoinAsync();
+    }
+    [Fact]
+    public async Task Shutdown_does_not_release_an_actual_write_that_completes_after_cancellation()
+    {
+        var (local, peer) = Duplex.Pair(); var remote = new AudioWorkerControl(peer);
+        var barrier = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously); local.WriteCompletion = barrier.Task;
+        var pump = new AudioWorkerControlPump(new(local), _ => false, _ => { });
+        var operation = pump.PublishAsync(AudioAuthorityProtocol.Control(Grant()));
+        _ = await remote.ReadAsync(CancellationToken.None); // Bytes submitted; completion is still genuinely owned.
+        var joined = pump.StopAndJoinAsync(); Assert.False(joined.IsCompleted); Assert.False(operation.IsCompleted);
+        barrier.SetResult(true); await joined.WaitAsync(TimeSpan.FromSeconds(3));
+        await Assert.ThrowsAnyAsync<Exception>(() => operation);
+    }
+    [Fact]
+    public async Task Sole_reader_routes_events_while_a_projection_acknowledgement_is_pending()
+    {
+        var (local, peer) = Duplex.Pair(); var remote = new AudioWorkerControl(peer);
+        var routed = new TaskCompletionSource<AudioWorkerFrame>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var failures = 0;
+        var pump = new AudioWorkerControlPump(new(local), frame => { routed.TrySetResult(frame); return true; }, _ => Interlocked.Increment(ref failures));
+        var bytes = AudioAuthorityProtocol.Control(Grant());
+        var projection = pump.PublishAsync(bytes); var request = await remote.ReadAsync(CancellationToken.None);
+        Assert.Equal(AudioWorkerFrameKind.Authority, request.Kind);
+        await remote.WriteAsync(AudioWorkerFrameKind.ConnectionObserved, new byte[112], CancellationToken.None);
+        Assert.Equal(AudioWorkerFrameKind.ConnectionObserved, (await routed.Task.WaitAsync(TimeSpan.FromSeconds(3))).Kind);
+        Assert.False(projection.IsCompleted);
+        await remote.WriteAsync(AudioWorkerFrameKind.AuthorityObserved, request.Body, CancellationToken.None);
+        Assert.True(await projection.WaitAsync(TimeSpan.FromSeconds(3)));
+        await pump.StopAndJoinAsync(); Assert.Equal(1, local.MaxReaders); Assert.Equal(0, failures);
+    }
+    [Fact]
+    public async Task Restrictive_projection_and_Stop_do_not_wait_for_a_positive_ack()
+    {
+        var (local, peer) = Duplex.Pair(); var remote = new AudioWorkerControl(peer);
+        var pump = new AudioWorkerControlPump(new(local), _ => false, _ => { }); var grant = Grant();
+        var bytes = AudioAuthorityProtocol.Control(grant);
+        var regular = pump.PublishAsync(bytes); Assert.Same(regular, pump.PublishAsync(bytes));
+        _ = await remote.ReadAsync(CancellationToken.None);
+        Assert.Throws<InvalidOperationException>(() => { _ = pump.PublishAsync(AudioAuthorityProtocol.Control(grant with { Revision = grant.Revision + 1 })); });
+        var closedBytes = AudioAuthorityProtocol.Control(grant with { Revision = grant.Revision + 1, Closed = true, OutputReady = false });
+        var restrictive = pump.PublishAsync(closedBytes);
+        var closed = await remote.ReadAsync(CancellationToken.None).AsTask().WaitAsync(TimeSpan.FromSeconds(3));
+        Assert.Equal(closedBytes, closed.Body); Assert.False(regular.IsCompleted);
+        await remote.WriteAsync(AudioWorkerFrameKind.AuthorityObserved, closed.Body, CancellationToken.None);
+        Assert.True(await restrictive.WaitAsync(TimeSpan.FromSeconds(3)));
+        await pump.SendStopAsync(); Assert.Equal(AudioWorkerFrameKind.Stop, (await remote.ReadAsync(CancellationToken.None)).Kind);
+        Assert.False(regular.IsCompleted); Assert.Throws<IOException>(() => { _ = pump.PublishAsync(bytes); });
+        await remote.WriteAsync(AudioWorkerFrameKind.AuthorityObserved, bytes, CancellationToken.None);
+        Assert.True(await regular.WaitAsync(TimeSpan.FromSeconds(3)));
+        await pump.StopAndJoinAsync(); Assert.Equal(1, local.MaxReaders);
+    }
+    [Fact]
+    public async Task Wrong_acknowledgement_fails_all_retained_operations_and_cannot_reconnect()
+    {
+        var (local, peer) = Duplex.Pair(); var remote = new AudioWorkerControl(peer); var failures = 0;
+        var pump = new AudioWorkerControlPump(new(local), _ => false, _ => Interlocked.Increment(ref failures));
+        var grant = Grant(); var bytes = AudioAuthorityProtocol.Control(grant); var operation = pump.PublishAsync(bytes);
+        _ = await remote.ReadAsync(CancellationToken.None);
+        await remote.WriteAsync(AudioWorkerFrameKind.AuthorityObserved,
+            AudioAuthorityProtocol.Control(grant with { AuthorityUntil = grant.AuthorityUntil + 1 }), CancellationToken.None);
+        await Assert.ThrowsAsync<InvalidDataException>(() => operation);
+        Assert.Throws<IOException>(() => { _ = pump.PublishAsync(bytes); });
+        await pump.StopAndJoinAsync(); Assert.Equal(1, failures);
+    }
     [Fact]
     public async Task Bootstrap_matches_shared_Rust_fixture_and_handles_fragmented_control()
     {
@@ -44,5 +125,25 @@ public sealed class AudioWorkerControlTests
             Input.AsSpan(Position, length).CopyTo(bytes.Span); Position += length; return ValueTask.FromResult(length);
         }
         public ValueTask WriteAsync(ReadOnlyMemory<byte> bytes, CancellationToken ct) => Output.WriteAsync(bytes, ct);
+    }
+    private sealed class Duplex : IEnrollmentChannel
+    {
+        private readonly System.Threading.Channels.Channel<byte> input = System.Threading.Channels.Channel.CreateBounded<byte>(new System.Threading.Channels.BoundedChannelOptions(32768) { AllowSynchronousContinuations = false });
+        private Duplex other = null!;
+        private int readers;
+        internal int MaxReaders;
+        internal Task? WriteCompletion;
+        internal static (Duplex, Duplex) Pair() { var a = new Duplex(); var b = new Duplex(); a.other = b; b.other = a; return (a, b); }
+        public async ValueTask<int> ReadAsync(Memory<byte> bytes, CancellationToken ct)
+        {
+            var count = Interlocked.Increment(ref readers); MaxReaders = Math.Max(MaxReaders, count);
+            try { var value = await input.Reader.ReadAsync(ct); bytes.Span[0] = value; return 1; }
+            finally { Interlocked.Decrement(ref readers); }
+        }
+        public async ValueTask WriteAsync(ReadOnlyMemory<byte> bytes, CancellationToken ct)
+        {
+            foreach (var value in bytes.ToArray()) await other.input.Writer.WriteAsync(value, ct);
+            if (WriteCompletion is not null) await WriteCompletion; // Synthetic delayed real completion, not an abandoned wait.
+        }
     }
 }

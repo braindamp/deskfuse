@@ -40,6 +40,7 @@
     <Compile Include="..\..\audio\DeskFuse.AudioBroker\BrokerWorkerLauncher.cs" Link="Audio\BrokerWorkerLauncher.cs" />
     <Compile Include="..\..\audio\DeskFuse.AudioBroker\BrokerWorkerToken.cs" Link="Audio\BrokerWorkerToken.cs" />
     <Compile Include="..\..\audio\DeskFuse.AudioBroker\AudioWorkerControl.cs" Link="Audio\AudioWorkerControl.cs" />
+    <Compile Include="..\..\audio\DeskFuse.AudioBroker\AudioWorkerControlPump.cs" Link="Audio\AudioWorkerControlPump.cs" />
     <Compile Include="..\..\audio\DeskFuse.AudioBroker\AudioAuthorityProtocol.cs" Link="Audio\AudioAuthorityProtocol.cs" />
     <Compile Include="..\..\audio\DeskFuse.AudioBroker\AudioRequestProtocol.cs" Link="Audio\AudioRequestProtocol.cs" />
     <Compile Include="..\..\audio\DeskFuse.AudioBroker\AudioSourceStopProtocol.cs" Link="Audio\AudioSourceStopProtocol.cs" />
