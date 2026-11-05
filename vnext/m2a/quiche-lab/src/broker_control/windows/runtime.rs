@@ -96,6 +96,8 @@ struct NativeRuntime {
     test_source: Option<std::sync::mpsc::SyncSender<(bool, usize, bool)>>,
     #[cfg(test)]
     test_open: Option<source_attach::TestOpen>,
+    #[cfg(test)]
+    test_cancel_first_promotion: bool,
 }
 
 pub(super) fn now() -> u64 {
@@ -139,6 +141,8 @@ impl NativeRuntime {
             test_source: None,
             #[cfg(test)]
             test_open: None,
+            #[cfg(test)]
+            test_cancel_first_promotion: false,
         })
     }
 
@@ -214,6 +218,10 @@ impl NativeRuntime {
                 }
                 if first {
                     self.promotion = Some(Promotion { grant, frame: frame.body, requested: false });
+                    #[cfg(test)]
+                    if self.test_cancel_first_promotion {
+                        self.listener.as_ref().unwrap().candidate.as_ref().unwrap().cancel();
+                    }
                     return Ok(None);
                 }
                 if self.promotion.is_some() { return Err(invalid()); }
@@ -1952,10 +1960,14 @@ mod tests {
     }
 
     #[test]
-    fn real_worker_moves_first_pinned_tls_and_keeps_pcm_gated() { first_delivery_fixture(false); }
+    fn real_worker_moves_first_pinned_tls_and_keeps_pcm_gated() { first_delivery_fixture(false, false); }
     #[test]
-    fn stop_after_first_pin_joins_worker_without_a_delivery_receipt() { first_delivery_fixture(true); }
-    fn first_delivery_fixture(stop_at_pin: bool) {
+    fn stop_after_first_pin_joins_worker_without_a_delivery_receipt() { first_delivery_fixture(true, false); }
+    #[test]
+    fn committed_first_delivery_candidate_failure_retires_worker_without_ack() {
+        first_delivery_fixture(false, true);
+    }
+    fn first_delivery_fixture(stop_at_pin: bool, fail_on_promotion: bool) {
         use crate::audio_tls::{Role, ALPN};
         use crate::audio_transport::DeliveryTls;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1988,6 +2000,7 @@ mod tests {
         runtime.source = Some(SourceOwner::new(config.scope.clone(), Box::new(input)));
         let (source_tx, source_rx) = sync_channel(64);
         runtime.test_source = Some(source_tx);
+        runtime.test_cancel_first_promotion = fail_on_promotion;
         let worker = spawn_offline(runtime);
         let source_bytes = bytes[4..4 + u16::from_be_bytes([bytes[2], bytes[3]]) as usize].to_vec();
         let mut n2 = [0x72; 32];
@@ -2142,6 +2155,15 @@ mod tests {
         delivery.delivery_digest = nominated.digest;
         let published = encode_control(&delivery);
         remote.write(AUTHORITY, &published).unwrap();
+        if fail_on_promotion {
+            stop_phone.store(true, Ordering::SeqCst);
+            let outcome = worker.join().unwrap();
+            assert!(outcome.is_err());
+            phone.join().unwrap();
+            assert!(remote.read(100).is_err());
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            return;
+        }
         assert_eq!(remote.read(3000).unwrap(), (AUTHORITY_OBSERVED, published));
         let cutoff = Instant::now() + Duration::from_secs(3);
         loop {
@@ -2265,6 +2287,7 @@ mod tests {
         let test_source = runtime.test_source;
         let test_idle = runtime.test_idle;
         let test_open = runtime.test_open;
+        let test_cancel_first_promotion = runtime.test_cancel_first_promotion;
         std::thread::spawn(move || {
             let mut runtime = NativeRuntime::new(client)?;
             runtime.authority = authority;
@@ -2273,6 +2296,7 @@ mod tests {
             runtime.test_source = test_source;
             runtime.test_idle = test_idle;
             runtime.test_open = test_open;
+            runtime.test_cancel_first_promotion = test_cancel_first_promotion;
             runtime.listener = Some(BoundListener {
                 events: crate::reactor::WindowsEvents::new(&_socket)?,
                 bytes, config, _socket, acknowledgement, setup_wake,

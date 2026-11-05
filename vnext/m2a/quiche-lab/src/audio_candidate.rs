@@ -575,7 +575,9 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicU64, AtomicUsize};
+    static WARM_CLOCK: AtomicU64 = AtomicU64::new(100);
+    fn warm_clock() -> io::Result<u64> { Ok(WARM_CLOCK.load(Ordering::SeqCst)) }
     fn now() -> io::Result<u64> {
         Ok(100)
     }
@@ -608,6 +610,10 @@ mod tests {
     }
     impl Harness {
         fn start(exhaust_send_budget: bool, messages: u16) -> Self {
+            Self::start_with_clock(exhaust_send_budget, messages, now, 100_000_000)
+        }
+        fn start_with_clock(exhaust_send_budget: bool, messages: u16,
+            clock: fn() -> io::Result<u64>, warm_until: u64) -> Self {
             let phone_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
             phone_socket.set_nonblocking(true).unwrap();
             let listener = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
@@ -634,7 +640,7 @@ mod tests {
                 thread::yield_now();
             };
             let limits = SetupLimits {
-                until100ns: 100_000_000,
+                until100ns: warm_until,
                 idle_ms: 10000,
                 queued_packets: 16,
                 max_packets: 1024,
@@ -663,7 +669,7 @@ mod tests {
                 SourceScope::parse(&source).unwrap(),
                 grant.boot,
                 limits,
-                now,
+                clock,
                 wake,
             )
             .unwrap();
@@ -1042,6 +1048,27 @@ mod tests {
         assert!(second.setup.finished());
         assert!(second.listener.local_addr().is_ok());
         assert!(second.setup.cancel_and_join().unwrap().is_none());
+    }
+    #[test]
+    fn warm_expiry_while_pin_is_queued_cannot_publish_pinned_authority() {
+        WARM_CLOCK.store(100, Ordering::SeqCst);
+        let mut h = Harness::start_with_clock(false, 32, warm_clock, 100_000);
+        h.until(|h| h.events.iter().any(|e| matches!(e, SetupEvent::Observed(_))));
+        let (_, delivery, mut parent) = fixture();
+        let binding = DeliveryBinding::parse(&delivery).unwrap();
+        parent.delivery_generation = 0;
+        parent.delivery_digest = [0; 32];
+        parent.output_generation = 0;
+        parent.ready = false;
+        WARM_CLOCK.store(100_000, Ordering::SeqCst);
+        let _ = h.setup.try_pin(parent, binding.request);
+        h.until(|h| h.setup.finished());
+        let outcome = h.setup.take_finished().unwrap().unwrap();
+        assert!(outcome.error.is_some());
+        assert!(outcome.pinned_request.is_none());
+        assert!(!outcome.promoted);
+        assert!(!h.events.iter().any(|e| matches!(e, SetupEvent::Pinned(_))));
+        assert!(h.listener.local_addr().is_ok());
     }
     #[test]
     fn candidate_pin_rejects_a_boot_other_than_its_actual_broker_bootstrap() {
