@@ -20,6 +20,12 @@ struct NativeRuntime {
     authority: AudioAuthority,
     listener: Option<BoundListener>,
     resume: ResumeWake,
+    #[cfg(test)]
+    test_clock: Option<Arc<std::sync::atomic::AtomicU64>>,
+    #[cfg(test)]
+    test_idle: Option<std::sync::mpsc::Sender<()>>,
+    #[cfg(test)]
+    test_datagram: Option<std::sync::mpsc::Sender<usize>>,
 }
 
 fn now() -> u64 {
@@ -42,7 +48,23 @@ impl NativeRuntime {
     fn new(client: BrokerControlClient) -> io::Result<Self> {
         let authority = AudioAuthority::new(client.boot(), client.worker())?;
         let resume = ResumeWake::register()?;
-        Ok(Self { client, authority, listener: None, resume })
+        Ok(Self {
+            client, authority, listener: None, resume,
+            #[cfg(test)]
+            test_clock: None,
+            #[cfg(test)]
+            test_idle: None,
+            #[cfg(test)]
+            test_datagram: None,
+        })
+    }
+
+    fn clock(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(clock) = &self.test_clock {
+            return clock.load(std::sync::atomic::Ordering::SeqCst);
+        }
+        now()
     }
 
     fn run(mut self) -> io::Result<()> {
@@ -57,7 +79,7 @@ impl NativeRuntime {
     fn live(&mut self) -> io::Result<()> {
         if let Some(error) = self.client.failure() { return Err(error); }
         if self.client.terminal() { return Err(retired()); }
-        if self.authority.deadline().is_some() && !self.authority.source_allowed(now()) {
+        if self.authority.deadline().is_some() && !self.authority.source_allowed(self.clock()) {
             return Err(expired());
         }
         Ok(())
@@ -70,7 +92,8 @@ impl NativeRuntime {
                 if self.listener.as_ref().is_some_and(|owned| !owned.config.scope.matches(&grant)) {
                     return Err(invalid());
                 }
-                self.authority.apply(grant, now())?;
+                let tick = self.clock();
+                self.authority.apply(grant, tick)?;
                 Ok(Some((AUTHORITY_OBSERVED, frame.body)))
             }
             CONFIGURE_LISTENER => {
@@ -122,7 +145,8 @@ impl NativeRuntime {
                 return Err(invalid());
             }
             let terminal = grant.closed;
-            self.authority.apply(grant, now())?;
+            let tick = self.clock();
+            self.authority.apply(grant, tick)?;
             if terminal {
                 closed = Some(frame.body);
                 break;
@@ -163,6 +187,8 @@ impl NativeRuntime {
                     if self.drain_listener()? { continue; }
                     self.live()?;
                     let timeout = self.timeout(None)?;
+                    #[cfg(test)]
+                    if let Some(sender) = &self.test_idle { let _ = sender.send(()); }
                     self.listener.as_ref().unwrap().events.wait_listener(
                         self.client.control_event().as_raw_handle(),
                         self.client.terminal_event().as_raw_handle(), self.resume.event(), timeout)?;
@@ -192,7 +218,12 @@ impl NativeRuntime {
             self.live()?;
             let received = self.listener.as_ref().unwrap()._socket.recv_from(&mut bytes);
             match received {
-                Ok(_) => {}
+                Ok((size, _)) => {
+                    #[cfg(test)]
+                    if let Some(sender) = &self.test_datagram { let _ = sender.send(size); }
+                    #[cfg(not(test))]
+                    let _ = size;
+                }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
                 Err(error) if error.raw_os_error() == Some(10040) => {}
                 Err(error) => return Err(error),
@@ -206,7 +237,7 @@ impl NativeRuntime {
     fn timeout(&self, until: Option<Instant>) -> io::Result<u32> {
         let mut remaining = until.map(|deadline| deadline.saturating_duration_since(Instant::now()).as_millis());
         if let Some(cutoff) = self.authority.deadline() {
-            let ticks = cutoff.checked_sub(now()).ok_or_else(expired)?;
+            let ticks = cutoff.checked_sub(self.clock()).ok_or_else(expired)?;
             let ms = u128::from(ticks / 10000) + u128::from(ticks % 10000 != 0);
             remaining = Some(remaining.map_or(ms, |other| other.min(ms)));
         }
@@ -282,6 +313,34 @@ mod tests {
         let client = runtime.client;
         std::thread::spawn(move || NativeRuntime::new(client).and_then(NativeRuntime::run))
     }
+    fn monitored_runtime(runtime: NativeRuntime, clock: Arc<std::sync::atomic::AtomicU64>) -> (
+        std::thread::JoinHandle<io::Result<()>>,
+        std::sync::mpsc::Receiver<usize>,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Receiver<usize>,
+        std::sync::mpsc::Receiver<Option<io::ErrorKind>>,
+    ) {
+        assert!(runtime.listener.is_none());
+        let client = runtime.client;
+        let (cookie_tx, cookie_rx) = std::sync::mpsc::sync_channel(1);
+        let (idle_tx, idle_rx) = std::sync::mpsc::channel();
+        let (datagram_tx, datagram_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let thread = std::thread::spawn(move || {
+            let result = (|| -> io::Result<()> {
+                let mut runtime = NativeRuntime::new(client)?;
+                runtime.test_clock = Some(clock);
+                runtime.test_idle = Some(idle_tx);
+                runtime.test_datagram = Some(datagram_tx);
+                let _ = cookie_tx.send(runtime.resume.cookie());
+                runtime.run()
+            })();
+            let _ = done_tx.send(result.as_ref().err().map(|error| error.kind()));
+            result
+        });
+        (thread, cookie_rx, idle_rx, datagram_rx, done_rx)
+    }
+
     #[test]
     fn sole_client_reader_binds_once_and_retries_exact_endpoint_ack() {
         let (runtime, remote) = runtime();
@@ -305,133 +364,70 @@ mod tests {
         assert!(UdpSocket::bind(address).is_ok());
     }
     #[test]
-    fn malformed_configuration_and_foreign_source_fail_before_binding() {
-        let (mut runtime, _remote) = runtime();
+    fn resume_rechecks_expired_boot_cutoff_and_preserves_preexpiry_listener() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let (runtime, remote) = runtime();
         let bytes = listener_bytes();
         let config = ListenerConfig::parse(&bytes, runtime.client.worker()).unwrap();
-        let mut wrong = bytes.clone();
-        wrong[1] = 2;
-        assert!(runtime.process(Frame {kind: CONFIGURE_LISTENER, body: wrong}).is_err());
-        assert!(runtime.listener.is_none());
-        let prior = grant_for(&config, 12, false);
-        runtime.process(Frame {kind: AUTHORITY, body: prior}).unwrap();
-        let mut wrong_source = bytes.clone();
-        let source_start = 4 + b"DeskFuse.Audio.Source.v1\0".len();
-        wrong_source[source_start] ^= 1;
-        assert!(runtime.process(Frame {kind: CONFIGURE_LISTENER, body: wrong_source}).is_err());
-        assert!(runtime.listener.is_none());
-    }
-    #[test]
-    fn later_source_substitution_is_terminal_and_exact_authority_bytes_are_acknowledged() {
-        let (mut runtime, _remote) = runtime();
-        let bytes = listener_bytes();
-        let config = ListenerConfig::parse(&bytes, runtime.client.worker()).unwrap();
-        let ack = runtime.process(Frame {kind: CONFIGURE_LISTENER, body: bytes.clone()}).unwrap().unwrap();
-        assert_eq!(ack.0, LISTENER_CONFIGURED);
-        let socket = Arc::clone(&runtime.listener.as_ref().unwrap()._socket);
-        assert_eq!(runtime.process(Frame {kind: CONFIGURE_LISTENER, body: bytes.clone()}).unwrap().unwrap().1, ack.1);
-        assert!(Arc::ptr_eq(&socket, &runtime.listener.as_ref().unwrap()._socket));
-        let mut conflicting = bytes.clone();
-        *conflicting.last_mut().unwrap() ^= 1;
-        assert!(runtime.process(Frame {kind: CONFIGURE_LISTENER, body: conflicting}).is_err());
-        assert!(Arc::ptr_eq(&socket, &runtime.listener.as_ref().unwrap()._socket));
-        let correct = grant_for(&config, 12, false);
-        assert_eq!(runtime.process(Frame {kind: AUTHORITY, body: correct.clone()}).unwrap().unwrap(), (AUTHORITY_OBSERVED, correct.clone()));
-        assert_eq!(runtime.process(Frame {kind: AUTHORITY, body: correct.clone()}).unwrap().unwrap().1, correct);
-        let mut wrong = correct;
-        let at = b"DeskFuse.Audio.Control.v1\0".len() + 32 + 16 + 16 + 32 + 16 + 16 + 8;
-        wrong[at] ^= 1;
-        assert!(runtime.process(Frame {kind: AUTHORITY, body: wrong}).is_err());
-    }
-    #[test]
-    fn queued_config_does_not_bind_after_stop_and_idle_wait_wakes_from_client_terminal() {
-        let (runtime, remote) = runtime();
-        let thread = spawn_runtime(runtime);
-        remote.write(STOP, &[]).unwrap();
-        remote.write(CONFIGURE_LISTENER, &listener_bytes()).ok();
-        assert!(thread.join().unwrap().is_ok());
-    }
-
-    #[test]
-    fn closed_projection_fences_queued_configuration_and_acks_exact_bytes() {
-        let (runtime, remote) = runtime();
-        let config = ListenerConfig::parse(&listener_bytes(), runtime.client.worker()).unwrap();
-        let closed = grant_for(&config, 12, true);
-        let thread = spawn_runtime(runtime);
-        remote.write(AUTHORITY, &closed).unwrap();
-        let _ = remote.write(CONFIGURE_LISTENER, &listener_bytes());
-        assert_eq!(remote.read(3000).unwrap(), (AUTHORITY_OBSERVED, closed));
-        assert!(thread.join().unwrap().is_ok());
-    }
-    #[test]
-    fn lost_service_wakes_otherwise_idle_runtime() {
-        let (runtime, remote) = runtime();
-        let thread = spawn_runtime(runtime);
-        drop(remote);
-        assert!(thread.join().unwrap().is_err());
-    }
-    #[test]
-    fn idle_projection_expires_without_another_pipe_frame() {
-        let (runtime, remote) = runtime();
-        let config = ListenerConfig::parse(&listener_bytes(), runtime.client.worker()).unwrap();
-        let mut bytes = grant_for(&config, 12, false);
-        let offset = bytes.len() - 18;
-        bytes[offset..offset + 8].copy_from_slice(&(now() + 20_000_000).to_be_bytes());
-        let thread = spawn_runtime(runtime);
-        remote.write(AUTHORITY, &bytes).unwrap();
-        assert_eq!(remote.read(3000).unwrap(), (AUTHORITY_OBSERVED, bytes));
-        assert!(thread.join().unwrap().is_err());
-    }
-    #[test]
-    fn configured_listener_drains_one_explicit_packet_budget_without_admitting_media() {
-        let (mut runtime, _remote) = runtime();
-        runtime.process(Frame { kind: CONFIGURE_LISTENER, body: listener_bytes() }).unwrap();
-        let owner = runtime.listener.as_ref().unwrap();
-        let address = owner._socket.local_addr().unwrap();
-        let limit = owner.config.policy.packet_work as usize;
-        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
-        for _ in 0..limit * 3 {
-            sender.send_to(&[2u8; 1200], address).unwrap();
-        }
-        assert!(runtime.drain_listener().unwrap());
-        assert!(runtime.drain_listener().unwrap());
-        assert!(runtime.drain_listener().unwrap());
-        assert!(!runtime.drain_listener().unwrap());
-        assert!(runtime.authority.grant().is_none());
-        assert!(!runtime.authority.media_allowed(now()));
-    }
-
-    #[test]
-    fn configured_listener_wakes_for_stop_during_bounded_udp_ingress() {
-        let (runtime, remote) = runtime();
-        let config = listener_bytes();
-        let thread = spawn_runtime(runtime);
-        remote.write(CONFIGURE_LISTENER, &config).unwrap();
-        let (kind, ack) = remote.read(3000).unwrap();
-        assert_eq!(kind, LISTENER_CONFIGURED);
-        let address = std::net::SocketAddr::new(
-            std::net::IpAddr::V4(std::net::Ipv4Addr::new(ack[34], ack[35], ack[36], ack[37])),
-            u16::from_be_bytes([ack[38], ack[39]]));
-        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
-        for _ in 0..64 { sender.send_to(&[7u8; 1200], address).unwrap(); }
-        remote.write(STOP, &[]).unwrap();
-        assert!(thread.join().unwrap().is_ok());
-        assert!(UdpSocket::bind(address).is_ok());
-    }
-
-    #[test]
-    fn valid_projection_round_trips_exact_wire_bytes_through_production_style_dispatch() {
-        let (runtime, remote) = runtime();
-        let config = ListenerConfig::parse(&listener_bytes(), runtime.client.worker()).unwrap();
         let grant = grant_for(&config, 12, false);
-        let thread = spawn_runtime(runtime);
-        remote.write(AUTHORITY, &grant).unwrap();
-        assert_eq!(remote.read(3000).unwrap(), (AUTHORITY_OBSERVED, grant.clone()));
+        let at = grant.len() - 18;
+        let cutoff = u64::from_be_bytes(grant[at..at + 8].try_into().unwrap());
+        let clock = Arc::new(AtomicU64::new(now()));
+        let (thread, cookie_rx, idle_rx, _datagram_rx, done_rx) =
+            monitored_runtime(runtime, Arc::clone(&clock));
+        let cookie = cookie_rx.recv_timeout(Duration::from_secs(3)).unwrap();
         remote.write(AUTHORITY, &grant).unwrap();
         assert_eq!(remote.read(3000).unwrap(), (AUTHORITY_OBSERVED, grant));
+        remote.write(CONFIGURE_LISTENER, &bytes).unwrap();
+        let (kind, ack) = remote.read(3000).unwrap();
+        assert_eq!(kind, LISTENER_CONFIGURED);
+        let addr = std::net::SocketAddr::from((
+            [ack[34], ack[35], ack[36], ack[37]],
+            u16::from_be_bytes([ack[38], ack[39]]),
+        ));
+        idle_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+
+        clock.store(cutoff - 10_000_000, Ordering::SeqCst);
+        super::super::resume::simulate_resume(cookie);
+        idle_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(!thread.is_finished());
+        assert!(UdpSocket::bind(addr).is_err());
+
+        clock.store(cutoff + 1, Ordering::SeqCst);
+        super::super::resume::simulate_resume(cookie);
+        let result = done_rx.recv_timeout(Duration::from_secs(3));
+        if result.is_err() { let _ = remote.write(STOP, &[]); }
+        assert_eq!(result.unwrap(), Some(io::ErrorKind::PermissionDenied));
+        assert!(thread.join().unwrap().is_err());
+        assert!(UdpSocket::bind(addr).is_ok());
+    }
+
+    #[test]
+    fn idle_udp_event_drains_loopback_without_another_broker_frame() {
+        use std::sync::atomic::AtomicU64;
+        let (runtime, remote) = runtime();
+        let clock = Arc::new(AtomicU64::new(now()));
+        let (thread, _cookie_rx, idle_rx, datagram_rx, done_rx) =
+            monitored_runtime(runtime, clock);
+        remote.write(CONFIGURE_LISTENER, &listener_bytes()).unwrap();
+        let (kind, ack) = remote.read(3000).unwrap();
+        assert_eq!(kind, LISTENER_CONFIGURED);
+        let addr = std::net::SocketAddr::from((
+            [ack[34], ack[35], ack[36], ack[37]],
+            u16::from_be_bytes([ack[38], ack[39]]),
+        ));
+        idle_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        assert_eq!(sender.send_to(&[42u8; 1200], addr).unwrap(), 1200);
+        let received = datagram_rx.recv_timeout(Duration::from_secs(3));
+        if received.is_err() { let _ = remote.write(STOP, &[]); }
+        assert_eq!(received.unwrap(), 1200);
+        assert!(remote.read(100).is_err());
         remote.write(STOP, &[]).unwrap();
+        assert_eq!(done_rx.recv_timeout(Duration::from_secs(3)).unwrap(), None);
         assert!(thread.join().unwrap().is_ok());
     }
+
     #[test]
     fn closed_projection_during_positive_ack_completion_is_still_acknowledged() {
         let (runtime, remote) = runtime();

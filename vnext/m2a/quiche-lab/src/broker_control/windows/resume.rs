@@ -89,6 +89,11 @@ impl ResumeWake {
         self.event.as_raw_handle()
     }
 
+    #[cfg(test)]
+    pub(super) fn cookie(&self) -> usize {
+        self.cookie
+    }
+
     pub(super) fn unregister(&mut self) -> io::Result<()> {
         let registration = std::mem::take(&mut self.registration);
         if registration == 0 {
@@ -111,4 +116,9 @@ impl Drop for ResumeWake {
     fn drop(&mut self) {
         let _ = self.unregister();
     }
+}
+
+#[cfg(test)]
+pub(super) fn simulate_resume(cookie: usize) {
+    unsafe { power_event(cookie as *const c_void, PBT_APMRESUMEAUTOMATIC, std::ptr::null()); }
 }

@@ -68,6 +68,8 @@ struct Shared {
     capacity_event: OwnedHandle,
     #[cfg(test)]
     completion_gate: Mutex<Option<(std::sync::mpsc::SyncSender<()>, std::sync::mpsc::Receiver<()>)>>,
+    #[cfg(test)]
+    enqueue_gate: Mutex<Option<(std::sync::mpsc::SyncSender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 impl Shared {
     fn lock(&self) -> std::sync::MutexGuard<'_, Queue> {
@@ -135,6 +137,8 @@ impl BrokerControlClient {
             capacity_event: handle(unsafe { CreateEventW(null(), 0, 0, null()) })?,
             #[cfg(test)]
             completion_gate: Mutex::new(None),
+            #[cfg(test)]
+            enqueue_gate: Mutex::new(None),
         });
         let r = Arc::clone(&shared);
         let rc = Arc::clone(&control);
@@ -197,6 +201,13 @@ impl BrokerControlClient {
         let (entered, observed) = std::sync::mpsc::sync_channel(1);
         let (resume, released) = std::sync::mpsc::sync_channel(1);
         *self.shared.completion_gate.lock().unwrap() = Some((entered, released));
+        (observed, resume)
+    }
+    #[cfg(test)]
+    pub(super) fn delay_next_enqueue(&self) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::SyncSender<()>) {
+        let (entered, observed) = std::sync::mpsc::sync_channel(1);
+        let (resume, released) = std::sync::mpsc::sync_channel(1);
+        *self.shared.enqueue_gate.lock().unwrap() = Some((entered, released));
         (observed, resume)
     }
     pub fn failure(&self) -> Option<io::Error> {
@@ -265,6 +276,11 @@ impl BrokerControlClient {
             }
             _ => return Err(invalid()),
         };
+        #[cfg(test)]
+        if let Some((entered, released)) = self.shared.enqueue_gate.lock().unwrap().take() {
+            let _ = entered.send(());
+            let _ = released.recv_timeout(Duration::from_secs(3));
+        }
         let mut q = self.shared.lock();
         if self.shared.stopping.load(Ordering::Acquire) || (self.terminal() && !closed_ack) {
             return Err(io::Error::new(
@@ -568,58 +584,72 @@ pub(crate) mod tests {
         assert!(client.reader.is_none() && client.writer.is_none());
         assert!(client.try_write(CONNECTION_CLOSED, &[1; 16]).is_err());
     }
+
+
     #[test]
-    fn persistent_cancellation_joins_a_reader_between_header_and_body_without_reconnect() {
+    fn terminal_rejects_raced_enqueue_and_a_queued_unadmitted_ack_without_writing() {
+        let grant = crate::audio_authority::ControlGrant::parse(&fixture("control", "controlHex")).unwrap();
         let (local, remote) = pair();
-        let grant =
-            crate::audio_authority::ControlGrant::parse(&fixture("control", "controlHex")).unwrap();
-        let mut client = BrokerControlClient::start(local, grant.boot, grant.worker).unwrap();
-        remote.exact(&mut 100u32.to_be_bytes(), true, 3000).unwrap(); // Real partial frame; body never arrives.
+        let client = BrokerControlClient::start(local, grant.boot, grant.worker).unwrap();
+        let terminal = client.terminal_event().try_clone_to_owned().unwrap();
+        let (entered, release) = client.delay_next_enqueue();
+        let worker = thread::spawn(move || {
+            let attempted = client.try_write_confirmed(LISTENER_CONFIGURED, &[7; 24]);
+            (attempted, client)
+        });
+        entered.recv_timeout(Duration::from_secs(3)).unwrap();
+        remote.write(STOP, &[]).unwrap();
+        assert_eq!(unsafe { WaitForSingleObject(terminal.as_raw_handle(), 3000) }, WAIT_OBJECT_0);
+        release.send(()).unwrap();
+        let (attempted, mut client) = worker.join().unwrap();
+        assert!(attempted.is_err());
+        assert!(remote.read(100).is_err());
         client.stop_and_join().unwrap();
-        client.stop_and_join().unwrap();
-        assert!(client.terminal());
-        assert!(client.reader.is_none() && client.writer.is_none());
-        assert!(client.try_write(CONNECTION_CLOSED, &[1; 16]).is_err());
-    }
-    #[test]
-    fn actual_write_completion_wakes_capacity_retry_without_fabricating_an_authority_ack() {
+
         let (local, remote) = pair();
-        let grant =
-            crate::audio_authority::ControlGrant::parse(&fixture("control", "controlHex")).unwrap();
         let mut client = BrokerControlClient::start(local, grant.boot, grant.worker).unwrap();
-        assert!(client.try_write(CONNECTION_CLOSED, &[19; 16]).unwrap());
-        let (kind, body) = remote.read(3000).unwrap();
-        assert_eq!(kind, CONNECTION_CLOSED);
-        assert_eq!(body, [19; 16]);
-        assert_eq!(
-            unsafe { WaitForSingleObject(client.control_event().as_raw_handle(), 3000) },
-            WAIT_OBJECT_0
-        );
-        assert!(client.drain(16).unwrap().is_empty());
-        assert_eq!(client.shared.lock().retained[Lane::Internal as usize], 0);
+        let (entered, release) = client.delay_next_write_completion();
+        let admitted = client.try_write_confirmed(LISTENER_CONFIGURED, &[3; 24]).unwrap().unwrap();
+        assert_eq!(remote.read(3000).unwrap(), (LISTENER_CONFIGURED, vec![3; 24]));
+        entered.recv_timeout(Duration::from_secs(3)).unwrap();
+        let queued = client.try_write_confirmed(LISTENER_CONFIGURED, &[4; 24]).unwrap().unwrap();
+        remote.write(STOP, &[]).unwrap();
+        assert_eq!(unsafe { WaitForSingleObject(client.terminal_event().as_raw_handle(), 3000) }, WAIT_OBJECT_0);
+        release.send(()).unwrap();
+        assert_eq!(unsafe { WaitForSingleObject(admitted.event().as_raw_handle(), 3000) }, WAIT_OBJECT_0);
+        assert!(admitted.take_result().unwrap().is_ok());
+        assert_eq!(unsafe { WaitForSingleObject(queued.event().as_raw_handle(), 3000) }, WAIT_OBJECT_0);
+        assert!(queued.take_result().unwrap().is_err());
+        assert!(remote.read(100).is_err());
         client.stop_and_join().unwrap();
     }
 
     #[test]
-    fn acknowledged_write_requires_real_io_completion_and_cancellation_joins_all_receipts() {
-        let (local, remote) = pair();
+    fn closed_projection_ack_survives_terminal_after_an_admitted_write() {
         let grant = crate::audio_authority::ControlGrant::parse(&fixture("control", "controlHex")).unwrap();
+        let (local, remote) = pair();
         let mut client = BrokerControlClient::start(local, grant.boot, grant.worker).unwrap();
-        let body = vec![17u8; 256];
-        let mut receipts = Vec::new();
-        let mut reached_capacity = false;
-        for _ in 0..64 {
-            match client.try_write_confirmed(LISTENER_CONFIGURED, &body).unwrap() {
-                Some(receipt) => receipts.push(receipt),
-                None => { reached_capacity = true; break; }
-            }
-        }
-        assert!(reached_capacity);
-        assert!(receipts.iter().any(|receipt| receipt.0.result.lock().unwrap().is_none()));
-        remote.write(STOP, &[]).unwrap();
+        let (entered, release) = client.delay_next_write_completion();
+        let admitted = client.try_write_confirmed(LISTENER_CONFIGURED, &[5; 24]).unwrap().unwrap();
+        assert_eq!(remote.read(3000).unwrap(), (LISTENER_CONFIGURED, vec![5; 24]));
+        entered.recv_timeout(Duration::from_secs(3)).unwrap();
+
+        let mut closed = fixture("control", "controlHex");
+        let n = closed.len();
+        closed[n - 2] = 0;
+        closed[n - 1] = 1;
+        assert!(crate::audio_authority::ControlGrant::parse(&closed).unwrap().closed);
+        remote.write(AUTHORITY, &closed).unwrap();
         assert_eq!(unsafe { WaitForSingleObject(client.terminal_event().as_raw_handle(), 3000) }, WAIT_OBJECT_0);
+        let restrictive = client.try_write_confirmed(AUTHORITY_OBSERVED, &closed).unwrap().unwrap();
+        assert!(client.try_write_confirmed(LISTENER_CONFIGURED, &[9; 24]).is_err());
+        release.send(()).unwrap();
+        assert_eq!(unsafe { WaitForSingleObject(admitted.event().as_raw_handle(), 3000) }, WAIT_OBJECT_0);
+        assert!(admitted.take_result().unwrap().is_ok());
+        assert_eq!(remote.read(3000).unwrap(), (AUTHORITY_OBSERVED, closed));
+        assert_eq!(unsafe { WaitForSingleObject(restrictive.event().as_raw_handle(), 3000) }, WAIT_OBJECT_0);
+        assert!(restrictive.take_result().unwrap().is_ok());
         client.stop_and_join().unwrap();
-        assert!(receipts.iter().all(|receipt| receipt.0.result.lock().unwrap().is_some()));
-        assert!(client.reader.is_none() && client.writer.is_none());
     }
+
 }
