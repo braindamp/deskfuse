@@ -116,7 +116,15 @@ jobs:
         run: dotnet build windows/audio/DeskFuse.TaskbarWatch/DeskFuse.TaskbarWatch.csproj -c Release -warnaserror
       - name: Compile explicit-opt-in WASAPI category probe (never run audio on CI)
         run: dotnet build windows/audio/DeskFuse.AudioCategoryProbe/DeskFuse.AudioCategoryProbe.csproj -c Release -warnaserror
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Build Kotlin enrollment interop JAR
+        run: .\android\gradlew.bat -p android :protocol3:interopJar --no-daemon
       - name: Run unit and simulated tests (no display changes)
+        env:
+          DESKFUSE_PROTOCOL3_KOTLIN_JAR: ${{ github.workspace }}/android/build/protocol3/deskfuse-protocol-v3-kotlin.jar
         run: python -B tools/build-receipt.py check --name host-tests --kind test --report out/provenance/host-tests.json --log out/provenance/host-tests.log -- dotnet test windows/agent/FocusWindow.Tests/FocusWindow.Tests.csproj -c Release --verbosity minimal
       - name: Restore standalone maintenance runtime pack (build dependencies only)
         run: dotnet restore windows/tools/DeskFuse.DriverTestOwner/DeskFuse.DriverTestOwner.csproj -r win-x64 -p:NuGetAudit=false
