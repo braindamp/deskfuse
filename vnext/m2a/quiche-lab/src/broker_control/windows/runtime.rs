@@ -18,6 +18,12 @@ enum AcquisitionRpc {
     Proof(u64),
 }
 
+struct PendingPin {
+    record: Record,
+    parent: ControlGrant,
+    confirmed: bool,
+}
+
 struct Nomination {
     route: [u8; 16],
     request: [u8; 32],
@@ -38,6 +44,7 @@ struct BoundListener {
     tls_observation: Option<Observation>,
     nomination_pending: Option<(u64, u64, [u8; 32])>,
     nomination: Option<Nomination>,
+    pin: Option<PendingPin>,
     acquisition_rpc: Option<AcquisitionRpc>,
     acquisition_challenge: bool,
     pending_regular: VecDeque<Record>,
@@ -206,6 +213,7 @@ impl NativeRuntime {
                     tls_observation: None,
                     nomination_pending: None,
                     nomination: None,
+                    pin: None,
                     acquisition_rpc: None,
                     acquisition_challenge: false,
                     pending_regular: VecDeque::new(),
@@ -686,10 +694,16 @@ impl NativeRuntime {
     }
 
     fn forward_request(&mut self, record: Record) -> io::Result<bool> {
+        if crate::audio_rpc::validate_request(record.kind, &record.body).is_err() {
+            self.local_reply(record, 3)?;
+            return Ok(true);
+        }
         let owned = self.listener.as_ref().ok_or_else(invalid)?;
         let connection = owned.observed.ok_or_else(invalid)?;
         let negative = ac::negative(record.kind);
         let acquiring = matches!(record.kind, ac::ISSUE | ac::PROOF);
+        let attaching = record.kind == ac::ISSUE && record.body[0] == 2;
+        let source_issue = record.kind == ac::ISSUE && record.body[0] == 1;
         let first_nomination = record.kind == ac::PREPARE
             && self.authority.prepared() && self.source.as_ref().is_some_and(|s| !s.has_delivery())
             && owned.nomination_pending.is_none() && owned.nomination.is_none()
@@ -697,8 +711,8 @@ impl NativeRuntime {
             && owned.tls_observation.as_ref().is_some_and(|o| o.connection == connection);
         if matches!(record.kind, ac::OUTPUT | ac::DETACH | ac::STOP)
             || record.kind == ac::PREPARE && !first_nomination
-            || acquiring && (self.source.is_some() || self.authority.grant().is_some())
-            || record.kind == ac::ISSUE && record.body.first() != Some(&1)
+            || source_issue && (self.source.is_some() || self.authority.grant().is_some())
+            || record.kind == ac::ISSUE && !source_issue && !attaching
             || record.kind == ac::PROOF && !owned.acquisition_challenge
         {
             self.local_reply(record, 4)?;
@@ -707,6 +721,32 @@ impl NativeRuntime {
         if acquiring && owned.acquisition_rpc.is_some() {
             self.local_reply(record, 2)?;
             return Ok(true);
+        }
+        if attaching {
+            let parent = self.authority.grant().cloned();
+            let accepted = parent.as_ref().is_some_and(|grant|
+                self.authority.prepared() && self.source.as_ref().is_some_and(|s| !s.has_delivery())
+                && owned.pin.is_none() && owned.acquisition_rpc.is_none()
+                && owned.nomination.as_ref().is_some_and(|n|
+                    n.route == connection && n.request == record.body[1..33]
+                        && n.binding.binding == grant.binding && n.binding.digest != [0; 32]
+                        && n.generation == n.binding.generation)
+                && record.body[37..53] == connection
+            );
+            if !accepted {
+                self.local_reply(record, 4)?;
+                return Ok(true);
+            }
+            let parent = parent.unwrap();
+            let request = record.body[1..33].try_into().unwrap();
+            match owned.candidate.as_ref().ok_or_else(invalid)?.try_pin(parent.clone(), request) {
+                Ok(true) => {
+                    self.listener.as_mut().unwrap().pin = Some(PendingPin { record, parent, confirmed: false });
+                    return Ok(true);
+                }
+                Ok(false) => { self.local_reply(record, 2)?; return Ok(true); }
+                Err(_) => { self.local_reply(record, 4)?; return Ok(true); }
+            }
         }
         if !negative && (owned.joined.is_some()
             || owned.candidate.as_ref().is_none_or(|setup| setup.finished())
@@ -746,7 +786,8 @@ impl NativeRuntime {
             return Ok(false);
         }
         let expired = self.listener.as_ref().is_some_and(|owned|
-            owned.candidate.is_some() && self.clock() >= owned.candidate_until);
+            owned.candidate.is_some() && owned.pin.is_none()
+                && self.clock() >= owned.candidate_until);
         if expired {
             self.listener.as_ref().unwrap().candidate.as_ref().unwrap().cancel();
         }
@@ -781,7 +822,16 @@ impl NativeRuntime {
                         self.pipe_requests.disposition(&message)?;
                     }
                 }
-                SetupEvent::Pinned(_) => return Err(invalid()),
+                SetupEvent::Pinned(request) => {
+                    let owned = self.listener.as_mut().unwrap();
+                    let pending = owned.pin.as_mut().ok_or_else(invalid)?;
+                    if pending.confirmed || pending.record.body[1..33] != request
+                        || pending.parent.revision != self.authority.revision()
+                        || self.authority.grant() != Some(&pending.parent)
+                    { return Err(invalid()); }
+                    pending.confirmed = true;
+                    owned.candidate_until = pending.parent.until;
+                },
             }
         }
 
@@ -849,6 +899,7 @@ impl NativeRuntime {
             owned.tls_observation = None;
             owned.nomination_pending = None;
             owned.nomination = None;
+            owned.pin = None;
             owned.acquisition_rpc = None;
             owned.acquisition_challenge = false;
             owned.candidate_until = 0;
