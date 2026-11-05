@@ -718,6 +718,68 @@ impl ControlConnection {
         self.egress = Egress::default();
         let _ = self.conn.close(true, 0, b"");
     }
+    pub(crate) fn approved_for(&self, grant: &ControlGrant, binding: &DeliveryBinding) -> bool {
+        self.approved.as_ref().is_some_and(|current| {
+            !self.retired && current.binding == *binding
+                && current.boot == grant.boot
+                && current.revision == grant.revision
+                && current.until == grant.until
+        })
+    }
+    pub(crate) fn queue_media(
+        &mut self, ledger: &mut crate::plaintext_expiry::PlaintextExpiry,
+        header: &crate::Header, pcm: &[u8; 960],
+        timing: crate::plaintext_expiry::PcmTiming, now: u64,
+    ) -> io::Result<crate::plaintext_expiry::QueueAdmission> {
+        self.advance(now)?;
+        if !self.is_approved() { return Err(denied()); }
+        match ledger.admit_pcm(&mut self.conn, header, pcm, timing) {
+            Ok(value) => Ok(value),
+            Err(_) => { self.retire(); Err(denied()) }
+        }
+    }
+    pub(crate) fn service_media_egress(
+        &mut self, ledger: &mut crate::plaintext_expiry::PlaintextExpiry,
+        socket: &UdpSocket, writable: bool, now: u64,
+        mut permitted: impl FnMut() -> bool,
+    ) -> io::Result<()> {
+        self.advance(now)?;
+        self.flush_stream()?;
+        let result = self.egress.service_with_io(
+            self.local, &mut self.conn, writable,
+            |conn| {
+                ledger.purge(conn, crate::source_age::local_qpc_100ns()?);
+                Ok(())
+            },
+            |ciphertext, to| {
+                if !permitted() { return Err(io::Error::from(io::ErrorKind::PermissionDenied)); }
+                socket.send_to(ciphertext, to)
+            },
+        );
+        if result.is_err() { self.retire(); return Err(denied()); }
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(crate) fn service_media_with_io(
+        &mut self, ledger: &mut crate::plaintext_expiry::PlaintextExpiry,
+        writable: bool, now: u64,
+        send: impl FnMut(&[u8], SocketAddr) -> io::Result<usize>,
+    ) -> io::Result<()> {
+        self.advance(now)?;
+        self.flush_stream()?;
+        let result = self.egress.service_with_io(
+            self.local, &mut self.conn, writable,
+            |conn| {
+                ledger.purge(conn, crate::source_age::local_qpc_100ns()?);
+                Ok(())
+            }, send,
+        );
+        if result.is_err() { self.retire(); return Err(denied()); }
+        Ok(())
+    }
+    pub(crate) fn sealed_pending(&self) -> bool {
+        self.egress.has_pending_ciphertext()
+    }
     pub fn is_approved(&self) -> bool {
         self.approved.is_some() && !self.retired
     }

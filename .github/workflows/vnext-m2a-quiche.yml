@@ -70,6 +70,11 @@ jobs:
       - name: Test Rust codec and authenticated QUIC handshake (locked dependencies)
         shell: bash
         run: cargo test --locked --manifest-path vnext/m2a/quiche-lab/Cargo.toml --verbose -- --nocapture
+      - name: Build protected Windows audio worker
+        if: runner.os == 'Windows'
+        shell: bash
+        run: cargo build --locked --manifest-path vnext/m2a/quiche-lab/Cargo.toml --release --bin deskfuse-audio-worker
+
 
   broker-control-test:
     name: H2 broker control and authority tests (windows-latest)

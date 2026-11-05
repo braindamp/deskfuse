@@ -1,6 +1,7 @@
 use super::*;
 use super::channel::{BrokerControlClient, Frame};
 use super::resume::ResumeWake;
+use super::source::SourceOwner;
 use crate::audio_authority::{AudioAuthority, ControlGrant};
 use crate::audio_candidate::{CandidateOutcome, CandidateSetup, SetupEvent};
 use crate::audio_control::{self as ac, Record};
@@ -31,6 +32,7 @@ struct NativeRuntime {
     client: BrokerControlClient,
     authority: AudioAuthority,
     listener: Option<BoundListener>,
+    source: Option<SourceOwner>,
     resume: ResumeWake,
     pipe_requests: PipeRequests,
     pending_replies: VecDeque<Message>,
@@ -65,7 +67,7 @@ impl NativeRuntime {
         let authority = AudioAuthority::new(client.boot(), client.worker())?;
         let resume = ResumeWake::register()?;
         Ok(Self {
-            client, authority, listener: None, resume,
+            client, authority, listener: None, source: None, resume,
             pipe_requests: PipeRequests::default(),
             pending_replies: VecDeque::new(),
             reply_custody: BTreeMap::new(),
@@ -89,6 +91,8 @@ impl NativeRuntime {
     fn run(mut self) -> io::Result<()> {
         let outcome = self.serve();
         self.authority.close();
+        if let Some(source) = self.source.as_mut() { let _ = source.fence_delivery(); }
+        self.source = None;
         self.listener = None;
         let joined = self.client.stop_and_join();
         let unregistered = self.resume.unregister();
@@ -112,7 +116,11 @@ impl NativeRuntime {
                     return Err(invalid());
                 }
                 let tick = self.clock();
-                self.authority.apply(grant, tick)?;
+                self.authority.apply(grant.clone(), tick)?;
+                if let Some(source) = self.source.as_mut() {
+                    if grant.closed { source.fence_delivery()?; }
+                    else { source.recheck(&grant, tick)?; }
+                }
                 Ok(Some((AUTHORITY_OBSERVED, frame.body)))
             }
             CONFIGURE_LISTENER => {
@@ -231,23 +239,46 @@ impl NativeRuntime {
             if self.dispatch_replies()? || self.service_candidate()? {
                 continue;
             }
+            if let Some(source) = self.source.as_mut() {
+                let client = &self.client;
+                if source.pump(&mut self.authority, now, || client.terminal())? { continue; }
+                if let Some(listener) = &self.listener {
+                    source.service_egress(
+                        &mut self.authority, &listener._socket, false,
+                        now, || client.terminal(),
+                    )?;
+                }
+            }
             if self.listener.is_some() {
                 if self.drain_listener()? { continue; }
                 self.live()?;
-                let timeout = self.timeout(None)?;
+                let timeout = self.timeout(self.source.as_ref().and_then(SourceOwner::deadline))?;
                 #[cfg(test)]
                 if let Some(sender) = &self.test_idle { let _ = sender.send(()); }
                 let owned = self.listener.as_ref().unwrap();
                 let completed = owned.candidate.as_ref().and_then(CandidateSetup::completion_handle);
-                let writable = owned.events.wait_listener(
+                let source_event = self.source.as_ref().map(SourceOwner::source_event);
+                let period_event = self.source.as_ref().map(SourceOwner::period_event);
+                let ready = owned.events.wait_listener(
                     self.client.control_event().as_raw_handle(),
                     self.client.terminal_event().as_raw_handle(),
                     self.resume.event(),
                     owned.setup_wake.as_raw_handle(),
+                    source_event, period_event,
                     completed, timeout,
                 )?;
                 self.live()?;
-                if writable {
+                if ready.period {
+                    if let Some(source) = self.source.as_ref() { source.service_period()?; }
+                }
+                if ready.writable {
+                    if let Some(source) = self.source.as_mut() {
+                        let client = &self.client;
+                        source.service_egress(
+                            &mut self.authority, &owned._socket, true,
+                            now, || client.terminal(),
+                        )?;
+                    }
                     if let Some(setup) = self.listener.as_ref().and_then(|owned| owned.candidate.as_ref()) {
                         setup.writable();
                     }
@@ -474,14 +505,21 @@ impl NativeRuntime {
     }
 
     fn route_packet(&mut self, bytes: &mut [u8], from: SocketAddr, to: SocketAddr) -> io::Result<()> {
-        let owned = self.listener.as_ref().unwrap();
-        // A joined setup still owns the route until its ordered closure is queued.
-        if owned.joined.is_some() || bytes.is_empty() { return Ok(()); }
+        if bytes.is_empty() { return Ok(()); }
         let header = match quiche::Header::from_slice(bytes, 16) {
             Ok(header) => header,
             Err(_) => return Ok(()),
         };
+        let tick = self.clock();
         let info = quiche::RecvInfo { from, to };
+        if let Some(source) = self.source.as_mut() {
+            if source.routes(header.dcid.as_ref(), info) {
+                source.receive(bytes, info, tick)?;
+                return Ok(());
+            }
+        }
+        let owned = self.listener.as_ref().unwrap();
+        if owned.joined.is_some() { return Ok(()); }
         if let Some(setup) = &owned.candidate {
             if setup.routes(header.dcid.as_ref(), info) && !setup.finished() {
                 let _ = setup.try_packet(bytes, quiche::RecvInfo { from, to });

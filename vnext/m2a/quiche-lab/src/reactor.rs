@@ -309,6 +309,8 @@ pub struct WindowsEvents {
     socket:usize,event:isize,timer:*mut std::ffi::c_void,
 }
 #[cfg(windows)]
+pub struct ListenerReadiness { pub writable: bool, pub period: bool }
+#[cfg(windows)]
 impl WindowsEvents {
     /// Control/terminal precede source/network in the kernel wait. These are
     /// borrowed events, not ownership transfers. The owner must inspect queue
@@ -362,19 +364,30 @@ impl WindowsEvents {
     pub fn wait_listener(
         &self, control: *mut std::ffi::c_void, terminal: *mut std::ffi::c_void,
         resume: *mut std::ffi::c_void, setup_wake: *mut std::ffi::c_void,
+        source: Option<*mut std::ffi::c_void>, period: Option<*mut std::ffi::c_void>,
         setup_done: Option<std::os::windows::io::BorrowedHandle<'_>>, timeout_ms: u32,
-    ) -> io::Result<bool> {
+    ) -> io::Result<ListenerReadiness> {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::{Networking::WinSock::*, System::Threading::*};
-        let mut handles = [
-            terminal, control, resume, setup_wake,
-            self.event as *mut std::ffi::c_void, std::ptr::null_mut()
-        ];
-        let count = if let Some(done) = setup_done {
-            handles[5] = handles[4];
-            handles[4] = done.as_raw_handle();
-            6
-        } else { 5 };
+        let mut handles = [std::ptr::null_mut(); 8];
+        handles[..4].copy_from_slice(&[terminal, control, resume, setup_wake]);
+        let mut count = 4;
+        if let Some(event) = source.filter(|handle| !handle.is_null()) {
+            handles[count] = event;
+            count += 1;
+        }
+        let period_index = if let Some(event) = period.filter(|handle| !handle.is_null()) {
+            handles[count] = event;
+            count += 1;
+            Some(count - 1)
+        } else { None };
+        if let Some(done) = setup_done {
+            handles[count] = done.as_raw_handle();
+            count += 1;
+        }
+        let udp_index = count;
+        handles[count] = self.event as *mut std::ffi::c_void;
+        count += 1;
         if handles[..count].iter().enumerate().any(|(at, handle)| {
             handle.is_null() || handles[..at].contains(handle)
         }) {
@@ -382,14 +395,17 @@ impl WindowsEvents {
         }
         unsafe {
             let result = WaitForMultipleObjects(count as u32, handles.as_ptr(), 0, timeout_ms);
-            if result == 258 {
+            if result == WAIT_TIMEOUT {
                 return Err(io::Error::new(io::ErrorKind::TimedOut, "Listener authority deadline"));
             }
             if result == u32::MAX { return Err(io::Error::last_os_error()); }
             if result >= count as u32 {
                 return Err(io::Error::other("Unexpected listener readiness"));
             }
-            if result != (count - 1) as u32 { return Ok(false); }
+            let period_ready = period_index.is_some_and(|index| result == index as u32);
+            if result != udp_index as u32 {
+                return Ok(ListenerReadiness { writable: false, period: period_ready });
+            }
             let mut events: WSANETWORKEVENTS = std::mem::zeroed();
             if WSAEnumNetworkEvents(self.socket, self.event, &mut events) != 0 {
                 return Err(io::Error::from_raw_os_error(WSAGetLastError()));
@@ -402,7 +418,10 @@ impl WindowsEvents {
                     return Err(io::Error::from_raw_os_error(events.iErrorCode[index as usize]));
                 }
             }
-            Ok(events.lNetworkEvents & FD_WRITE as i32 != 0)
+            Ok(ListenerReadiness {
+                writable: events.lNetworkEvents & FD_WRITE as i32 != 0,
+                period: period_ready,
+            })
         }
     }
     pub fn new(udp:&UdpSocket)->io::Result<Self> {

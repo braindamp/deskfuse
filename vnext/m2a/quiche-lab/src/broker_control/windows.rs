@@ -162,6 +162,7 @@ unsafe fn require_system(process: HANDLE) -> io::Result<()> {
 }
 
 mod resume;
+mod source;
 mod runtime;
 
 /// Production bootstrap, serialized listener custody and authority projections.
