@@ -741,9 +741,12 @@ impl NativeRuntime {
         let owned = self.listener.as_ref().ok_or_else(invalid)?;
         let connection = owned.observed.ok_or_else(invalid)?;
         let negative = ac::negative(record.kind);
-        let acquiring = matches!(record.kind, ac::ISSUE | ac::PROOF);
         let attaching = record.kind == ac::ISSUE && record.body[0] == 2;
         let source_issue = record.kind == ac::ISSUE && record.body[0] == 1;
+        let delivery_proof = record.kind == ac::PROOF
+            && owned.acquisition_challenge && owned.nomination.as_ref().is_some_and(|n|
+                n.route == connection && n.pin_revision.is_some());
+        let acquiring = matches!(record.kind, ac::ISSUE | ac::PROOF);
         let first_nomination = record.kind == ac::PREPARE
             && self.authority.prepared() && self.source.as_ref().is_some_and(|s| !s.has_delivery())
             && owned.nomination_pending.is_none() && owned.nomination.is_none()
@@ -753,7 +756,8 @@ impl NativeRuntime {
             || record.kind == ac::PREPARE && !first_nomination
             || source_issue && (self.source.is_some() || self.authority.grant().is_some())
             || record.kind == ac::ISSUE && !source_issue && !attaching
-            || record.kind == ac::PROOF && !owned.acquisition_challenge
+            || record.kind == ac::PROOF &&
+                (!owned.acquisition_challenge || self.source.is_some() && !delivery_proof)
         {
             self.local_reply(record, 4)?;
             return Ok(true);
