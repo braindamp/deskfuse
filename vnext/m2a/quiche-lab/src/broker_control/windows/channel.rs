@@ -205,6 +205,10 @@ impl BrokerControlClient {
         self.shared.capacity_event.as_handle()
     }
     #[cfg(test)]
+    pub(super) fn regular_writes_pending(&self) -> bool {
+        self.shared.lock().retained[Lane::Regular as usize] != 0
+    }
+    #[cfg(test)]
     pub(super) fn delay_next_write_completion(&self) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::SyncSender<()>) {
         let (entered, observed) = std::sync::mpsc::sync_channel(1);
         let (resume, released) = std::sync::mpsc::sync_channel(1);

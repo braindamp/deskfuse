@@ -370,7 +370,12 @@ public sealed class AudioAuthorityTests
     public async Task First_delivery_requires_exact_pin_evidence_and_preserves_parent_cutoff_and_receipt()
     {
         using var f = new Fixture();
-        var h = new Routing(f, acquisitionOnly: true);
+        var stopDuringOutputPublication = false;
+        var h = new Routing(f, acquisitionOnly: true, publish: () =>
+        {
+            if (stopDuringOutputPublication) f.Owner.CloseAdmission();
+            return Task.FromResult(true); // A successful publication can describe the newer terminal projection.
+        });
         var foreign = new Routing(f, acquisitionOnly: true);
         try
         {
@@ -432,8 +437,14 @@ public sealed class AudioAuthorityTests
             digest.CopyTo(output, 0);
             BinaryPrimitives.WriteUInt64BigEndian(output.AsSpan(32), 1);
             BinaryPrimitives.WriteUInt64BigEndian(output.AsSpan(40), 1);
+            output[48] = 1;
+            Assert.True(h.Send(AudioNetworkKind.Output, output));
+            Assert.Equal((byte)134, (await h.Reply()).Kind);
+            Assert.True(f.Owner.Snapshot().OutputReady);
+            stopDuringOutputPublication = true;
             Assert.True(h.Send(AudioNetworkKind.Output, output));
             Assert.Equal((byte)255, (await h.Reply()).Kind);
+            Assert.Equal(AudioAuthorityPhase.Closed, f.Owner.Snapshot().Phase);
         }
         finally
         {

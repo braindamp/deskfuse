@@ -249,6 +249,15 @@ mod native {
         output:Option<super::OutputStateV1>,
     }
     impl Renderer {
+        pub(crate) unsafe fn bind_gate(&mut self, context: *const c_void,
+            permit: extern "C" fn(*const c_void) -> bool, wake: extern "C" fn(*const c_void)) -> bool {
+            type Bind = unsafe extern "C" fn(*mut c_void, *const c_void,
+                extern "C" fn(*const c_void) -> bool, extern "C" fn(*const c_void)) -> bool;
+            let symbol = unsafe { dlsym(self.library, c"df_audio_bind_gate_v1".as_ptr()) };
+            if symbol.is_null() { return false; }
+            let bind: Bind = unsafe { std::mem::transmute(symbol) };
+            unsafe { bind(self.ctx, context, permit, wake) }
+        }
         pub fn open(path:&str)->Result<Self,String> {Self::open_with_buffer(path,0)}
         pub fn open_with_buffer(path:&str,buffer_bursts:u32)->Result<Self,String> {
             Self::open_with_config(path,OutputConfigV8::new(buffer_bursts,0,0,1440)?)

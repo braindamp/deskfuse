@@ -762,6 +762,8 @@ struct NativeObservation {
 }
 #[derive(Default)]
 struct ClientMedia {
+    configuration: Configuration,
+    delivery_generation: Option<u32>,
     first_sequence:Option<u32>, last_sequence:Option<u32>,
     received:u64, gaps:u64, late:u64, audio_queue_full:u64,
     recover_pending:u64, recover_started:u64, native_stale:u64,
@@ -869,7 +871,7 @@ impl ClientMedia {
                     playback_library:Option<&str>,modes:PlayModes,
                     authenticated_at:Option<Instant>)->Result<()> {
         let n=wire.len();
-        let (h,_)=parse(wire,&Configuration::default())
+        let (h,_)=parse(wire,&self.configuration)
             .map_err(|e|format!("Android rejected staged PCM header: {e:?}"))?;
         if n!=APP_BYTES || (synthetic && wire!=packet(h.packet_sequence)) {
             return Err("Android rejected staged PCM payload identity".into());
@@ -994,7 +996,7 @@ impl ClientMedia {
                                 &ZERO_PCM,
                                 expected + offset * AUDIO_FRAMES,
                                 h.media_epoch, h.source_stream_id,
-                                h.format_config_id, 1, true, self.authorized_recovery)
+                                h.format_config_id, self.delivery_generation.unwrap_or(1), true, self.authorized_recovery)
                                 .map_err(|e| format!("Android concealment: {e}"))?;
                             match state {
                                 Admission::Accepted => {
@@ -1070,7 +1072,7 @@ impl ClientMedia {
             match speaker.push_media(
                 samples, h.first_source_frame,
                 h.media_epoch, h.source_stream_id,
-                h.format_config_id, 1, false, self.authorized_recovery)
+                h.format_config_id, self.delivery_generation.unwrap_or(1), false, self.authorized_recovery)
                 .map_err(|e| format!("Android audio renderer: {e}"))? {
                 Admission::Accepted => {}
                 Admission::Overflow |
@@ -1130,6 +1132,26 @@ impl ClientMedia {
             self.diagnostics.periodic(sample);
             observed?;
         }
+        Ok(())
+    }
+}
+#[cfg(target_os = "android")]
+pub(crate) struct AuthorityMedia(ClientMedia);
+#[cfg(target_os = "android")]
+impl AuthorityMedia {
+    pub(crate) fn new(renderer: AndroidAudio, configuration: Configuration, generation: u32) -> Self {
+        Self(ClientMedia { audio: Some(renderer), configuration, delivery_generation: Some(generation), ..ClientMedia::default() })
+    }
+    pub(crate) fn renderer(&self) -> &AndroidAudio { self.0.audio.as_ref().unwrap() }
+    pub(crate) fn receive(&mut self, wire: &[u8], path: &str) -> Result<()> {
+        let (header, _) = parse(wire, &self.0.configuration).map_err(|e| format!("Invalid PCM: {e:?}"))?;
+        self.0.stage_media(header, wire, false, Some(path), PlayModes::default(), None)?;
+        if self.0.anchor_pending.is_some() { return Err("Authority delivery needs fresh-anchor recovery".into()); }
+        Ok(())
+    }
+    pub(crate) fn finish_batch(&mut self, path: &str) -> Result<()> {
+        self.0.drain_ready(true, false, Some(path), PlayModes::default(), None)?;
+        if self.0.anchor_pending.is_some() { return Err("Authority delivery needs fresh-anchor recovery".into()); }
         Ok(())
     }
 }

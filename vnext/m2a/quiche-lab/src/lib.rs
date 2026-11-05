@@ -26,6 +26,8 @@ extern crate self as deskfuse_quiche_lab;
 #[cfg(target_os="android")]
 #[path="bin/continuous-quic-lab.rs"]
 mod native_session;
+#[cfg(target_os = "android")]
+mod phone_audio;
 
 /// JNI adapter calls this on its dedicated owner thread. JSON contains only
 /// private-app paths/control, never PCM. No panic unwinds across C/JNI.

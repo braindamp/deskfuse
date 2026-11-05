@@ -708,6 +708,50 @@ impl ControlConnection {
         self.pinned_request = None;
         Ok(())
     }
+    /// Only the local receipt owner calls this after verifying and retaining the
+    /// exact pending result. Phone cutoffs use local BOOTTIME in 100-ns units.
+    #[cfg(any(target_os = "android", test))]
+    pub(crate) fn install_phone(
+        &mut self, scope: &SourceScope, binding: DeliveryBinding, observation: &Observation,
+        boot: [u8; 32], revision: u64, deadline: u64, now: u64,
+    ) -> io::Result<()> {
+        self.advance(now)?;
+        if self.role != Role::Phone || self.approved.is_some() || self.observation.as_ref() != Some(observation)
+            || boot == [0; 32] || revision == 0 || now >= deadline
+            || binding.source != scope.source || binding.source_digest != scope.digest
+            || binding.source_generation != scope.generation || binding.worker != scope.worker
+            || binding.wire != scope.wire || binding.native != observation.native
+            || binding.phone != observation.phone || binding.nonce != observation.nonce
+        { self.retire(); return Err(denied()); }
+        self.deadline = deadline;
+        self.approved = Some(Approved { binding, boot, revision, until: deadline });
+        Ok(())
+    }
+    #[cfg(any(target_os = "android", test))]
+    pub(crate) fn queue_phone_ready(&mut self, output: u64, now: u64) -> io::Result<u64> {
+        self.advance(now)?;
+        if self.role != Role::Phone || output == 0 { return Err(denied()); }
+        let binding = &self.approved.as_ref().ok_or_else(denied)?.binding;
+        let request = self.last_request.checked_add(1).ok_or_else(denied)?;
+        let body = crate::audio_rpc::OutputSignal { digest: binding.digest, delivery: binding.generation,
+            output, ready: true }.encode();
+        self.queue_control(Record { kind: wire::OUTPUT, request, body }, now)?;
+        Ok(request)
+    }
+    #[cfg(any(target_os = "android", test))]
+    pub(crate) fn phone_datagram(&mut self, bytes: &mut [u8]) -> io::Result<Option<usize>> {
+        if self.role != Role::Phone { return Err(denied()); }
+        match self.conn.dgram_recv(bytes) {
+            Ok(n) => Ok(Some(n)),
+            Err(quiche::Error::Done) => Ok(None),
+            Err(_) => Err(denied()),
+        }
+    }
+    #[cfg(target_os = "android")]
+    pub(crate) fn close_phone(&mut self, socket: &UdpSocket) {
+        self.retire();
+        let _ = self.egress.service_with_hook_at(socket, self.local, &mut self.conn, true, |_| Ok(()));
+    }
     pub fn retire(&mut self) {
         self.retired = true;
         self.approved = None;
@@ -951,6 +995,36 @@ pub(crate) mod tests {
         }
         assert!(native.facts(100).unwrap().is_some() && phone.facts(100).unwrap().is_some());
         (phone, native)
+    }
+    #[test]
+    fn phone_ready_requires_exact_live_connection_and_local_deadline() {
+        for invalid in ["route", "expiry", "none"] {
+            let (mut phone, mut native) = pair();
+            phone.queue_control(Record { kind: wire::INFO, request: 1, body: vec![] }, 100).unwrap();
+            pump(&mut phone, &mut native);
+            pump(&mut native, &mut phone);
+            phone.read_control(100).unwrap();
+            let mut observed = phone.observation(100).unwrap().unwrap();
+            let (source, mut bytes, grant) = fixture();
+            let scope = SourceScope::parse(&source).unwrap();
+            for (old, new) in [(15, observed.native), (16, observed.phone), (17, observed.nonce)] {
+                let at = bytes.windows(32).position(|b| b == [old; 32]).unwrap();
+                bytes[at..at + 32].copy_from_slice(&new);
+            }
+            assert!(phone.queue_phone_ready(7, 100).is_err());
+            if invalid == "route" { observed.connection[0] ^= 1; }
+            let deadline = if invalid == "expiry" { 100 } else { 200 };
+            let result = phone.install_phone(&scope, DeliveryBinding::parse(&bytes).unwrap(), &observed,
+                grant.boot, grant.revision, deadline, 100);
+            if invalid == "none" {
+                result.unwrap();
+                assert_eq!(phone.queue_phone_ready(7, 199).unwrap(), 2);
+                assert!(phone.queue_phone_ready(7, 200).is_err());
+            } else {
+                assert!(result.is_err());
+                assert!(phone.queue_phone_ready(7, 101).is_err());
+            }
+        }
     }
     #[test]
     fn candidate_pin_retains_actual_tls_past_warm_ttl_without_admitting_media_or_extending_on_retry(

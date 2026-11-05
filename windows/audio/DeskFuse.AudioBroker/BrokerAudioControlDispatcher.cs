@@ -209,9 +209,11 @@ internal sealed class BrokerAudioControlDispatcher : IAudioWorkerEventOwner
                     var retained = owner.GetAppliedResult(origin, b[..32], applied.Nonce, applied.Signature);
                     return retained?.RetainedReceipt() ?? throw new UnauthorizedAccessException("No retained signed result.");
                 case AudioNetworkKind.Output:
-                    if (acquisitionOnly) throw new UnauthorizedAccessException("Output is not yet enabled.");
-                    owner.ObserveOutput(origin, b[..32], U64(b, 32), U64(b, 40), b[48] == 1);
-                    await Publish().ConfigureAwait(false); return [];
+                    var output = owner.ObserveOutput(origin, b[..32], U64(b, 32), U64(b, 40), b[48] == 1);
+                    if (output.Closed || !await Publish().ConfigureAwait(false))
+                        throw new UnauthorizedAccessException("Output projection was not acknowledged.");
+                    owner.RequireControlCurrent(output);
+                    return [];
                 case AudioNetworkKind.Detach:
                     if (acquisitionOnly) throw new UnauthorizedAccessException("Delivery detach is not yet enabled.");
                     owner.ObserveDetach(origin, b[..32], U64(b, 32));
@@ -221,13 +223,14 @@ internal sealed class BrokerAudioControlDispatcher : IAudioWorkerEventOwner
         }
         finally { positive.Release(); }
     }
-    private async Task Publish(bool requireCurrent = false)
+    private async Task<bool> Publish(bool requireCurrent = false)
     {
         try
         {
             var current = await publish().ConfigureAwait(false);
             if (requireCurrent && !current)
                 throw new UnauthorizedAccessException("The exact Prepared native projection was not acknowledged.");
+            return current;
         }
         catch (Exception error) { owner.CloseAdmission(); fail(error); throw; }
     }

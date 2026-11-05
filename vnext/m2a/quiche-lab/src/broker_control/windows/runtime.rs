@@ -218,7 +218,10 @@ impl NativeRuntime {
                 }
                 if let Some(source) = self.source.as_mut() {
                     if grant.closed { source.fence_delivery()?; }
-                    else { source.recheck(&grant, tick)?; }
+                    else {
+                        source.recheck(&grant, tick)?;
+                        source.confirm_output(&grant, &mut self.authority, tick)?;
+                    }
                 }
                 if first {
                     self.promotion = Some(Promotion { grant, frame: frame.body, requested: false });
@@ -602,10 +605,21 @@ impl NativeRuntime {
             self.active_local_reply(id, record, 4)?;
             return Ok(true);
         }
+        let output = if record.kind == ac::OUTPUT {
+            let signal = crate::audio_rpc::OutputSignal::parse(&record.body)?;
+            if !self.source.as_ref().is_some_and(|source| source.check_output(id, signal)) {
+                self.active_local_reply(id, record, 1)?;
+                return Ok(true);
+            }
+            Some(signal)
+        } else { None };
         let tls = Message { request: record.request, connection: id, kind: record.kind, body: record.body };
         if let Some(pipe) = self.pipe_requests.propose(&tls)? {
             if self.client.try_write(NETWORK_REQUEST, &pipe.encode(false)?)? {
                 self.pipe_requests.submitted(&tls, &pipe)?;
+                if let Some(signal) = output.filter(|signal| signal.ready) {
+                    self.source.as_mut().unwrap().submit_ready(signal.output);
+                }
                 return Ok(true);
             }
         }
@@ -626,6 +640,13 @@ impl NativeRuntime {
         let mut work = !events.is_empty();
         if let Some(id) = observed {
             for record in events {
+                if record.kind == ac::OUTPUT {
+                    let signal = crate::audio_rpc::OutputSignal::parse(&record.body)?;
+                    let source = self.source.as_mut().unwrap();
+                    if !signal.ready && source.check_output(id, signal) {
+                        source.withdraw_output(signal.output, &mut self.authority, now)?;
+                    }
+                }
                 if ac::negative(record.kind) {
                     if self.active_negative.is_some() { return Err(invalid()); }
                     self.active_negative = Some((id, record));
@@ -1830,8 +1851,11 @@ mod tests {
     }
     impl OfflinePcm {
         fn push(&self, first_frame: u64) {
+            self.push_committed(first_frame, 1);
+        }
+        fn push_committed(&self, first_frame: u64, min_commit: u64) {
             self.chunks.lock().unwrap().push_back(crate::committed_source::Block {
-                first_frame, generation: 1, min_commit: 1,
+                first_frame, generation: 1, min_commit,
                 timing: crate::source_age::CommitTiming { commit_qpc: 0, presentation_qpc: 0 },
                 pcm: [7; 960],
             });
@@ -1984,13 +2008,29 @@ mod tests {
     fn finished_first_candidate_does_not_issue_after_pipe_backpressure() {
         first_delivery_fixture(FirstDelivery::CloseUnderBackpressure);
     }
+    #[test]
+    fn stop_during_first_output_request_prevents_ready_projection() {
+        first_delivery_fixture(FirstDelivery::StopAtReady);
+    }
+    #[test]
+    fn first_output_withdrawal_keeps_delayed_ready_projection_muted() {
+        first_delivery_fixture(FirstDelivery::WithdrawAtReady);
+    }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
-    enum FirstDelivery { Attach, StopAtPin, FailPromotion, CloseUnderBackpressure }
+    enum FirstDelivery { Attach, StopAtPin, FailPromotion, CloseUnderBackpressure, StopAtReady, WithdrawAtReady }
 
     fn finish_pin_after_backpressure(runtime: &mut NativeRuntime) {
         use windows_sys::Win32::System::Threading::ResetEvent;
 
+        // The PREPARE reply can reach the phone before the pipe writer releases
+        // its write credit. Arm the gate only after that write has retired.
+        let capacity = runtime.client.capacity_event().as_raw_handle();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while runtime.client.regular_writes_pending() {
+            assert!(Instant::now() < deadline, "PREPARE write credit did not retire");
+            assert_eq!(unsafe { WaitForSingleObject(capacity, 3000) }, WAIT_OBJECT_0);
+        }
         let (entered, resume) = runtime.client.delay_next_write_completion();
         for request in 1..=8 {
             let filler = Message {
@@ -2005,7 +2045,6 @@ mod tests {
         let setup = runtime.listener.as_ref().unwrap().candidate.as_ref().unwrap();
         setup.cancel();
         assert_eq!(unsafe { WaitForSingleObject(setup.completion_handle().unwrap().as_raw_handle(), 3000) }, WAIT_OBJECT_0);
-        let capacity = runtime.client.capacity_event().as_raw_handle();
         assert_ne!(unsafe { ResetEvent(capacity) }, 0);
         resume.send(()).unwrap();
         assert_eq!(unsafe { WaitForSingleObject(capacity, 3000) }, WAIT_OBJECT_0);
@@ -2056,6 +2095,10 @@ mod tests {
         proof.push(8);
         proof.extend_from_slice(&[0x47; 8]);
         let client_proof = proof.clone();
+        let phone_boot = parent.boot;
+        let phone_revision = parent.revision + 1;
+        let (ready_tx, ready_rx) = sync_channel(1);
+        let (withdraw_tx, withdraw_rx) = sync_channel(1);
         let stop_phone = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop_observer = Arc::clone(&stop_phone);
         let phone = std::thread::spawn(move || {
@@ -2066,6 +2109,10 @@ mod tests {
             let deadline = Instant::now() + Duration::from_secs(15);
             let mut info = false;
             let mut observed = None;
+            let mut nominated = None;
+            let mut ready = false;
+            let mut pending_withdrawal = None;
+            let scope = crate::audio_control::SourceScope::parse(&source_bytes).unwrap();
             let mut buf = [0u8; 1350];
             loop {
                 if stop_observer.load(Ordering::SeqCst) { return; }
@@ -2102,6 +2149,7 @@ mod tests {
                         (130, 2) => {
                             let binding = DeliveryBinding::parse(&record.body).unwrap();
                             assert_eq!(binding.request, n2);
+                            nominated = Some(binding);
                             let mut body = vec![2];
                             body.extend_from_slice(&n2);
                             body.extend_from_slice(&1000u32.to_be_bytes());
@@ -2124,10 +2172,37 @@ mod tests {
                         }
                         (139, 5) => {
                             assert_eq!(record.body, [0x99]);
-                            return;
+                            let observation = conn.observation(now()).unwrap().unwrap();
+                            let binding = nominated.take().unwrap();
+                            let withdrawal = crate::audio_rpc::OutputSignal { digest: binding.digest,
+                                delivery: binding.generation, output: 13, ready: false }.encode();
+                            conn.install_phone(&scope,
+                                binding, &observation, phone_boot, phone_revision,
+                                now() + 30_000_000, now()).unwrap();
+                            assert_eq!(conn.queue_phone_ready(13, now()).unwrap(), 6);
+                            if scenario == FirstDelivery::WithdrawAtReady {
+                                pending_withdrawal = Some(withdrawal);
+                            }
+                        }
+                        (134, 6) => {
+                            assert!(record.body.is_empty());
+                            ready = true;
+                            ready_tx.send(()).unwrap();
                         }
                         _ => panic!("unexpected first delivery TLS record {} {}", record.kind, record.request),
                     }
+                }
+                if pending_withdrawal.is_some() && withdraw_rx.try_recv().is_ok() {
+                    conn.queue_control(Record { kind: ac::OUTPUT, request: 7, body: pending_withdrawal.take().unwrap() }, now()).unwrap();
+                }
+                if let Some(size) = conn.phone_datagram(&mut buf).unwrap() {
+                    assert!(ready, "media arrived before the test released the ready reply");
+                    let (header, _) = crate::parse(&buf[..size], &crate::Configuration {
+                        media_epoch: scope.wire[0], source_stream_id: scope.wire[1], format_config_id: scope.wire[2],
+                        ..crate::Configuration::default()
+                    }).unwrap();
+                    assert_eq!(header.first_source_frame, 480);
+                    return;
                 }
                 conn.service_egress(&socket, true, now()).unwrap();
                 std::thread::sleep(Duration::from_millis(1));
@@ -2260,6 +2335,56 @@ mod tests {
         remote.write(NETWORK_REPLY, &Message {
             kind: 139, body: vec![0x99], ..applied
         }.encode(true).unwrap()).unwrap();
+        let (kind, output) = remote.read(3000).unwrap();
+        assert_eq!(kind, NETWORK_REQUEST);
+        let output = Message::parse(&output, false).unwrap();
+        let signal = crate::audio_rpc::OutputSignal::parse(&output.body).unwrap();
+        assert_eq!((output.kind, output.request, signal.delivery, signal.output), (ac::OUTPUT, 6, 1, 13));
+        assert!(signal.ready);
+        assert_eq!(signal.digest, delivery.delivery_digest);
+        if scenario == FirstDelivery::StopAtReady {
+            stop_phone.store(true, Ordering::SeqCst);
+            remote.write(STOP, &[]).unwrap();
+            phone.join().unwrap();
+            assert!(worker.join().unwrap().is_ok());
+            assert!(remote.read(100).is_err());
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            return;
+        }
+        if scenario == FirstDelivery::WithdrawAtReady {
+            withdraw_tx.send(()).unwrap();
+            let (kind, bytes) = remote.read(3000).unwrap();
+            assert_eq!(kind, NETWORK_REQUEST);
+            let withdrawal = Message::parse(&bytes, false).unwrap();
+            assert_eq!((withdrawal.kind, withdrawal.request), (ac::OUTPUT, 7));
+            assert!(!crate::audio_rpc::OutputSignal::parse(&withdrawal.body).unwrap().ready);
+        }
+        delivery.revision += 1;
+        delivery.ready = true;
+        delivery.output_generation = signal.output;
+        let published = encode_control(&delivery);
+        remote.write(AUTHORITY, &published).unwrap();
+        assert_eq!(remote.read(3000).unwrap(), (AUTHORITY_OBSERVED, published));
+        if scenario == FirstDelivery::WithdrawAtReady {
+            while source_rx.try_recv().is_ok() {}
+            pcm.push_committed(480, 2);
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !pcm.chunks.lock().unwrap().is_empty() {
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            let (attached, outstanding, ciphertext) = source_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            assert!(attached);
+            assert_eq!((outstanding, ciphertext), (0, false));
+            stop_phone.store(true, Ordering::SeqCst);
+            remote.write(STOP, &[]).unwrap();
+            phone.join().unwrap();
+            assert!(worker.join().unwrap().is_ok());
+            return;
+        }
+        remote.write(NETWORK_REPLY, &Message { kind: 134, body: vec![], ..output }.encode(true).unwrap()).unwrap();
+        ready_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        pcm.push_committed(480, 2);
         phone.join().unwrap();
         remote.write(STOP, &[]).unwrap();
         assert!(worker.join().unwrap().is_ok());
@@ -2318,6 +2443,7 @@ mod tests {
         };
         let mut source = SourceOwner::new(scope, Box::new(input));
         source.install(native, binding, &grant, endpoint, 100).unwrap();
+        if ready { source.submit_ready(grant.output_generation); }
         if blocked { source.block_sends(); }
         runtime.authority.apply(grant.clone(), 100).unwrap();
         runtime.authority.source_observed(grant.binding, 100).unwrap();

@@ -111,6 +111,8 @@ impl AudioAuthority {
             g.delivery_generation != generation || g.output_generation != output) {return Err(invalid());}
         self.output_observed=output; Ok(())
     }
+    #[cfg(windows)]
+    pub(crate) fn clear_output(&mut self) { self.output_observed = 0; }
     pub fn media_allowed(&mut self, now: u64) -> bool {
         self.advance(now) && self.source_observed && self.delivery_observed && self.current.as_ref().is_some_and(|g|
             g.ready && g.delivery_generation != 0 && g.output_generation != 0 && self.output_observed == g.output_generation)

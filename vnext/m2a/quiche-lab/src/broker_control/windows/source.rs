@@ -1,5 +1,6 @@
 use crate::audio_authority::{AudioAuthority, ControlGrant};
 use crate::audio_control::{self as ac, DeliveryBinding, Record, SourceScope};
+use crate::audio_rpc::OutputSignal;
 use crate::audio_transport::ControlConnection;
 use crate::committed_source::{Block, Source};
 use crate::fresh_anchor::CommitFence;
@@ -41,6 +42,8 @@ struct Delivery {
     generation: u64,
     digest: [u8; 32],
     ready_output: Option<u64>,
+    submitted_output: u64,
+    withdrawn_output: u64,
 }
 
 pub(super) struct SourceOwner {
@@ -116,6 +119,8 @@ impl SourceOwner {
             connection, binding, ledger: PlaintextExpiry::default(),
             generation: grant.delivery_generation, digest: grant.delivery_digest,
             ready_output: grant.ready.then_some(grant.output_generation),
+            submitted_output: 0,
+            withdrawn_output: 0,
         });
         self.authority_until = grant.until;
         self.reconnect_until = None;
@@ -159,6 +164,35 @@ impl SourceOwner {
             if delivery.connection.sealed_media_pending() { return self.fence_delivery_at(now); }
             delivery.connection.discard_plaintext_media(&mut delivery.ledger);
             self.fence = Some(self.input.discard_partial(source_age::local_qpc_100ns()?)?);
+        }
+        Ok(())
+    }
+    pub(super) fn check_output(&self, id: [u8; 16], signal: OutputSignal) -> bool {
+        self.delivery.as_ref().is_some_and(|delivery| {
+            delivery.connection.observed_id() == Some(id) && delivery.digest == signal.digest
+                && delivery.generation == signal.delivery && signal.output >= delivery.submitted_output
+                && (!signal.ready || signal.output > delivery.withdrawn_output)
+        })
+    }
+    pub(super) fn submit_ready(&mut self, output: u64) {
+        if let Some(delivery) = self.delivery.as_mut() { delivery.submitted_output = output; }
+    }
+    pub(super) fn withdraw_output(&mut self, output: u64, authority: &mut AudioAuthority, now: u64) -> io::Result<()> {
+        if let Some(delivery) = self.delivery.as_mut() {
+            delivery.withdrawn_output = delivery.withdrawn_output.max(output);
+        }
+        authority.clear_output();
+        self.pause_media(now)
+    }
+    pub(super) fn confirm_output(&mut self, grant: &ControlGrant, authority: &mut AudioAuthority, now: u64) -> io::Result<()> {
+        if !grant.ready { return Ok(()); }
+        let Some(delivery) = self.delivery.as_ref() else { authority.clear_output(); return Ok(()); };
+        if grant.output_generation > delivery.submitted_output { return Err(denied()); }
+        if grant.output_generation != delivery.submitted_output || grant.output_generation <= delivery.withdrawn_output {
+            authority.clear_output();
+        } else if !authority.media_allowed(now) {
+            self.fence = Some(self.input.discard_partial(source_age::local_qpc_100ns()?)?);
+            authority.output_observed(grant.delivery_generation, grant.output_generation, now)?;
         }
         Ok(())
     }

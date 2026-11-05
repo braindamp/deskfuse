@@ -19,6 +19,31 @@ fn proof(b: &[u8]) -> bool {
         && (8..=72).contains(&b[32])
         && b.len() == 33 + b[32] as usize
 }
+#[derive(Clone, Copy)]
+pub(crate) struct OutputSignal {
+    pub digest: [u8; 32],
+    pub delivery: u64,
+    pub output: u64,
+    pub ready: bool,
+}
+impl OutputSignal {
+    #[cfg(any(target_os = "android", test))]
+    pub(crate) fn encode(self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(49);
+        bytes.extend_from_slice(&self.digest);
+        bytes.extend_from_slice(&self.delivery.to_be_bytes());
+        bytes.extend_from_slice(&self.output.to_be_bytes());
+        bytes.push(u8::from(self.ready));
+        bytes
+    }
+    pub(crate) fn parse(b: &[u8]) -> io::Result<Self> {
+        if b.len() != 49 || !nonzero(&b[..32]) || u64_at(b, 32) == 0
+            || u64_at(b, 40) == 0 || b[48] > 1
+        { return Err(c::invalid()); }
+        Ok(Self { digest: b[..32].try_into().unwrap(), delivery: u64_at(b, 32),
+            output: u64_at(b, 40), ready: b[48] == 1 })
+    }
+}
 pub fn validate_request(kind: u8, b: &[u8]) -> io::Result<()> {
     let ok = match kind {
         c::INFO => b.is_empty() || b == [1],
@@ -34,13 +59,7 @@ pub fn validate_request(kind: u8, b: &[u8]) -> io::Result<()> {
         }
         c::PROOF => proof(b),
         c::STATUS => b.len() == 32 && nonzero(b),
-        c::OUTPUT => {
-            b.len() == 49
-                && nonzero(&b[..32])
-                && u64_at(b, 32) != 0
-                && u64_at(b, 40) != 0
-                && b[48] <= 1
-        }
+        c::OUTPUT => OutputSignal::parse(b).is_ok(),
         c::DETACH => b.len() == 40 && nonzero(&b[..32]) && u64_at(b, 32) != 0,
         c::STOP => s::FastSourceStop::parse(b).is_ok(),
         c::SIGNED_SOURCE_STOP => s::SignedSourceStop::parse(b).is_ok(),

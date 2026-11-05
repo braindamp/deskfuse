@@ -497,7 +497,7 @@ internal sealed class BrokerAudioOwner
     }
     internal byte[] BindingDescriptor()
     { lock (gate) return bindingBytes?.ToArray() ?? throw new InvalidOperationException("Source binding is not prepared."); }
-    internal void ObserveOutput(Connection origin, byte[] digest, ulong deliveryGeneration, ulong outputGeneration, bool outputReady)
+    internal AudioControlGrant ObserveOutput(Connection origin, byte[] digest, ulong deliveryGeneration, ulong outputGeneration, bool outputReady)
     {
         lock (gate)
         {
@@ -505,6 +505,7 @@ internal sealed class BrokerAudioOwner
             if (delivery is null || !ReferenceEquals(deliveryOrigin, origin) || !delivery.Digest.AsSpan().SequenceEqual(digest))
                 throw new UnauthorizedAccessException("Output observation is outside the current delivery.");
             OutputChanged(deliveryGeneration, outputGeneration, outputReady);
+            return ControlSnapshot();
         }
     }
     internal void ObserveDetach(Connection origin, byte[] digest, ulong deliveryGeneration)

@@ -58,6 +58,11 @@ public:
     df_audio::RenderCore core;
     std::atomic<uint32_t> modes{3};
     std::atomic<int32_t> stream_error{AAUDIO_OK};
+    using Permit = bool (*)(const void*);
+    using Wake = void (*)(const void*);
+    std::atomic<Permit> permit{nullptr};
+    const void* permit_context = nullptr;
+    Wake wake = nullptr;
     // v1/v2/v3 records remain ABI-stable; v4 is the coherent record.
     std::atomic<uint64_t> callbacks{0};
     bool measure_callbacks = false; // immutable after lifecycle setup
@@ -68,6 +73,11 @@ public:
         AAudioStream*, void* arg, void* audio, int32_t frames) noexcept {
         auto* r = static_cast<Renderer*>(arg);
         if (frames <= 0) return AAUDIO_CALLBACK_RESULT_CONTINUE;
+        if (const auto permit = r->permit.load(std::memory_order_acquire);
+            permit && (r->stream_error.load(std::memory_order_acquire) != AAUDIO_OK || !permit(r->permit_context))) {
+            std::memset(audio, 0, size_t(frames) * 2 * sizeof(int16_t));
+            return AAUDIO_CALLBACK_RESULT_CONTINUE;
+        }
         timespec before{},after{};
         const bool before_ok = r->measure_callbacks && clock_gettime(CLOCK_MONOTONIC,&before)==0;
         const uint32_t options = r->modes.load(std::memory_order_acquire);
@@ -95,7 +105,9 @@ public:
         return AAUDIO_CALLBACK_RESULT_CONTINUE;
     }
     static void error(AAudioStream*, void* arg, aaudio_result_t code) noexcept {
-        static_cast<Renderer*>(arg)->stream_error.store(code, std::memory_order_release);
+        auto* r = static_cast<Renderer*>(arg);
+        r->stream_error.store(code, std::memory_order_release);
+        if (r->permit.load(std::memory_order_acquire)) r->wake(r->permit_context);
     }
     void stats(Stats* s) noexcept {
         s->accepted_frames = core.published();
@@ -198,6 +210,15 @@ static int32_t open_audio(void** out, const df_audio::OutputConfigV8& config) no
     return 0;
 }
 DF_EXPORT int32_t df_audio_open(void** out) noexcept { return open_audio(out, {}); }
+DF_EXPORT bool df_audio_bind_gate_v1(void* ctx, const void* context, Renderer::Permit permit, Renderer::Wake wake) noexcept {
+    if (!ctx || !context || !permit || !wake) return false;
+    auto* r = static_cast<Renderer*>(ctx);
+    if (r->permit.load(std::memory_order_acquire)) return false;
+    r->permit_context = context;
+    r->wake = wake;
+    r->permit.store(permit, std::memory_order_release);
+    return true;
+}
 DF_EXPORT int32_t df_audio_open_config_v7(
     const df_audio::OutputConfigV7* config, void** out) noexcept {
     if (!out) return -1;
