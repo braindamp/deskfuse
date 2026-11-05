@@ -10,6 +10,7 @@ internal enum AudioWorkerFrameKind : byte {
     ConfigureListener = 6, ListenerConfigured = 7, ConnectionObserved = 8, ConnectionClosed = 9,
     NetworkRequest = 10, NetworkReply = 11, RundownObserved = 12,
     OpenSource = 13, SourceOpened = 14, AttachPcm = 15, SourceMapped = 16,
+    PinnedIssue = 17,
 }
 internal sealed record AudioWorkerFrame(AudioWorkerFrameKind Kind, byte[] Body);
 

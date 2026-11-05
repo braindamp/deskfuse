@@ -12,11 +12,12 @@ internal sealed class BrokerAudioControlDispatcher : IAudioWorkerEventOwner
 {
     private sealed class Route(BrokerAudioOwner.Connection origin)
     { internal readonly BrokerAudioOwner.Connection Origin = origin; internal ulong LastRequest; }
-    private sealed class Job(AudioNetworkMessage message, Route route, bool negative)
+    private sealed class Job(AudioNetworkMessage message, Route route, bool negative, AudioPinnedIssue? pin)
     {
         internal readonly AudioNetworkMessage Message = message;
         internal readonly Route Route = route;
         internal readonly bool Negative = negative;
+        internal readonly AudioPinnedIssue? Pin = pin;
         internal BrokerAudioOwner.StopVerification? Stop;
         internal Exception? Rejected;
         internal readonly TaskCompletionSource<bool> Done = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -77,15 +78,17 @@ internal sealed class BrokerAudioControlDispatcher : IAudioWorkerEventOwner
                 }
                 return true;
             }
-            if (frame.Kind != AudioWorkerFrameKind.NetworkRequest) return false;
-            var message = AudioWorkerNetworkProtocol.Parse(frame.Body);
+            if (frame.Kind is not (AudioWorkerFrameKind.NetworkRequest or AudioWorkerFrameKind.PinnedIssue)) return false;
+            if (frame.Kind == AudioWorkerFrameKind.PinnedIssue && !acquisitionOnly) return false;
+            var pin = frame.Kind == AudioWorkerFrameKind.PinnedIssue ? AudioWorkerNetworkProtocol.ParsePinnedIssue(frame.Body) : null;
+            var message = pin?.Message ?? AudioWorkerNetworkProtocol.Parse(frame.Body);
             if (!routes.TryGetValue(message.Connection, out var origin) || origin.LastRequest == ulong.MaxValue || message.Request != origin.LastRequest + 1)
                 return false;
             var negative = AudioWorkerNetworkProtocol.Negative(message.Kind);
             // Native forwarding credits use the same worker-wide budget. Public
             // candidate overload is dropped/rejected there, never overfills this pipe.
             if (executing.Count(p => p.Negative == negative) >= (negative ? 1 : 8)) return false;
-            job = new(message, origin, negative); origin.LastRequest = message.Request; jobs.Add(job); executing.Add(job);
+            job = new(message, origin, negative, pin); origin.LastRequest = message.Request; jobs.Add(job); executing.Add(job);
             try
             {
                 if (message.Kind == (byte)AudioNetworkKind.SignedSourceStop)
@@ -176,15 +179,17 @@ internal sealed class BrokerAudioControlDispatcher : IAudioWorkerEventOwner
                     return prepared.Bytes;
                 case AudioNetworkKind.Issue:
                     var operation = (AudioOperationKind)b[0]; AudioDeliveryDescriptor? candidate = null;
-                    if (acquisitionOnly && operation != AudioOperationKind.AcquireSource)
-                        throw new UnauthorizedAccessException("Only source acquisition is enabled.");
+                    if (acquisitionOnly && operation is not (AudioOperationKind.AcquireSource or AudioOperationKind.AttachDelivery))
+                        throw new UnauthorizedAccessException("Only first delivery attachment is enabled.");
+                    if (acquisitionOnly && (operation == AudioOperationKind.AttachDelivery) != (job.Pin is not null))
+                        throw new UnauthorizedAccessException("First delivery requires confirmed native pin evidence.");
                     if (operation is AudioOperationKind.AttachDelivery or AudioOperationKind.SupersedeDelivery)
                     {
                         lock (gate) candidate = nomination;
                         if (candidate is null || candidate.Connection?.Incarnation != new Guid(b.AsSpan(37), bigEndian: true) || !candidate.Intent.PhoneRequestNonce.AsSpan().SequenceEqual(b.AsSpan(1, 32)))
                             throw new UnauthorizedAccessException("No exact nominated delivery.");
                     }
-                    var challenge = owner.Issue(origin, operation, b[1..33], checked((int)BinaryPrimitives.ReadUInt32BigEndian(b.AsSpan(33))), candidate);
+                    var challenge = owner.Issue(origin, operation, b[1..33], checked((int)BinaryPrimitives.ReadUInt32BigEndian(b.AsSpan(33))), candidate, job.Pin);
                     return EnrollmentFraming.Signed(challenge.Transcript, challenge.HostSignature);
                 case AudioNetworkKind.Proof:
                     var proof = AudioWorkerNetworkProtocol.Proof(b);

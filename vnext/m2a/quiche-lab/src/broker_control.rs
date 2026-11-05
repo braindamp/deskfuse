@@ -19,6 +19,7 @@ pub const OPEN_SOURCE: u8 = 13;
 pub const SOURCE_OPENED: u8 = 14;
 pub const ATTACH_PCM: u8 = 15;
 pub const SOURCE_MAPPED: u8 = 16;
+pub const PINNED_ISSUE: u8 = 17;
 pub const HELLO_BYTES: usize = 61;
 const CLIENT_MASK: u32 = 0x0012_0083;
 const SYSTEM_SID: &[u8] = &[1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];

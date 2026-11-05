@@ -8,6 +8,7 @@ internal enum AudioNetworkKind : byte
     Detach = 7, Stop = 8, SignedSourceStop = 9, SourceStopStatus = 10, AppliedResult = 11,
 }
 internal sealed record AudioNetworkMessage(ulong Request, Guid Connection, byte Kind, byte[] Body);
+internal sealed record AudioPinnedIssue(AudioNetworkMessage Message, ulong ParentRevision, byte[] Digest);
 internal sealed record AudioConnectionObservation(Guid Connection, byte[] Native, byte[] Phone, byte[] Nonce);
 
 /// <summary>Bounded native pipe RPC. Identity comes from the bound pipe, never these bytes.</summary>
@@ -31,6 +32,16 @@ internal static class AudioWorkerNetworkProtocol
         var value = new AudioNetworkMessage(BinaryPrimitives.ReadUInt64BigEndian(bytes),
             new(bytes.AsSpan(8, 16), bigEndian: true), bytes[24], bytes.AsSpan(HeaderBytes).ToArray());
         _ = Encode(value, reply); return value;
+    }
+    internal static AudioPinnedIssue ParsePinnedIssue(byte[] bytes)
+    {
+        if (bytes.Length != HeaderBytes + 53 + 8 + 32) throw Invalid();
+        var message = Parse(bytes[..(HeaderBytes + 53)]);
+        var evidence = bytes.AsSpan(HeaderBytes + 53);
+        if (message.Kind != (byte)AudioNetworkKind.Issue || message.Body[0] != (byte)AudioOperationKind.AttachDelivery ||
+            BinaryPrimitives.ReadUInt64BigEndian(evidence) == 0) throw Invalid();
+        Hash(evidence[8..]);
+        return new(message, BinaryPrimitives.ReadUInt64BigEndian(evidence), evidence[8..].ToArray());
     }
     internal static AudioConnectionObservation Observation(byte[] bytes)
     {

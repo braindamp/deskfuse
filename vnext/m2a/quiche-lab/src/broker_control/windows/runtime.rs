@@ -781,6 +781,32 @@ impl NativeRuntime {
         Ok(true)
     }
 
+    fn forward_pinned_issue(&mut self) -> io::Result<bool> {
+        let owned = self.listener.as_ref().ok_or_else(invalid)?;
+        let Some(pin) = owned.pin.as_ref().filter(|pin| pin.confirmed) else { return Ok(false); };
+        let nomination = owned.nomination.as_ref().ok_or_else(invalid)?;
+        let route = owned.observed.ok_or_else(invalid)?;
+        if !self.authority.prepared() || self.authority.grant() != Some(&pin.parent)
+            || self.source.as_ref().is_none_or(SourceOwner::has_delivery)
+            || nomination.route != route || pin.record.body[1..33] != nomination.request
+            || pin.record.body[37..53] != route || nomination.binding.binding != pin.parent.binding
+        { return Err(invalid()); }
+        let tls = Message {
+            request: pin.record.request, connection: route,
+            kind: ac::ISSUE, body: pin.record.body.clone(),
+        };
+        let Some(pipe) = self.pipe_requests.propose(&tls)? else { return Ok(false); };
+        let mut evidence = pipe.encode(false)?;
+        evidence.extend_from_slice(&pin.parent.revision.to_be_bytes());
+        evidence.extend_from_slice(&nomination.binding.digest);
+        if !self.client.try_write(PINNED_ISSUE, &evidence)? { return Ok(false); }
+        self.pipe_requests.submitted(&tls, &pipe)?;
+        let owned = self.listener.as_mut().unwrap();
+        owned.pin = None;
+        owned.acquisition_rpc = Some(AcquisitionRpc::Issue(tls.request));
+        Ok(true)
+    }
+
     fn service_candidate(&mut self) -> io::Result<bool> {
         if !self.listener.as_ref().is_some_and(|owned| owned.candidate.is_some() || owned.joined.is_some()) {
             return Ok(false);
@@ -840,6 +866,11 @@ impl NativeRuntime {
             progress |= self.forward_request(record)?;
         }
         if self.listener.as_ref().unwrap().pending_negative.is_none() {
+            progress |= self.forward_pinned_issue()?;
+        }
+        if self.listener.as_ref().unwrap().pending_negative.is_none()
+            && self.listener.as_ref().unwrap().pin.is_none()
+        {
             for _ in 0..ac::MAX_PENDING {
                 let record = self.listener.as_mut().unwrap().pending_regular.pop_front();
                 let Some(record) = record else { break; };

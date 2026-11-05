@@ -254,13 +254,21 @@ internal sealed class BrokerAudioOwner
     internal (ulong IssuedThrough, int AppliedReplies, int Pending, int BrokerNonces) RequestCounts
     { get { lock (gate) { Prune(); return (issuedThrough, applied.Count, active is null ? 0 : 1, authority.PendingCount); } } }
 
-    internal AudioOperationChallenge Issue(Connection origin, AudioOperationKind kind, byte[] phoneRequestNonce, int challengeLifetimeMs, AudioDeliveryDescriptor? candidate = null)
+    internal AudioOperationChallenge Issue(Connection origin, AudioOperationKind kind, byte[] phoneRequestNonce, int challengeLifetimeMs, AudioDeliveryDescriptor? candidate = null, AudioPinnedIssue? pin = null)
     {
         var id = new AudioRequestId(phoneRequestNonce); var requestNonce = id.Bytes; Pending reservation;
         if (challengeLifetimeMs is < 1 or > BrokerProofChallenges.MaxChallengeLifetimeMs) throw new InvalidDataException("Invalid proof lifetime.");
         lock (gate)
         {
             var now = Now(); RequireOrigin(origin); RequireLive(now); Prune();
+            if (pin is not null && (kind != AudioOperationKind.AttachDelivery || candidate is null ||
+                phase != AudioAuthorityPhase.Prepared || delivery is not null || lastDeliveryGeneration != 0 ||
+                pin.ParentRevision != revision || pin.Message.Connection != origin.Incarnation ||
+                !ReferenceEquals(candidate.Connection, origin) ||
+                !pin.Digest.AsSpan().SequenceEqual(candidate.Digest) ||
+                !pin.Message.Body.AsSpan(1, 32).SequenceEqual(phoneRequestNonce) ||
+                !candidate.Intent.PhoneRequestNonce.AsSpan().SequenceEqual(phoneRequestNonce)))
+                throw new UnauthorizedAccessException("Pinned first delivery is stale or mismatched.");
             var old = active is not null && new AudioRequestId(active.PhoneNonce).Sequence == id.Sequence ? active :
                 applied.Values.Select(v => v.Pending).SingleOrDefault(p => new AudioRequestId(p.PhoneNonce).Sequence == id.Sequence);
             if (old is not null)
