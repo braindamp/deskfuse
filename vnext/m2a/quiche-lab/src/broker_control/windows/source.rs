@@ -86,7 +86,7 @@ impl SourceOwner {
     }
     pub(super) fn has_queued_media(&self) -> bool {
         self.delivery.as_ref().is_some_and(|d|
-            d.ledger.len() != 0 || (d.media_queued && d.connection.sealed_pending()))
+            d.media_queued || d.ledger.len() != 0)
     }
     pub(super) fn read_control(&mut self, now: u64) -> io::Result<Vec<Record>> {
         let Some(delivery) = self.delivery.as_mut() else { return Ok(Vec::new()); };
@@ -338,6 +338,67 @@ mod tests {
         let hex = value[key].as_str().unwrap();
         (0..hex.len()).step_by(2).map(|at|
             u8::from_str_radix(&hex[at..at + 2], 16).unwrap()).collect()
+    }
+
+    #[test]
+    fn output_withdrawal_retires_delivery_after_plaintext_ledger_is_drained() {
+        let f: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../../../tools/protocol3/audio-transport-v1.json"
+        )).unwrap();
+        let scope = SourceScope::parse(&bytes(&f, "sourceHex")).unwrap();
+        let mut grant = ControlGrant::parse(&bytes(&f, "controlHex")).unwrap();
+        let (_, mut native) = pair();
+        let observed = native.observation(100).unwrap().unwrap();
+        let mut delivery = bytes(&f, "deliveryHex");
+        for (old, new) in [
+            (15, observed.native), (16, observed.phone), (17, observed.nonce),
+        ] {
+            let offset = delivery.windows(32).position(|bytes| bytes == [old; 32]).unwrap();
+            delivery[offset..offset + 32].copy_from_slice(&new);
+        }
+        let binding = DeliveryBinding::parse(&delivery).unwrap();
+        grant.delivery_digest = binding.digest;
+        grant.until = 100_000_000;
+        grant.ready = true;
+        grant.output_generation = 13;
+        native.install_native(&scope, grant.boot, binding.clone(), &grant, 100).unwrap();
+
+        let mut authority = AudioAuthority::new(grant.boot, grant.worker).unwrap();
+        authority.apply(grant.clone(), 100).unwrap();
+        authority.source_observed(grant.binding, 100).unwrap();
+        authority.delivery_observed(grant.delivery_generation, grant.delivery_digest, 100).unwrap();
+        authority.output_observed(grant.delivery_generation, 13, 100).unwrap();
+
+        let qpc = source_age::local_qpc_100ns().unwrap();
+        let block = Block {
+            first_frame: 240, generation: 1, min_commit: 1,
+            timing: CommitTiming {
+                commit_qpc: qpc.saturating_sub(1_000), presentation_qpc: qpc,
+            },
+            pcm: [7; 960],
+        };
+        let fences = Arc::new(Mutex::new(0));
+        let input = Fake {
+            chunks: VecDeque::from([block]), fences: Arc::clone(&fences),
+        };
+        let mut source = SourceOwner::new(scope, Box::new(input));
+        source.install(
+            native, binding, &grant, "127.0.0.1:44002".parse().unwrap(), 101,
+        ).unwrap();
+        source.pump(&mut authority, || 102, || false, None).unwrap();
+        let incumbent = source.delivery.as_mut().unwrap();
+        assert!(incumbent.media_queued);
+        incumbent.ledger.clear();
+        assert!(!incumbent.connection.sealed_pending());
+        assert!(source.has_queued_media());
+
+        let mut withdrawn = grant;
+        withdrawn.revision += 1;
+        withdrawn.ready = false;
+        authority.apply(withdrawn.clone(), 103).unwrap();
+        source.recheck(&withdrawn, 103).unwrap();
+        assert!(!source.has_delivery());
+        assert_eq!(*fences.lock().unwrap(), 1);
     }
 
     #[test]
