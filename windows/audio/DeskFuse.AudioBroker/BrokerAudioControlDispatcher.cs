@@ -118,7 +118,7 @@ internal sealed class BrokerAudioControlDispatcher : IAudioWorkerEventOwner
                 job.Negative, () => { lock (gate) executing.Remove(job); }).ConfigureAwait(false);
         }
         catch (Exception error) { owner.CloseAdmission(); fail(error); }
-        finally { lock (gate) { jobs.Remove(job); executing.Remove(job); } job.Done.TrySetResult(true); }
+        finally { lock (gate) { jobs.Remove(job); executing.Remove(job); job.Done.TrySetResult(true); } }
     }
     private async Task<byte[]> Execute(Job job)
     {
