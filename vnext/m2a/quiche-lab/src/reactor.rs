@@ -372,7 +372,7 @@ impl WindowsEvents {
         }
         unsafe {
             let result = WaitForMultipleObjects(3, handles.as_ptr(), 0, timeout_ms);
-            if result == WAIT_TIMEOUT {
+            if result == 258 {
                 return Err(io::Error::new(io::ErrorKind::TimedOut, "Listener authority deadline"));
             }
             if result == u32::MAX { return Err(io::Error::last_os_error()); }
