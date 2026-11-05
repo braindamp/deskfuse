@@ -1349,11 +1349,13 @@ mod tests {
                 conn.service_timeout(now()).unwrap();
                 for _ in 0..16 {
                     match socket.recv_from(&mut buf) {
-                        Ok((n, from)) => conn.receive(
-                            &mut buf[..n], quiche::RecvInfo {
-                                from, to: socket.local_addr().unwrap()
-                            }, now(),
-                        ).unwrap(),
+                        Ok((n, from)) => {
+                            conn.receive(
+                                &mut buf[..n], quiche::RecvInfo {
+                                    from, to: socket.local_addr().unwrap()
+                                }, now(),
+                            ).unwrap();
+                        },
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                         Err(e) => panic!("{e}"),
                     }
