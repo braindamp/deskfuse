@@ -1948,7 +1948,10 @@ mod tests {
     }
 
     #[test]
-    fn real_worker_moves_first_pinned_tls_and_keeps_pcm_gated() {
+    fn real_worker_moves_first_pinned_tls_and_keeps_pcm_gated() { first_delivery_fixture(false); }
+    #[test]
+    fn stop_after_first_pin_joins_worker_without_a_delivery_receipt() { first_delivery_fixture(true); }
+    fn first_delivery_fixture(stop_at_pin: bool) {
         use crate::audio_tls::{Role, ALPN};
         use crate::audio_transport::DeliveryTls;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1989,6 +1992,8 @@ mod tests {
         proof.push(8);
         proof.extend_from_slice(&[0x47; 8]);
         let client_proof = proof.clone();
+        let stop_phone = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_observer = Arc::clone(&stop_phone);
         let phone = std::thread::spawn(move || {
             let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
             socket.set_nonblocking(true).unwrap();
@@ -1999,6 +2004,7 @@ mod tests {
             let mut observed = None;
             let mut buf = [0u8; 1350];
             loop {
+                if stop_observer.load(Ordering::SeqCst) { return; }
                 assert!(Instant::now() < deadline, "first delivery TLS transfer");
                 conn.service_timeout(now()).unwrap();
                 for _ in 0..16 {
@@ -2107,6 +2113,14 @@ mod tests {
         assert_eq!(&issue.body[1..33], &n2);
         assert_eq!(u64::from_be_bytes(pinned[78..86].try_into().unwrap()), parent.revision);
         assert_eq!(pinned[86..], nominated.digest);
+        if stop_at_pin {
+            stop_phone.store(true, Ordering::SeqCst);
+            remote.write(STOP, &[]).unwrap();
+            phone.join().unwrap();
+            assert!(worker.join().unwrap().is_ok());
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            return;
+        }
         remote.write(NETWORK_REPLY, &Message {
             kind: 131, body: vec![0x22], ..issue
         }.encode(true).unwrap()).unwrap();
