@@ -53,6 +53,11 @@ internal static class BrokerProtectedAudioAcquisition
                 .ConfigureAwait(false);
             return new(owner, resource, session, listener);
         }
+        catch (BrokerWorkerLaunchIncompleteException) when (worker is null)
+        {
+            image = null;
+            throw;
+        }
         catch (Exception failure)
         {
             if (tracked && owner is not null)
