@@ -428,7 +428,11 @@ public sealed class AudioAuthorityTests
             Assert.True(h.Send(AudioNetworkKind.AppliedResult, Request(2).Concat(proof).ToArray()));
             Assert.Equal(receipt.Body, (await h.Reply()).Body);
             Assert.Equal(counts, f.Owner.RequestCounts);
-            Assert.True(h.Send(AudioNetworkKind.Output, new byte[49]));
+            var output = new byte[49];
+            digest.CopyTo(output, 0);
+            BinaryPrimitives.WriteUInt64BigEndian(output.AsSpan(32), 1);
+            BinaryPrimitives.WriteUInt64BigEndian(output.AsSpan(40), 1);
+            Assert.True(h.Send(AudioNetworkKind.Output, output));
             Assert.Equal((byte)255, (await h.Reply()).Kind);
         }
         finally
