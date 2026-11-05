@@ -173,6 +173,7 @@ internal sealed class BrokerAudioOwner
         internal readonly Guid Incarnation;
         private readonly byte[] native, phone, nonce;
         internal bool Closed;
+        internal bool UsedForDelivery;
         internal Connection(BrokerAudioOwner owner, Guid incarnation, byte[] native, byte[] phone, byte[] nonce)
         { Owner = owner; Incarnation = incarnation; this.native = native.ToArray(); this.phone = phone.ToArray(); this.nonce = nonce.ToArray(); }
         internal bool Matches(AudioDeliveryIntent intent) => native.AsSpan().SequenceEqual(intent.NativeCertificate) &&
@@ -328,6 +329,7 @@ internal sealed class BrokerAudioOwner
             candidate.Intent.Generation <= lastDeliveryGeneration) throw new UnauthorizedAccessException("Delivery parent/binding/generation changed.");
         if (candidate.Connection is null) throw new UnauthorizedAccessException("Delivery lacks a connection observation.");
         RequireObserved(candidate.Connection);
+        if (candidate.Connection.UsedForDelivery) throw new UnauthorizedAccessException("Replacement requires a fresh observed TLS connection.");
         if (kind == AudioOperationKind.AttachDelivery && (delivery is not null || lastDeliveryGeneration != 0) ||
             kind == AudioOperationKind.SupersedeDelivery && lastDeliveryGeneration == 0)
             throw new UnauthorizedAccessException("Attach and supersede have different lifecycle semantics.");
@@ -363,7 +365,7 @@ internal sealed class BrokerAudioOwner
                 {
                     if (p.Kind == AudioOperationKind.AcquireSource) { phase = AudioAuthorityPhase.Preparing; acquisitionRecord = record; }
                     if (p.Delivery is not null)
-                    { delivery = p.Delivery; deliveryOrigin = delivery.Connection; lastDeliveryGeneration = delivery.Intent.Generation; outputGeneration = 0; ready = false; outputStopped = false; }
+                    { delivery = p.Delivery; deliveryOrigin = delivery.Connection; deliveryOrigin!.UsedForDelivery = true; lastDeliveryGeneration = delivery.Intent.Generation; outputGeneration = 0; ready = false; outputStopped = false; }
                     until = p.Until; revision = next; p.Result = record; p.Stage = AudioRequestStage.Applied;
                     applied.Add(key, record); replyOrder.Enqueue(key);
                     while (replyOrder.Count > 8) applied.Remove(replyOrder.Dequeue());

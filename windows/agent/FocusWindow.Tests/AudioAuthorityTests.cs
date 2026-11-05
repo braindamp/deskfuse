@@ -11,6 +11,73 @@ namespace FocusWindow.Tests;
 public sealed class AudioAuthorityTests
 {
     [Fact]
+    public void Replacement_never_relabels_a_previously_approved_TLS_connection_even_after_Detach()
+    {
+        using var f = new Fixture(); f.Attach(); var old = f.Origin; var before = f.Owner.RequestCounts;
+        var relabelled = f.Owner.PrepareDelivery(old.DeliveryIntent(2, Request(3)), old);
+        Assert.Throws<UnauthorizedAccessException>(() => f.Owner.Issue(old, AudioOperationKind.SupersedeDelivery, Request(3), 1000, relabelled));
+        Assert.Equal(before, f.Owner.RequestCounts);
+        f.Owner.Detach(1);
+        Assert.Throws<UnauthorizedAccessException>(() => f.Owner.Issue(old, AudioOperationKind.SupersedeDelivery, Request(3), 1000, relabelled));
+        Assert.Equal(before, f.Owner.RequestCounts);
+        var fresh = f.NewConnection(20, 21, 22);
+        var descriptor = f.Owner.PrepareDelivery(fresh.DeliveryIntent(2, Request(3)), fresh);
+        f.Origin = fresh; f.Admit(f.Owner.Issue(fresh, AudioOperationKind.SupersedeDelivery, Request(3), 1000, descriptor));
+        Assert.Equal(2UL, f.Owner.Snapshot().DeliveryGeneration);
+    }
+    private static AudioListenerConfiguration Listener(Fixture f) => AudioListenerConfiguration.Create(f.Owner.Source,
+        new(System.Net.IPAddress.Loopback, 0), new(1500, 10000, 8, 128, 65536, 32, 8, 8, 500)); // Synthetic policy only.
+    private static byte[] ListenerAck(AudioListenerConfiguration config, ushort port)
+    {
+        var reply = new byte[40]; reply[0] = 1; SHA256.HashData(config.Bytes).CopyTo(reply, 1);
+        reply[33] = 4; reply[34] = 127; reply[37] = 1; BinaryPrimitives.WriteUInt16BigEndian(reply.AsSpan(38), port); return reply;
+    }
+    [Fact]
+    public async Task Native_listener_completion_retains_actual_write_and_rejects_late_endpoint_substitution()
+    {
+        using var f = new Fixture(); var config = Listener(f);
+        var (local, peer) = AudioWorkerControlTests.Duplex.Pair(); var remote = new AudioWorkerControl(peer);
+        var barrier = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously); local.WriteCompletion = barrier.Task;
+        var routed = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var failed = new TaskCompletionSource<Exception>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var pump = new AudioWorkerControlPump(new(local), _ => { routed.TrySetResult(true); return true; }, e => { f.Owner.CloseAdmission(); failed.TrySetResult(e); });
+        try
+        {
+            var operation = pump.ConfigureListenerAsync(config); Assert.Same(operation, pump.ConfigureListenerAsync(config));
+            var request = await remote.ReadAsync(CancellationToken.None);
+            Assert.Equal(AudioWorkerFrameKind.ConfigureListener, request.Kind); Assert.Equal(config.Bytes, request.Body);
+            var acknowledgement = ListenerAck(config, 44002);
+            await remote.WriteAsync(AudioWorkerFrameKind.ListenerConfigured, acknowledgement, CancellationToken.None);
+            await remote.WriteAsync(AudioWorkerFrameKind.ConnectionObserved, new byte[112], CancellationToken.None);
+            await routed.Task.WaitAsync(TimeSpan.FromSeconds(3)); Assert.False(operation.IsCompleted);
+            barrier.SetResult(true);
+            Assert.Equal(new System.Net.IPEndPoint(System.Net.IPAddress.Loopback, 44002), await operation.WaitAsync(TimeSpan.FromSeconds(3)));
+            await remote.WriteAsync(AudioWorkerFrameKind.ListenerConfigured, acknowledgement, CancellationToken.None); // Exact retry.
+            await remote.WriteAsync(AudioWorkerFrameKind.ListenerConfigured, ListenerAck(config, 44003), CancellationToken.None);
+            Assert.IsType<InvalidDataException>(await failed.Task.WaitAsync(TimeSpan.FromSeconds(3)));
+            Assert.Equal(AudioAuthorityPhase.Closed, f.Owner.Snapshot().Phase);
+            Assert.Throws<IOException>(() => { _ = pump.ConfigureListenerAsync(config); });
+        }
+        finally { barrier.TrySetResult(true); await pump.StopAndJoinAsync(); }
+    }
+    [Fact]
+    public async Task Wrong_listener_ack_fails_closed_and_caller_cancellation_keeps_real_listener_IO_owned()
+    {
+        using var f = new Fixture(); var config = Listener(f);
+        var (local, peer) = AudioWorkerControlTests.Duplex.Pair(); var remote = new AudioWorkerControl(peer);
+        var pump = new AudioWorkerControlPump(new(local), _ => false, _ => f.Owner.CloseAdmission());
+        var operation = pump.ConfigureListenerAsync(config); _ = await remote.ReadAsync(CancellationToken.None);
+        using var caller = new CancellationTokenSource(); caller.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => operation.WaitAsync(caller.Token)); Assert.False(operation.IsCompleted);
+        var wrong = ListenerAck(config, 44002); wrong[1] ^= 1;
+        await remote.WriteAsync(AudioWorkerFrameKind.ListenerConfigured, wrong, CancellationToken.None);
+        await Assert.ThrowsAsync<InvalidDataException>(() => operation);
+        await pump.StopAndJoinAsync(); Assert.Equal(AudioAuthorityPhase.Closed, f.Owner.Snapshot().Phase);
+        using var other = new Fixture(); Assert.Throws<UnauthorizedAccessException>(() => config.RequireSource(other.Owner.Source));
+        Assert.Throws<NotSupportedException>(() => AudioListenerConfiguration.Create(other.Owner.Source,
+            new(System.Net.IPAddress.Loopback, 0), new(1500, 10000, 8, 128, 65536, 32, 8, 8, 500), AudioDeliveryMode.Interactive));
+    }
+    [Fact]
     public void Denial_and_quarantine_keep_replacement_blocked_and_terminal_metadata_survives_dead_registration()
     {
         using var f = new Fixture(); var target = AudioSourceStopProtocol.Target(f.Owner.Source, Nonce(3));

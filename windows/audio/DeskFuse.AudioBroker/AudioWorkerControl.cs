@@ -86,6 +86,8 @@ internal sealed class BrokerAudioWorkerSession
     private readonly object publicationGate = new();
     private Task<bool>? publication;
     private Task<bool>? terminalPublication;
+    private Task<System.Net.IPEndPoint>? listenerConfiguration;
+    private AudioListenerConfiguration? retainedListener;
     private IAudioWorkerEventOwner? eventOwner;
     private Task? stopOperation;
     private BrokerAudioOwner? audioOwner;
@@ -118,6 +120,47 @@ internal sealed class BrokerAudioWorkerSession
             throw new UnauthorizedAccessException("Audio publication is outside its retained source/worker owner.");
     }
     internal Task SendReplyAsync(byte[] bytes, bool negative) => pump.SendReplyAsync(bytes, negative);
+    internal Task<System.Net.IPEndPoint> ConfigureListenerAsync(BrokerAudioOwner owner, AudioListenerConfiguration configuration, CancellationToken ct)
+    {
+        Task<System.Net.IPEndPoint> operation;
+        lock (publicationGate)
+        {
+            RequireOwner(owner); configuration.RequireSource(owner.Source); audioOwner = owner;
+            if (eventOwner is null) throw new InvalidOperationException("Bind the native event owner before opening its listener.");
+            if (ct.IsCancellationRequested) { _ = QueueTerminal(owner); return Task.FromCanceled<System.Net.IPEndPoint>(ct); }
+            if (stopping) throw new InvalidOperationException("Native owner is stopping.");
+            // The pump retains one immutable listener and exact retry. A changed
+            // configuration never silently rebinds a running source's socket.
+            if (listenerConfiguration is not null)
+            {
+                if (!retainedListener!.Bytes.AsSpan().SequenceEqual(configuration.Bytes)) throw new InvalidOperationException("A different listener is already owned.");
+                operation = listenerConfiguration;
+            }
+            else { retainedListener = configuration; operation = listenerConfiguration = ConfigureCore(owner, configuration); }
+        }
+        return AwaitListenerCaller(owner, operation, ct);
+    }
+    private async Task<System.Net.IPEndPoint> ConfigureCore(BrokerAudioOwner owner, AudioListenerConfiguration configuration)
+    {
+        try
+        {
+            var endpoint = await pump.ConfigureListenerAsync(configuration).ConfigureAwait(false);
+            if (!caller.Matches(Worker) || owner.Snapshot().Phase == AudioAuthorityPhase.Closed)
+                throw new UnauthorizedAccessException("Native listener completion is no longer current.");
+            return endpoint;
+        }
+        catch { owner.CloseAdmission(); throw; }
+    }
+    private async Task<System.Net.IPEndPoint> AwaitListenerCaller(BrokerAudioOwner owner, Task<System.Net.IPEndPoint> operation, CancellationToken ct)
+    {
+        try
+        {
+            var endpoint = await operation.WaitAsync(ct).ConfigureAwait(false); ct.ThrowIfCancellationRequested();
+            if (owner.Snapshot().Phase == AudioAuthorityPhase.Closed) throw new UnauthorizedAccessException("Native listener owner is closed.");
+            return endpoint;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { _ = QueueTerminal(owner); throw; }
+    }
 
     internal static async Task<BrokerAudioWorkerSession> ConnectAsync(BrokerRegisteredWorker worker, byte[] serviceBoot, CancellationToken ct)
     {
@@ -249,7 +292,7 @@ internal sealed class BrokerAudioWorkerSession
         {
             if (stopped) return Task.CompletedTask;
             if (stopOperation is { IsFaulted: false }) return stopOperation;
-            stopping = true; audioOwner?.CloseAdmission(); var pending = new[] { publication, terminalPublication }.OfType<Task>().Distinct().ToArray();
+            stopping = true; audioOwner?.CloseAdmission(); var pending = new Task?[] { publication, terminalPublication, listenerConfiguration }.OfType<Task>().Distinct().ToArray();
             // One retained cold operation, shared by cancellation/shutdown.
             // No process wait or pipe I/O occurs under publicationGate.
             return stopOperation = Task.Run(() => StopCore(pending));

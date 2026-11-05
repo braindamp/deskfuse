@@ -200,6 +200,42 @@ Evidence: `out/control-handover-checks/native-control-all.log`.
 The native entrypoint still needs the configured listener/source composition;
 the new components have not activated production authority or physical media.
 
+## Iteration 7 — H2 listener configuration and fresh-connection admission
+
+5 November 2026. Added matching C#/Rust local listener configuration and exact
+bind acknowledgement codecs with shared IPv4/IPv6 vectors. Inputs include the
+unchanged source descriptor, explicit interface and explicit candidate policy;
+synthetic fixture values do not select product defaults. Native rejects foreign
+worker/mode, malformed policy/address and overflow before socket action. An
+ephemeral loopback bind reports its actual assigned endpoint without opening
+an audio source. The exact framing is in [Audio_Native_Control_RPC.md](Audio_Native_Control_RPC.md).
+
+The existing broker pump/session now own one immutable listener configuration,
+route its ACK through the sole reader, retain real writes through cancellation,
+require exact late retries and reject endpoint/configuration substitution. The
+session requires an event owner before listener opening and retains its actual
+configuration job through shutdown. This implements the already selected H2
+control boundary; the native run loop still needs listener composition.
+
+Enforced the reviewed H2 requirement that a replacement uses a fresh observed
+TLS connection. A connection already admitted as a delivery cannot be relabelled
+with a new generation, even after Detach. Normal renewal and exact applied-result
+retry retain their existing connection. The new gate runs only in authority
+admission and adds no media-path work.
+
+Shared codec checks passed in C# and Rust; listener control checks exercise ACK
+before real write completion, cancellation, a late changed endpoint and source
+substitution. The fresh-connection case verifies denial before request-history
+allocation and acceptance of an actual new observed connection. Updated build/
+verification: **60 focused C# checks passed**, no failures/skips, and the broker
+build passed with zero warnings/errors. **All 75 offline native library checks
+passed**, zero ignored/filtered/failures. Windows x64 Release worker/DLL staging
+and the Android ARM64 rebuild/shipping Kotlin compile passed (the six existing
+lab/conditional native warnings remain). Evidence:
+`out/control-handover-checks/listener-control.trx` and
+`out/control-handover-checks/native-control-all.log`. No installed/physical work
+or production authority was activated.
+
 ## Continue on High
 
 The single broker-pipe reader/demultiplexer and bounded broker observation/request

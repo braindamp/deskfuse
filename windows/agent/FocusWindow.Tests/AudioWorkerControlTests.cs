@@ -142,7 +142,7 @@ public sealed class AudioWorkerControlTests
         }
         public ValueTask WriteAsync(ReadOnlyMemory<byte> bytes, CancellationToken ct) => Output.WriteAsync(bytes, ct);
     }
-    private sealed class Duplex : IEnrollmentChannel
+    internal sealed class Duplex : IEnrollmentChannel
     {
         private readonly System.Threading.Channels.Channel<byte> input = System.Threading.Channels.Channel.CreateBounded<byte>(new System.Threading.Channels.BoundedChannelOptions(32768) { AllowSynchronousContinuations = false });
         private Duplex other = null!;

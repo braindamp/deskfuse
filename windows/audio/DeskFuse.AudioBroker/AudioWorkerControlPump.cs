@@ -7,6 +7,14 @@ namespace DeskFuse.AudioBroker;
 /// </summary>
 internal sealed class AudioWorkerControlPump
 {
+    private sealed class Listener(AudioListenerConfiguration configuration)
+    {
+        internal readonly AudioListenerConfiguration Configuration = configuration;
+        internal readonly TaskCompletionSource<System.Net.IPEndPoint> Ack = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal readonly TaskCompletionSource<System.Net.IPEndPoint> Done = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal byte[]? Observed;
+    }
+    private Listener? listener;
     private sealed class Pending(byte[] bytes, bool closed)
     {
         internal readonly byte[] Bytes = bytes;
@@ -55,6 +63,38 @@ internal sealed class AudioWorkerControlPump
         _ = CompleteProjection(value, (grant.SourceGrant, grant.Revision));
         return value.Done.Task;
     }
+    internal Task<System.Net.IPEndPoint> ConfigureListenerAsync(AudioListenerConfiguration configuration)
+    {
+        Listener value;
+        lock (gate)
+        {
+            RequireLive();
+            if (listener is not null)
+            {
+                if (!listener.Configuration.Bytes.AsSpan().SequenceEqual(configuration.Bytes)) throw new InvalidOperationException("A different listener is already owned.");
+                return listener.Done.Task;
+            }
+            value = listener = new(configuration);
+        }
+        _ = CompleteListener(value); return value.Done.Task;
+    }
+    private async Task CompleteListener(Listener value)
+    {
+        System.Net.IPEndPoint? endpoint = null; Exception? failure = null;
+        try
+        {
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
+            deadline.CancelAfter(TimeSpan.FromSeconds(3));
+            await control.WriteAsync(AudioWorkerFrameKind.ConfigureListener, value.Configuration.Bytes, deadline.Token).ConfigureAwait(false);
+            endpoint = await value.Ack.Task.WaitAsync(deadline.Token).ConfigureAwait(false);
+        }
+        catch (Exception error) { lock (gate) failure = failed ?? error; Fail(failure); }
+        finally
+        {
+            if (value.Ack.Task.IsFaulted) _ = value.Ack.Task.Exception;
+            if (failure is null) value.Done.TrySetResult(endpoint!); else value.Done.TrySetException(failure);
+        }
+    }
     private async Task CompleteProjection(Pending value, (Guid Source, ulong Revision) key)
     {
         Exception? failure = null;
@@ -82,7 +122,18 @@ internal sealed class AudioWorkerControlPump
             while (true)
             {
                 var frame = await control.ReadAsync(lifetime.Token).ConfigureAwait(false);
-                if (frame.Kind == AudioWorkerFrameKind.AuthorityObserved)
+                if (frame.Kind == AudioWorkerFrameKind.ListenerConfigured)
+                {
+                    lock (gate)
+                    {
+                        var pending = listener ?? throw new InvalidDataException("Unsolicited native listener acknowledgement.");
+                        var endpoint = pending.Configuration.VerifyAcknowledgement(frame.Body);
+                        if (pending.Observed is not null && !pending.Observed.AsSpan().SequenceEqual(frame.Body))
+                            throw new InvalidDataException("Native listener changed its assigned endpoint.");
+                        pending.Observed ??= frame.Body.ToArray(); pending.Ack.TrySetResult(endpoint);
+                    }
+                }
+                else if (frame.Kind == AudioWorkerFrameKind.AuthorityObserved)
                 {
                     var grant = AudioAuthorityProtocol.ParseControl(frame.Body);
                     lock (gate)
@@ -160,9 +211,11 @@ internal sealed class AudioWorkerControlPump
             stopping = true;
             var work = pending.Values.Select(p => p.Done.Task).Cast<Task>().Append(reader).ToList();
             work.AddRange(replies.Select(p => p.Done.Task));
+            if (listener is not null) work.Add(listener.Done.Task);
             if (stopWrite is not null) work.Add(stopWrite);
             if (!lifetime.IsCancellationRequested) lifetime.Cancel();
             foreach (var p in pending.Values) p.Ack.TrySetException(new IOException("Native control retired."));
+            listener?.Ack.TrySetException(new IOException("Native control retired."));
             return join = Join(work);
         }
     }
@@ -178,6 +231,7 @@ internal sealed class AudioWorkerControlPump
         {
             notify = failed is null && !stopping; failed ??= error;
             foreach (var value in pending.Values) value.Ack.TrySetException(error);
+            listener?.Ack.TrySetException(error);
             if (!lifetime.IsCancellationRequested) lifetime.Cancel();
         }
         if (notify) onFailure(error);

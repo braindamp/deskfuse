@@ -63,3 +63,31 @@ dependencies. Unit routing fixtures use explicit simulated observations; they
 do not qualify native setup, media installation, endpoint/kernel rundown or
 physical delivery. Listener/rundown framing and native owner composition remain
 separate implementation work, tracked in the current implementation status.
+
+## Local listener setup (H2, 5 November 2026)
+
+ConfigureListener=6 contains Version u8=1, Mode u8=Game(1), SourceLength u16,
+the unchanged canonical Source.v1 bytes, explicit bind address, then explicit
+candidate policy. Address encoding is Family u8 (4/6), raw IP[4/16], Port u16,
+and ScopeId u32 only for IPv6. Wildcard, multicast, broadcast, mapped IPv4/IPv6
+aliases and unscoped link-local binds are rejected. Port zero requests an
+ephemeral port. No hostname resolution or process/network rebinding is involved.
+
+Policy order is WarmMilliseconds u32, IdleMilliseconds u32, QueuedPackets u16,
+MaxPackets u32, MaxBytes u32, MaxControlMessages u16, PacketsPerTurn u8,
+ControlsPerTurn u8, CooldownMilliseconds u32. All values are supplied explicitly;
+the shared fixture contains synthetic test values, **not operating defaults**.
+Bounds reuse the candidate component's existing work/traffic/storage limits.
+Native checks the source's worker against actual HELLO before any socket bind.
+
+ListenerConfigured=7 is Version u8=1, SHA-256[32] of the exact configuration,
+then the actual assigned bind address in the encoding above. The broker requires
+the requested interface/scope and fixed port (or a nonzero assigned ephemeral
+port). Exact retries join one retained configuration/write. A conflicting
+configuration cannot rebind the source, and a changed late acknowledgement is
+terminal. Cancellation retains actual write completion and fences the source.
+Bind the event owner before configuration so no observation can arrive unowned.
+
+This is public setup metadata over the existing trusted local pipe. It supplies
+no source/delivery authority or physical rundown claim. The configured native
+runtime still needs to consume this codec and compose the single UDP owner.

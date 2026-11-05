@@ -274,7 +274,7 @@ fn read_loop(
             NETWORK_REPLY => {
                 crate::audio_rpc::Message::parse(&body, true)?;
             }
-            CONFIGURE_LISTENER => {} // Concrete listener codec runs before any socket action.
+            CONFIGURE_LISTENER => { crate::audio_listener_config::ListenerConfig::parse(&body,worker)?; }
             _ => return Err(invalid()),
         }
         let mut q = shared.lock();

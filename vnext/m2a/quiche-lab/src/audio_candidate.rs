@@ -31,7 +31,7 @@ pub struct SetupLimits {
     pub controls_per_turn: usize,
 }
 impl SetupLimits {
-    fn validate(self, now: u64) -> io::Result<()> {
+    pub(crate) fn validate(self, now: u64) -> io::Result<()> {
         if self.until100ns <= now
             || self.idle_ms == 0
             || !(1..=32).contains(&self.queued_packets)
