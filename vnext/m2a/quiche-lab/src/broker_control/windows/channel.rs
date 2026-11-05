@@ -262,6 +262,10 @@ impl BrokerControlClient {
                     Lane::Regular
                 }
             }
+            PINNED_ISSUE => {
+                crate::audio_rpc::pinned_issue(body)?;
+                Lane::Regular
+            }
             CONNECTION_OBSERVED => {
                 crate::audio_control::Observation::parse(body)?;
                 Lane::Internal

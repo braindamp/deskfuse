@@ -3,6 +3,7 @@ use crate::{audio_control as c, audio_source_stop as s};
 use std::io;
 pub const HEADER: usize = 25;
 pub const MAX_BODY: usize = crate::broker_control::MAX_FRAME - 1 - HEADER;
+pub const PINNED_ISSUE_BYTES: usize = HEADER + 53 + 8 + 32;
 fn nonzero(b: &[u8]) -> bool {
     b.iter().any(|v| *v != 0)
 }
@@ -96,6 +97,17 @@ impl Message {
         value.encode(reply)?;
         Ok(value)
     }
+}
+
+pub fn pinned_issue(bytes: &[u8]) -> io::Result<(Message, u64, [u8; 32])> {
+    if bytes.len() != PINNED_ISSUE_BYTES { return Err(c::invalid()); }
+    let message = Message::parse(&bytes[..HEADER + 53], false)?;
+    let revision = u64_at(bytes, HEADER + 53);
+    let digest: [u8; 32] = bytes[HEADER + 61..].try_into().unwrap();
+    if message.kind != c::ISSUE || message.body[0] != 2 || revision == 0 || digest == [0; 32] {
+        return Err(c::invalid());
+    }
+    Ok((message, revision, digest))
 }
 
 /// Worker-wide forwarding credits, in addition to each TLS connection's bounded
