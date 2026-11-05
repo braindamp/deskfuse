@@ -186,7 +186,9 @@ internal sealed class BrokerAudioControlDispatcher : IAudioWorkerEventOwner
                         try { await prepareSource(committed).ConfigureAwait(false); }
                         catch (Exception error) { owner.CloseAdmission(); fail(error); throw; }
                     }
-                    await Publish().ConfigureAwait(false); return committed.SignedReceipt(grants);
+                    await Publish(requireCurrent: acquisitionOnly && committed.Kind == AudioOperationKind.AcquireSource)
+                        .ConfigureAwait(false);
+                    return committed.SignedReceipt(grants);
                 case AudioNetworkKind.AppliedResult:
                     var applied = AudioWorkerNetworkProtocol.Proof(b.AsSpan(32));
                     var retained = owner.GetAppliedResult(origin, b[..32], applied.Nonce, applied.Signature);
@@ -204,9 +206,14 @@ internal sealed class BrokerAudioControlDispatcher : IAudioWorkerEventOwner
         }
         finally { positive.Release(); }
     }
-    private async Task Publish()
+    private async Task Publish(bool requireCurrent = false)
     {
-        try { _ = await publish().ConfigureAwait(false); }
+        try
+        {
+            var current = await publish().ConfigureAwait(false);
+            if (requireCurrent && !current)
+                throw new UnauthorizedAccessException("The exact Prepared native projection was not acknowledged.");
+        }
         catch (Exception error) { owner.CloseAdmission(); fail(error); throw; }
     }
     private void RequestRundown()

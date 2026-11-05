@@ -264,6 +264,25 @@ public sealed class AudioAuthorityTests
     }
 
     [Fact]
+    public async Task Protected_acquisition_does_not_sign_receipt_without_Prepared_ack()
+    {
+        using var f = new Fixture();
+        var h = new Routing(f, acquisitionOnly: true, publish: () => Task.FromResult(false));
+        try
+        {
+            Assert.True(h.Send(AudioNetworkKind.Issue, IssueBody(AudioOperationKind.AcquireSource, Request(1))));
+            var challenge = AudioRequestProtocol.ParseProof(EnrollmentFraming.ParseSigned((await h.Reply()).Body).Message);
+            var proof = ProofBody(challenge.Facts.Nonce,
+                f.Persistence.SignPhone(AudioRequestProtocol.Proof(challenge.Core, challenge.Binding)));
+            Assert.True(h.Send(AudioNetworkKind.Proof, proof));
+            var result = await h.Reply();
+            Assert.Equal((byte)255, result.Kind);
+            Assert.Equal(AudioAuthorityPhase.Closed, f.Owner.Snapshot().Phase);
+        }
+        finally { await h.Dispatcher.StopAndJoinAsync(); }
+    }
+
+    [Fact]
     public async Task Protected_acquisition_rejects_foreign_proof_and_delivery_issue()
     {
         using var f = new Fixture();
@@ -425,7 +444,8 @@ public sealed class AudioAuthorityTests
         private ulong sequence;
         internal Routing(Fixture f, Func<byte[], bool, Task>? send = null, Action<Exception>? fail = null,
             Func<byte[], bool, Action<AudioWorkerControlPump.ReplyPermit>, Task>? sendWithPermit = null,
-            Func<BrokerAudioOwner.Committed, Task>? prepare = null, bool acquisitionOnly = false)
+            Func<BrokerAudioOwner.Committed, Task>? prepare = null, bool acquisitionOnly = false,
+            Func<Task<bool>>? publish = null)
         {
             var regularReplies = new SemaphoreSlim(8, 8);
             var negativeReply = new SemaphoreSlim(1, 1);
@@ -434,7 +454,7 @@ public sealed class AudioAuthorityTests
                 s => f.Persistence.SignHost(AudioSourceStopProtocol.Status(s.Snapshot)),
                 prepare ?? (c => { f.Owner.ClaimPreparation(c); Assert.True(f.Owner.CompletePreparation(c, f.Observed)); return Task.CompletedTask; }),
                 () => { }, // Actual resource rundown has its own separately retained owner.
-                () => Task.FromResult(true), // Unit authority routing, not native I/O or physical qualification.
+                publish ?? (() => Task.FromResult(true)), // Unit authority routing, not native I/O or physical qualification.
                 sendWithPermit ?? (async (bytes, negative, reserved) =>
                 {
                     var capacity = negative ? negativeReply : regularReplies;
