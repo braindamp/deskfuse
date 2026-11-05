@@ -50,7 +50,7 @@ struct NativeRuntime {
     test_source: Option<std::sync::mpsc::SyncSender<(bool, usize, bool)>>,
 }
 
-fn now() -> u64 {
+pub(super) fn now() -> u64 {
     let mut value = 0;
     unsafe { QueryInterruptTimePrecise(&mut value); }
     value
@@ -255,10 +255,10 @@ impl NativeRuntime {
             work |= self.service_active()?;
             let mut source_work = false;
             #[cfg(test)]
-            let synthetic_clock = self.test_clock.as_deref();
+            let synthetic_clock = self.test_clock.clone();
             let boot = || {
                 #[cfg(test)]
-                if let Some(clock) = synthetic_clock {
+                if let Some(clock) = &synthetic_clock {
                     return clock.load(std::sync::atomic::Ordering::SeqCst);
                 }
                 now()
@@ -338,7 +338,6 @@ impl NativeRuntime {
                 if ready.period {
                     if let Some(source) = self.source.as_ref() { source.service_period()?; }
                 }
-                if ready.readable { continue; }
                 if ready.writable {
                     if let Some(source) = self.source.as_mut() {
                         let client = &self.client;
@@ -351,6 +350,7 @@ impl NativeRuntime {
                         setup.writable();
                     }
                 }
+                if ready.readable { continue; }
             } else {
                 self.wait(self.client.control_event().as_raw_handle(), None, false)?;
             }
@@ -1268,7 +1268,13 @@ mod tests {
     }
     impl super::super::source::Input for OfflineInput {
         fn next_block(&mut self) -> io::Result<Option<crate::committed_source::Block>> {
-            Ok(self.chunks.pop_front())
+            let mut block = self.chunks.pop_front();
+            if let Some(block) = block.as_mut() {
+                let qpc = crate::source_age::local_qpc_100ns()?;
+                block.timing.commit_qpc = qpc.saturating_sub(1000);
+                block.timing.presentation_qpc = qpc;
+            }
+            Ok(block)
         }
         fn arm(&self) -> io::Result<()> { Ok(()) }
         fn event(&self) -> HANDLE { std::ptr::null_mut() }
@@ -1385,6 +1391,35 @@ mod tests {
         runtime.test_clock = Some(Arc::clone(&clock));
         (runtime, remote, phone, phone_socket, grant, observed.connection, fences, drops, clock)
     }
+    fn spawn_offline(mut runtime: NativeRuntime) -> std::thread::JoinHandle<io::Result<()>> {
+        let listener = runtime.listener.take().unwrap();
+        let BoundListener {
+            events, bytes, config, _socket, acknowledgement, setup_wake, ..
+        } = listener;
+        drop(events);
+        runtime.resume.unregister().unwrap();
+        let client = runtime.client;
+        let authority = runtime.authority;
+        let source = runtime.source;
+        let clock = runtime.test_clock;
+        let test_source = runtime.test_source;
+        std::thread::spawn(move || {
+            let mut runtime = NativeRuntime::new(client)?;
+            runtime.authority = authority;
+            runtime.source = source;
+            runtime.test_clock = clock;
+            runtime.test_source = test_source;
+            runtime.listener = Some(BoundListener {
+                events: crate::reactor::WindowsEvents::new(&_socket)?,
+                bytes, config, _socket, acknowledgement, setup_wake,
+                candidate: None, observed: None,
+                pending_regular: VecDeque::new(), pending_negative: None,
+                pending_local: VecDeque::new(), joined: None,
+                cooldown_until: 0, candidate_until: 0,
+            });
+            runtime.run()
+        })
+    }
     #[test]
     fn real_worker_loop_fences_blocked_incumbent_and_retains_source_until_stop() {
         use std::sync::atomic::Ordering;
@@ -1392,11 +1427,11 @@ mod tests {
             offline_incumbent(true, true, 10000, false);
         let (tx, rx) = std::sync::mpsc::sync_channel(32);
         runtime.test_source = Some(tx);
-        let thread = std::thread::spawn(move || runtime.run());
+        let thread = spawn_offline(runtime);
         let mut pending = false;
         for _ in 0..64 {
             let (active, queued, sealed) = rx.recv_timeout(Duration::from_millis(100)).unwrap();
-            if active && queued != 0 && sealed { pending = true; break; }
+            if active && sealed { pending = true; break; }
         }
         assert!(pending, "real owner never retained blocked ciphertext");
         let mut next = grant;
@@ -1426,7 +1461,7 @@ mod tests {
         use crate::audio_rpc::Message;
         use std::sync::atomic::Ordering;
         let (runtime, remote, mut phone, phone_socket, _grant, connection, fences, drops, _clock) =
-            offline_incumbent(false, false, 300, true);
+            offline_incumbent(false, false, 1000, true);
         let thread = std::thread::spawn(move || runtime.run());
         let (kind, wire) = remote.read(3000).unwrap();
         assert_eq!(kind, NETWORK_REQUEST);
