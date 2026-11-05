@@ -379,6 +379,9 @@ impl WindowsEvents {
             if !(WAIT_OBJECT_0..WAIT_OBJECT_0 + 3).contains(&result) {
                 return Err(io::Error::other("Unexpected listener readiness"));
             }
+            if result == WAIT_OBJECT_0 || result == WAIT_OBJECT_0 + 1 {
+                return Ok(());
+            }
             let mut events: WSANETWORKEVENTS = std::mem::zeroed();
             if WSAEnumNetworkEvents(self.socket, self.event, &mut events) != 0 {
                 return Err(io::Error::from_raw_os_error(WSAGetLastError()));
