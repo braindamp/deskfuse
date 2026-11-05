@@ -2153,6 +2153,16 @@ mod tests {
             }
             assert!(Instant::now() < cutoff, "worker did not adopt first pinned delivery");
         }
+        while source_rx.try_recv().is_ok() {}
+        pcm.push(240);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !pcm.chunks.lock().unwrap().is_empty() {
+            assert!(Instant::now() < deadline, "gated source did not consume offline PCM");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let (_, outstanding, ciphertext) = source_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(outstanding, 0);
+        assert!(!ciphertext);
         remote.write(NETWORK_REPLY, &Message {
             kind: 132, body: vec![0x99], ..proved
         }.encode(true).unwrap()).unwrap();

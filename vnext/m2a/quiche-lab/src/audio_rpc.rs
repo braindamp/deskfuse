@@ -206,6 +206,42 @@ impl PipeRequests {
 mod tests {
     use super::*;
     #[test]
+    fn pinned_issue_requires_exact_regular_issue_and_frozen_parent_evidence() {
+        let mut request = [0x72; 32];
+        request[..8].copy_from_slice(&2u64.to_be_bytes());
+        let mut body = vec![2];
+        body.extend_from_slice(&request);
+        body.extend_from_slice(&1000u32.to_be_bytes());
+        body.extend_from_slice(&[19; 16]);
+        let issue = Message { request: 3, connection: [19; 16], kind: c::ISSUE, body };
+        let mut frame = issue.encode(false).unwrap();
+        frame.extend_from_slice(&12u64.to_be_bytes());
+        frame.extend_from_slice(&[0xa5; 32]);
+        let (parsed, revision, digest) = pinned_issue(&frame).unwrap();
+        assert_eq!(parsed, issue);
+        assert_eq!(revision, 12);
+        assert_eq!(digest, [0xa5; 32]);
+        for end in 0..frame.len() {
+            assert!(pinned_issue(&frame[..end]).is_err(), "truncated at {end}");
+        }
+        let mut bad = frame.clone();
+        bad.push(0);
+        assert!(pinned_issue(&bad).is_err());
+        let mut bad = frame.clone();
+        bad[HEADER] = 1;
+        assert!(pinned_issue(&bad).is_err());
+        let mut bad = frame.clone();
+        bad[HEADER + 53..HEADER + 61].fill(0);
+        assert!(pinned_issue(&bad).is_err());
+        let mut bad = frame.clone();
+        bad[HEADER + 61..].fill(0);
+        assert!(pinned_issue(&bad).is_err());
+        let mut bad = frame;
+        bad[8..24].fill(0);
+        assert!(pinned_issue(&bad).is_err());
+    }
+
+    #[test]
     fn pipe_admission_numbers_only_submitted_requests_and_retains_reply_credit() {
         let mut routes = PipeRequests::default();
         let connection = [17; 16];

@@ -538,6 +538,36 @@ pub(crate) mod tests {
             .collect()
     }
     #[test]
+    fn pinned_issue_uses_regular_pipe_lane_and_preserves_signed_stop_capacity() {
+        let (local, remote) = pair();
+        let grant = crate::audio_authority::ControlGrant::parse(&fixture("control", "controlHex")).unwrap();
+        let mut client = BrokerControlClient::start(local, grant.boot, grant.worker).unwrap();
+        let mut request_id = [0x72; 32];
+        request_id[..8].copy_from_slice(&2u64.to_be_bytes());
+        let mut body = vec![2];
+        body.extend_from_slice(&request_id);
+        body.extend_from_slice(&1000u32.to_be_bytes());
+        body.extend_from_slice(&[19; 16]);
+        let mut issue = crate::audio_rpc::Message {
+            request: 1, connection: [19; 16], kind: crate::audio_control::ISSUE, body
+        }.encode(false).unwrap();
+        issue.extend_from_slice(&12u64.to_be_bytes());
+        issue.extend_from_slice(&[0xa5; 32]);
+        assert!(client.try_write(PINNED_ISSUE, &issue).unwrap());
+        assert_eq!(remote.read(3000).unwrap(), (PINNED_ISSUE, issue.clone()));
+        let stop = crate::audio_rpc::Message {
+            request: 2, connection: [19; 16],
+            kind: crate::audio_control::SIGNED_SOURCE_STOP,
+            body: fixture("stop", "signedStopHex"),
+        }.encode(false).unwrap();
+        assert!(client.try_write(NETWORK_REQUEST, &stop).unwrap());
+        assert_eq!(remote.read(3000).unwrap(), (NETWORK_REQUEST, stop));
+        issue[issue.len() - 32..].fill(0);
+        assert!(client.try_write(PINNED_ISSUE, &issue).is_err());
+        client.stop_and_join().unwrap();
+    }
+
+    #[test]
     fn actual_pipe_reader_observes_terminal_while_ordered_writer_and_negative_capacity_are_retained(
     ) {
         let (local, remote) = pair();
