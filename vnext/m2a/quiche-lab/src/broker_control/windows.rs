@@ -161,29 +161,10 @@ unsafe fn require_system(process: HANDLE) -> io::Result<()> {
     Ok(())
 }
 
-/// N2 authorization projection. N3/N4 supply actual TLS/source observations;
-/// this role still opens no endpoint, DLL, key file or media socket.
+mod runtime;
+
+/// Production bootstrap, serialized listener custody and authority projections.
+/// The client owns the only post-HELLO pipe reader and ordered writer.
 pub fn run(registration: [u8; 16]) -> io::Result<()> {
-    let control = Control::connect(registration)?;
-    let (kind, hello) = control.read(3000)?;
-    if kind != HELLO { return Err(invalid()); }
-    require_hello(&hello, &registration, control.server_pid, control.server_created)?;
-    control.write(READY, &hello)?;
-    let mut authority=crate::audio_authority::AudioAuthority::new(hello[17..49].try_into().unwrap(),registration)?;
-    fn now()->u64 {let mut value=0;unsafe{QueryInterruptTimePrecise(&mut value);}value}
-    loop {
-        let timeout=match authority.deadline() {
-            Some(until)=> {
-                let remaining=until.checked_sub(now()).ok_or_else(invalid)?;
-                ((remaining/10000)+u64::from(remaining%10000!=0)).max(1).min(u64::from(u32::MAX-1)) as u32
-            }, None=>INFINITE,
-        };
-        let (kind,body)=control.read(timeout)?;
-        if kind==STOP && body.is_empty() {authority.close();return Ok(());}
-        if kind!=AUTHORITY {return Err(invalid());}
-        let grant=crate::audio_authority::ControlGrant::parse(&body)?;let closed=grant.closed;
-        authority.apply(grant,now())?;
-        control.write(AUTHORITY_OBSERVED,&body)?;
-        if closed {return Ok(());}
-    }
+    runtime::run(registration)
 }

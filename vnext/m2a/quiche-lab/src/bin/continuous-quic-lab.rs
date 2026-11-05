@@ -85,6 +85,14 @@ fn captured_header(sequence: u32, device_frame: u64) -> Header {
     }
 }
 
+#[cfg(test)]
+fn captured_packet(sequence: u32, device_frame: u64, payload: &[u8]) -> Vec<u8> {
+    assert_eq!(payload.len(), PAYLOAD_BYTES);
+    let mut wire = encode(&captured_header(sequence, device_frame)).to_vec();
+    wire.extend_from_slice(payload);
+    wire
+}
+
 fn verified(conn: &quiche::Connection) -> Result<()> {
     if conn.peer_cert().is_none() {
         return Err("REFUSED: mutually authenticated TLS peer certificate absent".into());

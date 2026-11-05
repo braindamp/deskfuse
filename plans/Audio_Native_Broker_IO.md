@@ -57,7 +57,12 @@ native library suite passed 73 checks, including source freshness, immutable
 ciphertext, receive floors, native mapping/ABI and built DLL exports using only
 invalid/no-device open inputs. No physical audio or installed service ran.
 
-The old native run entry remains an authorization-only projection loop. Connect
-the new client, configured single listener, global forwarding credits, candidate
-pin/transfer and actual N4 source/rundown owner before claiming N3 or handover
-completion. Retain actual control, setup and resource jobs through source Stop.
+The H2a native entry now uses this client as the sole post-bootstrap reader
+and ordered writer. It retains one validated listener socket/configuration/ACK
+in a serialized runtime, checks source identity across grants, and waits for
+actual write completion through a narrow receipt before acknowledging success.
+Closed/Stop/cutoff/service failure retires the listener and joins pipe work.
+Source/media observations are not inferred from this metadata. The UDP receive
+owner, candidate dispatch/transfer, global forwarding and actual N4 source/
+rundown integration are still pending; N3 and handover are not complete.
+H2a Windows tests are added but NOT RUN in this environment.

@@ -64,6 +64,7 @@ impl AudioAuthority {
     }
     pub fn deadline(&self) -> Option<u64> { if self.terminal { None } else { self.current.as_ref().map(|g|g.until) } }
     pub fn revision(&self) -> u64 { self.current.as_ref().map_or(0, |g|g.revision) }
+    pub fn grant(&self) -> Option<&ControlGrant> { self.current.as_ref() }
     pub fn source_allowed(&mut self, now: u64) -> bool { self.advance(now) && self.current.is_some() }
     pub fn apply(&mut self, grant: ControlGrant, now: u64) -> io::Result<bool> {
         let result=self.apply_inner(grant,now); if result.is_err() {self.close();} result

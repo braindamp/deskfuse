@@ -263,6 +263,84 @@ Evidence: `android/app/build/test-results/testDebugUnitTest/TEST-com.focuswindow
 and `TEST-com.focuswindow.client.transport.AudioCellularRequestTest.xml` beside it.
 No actual cellular request, DNS, radio, JNI playback or device operation ran.
 
+
+## H2a — native bootstrap and listener-ownership implementation
+
+5 November 2026. The fixed Windows worker entrypoint now runs through
+`BrokerControlClient::connect`, retaining its verified SYSTEM bootstrap and a
+single post-bootstrap reader and FIFO writer. One serialized native runtime
+holds the immutable validated listener configuration, actual nonblocking UDP
+socket and first assigned endpoint ACK. Exact configuration retries return the
+same ACK without another bind. Configuration may precede the first grant but
+does not confer source/output authority. The runtime rejects mismatched
+prior/later authority sources and conflicting listener configuration.
+
+The client additionally retains a per-write completion event for native
+authority/listener acknowledgements; queue acceptance is not actual I/O
+completion. Capacity exhaustion is retried on a wake, and terminal failure
+cancels and joins queued/in-flight writes. Stop, closed grants, service death,
+malformed trusted frames and authority expiry fence the listener, with
+event-driven waits. Closed-grant ACK is control metadata only, not proof of
+source, kernel or endpoint rundown. No UDP reader, candidate dispatch,
+activation, source creation or physical qualification is added.
+
+Focused Rust synthetic Windows-pipe/loopback tests were added for sole-reader
+dispatch, exact retries and endpoint ACKs, conflicting/foreign configuration,
+unchanged authority projection bytes, terminal precedence, idle shutdown,
+cutoff and blocked completion/cancellation. **Validation: NOT RUN** in this
+implementation environment (no Windows Rust/.NET toolchain). Existing earlier
+checkpoints and their recorded results are unchanged; the new tests do not
+inherit those historical passes.
+
+Subsequent PR verification: GitHub Actions Rust run 41957883881 passed on
+Windows, Ubuntu, macOS ARM64 and macOS Intel. Windows ran **84 native library
+tests** with zero failures/ignores, including the new H2a Windows pipe,
+listener, authority cutoff and cancellation checks. This is CI execution,
+not local Windows validation. The x64 Release worker/DLL staging script
+`tools/build-audio-worker.ps1` remains **NOT RUN**, as do installed service,
+driver, source, endpoint and physical gates. The separate unified CI run
+failed in unchanged Windows C++ thread-handle conversions and Android
+`cargo ndk` environment setup; those are not H2a runtime-test results.
+
+Local Windows PR #32 verification, 5 November: `tools/build-audio-worker.ps1`
+passed after fixing a reproduced terminal/ACK race. A closed projection arriving
+during ordinary ACK completion previously exited the runtime before sending its
+closed ACK. Pending frames now survive the interrupted turn and enter restrictive
+dispatch before pipe cancellation. Two deterministic synthetic-pipe regression
+tests cover closed authority and Stop during ACK completion. All **86 native
+library checks** and **60 focused broker control/listener/authority checks** passed,
+zero failures/skips. Logs: `out/control-handover-checks/pr32-native-tests.log` and
+`pr32-broker-control.trx`. No installed/physical operations were performed.
+
+The rest of H2 still requires one UDP receive/routing owner, bounded candidate
+dispatch, actual global RPC forwarding, nomination/pin/transfer, native source
+preparation and old-egress/assembly/ledger retirement. H3/H4, real N4/N5
+rundown, H5 and installed/physical qualification remain pending. Production
+authority stays disabled.
+
+## H2b — bounded single-owner UDP ingress
+
+5 November 2026. The configured Windows native runtime now installs the
+existing socket event owner before the first listener acknowledgement. The
+serialized runtime, not a new thread or candidate worker, is the sole UDP
+reader. On each source turn it checks broker terminal/deadline first, consumes
+at most the explicitly configured candidate packet-work budget, then returns
+to the broker control queue. An idle listener waits on actual UDP/control/
+terminal handles without periodic polling. Oversized datagrams are dropped
+without closing the trusted control channel.
+
+This is ingress custody only. All datagrams are deliberately discarded until
+the subsequent H2 candidate/active CID routing and forwarding integration; no
+connection, source, output readiness, media admission or physical cleanup is
+inferred. Two focused synthetic Windows loopback/pipe tests cover bounded
+ingress without authorization and terminal wake during queued datagrams.
+
+Validation: **NOT RUN** at the time of this source checkpoint. H2a's
+previously recorded 86 Windows native and 60 focused broker passes remain
+historical evidence, not validation of these new changes. The sole-candidate
+dispatch, worker-wide RPC forwarding, transfer barrier and source/rundown
+composition remain pending.
+
 ## Continue on High
 
 The single broker-pipe reader/demultiplexer and bounded broker observation/request

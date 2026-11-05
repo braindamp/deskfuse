@@ -25,6 +25,30 @@ enum Lane {
 struct Outbound {
     frame: Frame,
     lane: Lane,
+    completion: Option<Arc<Completion>>,
+}
+struct Completion {
+    event: OwnedHandle,
+    result: Mutex<Option<io::Result<()>>>,
+}
+impl Completion {
+    fn new() -> io::Result<Self> {
+        Ok(Self { event: handle(unsafe { CreateEventW(null(), 1, 0, null()) })?, result: Mutex::new(None) })
+    }
+    fn finish(&self, result: io::Result<()>) {
+        *self.result.lock().unwrap_or_else(|p| p.into_inner()) = Some(result);
+        unsafe { SetEvent(self.event.as_raw_handle()); }
+    }
+}
+pub struct WriteReceipt(Arc<Completion>);
+impl WriteReceipt {
+    pub fn event(&self) -> std::os::windows::io::BorrowedHandle<'_> {
+        use std::os::windows::io::AsHandle;
+        self.0.event.as_handle()
+    }
+    pub fn take_result(&self) -> Option<io::Result<()>> {
+        self.0.result.lock().unwrap_or_else(|p| p.into_inner()).take()
+    }
 }
 #[derive(Default)]
 struct Queue {
@@ -40,6 +64,9 @@ struct Shared {
     stopping: AtomicBool,
     control_event: OwnedHandle,
     terminal_event: OwnedHandle,
+    capacity_event: OwnedHandle,
+    #[cfg(test)]
+    completion_gate: Mutex<Option<(std::sync::mpsc::SyncSender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 impl Shared {
     fn lock(&self) -> std::sync::MutexGuard<'_, Queue> {
@@ -57,9 +84,14 @@ impl Shared {
             if q.error.is_none() {
                 q.error = Some(error.to_string());
             }
+            self.terminal();
+            self.stopping.store(true, Ordering::Release);
+            for outgoing in q.outgoing.drain(..) {
+                if let Some(completion) = outgoing.completion {
+                    completion.finish(Err(io::Error::new(io::ErrorKind::BrokenPipe, "Control failed")));
+                }
+            }
         }
-        self.terminal();
-        self.stopping.store(true, Ordering::Release);
         self.changed.notify_all();
         control.cancel();
     }
@@ -83,6 +115,10 @@ impl BrokerControlClient {
         control.write(READY, &hello)?;
         Self::start(control, hello[17..49].try_into().unwrap(), worker)
     }
+    #[cfg(test)]
+    pub(super) fn start_synthetic(control: Control, boot: [u8; 32], worker: [u8; 16]) -> io::Result<Self> {
+        Self::start(control, boot, worker)
+    }
     fn start(control: Control, boot: [u8; 32], worker: [u8; 16]) -> io::Result<Self> {
         if boot == [0; 32] || worker == [0; 16] {
             return Err(invalid());
@@ -95,6 +131,9 @@ impl BrokerControlClient {
             stopping: AtomicBool::new(false),
             control_event: handle(unsafe { CreateEventW(null(), 1, 0, null()) })?,
             terminal_event: handle(unsafe { CreateEventW(null(), 1, 0, null()) })?,
+            capacity_event: handle(unsafe { CreateEventW(null(), 0, 0, null()) })?,
+            #[cfg(test)]
+            completion_gate: Mutex::new(None),
         });
         let r = Arc::clone(&shared);
         let rc = Arc::clone(&control);
@@ -148,6 +187,20 @@ impl BrokerControlClient {
         use std::os::windows::io::AsHandle;
         self.shared.terminal_event.as_handle()
     }
+    pub fn capacity_event(&self) -> std::os::windows::io::BorrowedHandle<'_> {
+        use std::os::windows::io::AsHandle;
+        self.shared.capacity_event.as_handle()
+    }
+    #[cfg(test)]
+    pub(super) fn delay_next_write_completion(&self) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::SyncSender<()>) {
+        let (entered, observed) = std::sync::mpsc::sync_channel(1);
+        let (resume, released) = std::sync::mpsc::sync_channel(1);
+        *self.shared.completion_gate.lock().unwrap() = Some((entered, released));
+        (observed, resume)
+    }
+    pub fn failure(&self) -> Option<io::Error> {
+        self.shared.lock().error.as_ref().map(|message| io::Error::other(message.clone()))
+    }
     pub fn drain(&self, limit: usize) -> io::Result<Vec<Frame>> {
         if !(1..=16).contains(&limit) {
             return Err(invalid());
@@ -165,6 +218,15 @@ impl BrokerControlClient {
         Ok(frames)
     }
     pub fn try_write(&self, kind: u8, body: &[u8]) -> io::Result<bool> {
+        self.enqueue(kind, body, None)
+    }
+    pub fn try_write_confirmed(&self, kind: u8, body: &[u8]) -> io::Result<Option<WriteReceipt>> {
+        let completion = Arc::new(Completion::new()?);
+        if self.enqueue(kind, body, Some(Arc::clone(&completion)))? {
+            Ok(Some(WriteReceipt(completion)))
+        } else { Ok(None) }
+    }
+    fn enqueue(&self, kind: u8, body: &[u8], completion: Option<Arc<Completion>>) -> io::Result<bool> {
         if body.len() >= MAX_FRAME {
             return Err(invalid());
         }
@@ -224,6 +286,7 @@ impl BrokerControlClient {
                 body: body.to_vec(),
             },
             lane,
+            completion,
         });
         self.shared.changed.notify_one();
         Ok(true)
@@ -231,6 +294,14 @@ impl BrokerControlClient {
     pub fn stop_and_join(&mut self) -> io::Result<()> {
         self.shared.terminal();
         self.shared.stopping.store(true, Ordering::Release);
+        {
+            let mut q = self.shared.lock();
+            for outgoing in q.outgoing.drain(..) {
+                if let Some(completion) = outgoing.completion {
+                    completion.finish(Err(io::Error::new(io::ErrorKind::BrokenPipe, "Control cancelled")));
+                }
+            }
+        }
         self.shared.changed.notify_all();
         self.control.cancel();
         let mut panic = false;
@@ -260,28 +331,31 @@ fn read_loop(
 ) -> io::Result<()> {
     while !shared.stopping.load(Ordering::Acquire) {
         let (kind, body) = control.read(INFINITE)?;
-        match kind {
-            STOP if body.is_empty() => shared.terminal(),
+        let terminal = match kind {
+            STOP if body.is_empty() => true,
             AUTHORITY => {
                 let grant = crate::audio_authority::ControlGrant::parse(&body)?;
                 if grant.boot != boot || grant.worker != worker {
                     return Err(invalid());
                 }
-                if grant.closed {
-                    shared.terminal();
-                }
+                grant.closed
             }
             NETWORK_REPLY => {
                 crate::audio_rpc::Message::parse(&body, true)?;
+                false
             }
-            CONFIGURE_LISTENER => { crate::audio_listener_config::ListenerConfig::parse(&body,worker)?; }
+            CONFIGURE_LISTENER => {
+                crate::audio_listener_config::ListenerConfig::parse(&body,worker)?;
+                false
+            }
             _ => return Err(invalid()),
-        }
+        };
         let mut q = shared.lock();
         if q.incoming.len() >= 16 {
             return Err(invalid());
         }
         q.incoming.push_back(Frame { kind, body });
+        if terminal { shared.terminal(); }
         unsafe {
             SetEvent(shared.control_event.as_raw_handle());
         }
@@ -302,9 +376,25 @@ fn write_loop(control: &Control, shared: &Shared) -> io::Result<()> {
         };
         // Class capacity includes this actual write until completed/cancelled.
         // FIFO preserves already admitted request IDs/frame ordering.
-        control.write(value.frame.kind, &value.frame.body)?;
+        let outcome = control.write(value.frame.kind, &value.frame.body);
+        #[cfg(test)]
+        {
+            let gate = shared.completion_gate.lock().unwrap().take();
+            if let Some((entered, released)) = gate {
+                let _ = entered.send(());
+                let _ = released.recv_timeout(Duration::from_secs(3));
+            }
+        }
+        if let Some(completion) = value.completion {
+            completion.finish(match &outcome {
+                Ok(()) => Ok(()),
+                Err(error) => Err(io::Error::new(error.kind(), error.to_string())),
+            });
+        }
+        outcome?;
         let mut q = shared.lock();
         q.retained[value.lane as usize] -= 1;
+        unsafe { SetEvent(shared.capacity_event.as_raw_handle()); }
         // A source turn holding a bounded, not-yet-submitted frame can retry
         // when capacity actually returns, without a polling/capture timer.
         // This wake is only a hint, never an authority acknowledgement.
@@ -315,9 +405,9 @@ fn write_loop(control: &Control, shared: &Shared) -> io::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    fn pair() -> (Control, Control) {
+    pub(crate) fn pair() -> (Control, Control) {
         // Synthetic local I/O only. Production connect() always performs the
         // SYSTEM/descriptor/image/incarnation checks; this factory is not built
         // into the product and creates no service, source, endpoint or keys.
@@ -384,7 +474,7 @@ mod tests {
         };
         (wrap(client), wrap(server))
     }
-    fn fixture(file: &str, key: &str) -> Vec<u8> {
+    pub(crate) fn fixture(file: &str, key: &str) -> Vec<u8> {
         let text = match file {
             "control" => include_str!("../../../../../../tools/protocol3/audio-authority-v1.json"),
             _ => include_str!("../../../../../../tools/protocol3/audio-source-stop-v1.json"),
@@ -495,5 +585,28 @@ mod tests {
         assert!(client.drain(16).unwrap().is_empty());
         assert_eq!(client.shared.lock().retained[Lane::Internal as usize], 0);
         client.stop_and_join().unwrap();
+    }
+
+    #[test]
+    fn acknowledged_write_requires_real_io_completion_and_cancellation_joins_all_receipts() {
+        let (local, remote) = pair();
+        let grant = crate::audio_authority::ControlGrant::parse(&fixture("control", "controlHex")).unwrap();
+        let mut client = BrokerControlClient::start(local, grant.boot, grant.worker).unwrap();
+        let body = vec![17u8; 256];
+        let mut receipts = Vec::new();
+        let mut reached_capacity = false;
+        for _ in 0..64 {
+            match client.try_write_confirmed(LISTENER_CONFIGURED, &body).unwrap() {
+                Some(receipt) => receipts.push(receipt),
+                None => { reached_capacity = true; break; }
+            }
+        }
+        assert!(reached_capacity);
+        assert!(receipts.iter().any(|receipt| receipt.0.result.lock().unwrap().is_none()));
+        remote.write(STOP, &[]).unwrap();
+        assert_eq!(unsafe { WaitForSingleObject(client.terminal_event().as_raw_handle(), 3000) }, WAIT_OBJECT_0);
+        client.stop_and_join().unwrap();
+        assert!(receipts.iter().all(|receipt| receipt.0.result.lock().unwrap().is_some()));
+        assert!(client.reader.is_none() && client.writer.is_none());
     }
 }
