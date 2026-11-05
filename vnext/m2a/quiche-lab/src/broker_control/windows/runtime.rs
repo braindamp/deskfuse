@@ -22,6 +22,9 @@ struct BoundListener {
     candidate: Option<CandidateSetup>,
     observation_pending: Option<[u8; 16]>,
     observed: Option<[u8; 16]>,
+    acquisition_issue: Option<u64>,
+    acquisition_challenge: bool,
+    acquisition_proof: bool,
     pending_regular: VecDeque<Record>,
     pending_negative: Option<Record>,
     pending_local: VecDeque<(Record, bool)>,
@@ -185,6 +188,9 @@ impl NativeRuntime {
                     candidate: None,
                     observation_pending: None,
                     observed: None,
+                    acquisition_issue: None,
+                    acquisition_challenge: false,
+                    acquisition_proof: false,
                     pending_regular: VecDeque::new(),
                     pending_negative: None,
                     pending_local: VecDeque::new(),
@@ -196,6 +202,16 @@ impl NativeRuntime {
             }
             NETWORK_REPLY => {
                 let message = self.pipe_requests.reply(Message::parse(&frame.body, true)?)?;
+                if let Some(owned) = self.listener.as_mut().filter(|owned|
+                    owned.observed == Some(message.connection)
+                        && owned.acquisition_issue == Some(message.request)
+                ) {
+                    if message.kind == ac::ISSUE + 128 {
+                        owned.acquisition_challenge = true;
+                    } else {
+                        owned.acquisition_issue = None;
+                    }
+                }
                 if self.pending_replies.len() >= ac::MAX_PENDING + 1 {
                     return Err(invalid());
                 }
@@ -627,7 +643,17 @@ impl NativeRuntime {
         let owned = self.listener.as_ref().ok_or_else(invalid)?;
         let connection = owned.observed.ok_or_else(invalid)?;
         let negative = ac::negative(record.kind);
-        if matches!(record.kind, ac::PREPARE | ac::ISSUE | ac::PROOF | ac::OUTPUT | ac::DETACH | ac::STOP) {
+        if matches!(record.kind, ac::PREPARE | ac::OUTPUT | ac::DETACH | ac::STOP)
+            || record.kind == ac::ISSUE && (
+                record.body.first() != Some(&1)
+                    || owned.acquisition_issue.is_some()
+                    || self.source.is_some()
+                    || self.authority.grant().is_some()
+            )
+            || record.kind == ac::PROOF && (
+                !owned.acquisition_challenge || owned.acquisition_proof
+            )
+        {
             self.local_reply(record, 4)?;
             return Ok(true);
         }
@@ -642,6 +668,11 @@ impl NativeRuntime {
         if let Some(pipe) = pipe {
             if self.client.try_write(NETWORK_REQUEST, &pipe.encode(false)?)? {
                 self.pipe_requests.submitted(&tls, &pipe)?;
+                if tls.kind == ac::ISSUE {
+                    self.listener.as_mut().unwrap().acquisition_issue = Some(tls.request);
+                } else if tls.kind == ac::PROOF {
+                    self.listener.as_mut().unwrap().acquisition_proof = true;
+                }
                 return Ok(true);
             }
         }
@@ -758,6 +789,9 @@ impl NativeRuntime {
             let owned = self.listener.as_mut().unwrap();
             owned.joined = None;
             owned.observed = None;
+            owned.acquisition_issue = None;
+            owned.acquisition_challenge = false;
+            owned.acquisition_proof = false;
             owned.candidate_until = 0;
             owned.pending_regular.clear();
             owned.pending_local.clear();
@@ -1583,6 +1617,9 @@ mod tests {
             bytes, config, _socket: socket, acknowledgement,
             setup_wake: Arc::new(handle(unsafe { CreateEventW(null(), 0, 0, null()) }).unwrap()),
             candidate: None, observation_pending: None, observed: None,
+                    acquisition_issue: None,
+                    acquisition_challenge: false,
+                    acquisition_proof: false,
             pending_regular: VecDeque::new(), pending_negative: None,
             pending_local: VecDeque::new(), joined: None,
             cooldown_until: 0, candidate_until: 0,
@@ -1617,6 +1654,9 @@ mod tests {
                 events: crate::reactor::WindowsEvents::new(&_socket)?,
                 bytes, config, _socket, acknowledgement, setup_wake,
                 candidate: None, observation_pending: None, observed: None,
+                    acquisition_issue: None,
+                    acquisition_challenge: false,
+                    acquisition_proof: false,
                 pending_regular: VecDeque::new(), pending_negative: None,
                 pending_local: VecDeque::new(), joined: None,
                 cooldown_until: 0, candidate_until: 0,
