@@ -443,6 +443,81 @@ public sealed class AudioAuthorityTests
     }
 
     [Fact]
+    public async Task First_delivery_rejected_native_transfer_closes_authority_without_signing_a_receipt()
+    {
+        using var f = new Fixture();
+        var nativeAccepted = true;
+        var h = new Routing(f, acquisitionOnly: true, publish: () => Task.FromResult(nativeAccepted));
+        try
+        {
+            Assert.True(h.Send(AudioNetworkKind.Issue, IssueBody(AudioOperationKind.AcquireSource, Request(1))));
+            var source = AudioRequestProtocol.ParseProof(EnrollmentFraming.ParseSigned((await h.Reply()).Body).Message);
+            var sourceProof = ProofBody(source.Facts.Nonce,
+                f.Persistence.SignPhone(AudioRequestProtocol.Proof(source.Core, source.Binding)));
+            Assert.True(h.Send(AudioNetworkKind.Proof, sourceProof));
+            Assert.Equal((byte)132, (await h.Reply()).Kind);
+            var parent = f.Owner.Snapshot();
+            var prepare = new byte[56];
+            BinaryPrimitives.WriteUInt64BigEndian(prepare, 1);
+            Request(2).CopyTo(prepare, 8);
+            h.Connection.TryWriteBytes(prepare.AsSpan(40), bigEndian: true, out _);
+            Assert.True(h.Send(AudioNetworkKind.Prepare, prepare));
+            var nomination = await h.Reply();
+            Assert.Equal((byte)130, nomination.Kind);
+            Assert.True(h.SendPinnedIssue(IssueBody(AudioOperationKind.AttachDelivery, Request(2), h.Connection),
+                parent.Revision, SHA256.HashData(nomination.Body)));
+            var challenge = AudioRequestProtocol.ParseProof(EnrollmentFraming.ParseSigned((await h.Reply()).Body).Message);
+            nativeAccepted = false;
+            var deliveryProof = ProofBody(challenge.Facts.Nonce,
+                f.Persistence.SignPhone(AudioRequestProtocol.Proof(challenge.Core, challenge.Binding)));
+            Assert.True(h.Send(AudioNetworkKind.Proof, deliveryProof));
+            Assert.Equal((byte)255, (await h.Reply()).Kind);
+            Assert.Equal(AudioAuthorityPhase.Closed, f.Owner.Snapshot().Phase);
+            Assert.True(h.Send(AudioNetworkKind.AppliedResult, Request(2).Concat(deliveryProof).ToArray()));
+            Assert.Equal((byte)255, (await h.Reply()).Kind);
+        }
+        finally { await h.Dispatcher.StopAndJoinAsync(); }
+    }
+
+    [Fact]
+    public async Task Lost_candidate_nomination_preserves_live_prepared_source_without_issuing()
+    {
+        using var f = new Fixture();
+        var first = new Routing(f, acquisitionOnly: true);
+        try
+        {
+            Assert.True(first.Send(AudioNetworkKind.Issue, IssueBody(AudioOperationKind.AcquireSource, Request(1))));
+            var acquire = AudioRequestProtocol.ParseProof(EnrollmentFraming.ParseSigned((await first.Reply()).Body).Message);
+            var sourceProof = ProofBody(acquire.Facts.Nonce,
+                f.Persistence.SignPhone(AudioRequestProtocol.Proof(acquire.Core, acquire.Binding)));
+            Assert.True(first.Send(AudioNetworkKind.Proof, sourceProof));
+            Assert.Equal((byte)132, (await first.Reply()).Kind);
+            var parent = f.Owner.Snapshot();
+            var prepare = new byte[56];
+            BinaryPrimitives.WriteUInt64BigEndian(prepare, 1);
+            Request(2).CopyTo(prepare, 8);
+            first.Connection.TryWriteBytes(prepare.AsSpan(40), bigEndian: true, out _);
+            Assert.True(first.Send(AudioNetworkKind.Prepare, prepare));
+            Assert.Equal((byte)130, (await first.Reply()).Kind);
+            Assert.True(first.Dispatcher.TryPost(new(AudioWorkerFrameKind.ConnectionClosed,
+                first.Connection.ToByteArray(bigEndian: true))));
+            Assert.Equal(parent, f.Owner.Snapshot());
+            Assert.Equal(1UL, f.Owner.RequestCounts.IssuedThrough);
+            var next = new Routing(f, acquisitionOnly: true);
+            try
+            {
+                next.Connection.TryWriteBytes(prepare.AsSpan(40), bigEndian: true, out _);
+                Assert.True(next.Send(AudioNetworkKind.Prepare, prepare));
+                Assert.Equal((byte)130, (await next.Reply()).Kind);
+                Assert.Equal(parent, f.Owner.Snapshot());
+                Assert.Equal(1UL, f.Owner.RequestCounts.IssuedThrough);
+            }
+            finally { await next.Dispatcher.StopAndJoinAsync(); }
+        }
+        finally { await first.Dispatcher.StopAndJoinAsync(); }
+    }
+
+    [Fact]
     public async Task Protected_source_Stop_fences_an_inflight_preparation_before_receipt()
     {
         using var f = new Fixture();
