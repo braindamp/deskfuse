@@ -234,27 +234,92 @@ public sealed class AudioAuthorityTests
         target.TryWriteBytes(b.AsSpan(37), bigEndian: true, out _); return b;
     }
     private static byte[] ProofBody(byte[] nonce, byte[] signature) => nonce.Concat(new[] { checked((byte)signature.Length) }).Concat(signature).ToArray();
+
+    [Fact]
+    public async Task Broker_reply_capacity_remains_owned_through_dispatcher_cleanup()
+    {
+        using var f = new Fixture();
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var (local, peer) = AudioWorkerControlTests.Duplex.Pair();
+        var remote = new AudioWorkerControl(peer);
+        var writeCompletion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cleanup = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var writesDone = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var ninthReservedInline = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        local.WriteCompletion = writeCompletion.Task;
+        var writes = 0;
+        var failures = 0;
+        void Fail(Exception _) => Interlocked.Increment(ref failures);
+        var pump = new AudioWorkerControlPump(new(local), _ => false, Fail);
+        var h = new Routing(f, fail: Fail, sendWithPermit: async (bytes, negative, reserved) =>
+        {
+            var request = AudioWorkerNetworkProtocol.Parse(bytes, reply: true).Request;
+            if (request == 9) await writesDone.Task.WaitAsync(deadline.Token);
+            var reserveStarted = 0;
+            var write = pump.SendReplyAsync(bytes, negative, permit =>
+            {
+                reserved(permit);
+                Volatile.Write(ref reserveStarted, 1);
+            });
+            if (request == 9) ninthReservedInline.SetResult(Volatile.Read(ref reserveStarted) == 1);
+            await write;
+            if (Interlocked.Increment(ref writes) == 8) writesDone.SetResult(true);
+            await cleanup.Task;
+        });
+        try
+        {
+            for (var i = 0; i < 8; i++) Assert.True(h.Send(AudioNetworkKind.Info, []));
+            Assert.Equal(AudioWorkerFrameKind.NetworkReply, (await remote.ReadAsync(deadline.Token)).Kind);
+            Assert.Equal(0, Volatile.Read(ref writes));
+            // Execution credit is reusable as soon as native can read a reply.
+            Assert.True(h.Send(AudioNetworkKind.Info, []));
+            writeCompletion.SetResult(true);
+            for (var i = 1; i < 8; i++) Assert.Equal(AudioWorkerFrameKind.NetworkReply, (await remote.ReadAsync(deadline.Token)).Kind);
+            Assert.False(await ninthReservedInline.Task.WaitAsync(deadline.Token));
+            var joined = h.Dispatcher.StopAndJoinAsync();
+            Assert.False(joined.IsCompleted);
+            cleanup.SetResult(true);
+            var final = await remote.ReadAsync(deadline.Token);
+            Assert.Equal(9UL, AudioWorkerNetworkProtocol.Parse(final.Body, reply: true).Request);
+            await joined.WaitAsync(deadline.Token);
+            Assert.Equal(0, failures);
+        }
+        finally
+        {
+            writeCompletion.TrySetResult(true);
+            cleanup.TrySetResult(true);
+            writesDone.TrySetResult(true);
+            await h.Dispatcher.StopAndJoinAsync().WaitAsync(TimeSpan.FromSeconds(5));
+            await pump.StopAndJoinAsync();
+        }
+    }
+
     private sealed class Routing
     {
         internal readonly Guid Connection = Guid.NewGuid();
         internal readonly BrokerAudioControlDispatcher Dispatcher;
         private readonly System.Threading.Channels.Channel<AudioNetworkMessage> replies = System.Threading.Channels.Channel.CreateBounded<AudioNetworkMessage>(16);
         private ulong sequence;
-        internal Routing(Fixture f, Func<byte[], bool, Task>? send = null, Action<Exception>? fail = null)
+        internal Routing(Fixture f, Func<byte[], bool, Task>? send = null, Action<Exception>? fail = null,
+            Func<byte[], bool, Action<AudioWorkerControlPump.ReplyPermit>, Task>? sendWithPermit = null)
         {
+            var regularReplies = new SemaphoreSlim(8, 8);
+            var negativeReply = new SemaphoreSlim(1, 1);
             Dispatcher = new(f.Owner, f.AudioWorker, new Signer(f),
                 s => f.Persistence.SignHost(AudioRequestProtocol.Status(s.Snapshot)),
                 s => f.Persistence.SignHost(AudioSourceStopProtocol.Status(s.Snapshot)),
                 c => { f.Owner.ClaimPreparation(c); Assert.True(f.Owner.CompletePreparation(c, f.Observed)); return Task.CompletedTask; },
                 () => { }, // Actual resource rundown has its own separately retained owner.
                 () => Task.FromResult(true), // Unit authority routing, not native I/O or physical qualification.
-                (bytes, negative, reserved) =>
+                sendWithPermit ?? (async (bytes, negative, reserved) =>
                 {
-                    reserved();
-                    return send is null
+                    var capacity = negative ? negativeReply : regularReplies;
+                    await capacity.WaitAsync();
+                    reserved(new(capacity));
+                    await (send is null
                         ? replies.Writer.WriteAsync(AudioWorkerNetworkProtocol.Parse(bytes, reply: true)).AsTask()
-                        : send(bytes, negative);
-                },
+                        : send(bytes, negative));
+                }),
                 fail ?? (_ => { }));
             var observation = Connection.ToByteArray(bigEndian: true).Concat(Nonce(4)).Concat(Nonce(5)).Concat(Nonce(6)).ToArray();
             Assert.True(Dispatcher.TryPost(new(AudioWorkerFrameKind.ConnectionObserved, observation)));

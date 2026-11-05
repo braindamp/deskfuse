@@ -474,13 +474,14 @@ impl NativeRuntime {
     }
 
     fn route_packet(&mut self, bytes: &mut [u8], from: SocketAddr, to: SocketAddr) -> io::Result<()> {
-        if bytes.is_empty() { return Ok(()); }
+        let owned = self.listener.as_ref().unwrap();
+        // A joined setup still owns the route until its ordered closure is queued.
+        if owned.joined.is_some() || bytes.is_empty() { return Ok(()); }
         let header = match quiche::Header::from_slice(bytes, 16) {
             Ok(header) => header,
             Err(_) => return Ok(()),
         };
         let info = quiche::RecvInfo { from, to };
-        let owned = self.listener.as_ref().unwrap();
         if let Some(setup) = &owned.candidate {
             if setup.routes(header.dcid.as_ref(), info) && !setup.finished() {
                 let _ = setup.try_packet(bytes, quiche::RecvInfo { from, to });
@@ -938,6 +939,70 @@ mod tests {
         phone.join().unwrap();
         remote.write(STOP, &[]).unwrap();
         assert!(thread.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn joined_candidate_owns_slot_until_ordered_close_is_queued() {
+        use crate::audio_tls::Role;
+        use crate::audio_transport::DeliveryTls;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let (mut runtime, remote) = runtime();
+        let clock = Arc::new(AtomicU64::new(now()));
+        runtime.test_clock = Some(Arc::clone(&clock));
+        runtime.process(Frame { kind: CONFIGURE_LISTENER, body: listener_bytes() }).unwrap();
+        let listener = Arc::clone(&runtime.listener.as_ref().unwrap()._socket);
+        let to = listener.local_addr().unwrap();
+        let phone = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let tick = runtime.clock();
+        let mut client = DeliveryTls::generate(Role::Phone).unwrap()
+            .connect(phone.local_addr().unwrap(), to, tick + 100_000_000, 10_000).unwrap();
+        client.service_egress(&phone, true, tick).unwrap();
+        let mut initial = [0; 1350];
+        let until = Instant::now() + Duration::from_secs(3);
+        let (size, from) = loop {
+            match listener.recv_from(&mut initial) {
+                Ok(packet) => break packet,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < until, "phone Initial did not arrive");
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("{error}"),
+            }
+        };
+        let initial = &mut initial[..size];
+        runtime.route_packet(initial, from, to).unwrap();
+        let connection = [4; 16];
+        let owned = runtime.listener.as_mut().unwrap();
+        owned.observed = Some(connection);
+        let setup = owned.candidate.as_ref().unwrap();
+        setup.cancel();
+        assert_eq!(unsafe { WaitForSingleObject(setup.completion_handle().unwrap().as_raw_handle(), 3000) }, WAIT_OBJECT_0);
+        clock.store(owned.cooldown_until, Ordering::SeqCst);
+
+        let (entered, resume) = runtime.client.delay_next_write_completion();
+        assert!(runtime.client.try_write(LISTENER_CONFIGURED, &[1]).unwrap());
+        entered.recv_timeout(Duration::from_secs(3)).unwrap();
+        for _ in 1..8 { assert!(runtime.client.try_write(LISTENER_CONFIGURED, &[1]).unwrap()); }
+        assert!(runtime.service_candidate().unwrap());
+        assert!(runtime.listener.as_ref().unwrap().joined.is_some());
+        runtime.route_packet(initial, from, to).unwrap();
+        let owned = runtime.listener.as_ref().unwrap();
+        assert!(owned.candidate.is_none());
+        assert_eq!(owned.observed, Some(connection));
+
+        resume.send(()).unwrap();
+        assert_eq!(unsafe { WaitForSingleObject(runtime.client.capacity_event().as_raw_handle(), 3000) }, WAIT_OBJECT_0);
+        assert!(runtime.service_candidate().unwrap());
+        for _ in 0..8 { assert_eq!(remote.read(3000).unwrap(), (LISTENER_CONFIGURED, vec![1])); }
+        assert_eq!(remote.read(3000).unwrap(), (CONNECTION_CLOSED, connection.to_vec()));
+        assert!(runtime.listener.as_ref().unwrap().joined.is_none());
+        assert!(runtime.listener.as_ref().unwrap().observed.is_none());
+        runtime.route_packet(initial, from, to).unwrap();
+        assert!(runtime.listener.as_ref().unwrap().candidate.is_none());
+        clock.store(runtime.listener.as_ref().unwrap().cooldown_until, Ordering::SeqCst);
+        runtime.route_packet(initial, from, to).unwrap();
+        assert!(runtime.listener.as_ref().unwrap().candidate.is_some());
     }
 
     #[test]

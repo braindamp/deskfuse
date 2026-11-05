@@ -29,7 +29,7 @@ internal sealed class BrokerAudioControlDispatcher : IAudioWorkerEventOwner
     private readonly Func<BrokerAudioOwner.StopStatus, byte[]> signStopStatus;
     private readonly Func<BrokerAudioOwner.Committed, Task> prepareSource;
     private readonly Func<Task<bool>> publish;
-    private readonly Func<byte[], bool, Action, Task> send;
+    private readonly Func<byte[], bool, Action<AudioWorkerControlPump.ReplyPermit>, Task> send;
     private readonly Action<Exception> fail;
     private readonly Action requestRundown;
     private int rundownRequested;
@@ -45,7 +45,7 @@ internal sealed class BrokerAudioControlDispatcher : IAudioWorkerEventOwner
     internal BrokerAudioControlDispatcher(BrokerAudioOwner owner, IBrokerAudioWorker worker, IAudioGrantSigner grants,
         Func<BrokerAudioOwner.RequestStatus, byte[]> signStatus, Func<BrokerAudioOwner.StopStatus, byte[]> signStopStatus,
         Func<BrokerAudioOwner.Committed, Task> prepareSource, Action requestRundown, Func<Task<bool>> publish,
-        Func<byte[], bool, Action, Task> send, Action<Exception> fail)
+        Func<byte[], bool, Action<AudioWorkerControlPump.ReplyPermit>, Task> send, Action<Exception> fail)
     {
         if (!owner.IsWorker(worker)) throw new UnauthorizedAccessException("Foreign control worker.");
         this.owner = owner; this.worker = worker; this.grants = grants; this.signStatus = signStatus; this.signStopStatus = signStopStatus;
@@ -99,6 +99,7 @@ internal sealed class BrokerAudioControlDispatcher : IAudioWorkerEventOwner
     }
     private async Task Run(Job job)
     {
+        AudioWorkerControlPump.ReplyPermit? replyPermit = null;
         try
         {
             byte[] body; byte kind;
@@ -115,10 +116,26 @@ internal sealed class BrokerAudioControlDispatcher : IAudioWorkerEventOwner
             // owner then releases the retained forwarding credit and drops the
             // undeliverable network reply; closure cannot abandon actual work.
             await send(AudioWorkerNetworkProtocol.Encode(new(job.Message.Request, job.Message.Connection, kind, body), reply: true),
-                job.Negative, () => { lock (gate) executing.Remove(job); }).ConfigureAwait(false);
+                job.Negative, permit =>
+                {
+                    lock (gate)
+                    {
+                        replyPermit = permit;
+                        executing.Remove(job);
+                    }
+                }).ConfigureAwait(false);
         }
         catch (Exception error) { owner.CloseAdmission(); fail(error); }
-        finally { lock (gate) { jobs.Remove(job); executing.Remove(job); job.Done.TrySetResult(true); } }
+        finally
+        {
+            lock (gate)
+            {
+                jobs.Remove(job);
+                executing.Remove(job);
+                job.Done.TrySetResult(true);
+                replyPermit?.Dispose();
+            }
+        }
     }
     private async Task<byte[]> Execute(Job job)
     {

@@ -119,7 +119,8 @@ internal sealed class BrokerAudioWorkerSession
         if (!owner.IsWorker(Worker) || audioOwner is not null && !ReferenceEquals(audioOwner, owner))
             throw new UnauthorizedAccessException("Audio publication is outside its retained source/worker owner.");
     }
-    internal Task SendReplyAsync(byte[] bytes, bool negative) => pump.SendReplyAsync(bytes, negative);
+    internal Task SendReplyAsync(byte[] bytes, bool negative, Action<AudioWorkerControlPump.ReplyPermit> reserved) =>
+        pump.SendReplyAsync(bytes, negative, reserved);
     internal Task<System.Net.IPEndPoint> ConfigureListenerAsync(BrokerAudioOwner owner, AudioListenerConfiguration configuration, CancellationToken ct)
     {
         Task<System.Net.IPEndPoint> operation;
