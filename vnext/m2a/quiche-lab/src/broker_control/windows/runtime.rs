@@ -1946,6 +1946,208 @@ mod tests {
         assert!(thread.join().unwrap().is_ok());
         assert!(remote.read(100).is_err());
     }
+
+    #[test]
+    fn real_worker_moves_first_pinned_tls_and_keeps_pcm_gated() {
+        use crate::audio_tls::{Role, ALPN};
+        use crate::audio_transport::DeliveryTls;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::mpsc::sync_channel;
+        let (mut runtime, remote) = runtime();
+        let mut bytes = listener_bytes();
+        let warm = bytes.len() - 26;
+        bytes[warm..warm + 4].copy_from_slice(&15_000u32.to_be_bytes());
+        let config = ListenerConfig::parse(&bytes, runtime.client.worker()).unwrap();
+        let mut parent = ControlGrant::parse(&grant_for(&config, 12, false)).unwrap();
+        parent.delivery_generation = 0;
+        parent.delivery_digest = [0; 32];
+        parent.ready = false;
+        parent.output_generation = 0;
+        let tick = now();
+        runtime.authority.apply(parent.clone(), tick).unwrap();
+        runtime.authority.source_observed(parent.binding, tick).unwrap();
+        runtime.process(Frame { kind: CONFIGURE_LISTENER, body: bytes.clone() }).unwrap();
+        let server = runtime.listener.as_ref().unwrap()._socket.local_addr().unwrap();
+        let pcm = Arc::new(OfflinePcm {
+            chunks: std::sync::Mutex::new(VecDeque::new()),
+            event: handle(unsafe { CreateEventW(null(), 0, 0, null()) }).unwrap(),
+        });
+        let drops = Arc::new(AtomicUsize::new(0));
+        let input = OfflineInput {
+            pcm: Arc::clone(&pcm),
+            fences: Arc::new(AtomicUsize::new(0)),
+            drops: Arc::clone(&drops),
+        };
+        runtime.source = Some(SourceOwner::new(config.scope.clone(), Box::new(input)));
+        let (source_tx, source_rx) = sync_channel(64);
+        runtime.test_source = Some(source_tx);
+        let worker = spawn_offline(runtime);
+        let source_bytes = bytes[4..4 + u16::from_be_bytes([bytes[2], bytes[3]]) as usize].to_vec();
+        let mut n2 = [0x72; 32];
+        n2[..8].copy_from_slice(&2u64.to_be_bytes());
+        let mut proof = vec![0x35; 32];
+        proof.push(8);
+        proof.extend_from_slice(&[0x47; 8]);
+        let client_proof = proof.clone();
+        let phone = std::thread::spawn(move || {
+            let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+            socket.set_nonblocking(true).unwrap();
+            let mut conn = DeliveryTls::generate(Role::Phone).unwrap()
+                .connect(socket.local_addr().unwrap(), server, now() + 300_000_000, 10_000).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let mut info = false;
+            let mut observed = None;
+            let mut buf = [0u8; 1350];
+            loop {
+                assert!(Instant::now() < deadline, "first delivery TLS transfer");
+                conn.service_timeout(now()).unwrap();
+                for _ in 0..16 {
+                    match socket.recv_from(&mut buf) {
+                        Ok((n, from)) => {
+                            conn.receive(&mut buf[..n], quiche::RecvInfo {
+                                from, to: socket.local_addr().unwrap(),
+                            }, now()).unwrap();
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(e) => panic!("{e}"),
+                    }
+                }
+                if !info && conn.facts(now()).unwrap().is_some() {
+                    conn.queue_control(Record { kind: ac::INFO, request: 1, body: vec![] }, now()).unwrap();
+                    info = true;
+                }
+                for record in conn.read_control(now()).unwrap() {
+                    match (record.kind, record.request) {
+                        (ac::NOTICE, 0) => {
+                            observed = Some(Observation::parse(&record.body).unwrap().connection);
+                        }
+                        (129, 1) => {
+                            assert_eq!(record.body, source_bytes);
+                            let mut body = Vec::new();
+                            body.extend_from_slice(&1u64.to_be_bytes());
+                            body.extend_from_slice(&n2);
+                            body.extend_from_slice(&observed.unwrap());
+                            conn.queue_control(Record { kind: ac::PREPARE, request: 2, body }, now()).unwrap();
+                        }
+                        (130, 2) => {
+                            let binding = DeliveryBinding::parse(&record.body).unwrap();
+                            assert_eq!(binding.request, n2);
+                            let mut body = vec![2];
+                            body.extend_from_slice(&n2);
+                            body.extend_from_slice(&1000u32.to_be_bytes());
+                            body.extend_from_slice(&observed.unwrap());
+                            conn.queue_control(Record { kind: ac::ISSUE, request: 3, body }, now()).unwrap();
+                        }
+                        (131, 3) => {
+                            assert_eq!(record.body, [0x22]);
+                            conn.queue_control(Record {
+                                kind: ac::PROOF, request: 4, body: client_proof.clone(),
+                            }, now()).unwrap();
+                        }
+                        (132, 4) => {
+                            assert_eq!(record.body, [0x99]);
+                            let mut body = n2.to_vec();
+                            body.extend_from_slice(&client_proof);
+                            conn.queue_control(Record {
+                                kind: ac::APPLIED_RESULT, request: 5, body,
+                            }, now()).unwrap();
+                        }
+                        (139, 5) => {
+                            assert_eq!(record.body, [0x99]);
+                            return;
+                        }
+                        _ => panic!("unexpected first delivery TLS record {} {}", record.kind, record.request),
+                    }
+                }
+                conn.service_egress(&socket, true, now()).unwrap();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let (kind, observation) = remote.read(3000).unwrap();
+        assert_eq!(kind, CONNECTION_OBSERVED);
+        let observed = Observation::parse(&observation).unwrap();
+        let (kind, info) = remote.read(3000).unwrap();
+        assert_eq!(kind, NETWORK_REQUEST);
+        let info = Message::parse(&info, false).unwrap();
+        assert_eq!((info.kind, info.request, info.connection), (ac::INFO, 1, observed.connection));
+        remote.write(NETWORK_REPLY, &Message {
+            kind: 129, body: bytes[4..4 + u16::from_be_bytes([bytes[2], bytes[3]]) as usize].to_vec(), ..info
+        }.encode(true).unwrap()).unwrap();
+        let (kind, prepare) = remote.read(3000).unwrap();
+        assert_eq!(kind, NETWORK_REQUEST);
+        let prepare = Message::parse(&prepare, false).unwrap();
+        assert_eq!((prepare.kind, prepare.request, prepare.connection), (ac::PREPARE, 2, observed.connection));
+        assert_eq!(&prepare.body[8..40], &n2);
+        assert_eq!(&prepare.body[40..56], &observed.connection);
+        let scope = config.scope;
+        let mut bytes = b"DeskFuse.Audio.Delivery.v1\0".to_vec();
+        bytes.extend_from_slice(&scope.source);
+        bytes.extend_from_slice(&scope.digest);
+        bytes.extend_from_slice(&scope.generation.to_be_bytes());
+        bytes.extend_from_slice(&parent.binding);
+        bytes.extend_from_slice(&scope.worker);
+        bytes.extend_from_slice(&1u64.to_be_bytes());
+        for word in scope.wire { bytes.extend_from_slice(&word.to_be_bytes()); }
+        bytes.extend_from_slice(&observed.native);
+        bytes.extend_from_slice(&observed.phone);
+        bytes.extend_from_slice(&n2);
+        bytes.extend_from_slice(&observed.nonce);
+        bytes.extend_from_slice(&(ALPN.len() as u16).to_be_bytes());
+        bytes.extend_from_slice(ALPN);
+        bytes.push(1);
+        let nominated = DeliveryBinding::parse(&bytes).unwrap();
+        remote.write(NETWORK_REPLY, &Message {
+            kind: 130, body: bytes, ..prepare
+        }.encode(true).unwrap()).unwrap();
+        let (kind, pinned) = remote.read(3000).unwrap();
+        assert_eq!(kind, PINNED_ISSUE);
+        assert_eq!(pinned.len(), 25 + 53 + 40);
+        let issue = Message::parse(&pinned[..78], false).unwrap();
+        assert_eq!((issue.kind, issue.request, issue.connection), (ac::ISSUE, 3, observed.connection));
+        assert_eq!(&issue.body[1..33], &n2);
+        assert_eq!(u64::from_be_bytes(pinned[78..86].try_into().unwrap()), parent.revision);
+        assert_eq!(pinned[86..], nominated.digest);
+        remote.write(NETWORK_REPLY, &Message {
+            kind: 131, body: vec![0x22], ..issue
+        }.encode(true).unwrap()).unwrap();
+        let (kind, proved) = remote.read(3000).unwrap();
+        assert_eq!(kind, NETWORK_REQUEST);
+        let proved = Message::parse(&proved, false).unwrap();
+        assert_eq!((proved.kind, proved.request), (ac::PROOF, 4));
+        assert_eq!(proved.body, proof);
+        let mut delivery = parent.clone();
+        delivery.revision += 1;
+        delivery.delivery_generation = 1;
+        delivery.delivery_digest = nominated.digest;
+        let published = encode_control(&delivery);
+        remote.write(AUTHORITY, &published).unwrap();
+        assert_eq!(remote.read(3000).unwrap(), (AUTHORITY_OBSERVED, published));
+        let cutoff = Instant::now() + Duration::from_secs(3);
+        loop {
+            let (attached, outstanding, ciphertext) = source_rx.recv_timeout(Duration::from_millis(150)).unwrap();
+            if attached {
+                assert_eq!(outstanding, 0);
+                assert!(!ciphertext);
+                break;
+            }
+            assert!(Instant::now() < cutoff, "worker did not adopt first pinned delivery");
+        }
+        remote.write(NETWORK_REPLY, &Message {
+            kind: 132, body: vec![0x99], ..proved
+        }.encode(true).unwrap()).unwrap();
+        let (kind, applied) = remote.read(3000).unwrap();
+        assert_eq!(kind, NETWORK_REQUEST);
+        let applied = Message::parse(&applied, false).unwrap();
+        assert_eq!((applied.kind, applied.request), (ac::APPLIED_RESULT, 5));
+        remote.write(NETWORK_REPLY, &Message {
+            kind: 139, body: vec![0x99], ..applied
+        }.encode(true).unwrap()).unwrap();
+        phone.join().unwrap();
+        remote.write(STOP, &[]).unwrap();
+        assert!(worker.join().unwrap().is_ok());
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
     fn offline_incumbent(
         ready: bool, blocked: bool, idle_ms: u32,
     ) -> (
