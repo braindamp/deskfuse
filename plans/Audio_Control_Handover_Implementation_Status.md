@@ -236,6 +236,33 @@ lab/conditional native warnings remain). Evidence:
 `out/control-handover-checks/native-control-all.log`. No installed/physical work
 or production authority was activated.
 
+## Iteration 8 — H3 cellular callback and actual-work custody
+
+5 November 2026. Added `CHANGE_NETWORK_STATE` and the concrete Android cellular
+request component. Explicit consent, route/policy and acquisition/warm inputs
+are required. One selected Network supplies callback snapshots, target DNS and
+fresh-descriptor socket binding; onAvailable alone admits no work. There is no
+process binding or incumbent socket change. Network/policy denial is latched
+against late callbacks. No new preparation defaults or automatic activation.
+
+The callback/request survives exact pin, uncertain commit/reconciliation and
+promotion into the active path. Cancellation retains the actual dependent
+DNS/socket/native job and registration call before unregister. Failed cleanup
+is quarantined. The pure custody transitions and Android adapter are described
+in [Audio_Android_Cellular_Custody.md](Audio_Android_Cellular_Custody.md).
+The independent coordinator, passive Data Saver/VPN/network observation wiring,
+native receipt/install path and combined H4 work remain open. Existing legacy
+SpeakerController behavior is unchanged and is not the new authority owner.
+
+**16 focused Android checks passed**, zero failures/skips: 11 deterministic
+custody checks and five simulated framework callback/socket cases. Shipping
+Kotlin compilation and the existing JVM broker-proof/JCA signing check passed.
+The final test run used a workspace temporary directory on D: after C: ran out
+of space while Robolectric created temporary directories. No files were deleted.
+Evidence: `android/app/build/test-results/testDebugUnitTest/TEST-com.focuswindow.client.transport.AudioCellularCustodyTest.xml`
+and `TEST-com.focuswindow.client.transport.AudioCellularRequestTest.xml` beside it.
+No actual cellular request, DNS, radio, JNI playback or device operation ran.
+
 ## Continue on High
 
 The single broker-pipe reader/demultiplexer and bounded broker observation/request
@@ -246,8 +273,8 @@ relay; its broker primitives are implemented but physical integration remains.
 The native candidate component is implemented. Connect its single-reader
 listener routing, pin/transfer, actual old-egress barrier and source ownership,
 then implement phone receipt-based approval,
-followed by the Network-handle-aware coordinator and cellular lease lifecycle
-(reviewed H2–H4), preserving source/renderer/floors. H1 broker/phone primitives
+followed by the Network-handle-aware coordinator using the implemented cellular
+request/custody component (reviewed H2–H4), preserving source/renderer/floors. H1 broker/phone primitives
 are source checked; native request routing remains part of that integration.
 
 Source Stop physical cleanup and successful terminal acknowledgement must follow

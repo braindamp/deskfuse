@@ -17,9 +17,12 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- LAN transport only. No relay in the default path (FR-TRUST-03). -->
+    <!-- LAN default; new audio may use an explicitly configured cellular route.
+         No relay in the default path (FR-TRUST-03). -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Explicit, consent/policy-gated audio candidate requestNetwork only. -->
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
 
     <!-- FR-REF-03 — keep the screen alive for the length of a session. -->
