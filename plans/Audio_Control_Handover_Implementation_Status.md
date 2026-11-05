@@ -318,6 +318,29 @@ preparation and old-egress/assembly/ledger retirement. H3/H4, real N4/N5
 rundown, H5 and installed/physical qualification remain pending. Production
 authority stays disabled.
 
+## H2b — bounded single-owner UDP ingress
+
+5 November 2026. The configured Windows native runtime now installs the
+existing socket event owner before the first listener acknowledgement. The
+serialized runtime, not a new thread or candidate worker, is the sole UDP
+reader. On each source turn it checks broker terminal/deadline first, consumes
+at most the explicitly configured candidate packet-work budget, then returns
+to the broker control queue. An idle listener waits on actual UDP/control/
+terminal handles without periodic polling. Oversized datagrams are dropped
+without closing the trusted control channel.
+
+This is ingress custody only. All datagrams are deliberately discarded until
+the subsequent H2 candidate/active CID routing and forwarding integration; no
+connection, source, output readiness, media admission or physical cleanup is
+inferred. Two focused synthetic Windows loopback/pipe tests cover bounded
+ingress without authorization and terminal wake during queued datagrams.
+
+Validation: **NOT RUN** at the time of this source checkpoint. H2a's
+previously recorded 86 Windows native and 60 focused broker passes remain
+historical evidence, not validation of these new changes. The sole-candidate
+dispatch, worker-wide RPC forwarding, transfer barrier and source/rundown
+composition remain pending.
+
 ## Continue on High
 
 The single broker-pipe reader/demultiplexer and bounded broker observation/request

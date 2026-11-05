@@ -7,6 +7,7 @@ use std::net::UdpSocket;
 use std::sync::Arc;
 
 struct BoundListener {
+    events: crate::reactor::WindowsEvents,
     bytes: Vec<u8>,
     config: ListenerConfig,
     _socket: Arc<UdpSocket>,
@@ -79,8 +80,10 @@ impl NativeRuntime {
                 }
                 self.live()?;
                 let (socket, acknowledgement) = config.bind()?;
+                let events = crate::reactor::WindowsEvents::new(&socket)?;
                 self.live()?;
                 self.listener = Some(BoundListener {
+                    events,
                     bytes: frame.body,
                     config,
                     _socket: socket,
@@ -152,7 +155,16 @@ impl NativeRuntime {
             self.live()?;
             let frames = self.client.drain(8)?;
             if frames.is_empty() {
-                self.wait(self.client.control_event().as_raw_handle(), None, false)?;
+                if self.listener.is_some() {
+                    if self.drain_listener()? { continue; }
+                    self.live()?;
+                    let timeout = self.timeout(None)?;
+                    self.listener.as_ref().unwrap().events.wait_listener(
+                        self.client.control_event().as_raw_handle(),
+                        self.client.terminal_event().as_raw_handle(), timeout)?;
+                } else {
+                    self.wait(self.client.control_event().as_raw_handle(), None, false)?;
+                }
                 continue;
             }
             pending.extend(frames);
@@ -167,6 +179,24 @@ impl NativeRuntime {
                 }
             }
         }
+    }
+
+    fn drain_listener(&mut self) -> io::Result<bool> {
+        let limit = self.listener.as_ref().unwrap().config.policy.packet_work as usize;
+        let mut bytes = [0u8; crate::reactor::MAX_QUIC_UDP_BYTES + 1];
+        for _ in 0..limit {
+            self.live()?;
+            let received = self.listener.as_ref().unwrap()._socket.recv_from(&mut bytes);
+            match received {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+                Err(error) if error.raw_os_error() == Some(10040) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        // No candidate/active route is authorized by this ingress slice.
+        // Every packet is discarded without source, delivery or readiness side effects.
+        Ok(true)
     }
 
     fn timeout(&self, until: Option<Instant>) -> io::Result<u32> {
@@ -347,6 +377,43 @@ mod tests {
         assert_eq!(remote.read(3000).unwrap(), (AUTHORITY_OBSERVED, bytes));
         assert!(thread.join().unwrap().is_err());
     }
+    #[test]
+    fn configured_listener_drains_one_explicit_packet_budget_without_admitting_media() {
+        let (mut runtime, _remote) = runtime();
+        runtime.process(Frame { kind: CONFIGURE_LISTENER, body: listener_bytes() }).unwrap();
+        let owner = runtime.listener.as_ref().unwrap();
+        let address = owner._socket.local_addr().unwrap();
+        let limit = owner.config.policy.packet_work as usize;
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        for _ in 0..limit * 3 {
+            sender.send_to(&[2u8; 1200], address).unwrap();
+        }
+        assert!(runtime.drain_listener().unwrap());
+        assert!(runtime.drain_listener().unwrap());
+        assert!(runtime.drain_listener().unwrap());
+        assert!(!runtime.drain_listener().unwrap());
+        assert!(runtime.authority.grant().is_none());
+        assert!(!runtime.authority.media_allowed(now()));
+    }
+
+    #[test]
+    fn configured_listener_wakes_for_stop_during_bounded_udp_ingress() {
+        let (runtime, remote) = runtime();
+        let config = listener_bytes();
+        let thread = std::thread::spawn(move || runtime.run());
+        remote.write(CONFIGURE_LISTENER, &config).unwrap();
+        let (kind, ack) = remote.read(3000).unwrap();
+        assert_eq!(kind, LISTENER_CONFIGURED);
+        let address = std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(ack[34], ack[35], ack[36], ack[37])),
+            u16::from_be_bytes([ack[38], ack[39]]));
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        for _ in 0..64 { sender.send_to(&[7u8; 1200], address).unwrap(); }
+        remote.write(STOP, &[]).unwrap();
+        assert!(thread.join().unwrap().is_ok());
+        assert!(UdpSocket::bind(address).is_ok());
+    }
+
     #[test]
     fn valid_projection_round_trips_exact_wire_bytes_through_production_style_dispatch() {
         let (runtime, remote) = runtime();

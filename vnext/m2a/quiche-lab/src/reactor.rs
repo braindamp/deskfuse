@@ -359,6 +359,41 @@ impl WindowsEvents {
                 control:signaled(0),terminal:signaled(1),source:signaled(2)}})
         }
     }
+    /// Unconfigured media has no source handle. Listen for broker and UDP
+    /// readiness without a timer tick or a synthetic source event.
+    pub fn wait_listener(&self, control: *mut std::ffi::c_void,
+        terminal: *mut std::ffi::c_void, timeout_ms: u32) -> io::Result<()> {
+        use windows_sys::Win32::{Networking::WinSock::*, System::Threading::*};
+        let handles = [terminal, control, self.event as *mut std::ffi::c_void];
+        if handles.iter().any(|h| h.is_null()) ||
+            handles[0] == handles[1] || handles[0] == handles[2] ||
+            handles[1] == handles[2] {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "listener requires distinct live events"));
+        }
+        unsafe {
+            let result = WaitForMultipleObjects(3, handles.as_ptr(), 0, timeout_ms);
+            if result == WAIT_TIMEOUT {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "Listener authority deadline"));
+            }
+            if result == WAIT_FAILED { return Err(io::Error::last_os_error()); }
+            if !(WAIT_OBJECT_0..WAIT_OBJECT_0 + 3).contains(&result) {
+                return Err(io::Error::other("Unexpected listener readiness"));
+            }
+            let mut events: WSANETWORKEVENTS = std::mem::zeroed();
+            if WSAEnumNetworkEvents(self.socket, self.event, &mut events) != 0 {
+                return Err(io::Error::from_raw_os_error(WSAGetLastError()));
+            }
+            if events.lNetworkEvents & FD_CLOSE as i32 != 0 {
+                return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "Listener socket closed"));
+            }
+            for index in [FD_READ_BIT, FD_WRITE_BIT] {
+                if events.iErrorCode[index as usize] != 0 {
+                    return Err(io::Error::from_raw_os_error(events.iErrorCode[index as usize]));
+                }
+            }
+            Ok(())
+        }
+    }
     pub fn new(udp:&UdpSocket)->io::Result<Self> {
         use std::os::windows::io::AsRawSocket;
         use windows_sys::Win32::{Networking::WinSock::*,System::Threading::*};
