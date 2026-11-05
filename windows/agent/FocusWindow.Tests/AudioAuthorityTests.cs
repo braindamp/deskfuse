@@ -229,7 +229,13 @@ public sealed class AudioAuthorityTests
                 c => { f.Owner.ClaimPreparation(c); Assert.True(f.Owner.CompletePreparation(c, f.Observed)); return Task.CompletedTask; },
                 () => { }, // Actual resource rundown has its own separately retained owner.
                 () => Task.FromResult(true), // Unit authority routing, not native I/O or physical qualification.
-                send ?? ((bytes, _) => replies.Writer.WriteAsync(AudioWorkerNetworkProtocol.Parse(bytes, reply: true)).AsTask()),
+                (bytes, negative, reserved) =>
+                {
+                    reserved();
+                    return send is null
+                        ? replies.Writer.WriteAsync(AudioWorkerNetworkProtocol.Parse(bytes, reply: true)).AsTask()
+                        : send(bytes, negative);
+                },
                 fail ?? (_ => { }));
             var observation = Connection.ToByteArray(bigEndian: true).Concat(Nonce(4)).Concat(Nonce(5)).Concat(Nonce(6)).ToArray();
             Assert.True(Dispatcher.TryPost(new(AudioWorkerFrameKind.ConnectionObserved, observation)));
@@ -669,6 +675,25 @@ public sealed class AudioAuthorityTests
         Assert.Equal((2UL, 0, 1, 1), f.Owner.RequestCounts);
         Assert.NotEqual(challenge.Nonce, successor.Nonce);
     }
+    [Fact]
+    public void Cold_candidate_close_does_not_publish_idle_but_current_delivery_close_changes_authority()
+    {
+        using (var idle = new Fixture())
+        {
+            var cold = idle.NewConnection(20, 21, 22);
+            Assert.False(idle.Owner.ConnectionClosed(cold));
+            Assert.Equal(AudioAuthorityPhase.Idle, idle.Owner.Snapshot().Phase);
+            Assert.False(idle.Owner.ConnectionClosed(cold));
+            Assert.NotNull(idle.Owner.Issue(idle.Origin, AudioOperationKind.AcquireSource, Request(1), 1000));
+        }
+        using (var active = new Fixture())
+        {
+            active.Attach();
+            Assert.True(active.Owner.ConnectionClosed(active.Origin));
+            Assert.Equal(0UL, active.Owner.Snapshot().DeliveryGeneration);
+        }
+    }
+
     [Fact]
     public void Live_handoff_uses_the_approved_lane_and_a_closed_candidate_cannot_complete_late()
     {

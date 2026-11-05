@@ -2,10 +2,10 @@ use super::*;
 use super::channel::{BrokerControlClient, Frame};
 use super::resume::ResumeWake;
 use crate::audio_authority::{AudioAuthority, ControlGrant};
-use crate::audio_candidate::{CandidateSetup, SetupEvent};
+use crate::audio_candidate::{CandidateOutcome, CandidateSetup, SetupEvent};
 use crate::audio_control::{self as ac, Record};
 use crate::audio_listener_config::ListenerConfig;
-use crate::audio_rpc::{Forwarding, Message};
+use crate::audio_rpc::{Message, PipeRequests};
 use std::collections::{BTreeMap, VecDeque};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
@@ -19,7 +19,10 @@ struct BoundListener {
     setup_wake: Arc<OwnedHandle>,
     candidate: Option<CandidateSetup>,
     observed: Option<[u8; 16]>,
-    pending_event: Option<(SetupEvent, bool)>,
+    pending_regular: VecDeque<Record>,
+    pending_negative: Option<Record>,
+    pending_local: VecDeque<(Record, bool)>,
+    joined: Option<CandidateOutcome>,
     cooldown_until: u64,
     candidate_until: u64,
 }
@@ -29,7 +32,7 @@ struct NativeRuntime {
     authority: AudioAuthority,
     listener: Option<BoundListener>,
     resume: ResumeWake,
-    forwarding: Forwarding,
+    pipe_requests: PipeRequests,
     pending_replies: VecDeque<Message>,
     reply_custody: BTreeMap<([u8; 16], u64), Message>,
     #[cfg(test)]
@@ -63,7 +66,7 @@ impl NativeRuntime {
         let resume = ResumeWake::register()?;
         Ok(Self {
             client, authority, listener: None, resume,
-            forwarding: Forwarding::default(),
+            pipe_requests: PipeRequests::default(),
             pending_replies: VecDeque::new(),
             reply_custody: BTreeMap::new(),
             #[cfg(test)]
@@ -135,15 +138,17 @@ impl NativeRuntime {
                     setup_wake,
                     candidate: None,
                     observed: None,
-                    pending_event: None,
+                    pending_regular: VecDeque::new(),
+                    pending_negative: None,
+                    pending_local: VecDeque::new(),
+                    joined: None,
                     cooldown_until: 0,
                     candidate_until: 0,
                 });
                 Ok(Some((LISTENER_CONFIGURED, acknowledgement)))
             }
             NETWORK_REPLY => {
-                let message = Message::parse(&frame.body, true)?;
-                self.forwarding.validate_reply(&message)?;
+                let message = self.pipe_requests.reply(Message::parse(&frame.body, true)?)?;
                 if self.pending_replies.len() >= ac::MAX_PENDING + 1 {
                     return Err(invalid());
                 }
@@ -233,9 +238,7 @@ impl NativeRuntime {
                 #[cfg(test)]
                 if let Some(sender) = &self.test_idle { let _ = sender.send(()); }
                 let owned = self.listener.as_ref().unwrap();
-                let completed = owned.candidate.as_ref()
-                    .filter(|setup| !setup.finished())
-                    .and_then(CandidateSetup::completion_handle);
+                let completed = owned.candidate.as_ref().and_then(CandidateSetup::completion_handle);
                 let writable = owned.events.wait_listener(
                     self.client.control_event().as_raw_handle(),
                     self.client.terminal_event().as_raw_handle(),
@@ -261,7 +264,7 @@ impl NativeRuntime {
         for _ in 0..count {
             self.live()?;
             let message = self.pending_replies.pop_front().unwrap();
-            self.forwarding.validate_reply(&message)?;
+            message.encode(true)?;
             let active = self.listener.as_ref().is_some_and(|owned| {
                 owned.observed == Some(message.connection)
                     && owned.candidate.as_ref().is_some_and(|setup| !setup.finished())
@@ -283,36 +286,73 @@ impl NativeRuntime {
                     }
                     Ok(false) => self.pending_replies.push_back(message),
                     Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
-                        self.forwarding.complete(&message)?;
+                        self.pipe_requests.disposition(&message)?;
                         dispatched = true;
                     }
                     Err(error) => return Err(error),
                 }
             } else {
-                self.forwarding.complete(&message)?;
+                self.pipe_requests.disposition(&message)?;
                 dispatched = true;
             }
         }
         Ok(dispatched)
     }
 
-    fn service_candidate(&mut self) -> io::Result<bool> {
-        if !self.listener.as_ref().is_some_and(|owned| owned.candidate.is_some()) {
+    fn local_reply(&mut self, record: Record, reason: u8) -> io::Result<()> {
+        let owned = self.listener.as_mut().ok_or_else(invalid)?;
+        if owned.pending_local.len() >= ac::MAX_PENDING + 1 { return Err(invalid()); }
+        owned.pending_local.push_back((Record {
+            kind: ac::ERROR, request: record.request, body: vec![reason],
+        }, ac::negative(record.kind)));
+        Ok(())
+    }
+
+    fn forward_request(&mut self, record: Record) -> io::Result<bool> {
+        let owned = self.listener.as_ref().ok_or_else(invalid)?;
+        let connection = owned.observed.ok_or_else(invalid)?;
+        let negative = ac::negative(record.kind);
+        if matches!(record.kind, ac::PREPARE | ac::ISSUE | ac::PROOF | ac::OUTPUT | ac::DETACH | ac::STOP) {
+            self.local_reply(record, 4)?;
+            return Ok(true);
+        }
+        if !negative && (owned.joined.is_some()
+            || owned.candidate.as_ref().is_none_or(|setup| setup.finished())
+            || self.clock() >= owned.candidate_until)
+        {
+            return Ok(true);
+        }
+        let tls = Message { request: record.request, connection, kind: record.kind, body: record.body };
+        let pipe = self.pipe_requests.propose(&tls)?;
+        if let Some(pipe) = pipe {
+            if self.client.try_write(NETWORK_REQUEST, &pipe.encode(false)?)? {
+                self.pipe_requests.submitted(&tls, &pipe)?;
+                return Ok(true);
+            }
+        }
+        if negative {
+            self.listener.as_mut().unwrap().pending_negative = Some(Record {
+                kind: tls.kind, request: tls.request, body: tls.body
+            });
             return Ok(false);
         }
-        let expired = self.listener.as_ref().is_some_and(|owned| self.clock() >= owned.candidate_until);
+        self.local_reply(Record { kind: tls.kind, request: tls.request, body: tls.body }, 2)?;
+        Ok(true)
+    }
+
+    fn service_candidate(&mut self) -> io::Result<bool> {
+        if !self.listener.as_ref().is_some_and(|owned| owned.candidate.is_some() || owned.joined.is_some()) {
+            return Ok(false);
+        }
+        let expired = self.listener.as_ref().is_some_and(|owned|
+            owned.candidate.is_some() && self.clock() >= owned.candidate_until);
         if expired {
             self.listener.as_ref().unwrap().candidate.as_ref().unwrap().cancel();
         }
-        {
-            let owned = self.listener.as_mut().unwrap();
-            if owned.pending_event.is_none() {
-                if let Some(event) = owned.candidate.as_ref().unwrap().drain_events(1)?.pop() {
-                    owned.pending_event = Some((event, false));
-                }
-            }
-        }
-        if let Some((event, credited)) = self.listener.as_mut().unwrap().pending_event.take() {
+        let events = self.listener.as_ref().unwrap().candidate.as_ref()
+            .map(|setup| setup.drain_events(32)).transpose()?.unwrap_or_default();
+        let mut progress = !events.is_empty();
+        for event in events {
             self.live()?;
             match event {
                 SetupEvent::Observed(observation) => {
@@ -321,77 +361,93 @@ impl NativeRuntime {
                     self.listener.as_mut().unwrap().observed = Some(observation.connection);
                 }
                 SetupEvent::Request(record) => {
-                    let connection = self.listener.as_ref().unwrap().observed.ok_or_else(invalid)?;
-                    if matches!(record.kind, ac::PREPARE | ac::ISSUE | ac::PROOF | ac::OUTPUT | ac::DETACH | ac::STOP) {
-                        let unavailable = Record { kind: ac::ERROR, request: record.request, body: vec![4] };
-                        let setup = self.listener.as_ref().unwrap().candidate.as_ref().unwrap();
-                        if setup.finished() { return Ok(true); }
-                        match setup.try_reply(&unavailable) {
-                            Ok(true) => return Ok(true),
-                            Ok(false) => {
-                                self.listener.as_mut().unwrap().pending_event = Some((SetupEvent::Request(record), false));
-                                return Ok(false);
-                            }
-                            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => return Ok(true),
-                            Err(error) => return Err(error),
-                        }
-                    }
-                    let message = Message {
-                        request: record.request,
-                        connection,
-                        kind: record.kind,
-                        body: record.body.clone(),
-                    };
-                    if (expired || self.listener.as_ref().unwrap().candidate.as_ref().unwrap().finished())
-                        && !ac::negative(record.kind)
-                    {
-                        if credited { self.forwarding.abort_unpublished(&message)?; }
-                        return Ok(true);
-                    }
-                    if !credited && !self.forwarding.admit(&message)? {
-                        self.listener.as_mut().unwrap().pending_event = Some((SetupEvent::Request(record), false));
-                        return Ok(false);
-                    }
-                    if !self.client.try_write(NETWORK_REQUEST, &message.encode(false)?)? {
-                        self.listener.as_mut().unwrap().pending_event = Some((SetupEvent::Request(record), true));
-                        return Ok(false);
+                    let owned = self.listener.as_mut().unwrap();
+                    if owned.observed.is_none() { return Err(invalid()); }
+                    if ac::negative(record.kind) {
+                        if owned.pending_negative.is_some() { return Err(invalid()); }
+                        owned.pending_negative = Some(record);
+                    } else {
+                        if owned.pending_regular.len() >= ac::MAX_PENDING { return Err(invalid()); }
+                        owned.pending_regular.push_back(record);
                     }
                 }
                 SetupEvent::ReplyQueued(request) => {
                     let connection = self.listener.as_ref().unwrap().observed.ok_or_else(invalid)?;
                     if let Some(message) = self.reply_custody.remove(&(connection, request)) {
-                        self.forwarding.complete(&message)?;
+                        self.pipe_requests.disposition(&message)?;
                     }
                 }
                 SetupEvent::Pinned(_) => return Err(invalid()),
             }
-            return Ok(true);
         }
-        let observed = self.listener.as_ref().unwrap().observed;
-        if !self.listener.as_ref().unwrap().candidate.as_ref().unwrap().finished() {
-            return Ok(false);
+
+        if let Some(record) = self.listener.as_mut().unwrap().pending_negative.take() {
+            progress |= self.forward_request(record)?;
         }
-        if let Some(connection) = observed {
-            if !self.client.try_write(CONNECTION_CLOSED, &connection)? {
-                return Ok(false);
-            }
-            let keys: Vec<_> = self.reply_custody.keys()
-                .filter(|(id, _)| *id == connection).copied().collect();
-            for key in keys {
-                let message = self.reply_custody.remove(&key).unwrap();
-                self.forwarding.complete(&message)?;
+        if self.listener.as_ref().unwrap().pending_negative.is_none() {
+            for _ in 0..ac::MAX_PENDING {
+                let record = self.listener.as_mut().unwrap().pending_regular.pop_front();
+                let Some(record) = record else { break; };
+                progress |= self.forward_request(record)?;
             }
         }
-        let next_at = self.clock();
-        let owned = self.listener.as_mut().unwrap();
-        let outcome = owned.candidate.as_mut().unwrap().take_finished()?;
-        let Some(outcome) = outcome else { return Err(invalid()); };
-        if outcome.promoted || outcome.pinned_request.is_some() { return Err(invalid()); }
-        owned.candidate = None;
-        owned.observed = None;
-        owned.candidate_until = 0;
-        owned.cooldown_until = next_at.saturating_add(owned.config.policy.cooldown100ns());
-        Ok(true)
+        let local_count = self.listener.as_ref().unwrap().pending_local.len();
+        for _ in 0..local_count {
+            self.live()?;
+            let reply = {
+                let owned = self.listener.as_mut().unwrap();
+                let at = owned.pending_local.iter().position(|(_, negative)| *negative).unwrap_or(0);
+                owned.pending_local.remove(at).unwrap()
+            };
+            let (reply, negative) = reply;
+            let accepted = self.listener.as_ref().unwrap().candidate.as_ref()
+                .filter(|setup| !setup.finished())
+                .map(|setup| setup.try_reply(&reply))
+                .transpose();
+            match accepted {
+                Ok(Some(true)) => progress = true,
+                Ok(Some(false)) => self.listener.as_mut().unwrap().pending_local.push_back((reply, negative)),
+                Ok(None) => progress = true,
+                Err(error) if error.kind() == io::ErrorKind::BrokenPipe => progress = true,
+                Err(error) => return Err(error),
+            }
+        }
+
+        if self.listener.as_ref().unwrap().candidate.as_ref().is_some_and(CandidateSetup::finished) {
+            let outcome = self.listener.as_mut().unwrap().candidate.as_mut().unwrap().take_finished()?;
+            if let Some(outcome) = outcome {
+                if outcome.promoted || outcome.pinned_request.is_some() { return Err(invalid()); }
+                let owned = self.listener.as_mut().unwrap();
+                owned.candidate = None;
+                owned.joined = Some(outcome);
+                progress = true;
+            }
+        }
+        if self.listener.as_ref().unwrap().joined.is_some()
+            && self.listener.as_ref().unwrap().pending_negative.is_none()
+        {
+            let observed = self.listener.as_ref().unwrap().observed;
+            if let Some(connection) = observed {
+                if !self.client.try_write(CONNECTION_CLOSED, &connection)? { return Ok(progress); }
+                let keys: Vec<_> = self.reply_custody.keys()
+                    .filter(|(id, _)| *id == connection).copied().collect();
+                for key in keys {
+                    let reply = self.reply_custody.remove(&key).unwrap();
+                    self.pipe_requests.disposition(&reply)?;
+                }
+                self.pipe_requests.retire_route(connection);
+            }
+            let next_at = self.clock();
+            let owned = self.listener.as_mut().unwrap();
+            owned.joined = None;
+            owned.observed = None;
+            owned.candidate_until = 0;
+            owned.pending_regular.clear();
+            owned.pending_local.clear();
+            owned.cooldown_until = next_at.saturating_add(owned.config.policy.cooldown100ns());
+            progress = true;
+        }
+        Ok(progress)
     }
 
     fn drain_listener(&mut self) -> io::Result<bool> {

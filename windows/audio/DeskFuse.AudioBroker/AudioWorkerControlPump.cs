@@ -40,6 +40,8 @@ internal sealed class AudioWorkerControlPump
         internal readonly TaskCompletionSource<bool> Done = new(TaskCreationOptions.RunContinuationsAsynchronously);
     }
     private readonly HashSet<Reply> replies = [];
+    private readonly SemaphoreSlim regularReplySlots = new(8, 8);
+    private readonly SemaphoreSlim negativeReplySlot = new(1, 1);
     internal AudioWorkerControlPump(AudioWorkerControl control, Func<AudioWorkerFrame, bool> tryPost, Action<Exception> onFailure)
     { this.control = control; post = tryPost; this.onFailure = onFailure; reader = ReadLoop(); }
 
@@ -173,19 +175,36 @@ internal sealed class AudioWorkerControlPump
         }
         catch (Exception error) { Fail(error); throw; }
     }
-    internal Task SendReplyAsync(byte[] body, bool negative)
+    internal Task SendReplyAsync(byte[] body, bool negative) => SendReplyAsync(body, negative, () => { });
+    internal async Task SendReplyAsync(byte[] body, bool negative, Action reserved)
     {
         if (body.Length >= AudioWorkerControl.MaxFrame) throw new InvalidDataException("Oversized native reply.");
         var snapshot = body.ToArray(); _ = AudioWorkerNetworkProtocol.Parse(snapshot, reply: true);
-        Reply value;
-        lock (gate)
+        var capacity = negative ? negativeReplySlot : regularReplySlots;
+        await capacity.WaitAsync(lifetime.Token).ConfigureAwait(false);
+        Reply? value = null;
+        bool started = false;
+        try
         {
-            RequireLive();
-            if (replies.Count(p => p.Negative == negative) >= (negative ? 1 : 8))
-                throw new InvalidOperationException("Native reply capacity is occupied.");
-            value = new(negative); replies.Add(value);
+            lock (gate)
+            {
+                RequireLive();
+                value = new(negative); replies.Add(value);
+            }
+            reserved();
+            started = true;
+            await WriteReply(value, snapshot).ConfigureAwait(false);
+            await value.Done.Task.ConfigureAwait(false);
         }
-        _ = WriteReply(value, snapshot); return value.Done.Task;
+        finally
+        {
+            if (!started && value is not null)
+            {
+                lock (gate) replies.Remove(value);
+                value.Done.TrySetResult(true);
+            }
+            capacity.Release();
+        }
     }
     private async Task WriteReply(Reply value, byte[] body)
     {

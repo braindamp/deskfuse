@@ -15,12 +15,15 @@ public sealed class AudioWorkerControlTests
         byte[] Reply(ulong request, byte kind) => AudioWorkerNetworkProtocol.Encode(new(request, Guid.Parse("11111111-1111-1111-1111-111111111111"), kind, [1]), reply: true);
         var work = Enumerable.Range(1, 8).Select(i => pump.SendReplyAsync(Reply((ulong)i, 129), false)).ToList();
         _ = await remote.ReadAsync(CancellationToken.None);
-        Assert.Throws<InvalidOperationException>(() => { _ = pump.SendReplyAsync(Reply(9, 129), false); });
+        var regularWaiter = pump.SendReplyAsync(Reply(9, 129), false);
+        Assert.False(regularWaiter.IsCompleted);
         work.Add(pump.SendReplyAsync(Reply(9, 255), true));
-        Assert.Throws<InvalidOperationException>(() => { _ = pump.SendReplyAsync(Reply(10, 255), true); });
+        var negativeWaiter = pump.SendReplyAsync(Reply(10, 255), true);
+        Assert.False(negativeWaiter.IsCompleted);
         barrier.SetResult(true);
-        for (var i = 0; i < 8; i++) Assert.Equal(AudioWorkerFrameKind.NetworkReply, (await remote.ReadAsync(CancellationToken.None)).Kind);
-        await Task.WhenAll(work).WaitAsync(TimeSpan.FromSeconds(3)); await pump.StopAndJoinAsync();
+        for (var i = 0; i < 10; i++) Assert.Equal(AudioWorkerFrameKind.NetworkReply, (await remote.ReadAsync(CancellationToken.None)).Kind);
+        await Task.WhenAll(work.Append(regularWaiter).Append(negativeWaiter)).WaitAsync(TimeSpan.FromSeconds(3));
+        await pump.StopAndJoinAsync();
     }
     private static AudioControlGrant Grant()
     {

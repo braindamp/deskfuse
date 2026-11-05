@@ -29,12 +29,13 @@ internal sealed class BrokerAudioControlDispatcher : IAudioWorkerEventOwner
     private readonly Func<BrokerAudioOwner.StopStatus, byte[]> signStopStatus;
     private readonly Func<BrokerAudioOwner.Committed, Task> prepareSource;
     private readonly Func<Task<bool>> publish;
-    private readonly Func<byte[], bool, Task> send;
+    private readonly Func<byte[], bool, Action, Task> send;
     private readonly Action<Exception> fail;
     private readonly Action requestRundown;
     private int rundownRequested;
     private readonly Dictionary<Guid, Route> routes = [];
     private readonly HashSet<Job> jobs = [];
+    private readonly HashSet<Job> executing = [];
     private readonly SemaphoreSlim positive = new(1, 1);
     private AudioDeliveryDescriptor? nomination;
     private bool stopping;
@@ -44,7 +45,7 @@ internal sealed class BrokerAudioControlDispatcher : IAudioWorkerEventOwner
     internal BrokerAudioControlDispatcher(BrokerAudioOwner owner, IBrokerAudioWorker worker, IAudioGrantSigner grants,
         Func<BrokerAudioOwner.RequestStatus, byte[]> signStatus, Func<BrokerAudioOwner.StopStatus, byte[]> signStopStatus,
         Func<BrokerAudioOwner.Committed, Task> prepareSource, Action requestRundown, Func<Task<bool>> publish,
-        Func<byte[], bool, Task> send, Action<Exception> fail)
+        Func<byte[], bool, Action, Task> send, Action<Exception> fail)
     {
         if (!owner.IsWorker(worker)) throw new UnauthorizedAccessException("Foreign control worker.");
         this.owner = owner; this.worker = worker; this.grants = grants; this.signStatus = signStatus; this.signStopStatus = signStopStatus;
@@ -66,9 +67,11 @@ internal sealed class BrokerAudioControlDispatcher : IAudioWorkerEventOwner
             if (frame.Kind == AudioWorkerFrameKind.ConnectionClosed)
             {
                 if (!routes.Remove(AudioWorkerNetworkProtocol.Closed(frame.Body), out var route)) return false;
-                owner.ConnectionClosed(route.Origin);
-                lifecycleDirty = true;
-                if (lifecycle is null || lifecycle.IsCompleted) lifecycle = Task.Run(PublishLifecycle);
+                if (owner.ConnectionClosed(route.Origin))
+                {
+                    lifecycleDirty = true;
+                    if (lifecycle is null || lifecycle.IsCompleted) lifecycle = Task.Run(PublishLifecycle);
+                }
                 return true;
             }
             if (frame.Kind != AudioWorkerFrameKind.NetworkRequest) return false;
@@ -78,8 +81,8 @@ internal sealed class BrokerAudioControlDispatcher : IAudioWorkerEventOwner
             var negative = AudioWorkerNetworkProtocol.Negative(message.Kind);
             // Native forwarding credits use the same worker-wide budget. Public
             // candidate overload is dropped/rejected there, never overfills this pipe.
-            if (jobs.Count(p => p.Negative == negative) >= (negative ? 1 : 8)) return false;
-            job = new(message, origin, negative); origin.LastRequest = message.Request; jobs.Add(job);
+            if (executing.Count(p => p.Negative == negative) >= (negative ? 1 : 8)) return false;
+            job = new(message, origin, negative); origin.LastRequest = message.Request; jobs.Add(job); executing.Add(job);
             try
             {
                 if (message.Kind == (byte)AudioNetworkKind.SignedSourceStop)
@@ -111,10 +114,11 @@ internal sealed class BrokerAudioControlDispatcher : IAudioWorkerEventOwner
             // Even a closed TLS route receives its pipe completion. The native
             // owner then releases the retained forwarding credit and drops the
             // undeliverable network reply; closure cannot abandon actual work.
-            await send(AudioWorkerNetworkProtocol.Encode(new(job.Message.Request, job.Message.Connection, kind, body), reply: true), job.Negative).ConfigureAwait(false);
+            await send(AudioWorkerNetworkProtocol.Encode(new(job.Message.Request, job.Message.Connection, kind, body), reply: true),
+                job.Negative, () => { lock (gate) executing.Remove(job); }).ConfigureAwait(false);
         }
         catch (Exception error) { owner.CloseAdmission(); fail(error); }
-        finally { lock (gate) jobs.Remove(job); job.Done.TrySetResult(true); }
+        finally { lock (gate) { jobs.Remove(job); executing.Remove(job); } job.Done.TrySetResult(true); }
     }
     private async Task<byte[]> Execute(Job job)
     {

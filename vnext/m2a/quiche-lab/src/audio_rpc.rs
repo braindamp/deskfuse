@@ -107,23 +107,19 @@ pub struct Forwarding {
     pending: std::collections::BTreeMap<([u8; 16], u64), u8>,
 }
 impl Forwarding {
-    pub fn admit(&mut self, message: &Message) -> io::Result<bool> {
+    pub fn available(&self, message: &Message) -> io::Result<bool> {
         message.encode(false)?;
         let key = (message.connection, message.request);
         if self.pending.contains_key(&key) {
             return Err(c::invalid());
         }
         let negative = c::negative(message.kind);
-        if self
-            .pending
-            .values()
-            .filter(|k| c::negative(**k) == negative)
-            .count()
-            >= if negative { 1 } else { c::MAX_PENDING }
-        {
-            return Ok(false);
-        }
-        self.pending.insert(key, message.kind);
+        Ok(self.pending.values().filter(|kind| c::negative(**kind) == negative).count()
+            < if negative { 1 } else { c::MAX_PENDING })
+    }
+    pub fn admit(&mut self, message: &Message) -> io::Result<bool> {
+        if !self.available(message)? { return Ok(false); }
+        self.pending.insert((message.connection, message.request), message.kind);
         Ok(true)
     }
     pub(crate) fn abort_unpublished(&mut self, message: &Message) -> io::Result<()> {
@@ -151,9 +147,106 @@ impl Forwarding {
     }
 }
 
+
+#[derive(Default)]
+pub struct PipeRequests {
+    forwarding: Forwarding,
+    last: std::collections::BTreeMap<[u8; 16], u64>,
+    mapped: std::collections::BTreeMap<([u8; 16], u64), (u64, u8)>,
+}
+impl PipeRequests {
+    pub fn propose(&self, tls: &Message) -> io::Result<Option<Message>> {
+        if !self.forwarding.available(tls)? { return Ok(None); }
+        let request = self.last.get(&tls.connection).copied().unwrap_or(0)
+            .checked_add(1).ok_or_else(c::invalid)?;
+        let pipe = Message { request, connection: tls.connection, kind: tls.kind, body: tls.body.clone() };
+        pipe.encode(false)?;
+        Ok(Some(pipe))
+    }
+    pub fn submitted(&mut self, tls: &Message, pipe: &Message) -> io::Result<()> {
+        if self.propose(tls)?.as_ref() != Some(pipe) { return Err(c::invalid()); }
+        if !self.forwarding.admit(tls)? { return Err(c::invalid()); }
+        let key = (pipe.connection, pipe.request);
+        if self.mapped.insert(key, (tls.request, tls.kind)).is_some() { return Err(c::invalid()); }
+        self.last.insert(pipe.connection, pipe.request);
+        Ok(())
+    }
+    pub fn reply(&mut self, pipe: Message) -> io::Result<Message> {
+        let key = (pipe.connection, pipe.request);
+        let (tls_id, kind) = self.mapped.get(&key).copied().ok_or_else(c::invalid)?;
+        if pipe.kind != c::ERROR && pipe.kind != kind + 128 {
+            return Err(c::invalid());
+        }
+        let tls = Message { request: tls_id, ..pipe };
+        self.forwarding.validate_reply(&tls)?;
+        self.mapped.remove(&key);
+        Ok(tls)
+    }
+    pub fn disposition(&mut self, tls: &Message) -> io::Result<()> {
+        self.forwarding.complete(tls)
+    }
+    pub fn retire_route(&mut self, connection: [u8; 16]) {
+        self.last.remove(&connection);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pipe_admission_numbers_only_submitted_requests_and_retains_reply_credit() {
+        let mut routes = PipeRequests::default();
+        let connection = [17; 16];
+        let make = |request, kind, body: Vec<u8>| Message { request, connection, kind, body };
+        let first = make(1, c::INFO, vec![]);
+        let pipe_first = routes.propose(&first).unwrap().unwrap();
+        assert_eq!(pipe_first.request, 1);
+        routes.submitted(&first, &pipe_first).unwrap();
+
+        let rejected = make(2, c::ISSUE, vec![0; 53]);
+        assert!(routes.propose(&rejected).is_err());
+        let next = make(3, c::INFO, vec![]);
+        let pipe_next = routes.propose(&next).unwrap().unwrap();
+        assert_eq!(pipe_next.request, 2);
+        routes.submitted(&next, &pipe_next).unwrap();
+
+        let reply = routes.reply(Message { kind: 129, ..pipe_first }).unwrap();
+        assert_eq!(reply.request, 1);
+        assert!(routes.forwarding.pending.contains_key(&(connection, 1)));
+        routes.disposition(&reply).unwrap();
+        let reply = routes.reply(Message { kind: c::ERROR, body: vec![1], ..pipe_next }).unwrap();
+        assert_eq!(reply.request, 3);
+        routes.disposition(&reply).unwrap();
+
+        for request in 4..=11 {
+            let tls = make(request, c::INFO, vec![]);
+            let pipe = routes.propose(&tls).unwrap().unwrap();
+            assert_eq!(pipe.request, request - 1);
+            routes.submitted(&tls, &pipe).unwrap();
+        }
+        let next = make(12, c::INFO, vec![]);
+        assert!(routes.propose(&next).unwrap().is_none());
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../tools/protocol3/audio-source-stop-v1.json"
+        )).unwrap();
+        let hex = fixture["signedStopHex"].as_str().unwrap();
+        let body = (0..hex.len()).step_by(2).map(|i|
+            u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect();
+        let stop = make(13, c::SIGNED_SOURCE_STOP, body);
+        let pipe_stop = routes.propose(&stop).unwrap().unwrap();
+        assert_eq!(pipe_stop.request, 11);
+        assert_eq!(pipe_stop.body, stop.body);
+        routes.submitted(&stop, &pipe_stop).unwrap();
+        assert!(routes.propose(&make(14, c::INFO, vec![])).unwrap().is_none());
+
+        let closed_reply = routes.reply(Message {
+            kind: c::ERROR, body: vec![1], ..pipe_stop
+        }).unwrap();
+        routes.retire_route(connection);
+        assert_eq!(closed_reply.request, stop.request);
+        routes.disposition(&closed_reply).unwrap();
+    }
+
     fn bytes(f: &serde_json::Value, key: &str) -> Vec<u8> {
         let s = f[key].as_str().unwrap();
         (0..s.len())

@@ -213,16 +213,18 @@ internal sealed class BrokerAudioOwner
         if (!ReferenceEquals(origin.Owner, this) || origin.Closed || !connections.TryGetValue(origin.Incarnation, out var actual) ||
             !ReferenceEquals(actual, origin)) throw new UnauthorizedAccessException("Connection is not a retained observation.");
     }
-    internal void ConnectionClosed(Connection origin)
+    internal bool ConnectionClosed(Connection origin)
     {
         lock (gate)
         {
             if (!ReferenceEquals(origin.Owner, this)) throw new UnauthorizedAccessException();
-            if (origin.Closed) return;
+            if (origin.Closed) return false;
             RequireObserved(origin);
+            var before = revision;
             origin.Closed = true; connections.Remove(origin.Incarnation);
             if (phase != AudioAuthorityPhase.Closed && delivery is not null && ReferenceEquals(origin, deliveryOrigin)) Detach(delivery.Intent.Generation);
             if (active is { Result: null } p && (ReferenceEquals(p.Origin, origin) || ReferenceEquals(p.Delivery?.Connection, origin))) Retire(p);
+            return revision != before;
         }
     }
     private void Retire(Pending p, bool publish = true)

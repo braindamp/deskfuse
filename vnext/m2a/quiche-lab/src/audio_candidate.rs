@@ -336,6 +336,7 @@ impl CandidateSetup {
         }
     }
     pub fn cancel(&self) {
+        let _queue = self.shared.lock();
         self.shared.stopping.store(true, Ordering::Release);
         self.shared.changed.notify_one();
     }
