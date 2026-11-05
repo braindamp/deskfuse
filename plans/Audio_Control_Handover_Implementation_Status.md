@@ -292,6 +292,16 @@ implementation environment (no Windows Rust/.NET toolchain). Existing earlier
 checkpoints and their recorded results are unchanged; the new tests do not
 inherit those historical passes.
 
+Subsequent PR verification: GitHub Actions Rust run 41957883881 passed on
+Windows, Ubuntu, macOS ARM64 and macOS Intel. Windows ran **84 native library
+tests** with zero failures/ignores, including the new H2a Windows pipe,
+listener, authority cutoff and cancellation checks. This is CI execution,
+not local Windows validation. The x64 Release worker/DLL staging script
+`tools/build-audio-worker.ps1` remains **NOT RUN**, as do installed service,
+driver, source, endpoint and physical gates. The separate unified CI run
+failed in unchanged Windows C++ thread-handle conversions and Android
+`cargo ndk` environment setup; those are not H2a runtime-test results.
+
 The rest of H2 still requires one UDP receive/routing owner, bounded candidate
 dispatch, actual global RPC forwarding, nomination/pin/transfer, native source
 preparation and old-egress/assembly/ledger retirement. H3/H4, real N4/N5
