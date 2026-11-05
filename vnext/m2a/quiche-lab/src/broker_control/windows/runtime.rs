@@ -37,6 +37,9 @@ struct NativeRuntime {
     pipe_requests: PipeRequests,
     pending_replies: VecDeque<Message>,
     reply_custody: BTreeMap<([u8; 16], u64), Message>,
+    active_regular: VecDeque<([u8; 16], Record)>,
+    active_negative: Option<([u8; 16], Record)>,
+    active_local: VecDeque<([u8; 16], Record, bool)>,
     #[cfg(test)]
     test_clock: Option<Arc<std::sync::atomic::AtomicU64>>,
     #[cfg(test)]
@@ -45,7 +48,7 @@ struct NativeRuntime {
     test_datagram: Option<std::sync::mpsc::Sender<usize>>,
 }
 
-fn now() -> u64 {
+pub(super) fn now() -> u64 {
     let mut value = 0;
     unsafe { QueryInterruptTimePrecise(&mut value); }
     value
@@ -71,6 +74,9 @@ impl NativeRuntime {
             pipe_requests: PipeRequests::default(),
             pending_replies: VecDeque::new(),
             reply_custody: BTreeMap::new(),
+            active_regular: VecDeque::new(),
+            active_negative: None,
+            active_local: VecDeque::new(),
             #[cfg(test)]
             test_clock: None,
             #[cfg(test)]
@@ -102,7 +108,11 @@ impl NativeRuntime {
     fn live(&mut self) -> io::Result<()> {
         if let Some(error) = self.client.failure() { return Err(error); }
         if self.client.terminal() { return Err(retired()); }
-        if self.authority.deadline().is_some() && !self.authority.source_allowed(self.clock()) {
+        let now = self.clock();
+        if self.authority.deadline().is_some() && !self.authority.source_allowed(now) {
+            return Err(expired());
+        }
+        if self.source.as_ref().is_some_and(|source| source.grace_expired(now)) {
             return Err(expired());
         }
         Ok(())
@@ -236,13 +246,16 @@ impl NativeRuntime {
                     self.acknowledge(kind, &body, false)?;
                 }
             }
-            if self.dispatch_replies()? || self.service_candidate()? {
-                continue;
-            }
+            let mut work = self.dispatch_replies()?;
+            work |= self.service_candidate()?;
+            work |= self.service_active()?;
             let mut source_work = false;
             if let Some(source) = self.source.as_mut() {
                 let client = &self.client;
-                source_work = source.pump(&mut self.authority, now, || client.terminal())?;
+                source_work = source.pump(
+                    &mut self.authority, now, || client.terminal(),
+                    self.listener.as_ref().map(|owned| owned._socket.as_ref()),
+                )?;
                 if let Some(listener) = &self.listener {
                     source.service_egress(
                         &mut self.authority, &listener._socket, false,
@@ -251,8 +264,27 @@ impl NativeRuntime {
                 }
             }
             if self.listener.is_some() {
-                if self.drain_listener()? { continue; }
-                if source_work { continue; }
+                let drained = self.drain_listener()?;
+                let ready = self.listener.as_ref().unwrap().events.poll_listener(
+                    self.source.as_ref().map(SourceOwner::period_event),
+                )?;
+                if ready.period {
+                    if let Some(source) = self.source.as_ref() { source.service_period()?; }
+                }
+                if ready.writable {
+                    let owned = self.listener.as_ref().unwrap();
+                    if let Some(source) = self.source.as_mut() {
+                        let client = &self.client;
+                        source.service_egress(
+                            &mut self.authority, &owned._socket, true,
+                            now, || client.terminal(),
+                        )?;
+                    }
+                    if let Some(setup) = self.listener.as_ref().and_then(|owned| owned.candidate.as_ref()) {
+                        setup.writable();
+                    }
+                }
+                if drained || ready.readable || work || source_work { continue; }
                 self.live()?;
                 let timeout = match self.timeout(self.source.as_ref().and_then(SourceOwner::deadline)) {
                     Ok(ms) => ms,
@@ -272,6 +304,7 @@ impl NativeRuntime {
                 let ready = match owned.events.wait_listener(
                     self.client.control_event().as_raw_handle(),
                     self.client.terminal_event().as_raw_handle(),
+                    self.client.capacity_event().as_raw_handle(),
                     self.resume.event(),
                     owned.setup_wake.as_raw_handle(),
                     source_event, period_event,
@@ -288,6 +321,7 @@ impl NativeRuntime {
                 if ready.period {
                     if let Some(source) = self.source.as_ref() { source.service_period()?; }
                 }
+                if ready.readable { continue; }
                 if ready.writable {
                     if let Some(source) = self.source.as_mut() {
                         let client = &self.client;
@@ -306,6 +340,92 @@ impl NativeRuntime {
         }
     }
 
+    fn active_local_reply(&mut self, id: [u8; 16], record: Record, reason: u8) -> io::Result<()> {
+        if self.active_local.len() >= ac::MAX_PENDING + 1 { return Err(invalid()); }
+        self.active_local.push_back((
+            id, Record { kind: ac::ERROR, request: record.request, body: vec![reason] },
+            ac::negative(record.kind),
+        ));
+        Ok(())
+    }
+
+    fn forward_active(&mut self, id: [u8; 16], record: Record) -> io::Result<bool> {
+        let negative = ac::negative(record.kind);
+        if matches!(record.kind, ac::PREPARE | ac::ISSUE | ac::PROOF) {
+            self.active_local_reply(id, record, 4)?;
+            return Ok(true);
+        }
+        let tls = Message { request: record.request, connection: id, kind: record.kind, body: record.body };
+        if let Some(pipe) = self.pipe_requests.propose(&tls)? {
+            if self.client.try_write(NETWORK_REQUEST, &pipe.encode(false)?)? {
+                self.pipe_requests.submitted(&tls, &pipe)?;
+                return Ok(true);
+            }
+        }
+        let record = Record { kind: tls.kind, request: tls.request, body: tls.body };
+        if negative {
+            self.active_negative = Some((id, record));
+            return Ok(false);
+        }
+        self.active_local_reply(id, record, 2)?;
+        Ok(true)
+    }
+
+    fn service_active(&mut self) -> io::Result<bool> {
+        if self.source.is_none() { return Ok(false); }
+        let now = self.clock();
+        let observed = self.source.as_ref().and_then(SourceOwner::connection_id);
+        let events = self.source.as_mut().unwrap().read_control(now)?;
+        let mut work = !events.is_empty();
+        if let Some(id) = observed {
+            for record in events {
+                if ac::negative(record.kind) {
+                    if self.active_negative.is_some() { return Err(invalid()); }
+                    self.active_negative = Some((id, record));
+                } else if self.active_regular.len() < ac::MAX_PENDING {
+                    self.active_regular.push_back((id, record));
+                } else {
+                    self.active_local_reply(id, record, 2)?;
+                }
+            }
+        }
+        if let Some((id, record)) = self.active_negative.take() {
+            work |= self.forward_active(id, record)?;
+        }
+        if self.active_negative.is_none() {
+            for _ in 0..ac::MAX_PENDING {
+                let Some((id, record)) = self.active_regular.pop_front() else { break; };
+                if self.source.as_ref().and_then(SourceOwner::connection_id) == Some(id) {
+                    work |= self.forward_active(id, record)?;
+                }
+            }
+        }
+        let count = self.active_local.len();
+        for _ in 0..count {
+            let (id, record, negative) = self.active_local.pop_front().unwrap();
+            if self.source.as_ref().and_then(SourceOwner::connection_id) != Some(id) {
+                work = true;
+                continue;
+            }
+            match self.source.as_mut().unwrap().reply(record.clone(), now)? {
+                true => work = true,
+                false => self.active_local.push_back((id, record, negative)),
+            }
+        }
+        if let Some(id) = self.source.as_ref().and_then(SourceOwner::pending_close) {
+            if self.active_negative.as_ref().is_none_or(|(pending, _)| *pending != id) {
+                if self.client.try_write(CONNECTION_CLOSED, &id)? {
+                    self.source.as_mut().unwrap().close_submitted(id)?;
+                    self.pipe_requests.retire_route(id);
+                    self.active_regular.retain(|(connection, _)| *connection != id);
+                    self.active_local.retain(|(connection, _, _)| *connection != id);
+                    work = true;
+                }
+            }
+        }
+        Ok(work)
+    }
+
     fn dispatch_replies(&mut self) -> io::Result<bool> {
         let count = self.pending_replies.len();
         let mut dispatched = false;
@@ -317,6 +437,22 @@ impl NativeRuntime {
                 owned.observed == Some(message.connection)
                     && owned.candidate.as_ref().is_some_and(|setup| !setup.finished())
             });
+            if !active && self.source.as_ref().and_then(SourceOwner::connection_id) == Some(message.connection) {
+                let reply = Record {
+                    kind: message.kind, request: message.request, body: message.body.clone(),
+                };
+                let tick = self.clock();
+                if self.source.as_mut().unwrap().reply(reply, tick)? {
+                    self.pipe_requests.disposition(&message)?;
+                    dispatched = true;
+                } else if self.source.as_ref().and_then(SourceOwner::connection_id) == Some(message.connection) {
+                    self.pending_replies.push_back(message);
+                } else {
+                    self.pipe_requests.disposition(&message)?;
+                    dispatched = true;
+                }
+                continue;
+            }
             if active {
                 let reply = Record {
                     kind: message.kind,
@@ -572,6 +708,11 @@ impl NativeRuntime {
     fn timeout(&self, until: Option<Instant>) -> io::Result<u32> {
         let mut remaining = until.map(|deadline| deadline.saturating_duration_since(Instant::now()).as_millis());
         if let Some(cutoff) = self.authority.deadline() {
+            let ticks = cutoff.checked_sub(self.clock()).ok_or_else(expired)?;
+            let ms = u128::from(ticks / 10000) + u128::from(ticks % 10000 != 0);
+            remaining = Some(remaining.map_or(ms, |other| other.min(ms)));
+        }
+        if let Some(cutoff) = self.source.as_ref().and_then(SourceOwner::grace_deadline) {
             let ticks = cutoff.checked_sub(self.clock()).ok_or_else(expired)?;
             let ms = u128::from(ticks / 10000) + u128::from(ticks % 10000 != 0);
             remaining = Some(remaining.map_or(ms, |other| other.min(ms)));

@@ -1,5 +1,5 @@
 use crate::audio_authority::{AudioAuthority, ControlGrant};
-use crate::audio_control::{DeliveryBinding, SourceScope};
+use crate::audio_control::{self as ac, DeliveryBinding, Record, SourceScope};
 use crate::audio_transport::ControlConnection;
 use crate::committed_source::{Block, Source};
 use crate::fresh_anchor::CommitFence;
@@ -40,6 +40,7 @@ struct Delivery {
     ledger: PlaintextExpiry,
     generation: u64,
     digest: [u8; 32],
+    media_queued: bool,
 }
 
 pub(super) struct SourceOwner {
@@ -48,10 +49,20 @@ pub(super) struct SourceOwner {
     delivery: Option<Delivery>,
     sequence: u64,
     fence: Option<CommitFence>,
+    closed: Option<[u8; 16]>,
+    reconnect_until: Option<u64>,
+    authority_until: u64,
+    #[cfg(test)]
+    block_io: bool,
 }
 impl SourceOwner {
     pub(super) fn new(scope: SourceScope, input: Box<dyn Input>) -> Self {
-        Self { scope, input, delivery: None, sequence: 0, fence: None }
+        Self {
+            scope, input, delivery: None, sequence: 0, fence: None,
+            closed: None, reconnect_until: None, authority_until: 0,
+            #[cfg(test)]
+            block_io: false,
+        }
     }
     pub(super) fn source_event(&self) -> HANDLE { self.input.event() }
     pub(super) fn period_event(&self) -> HANDLE { self.input.period() }
@@ -60,12 +71,46 @@ impl SourceOwner {
     pub(super) fn sealed_pending(&self) -> bool {
         self.delivery.as_ref().is_some_and(|d| d.connection.sealed_pending())
     }
+    pub(super) fn connection_id(&self) -> Option<[u8; 16]> {
+        self.delivery.as_ref().and_then(|d| d.connection.observed_id())
+    }
+    pub(super) fn pending_close(&self) -> Option<[u8; 16]> { self.closed }
+    pub(super) fn close_submitted(&mut self, id: [u8; 16]) -> io::Result<()> {
+        if self.closed != Some(id) { return Err(denied()); }
+        self.closed = None;
+        Ok(())
+    }
+    pub(super) fn grace_deadline(&self) -> Option<u64> { self.reconnect_until }
+    pub(super) fn grace_expired(&self, now: u64) -> bool {
+        self.delivery.is_none() && self.reconnect_until.is_some_and(|until| now >= until)
+    }
+    pub(super) fn has_queued_media(&self) -> bool {
+        self.delivery.as_ref().is_some_and(|d|
+            d.ledger.len() != 0 || (d.media_queued && d.connection.sealed_pending()))
+    }
+    pub(super) fn read_control(&mut self, now: u64) -> io::Result<Vec<Record>> {
+        let Some(delivery) = self.delivery.as_mut() else { return Ok(Vec::new()); };
+        match delivery.connection.read_control_limited(now, ac::MAX_PENDING) {
+            Ok(records) => Ok(records),
+            Err(_) => { self.fence_delivery_at(now)?; Ok(Vec::new()) }
+        }
+    }
+    pub(super) fn reply(&mut self, record: Record, now: u64) -> io::Result<bool> {
+        let Some(delivery) = self.delivery.as_mut() else { return Ok(false); };
+        match delivery.connection.queue_control(record, now) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
+            Err(_) => { self.fence_delivery_at(now)?; Ok(false) }
+        }
+    }
     pub(super) fn install(
         &mut self, mut connection: ControlConnection, binding: DeliveryBinding,
         grant: &ControlGrant, local: SocketAddr, now: u64,
     ) -> io::Result<()> {
-        if self.delivery.is_some() || !self.scope.matches(grant)
+        if self.delivery.is_some() || self.closed.is_some()
+            || self.grace_expired(now) || !self.scope.matches(grant)
             || connection.local_endpoint() != local
+            || connection.observed_id().is_none()
             || !connection.approved_for(grant, &binding)
         {
             connection.retire();
@@ -74,39 +119,52 @@ impl SourceOwner {
         self.delivery = Some(Delivery {
             connection, binding, ledger: PlaintextExpiry::default(),
             generation: grant.delivery_generation, digest: grant.delivery_digest,
+            media_queued: false,
         });
+        self.authority_until = grant.until;
+        self.reconnect_until = None;
         if let Err(error) = self.recheck(grant, now) {
-            self.fence_delivery()?;
+            self.fence_delivery_at(now)?;
             return Err(error);
         }
         Ok(())
     }
     pub(super) fn recheck(&mut self, grant: &ControlGrant, now: u64) -> io::Result<()> {
         if !self.scope.matches(grant) || grant.closed || now >= grant.until {
-            self.fence_delivery()?;
+            self.fence_delivery_at(now)?;
             return Err(denied());
         }
+        self.authority_until = grant.until;
         if let Some(delivery) = self.delivery.as_ref() {
             if delivery.generation != grant.delivery_generation
                 || delivery.digest != grant.delivery_digest
             {
-                self.fence_delivery()?;
+                self.fence_delivery_at(now)?;
             } else if !delivery.connection.approved_for(grant, &delivery.binding) {
                 let delivery = self.delivery.as_mut().unwrap();
                 if delivery.connection.install_native(
                     &self.scope, grant.boot, delivery.binding.clone(), grant, now,
                 ).is_err() {
-                    self.fence_delivery()?;
+                    self.fence_delivery_at(now)?;
                     return Err(denied());
                 }
             }
         }
+        if !grant.ready && self.has_queued_media() { self.fence_delivery_at(now)?; }
         Ok(())
     }
     pub(super) fn fence_delivery(&mut self) -> io::Result<()> {
+        self.fence_delivery_at(super::runtime::now())
+    }
+    pub(super) fn fence_delivery_at(&mut self, now: u64) -> io::Result<()> {
         if let Some(mut delivery) = self.delivery.take() {
+            let id = delivery.connection.observed_id().ok_or_else(denied)?;
+            if self.closed.replace(id).is_some() { return Err(denied()); }
             delivery.connection.retire();
             delivery.ledger.clear();
+            self.reconnect_until = Some(
+                now.saturating_add(self.scope.grace100ns).min(self.authority_until)
+            );
             self.fence = Some(self.input.discard_partial(source_age::local_qpc_100ns()?)?);
         }
         Ok(())
@@ -118,13 +176,16 @@ impl SourceOwner {
         &mut self, ciphertext: &mut [u8], info: quiche::RecvInfo, now: u64,
     ) -> io::Result<()> {
         if let Some(delivery) = self.delivery.as_mut() {
-            delivery.connection.receive(ciphertext, info, now)?;
+            if delivery.connection.receive(ciphertext, info, now).is_err() {
+                self.fence_delivery_at(now)?;
+            }
         }
         Ok(())
     }
     pub(super) fn pump(
         &mut self, authority: &mut AudioAuthority,
         mut boot: impl FnMut() -> u64, mut terminal: impl FnMut() -> bool,
+        socket: Option<&UdpSocket>,
     ) -> io::Result<bool> {
         let allowed = !terminal() && authority.media_allowed(boot());
         let mut consumed = false;
@@ -137,11 +198,11 @@ impl SourceOwner {
             )) { continue; }
             if !allowed || self.delivery.is_none() { continue; }
             if terminal() || !authority.media_allowed(boot()) {
-                self.fence_delivery()?;
-                return Err(denied());
+                self.fence_delivery_at(boot())?;
+                return Ok(consumed);
             }
             if self.sequence > u32::MAX as u64 {
-                self.fence_delivery()?;
+                self.fence_delivery_at(boot())?;
                 return Err(denied());
             }
             let header = Header {
@@ -154,12 +215,16 @@ impl SourceOwner {
             };
             self.sequence += 1;
             let delivery = self.delivery.as_mut().unwrap();
-            if delivery.connection.queue_media(
+            match delivery.connection.queue_media(
                 &mut delivery.ledger, &header, &block.pcm,
                 PcmTiming::Committed(block.timing), boot(),
-            ).is_err() {
-                self.fence_delivery()?;
-                return Err(denied());
+            ) {
+                Ok(crate::plaintext_expiry::QueueAdmission::Queued) => delivery.media_queued = true,
+                Ok(_) => {},
+                Err(_) => { self.fence_delivery_at(boot())?; break; }
+            }
+            if let Some(socket) = socket {
+                self.service_egress(authority, socket, false, &mut boot, &mut terminal)?;
             }
         }
         self.input.arm()?;
@@ -170,23 +235,41 @@ impl SourceOwner {
         socket: &UdpSocket, writable: bool,
         mut boot: impl FnMut() -> u64, mut terminal: impl FnMut() -> bool,
     ) -> io::Result<()> {
-        if terminal() || !authority.media_allowed(boot()) {
-            if self.delivery.as_ref().is_some_and(|d|
-                d.connection.sealed_pending() || d.ledger.len() != 0
-            ) {
-                self.fence_delivery()?;
-            }
+        let now = boot();
+        if terminal() || !authority.source_allowed(now) {
+            self.fence_delivery_at(now)?;
+            return Ok(());
+        }
+        let media = authority.media_allowed(now);
+        if !media && self.has_queued_media() {
+            self.fence_delivery_at(now)?;
             return Ok(());
         }
         if let Some(delivery) = self.delivery.as_mut() {
-            let now = boot();
-            if delivery.connection.service_media_egress(
-                &mut delivery.ledger, socket, writable, now,
-                || !terminal() && authority.media_allowed(boot()),
-            ).is_err() {
-                self.fence_delivery()?;
-                return Err(denied());
-            }
+            #[cfg(test)]
+            let blocked = self.block_io;
+            let result = {
+                #[cfg(test)]
+                if blocked {
+                    delivery.connection.service_media_with_io(
+                        &mut delivery.ledger, writable, now,
+                        |_, _| Err(io::Error::from(io::ErrorKind::WouldBlock)),
+                    )
+                } else {
+                    delivery.connection.service_media_egress(
+                        &mut delivery.ledger, socket, writable, now,
+                        || !terminal() && authority.source_allowed(boot())
+                            && (!media || authority.media_allowed(boot())),
+                    )
+                }
+                #[cfg(not(test))]
+                delivery.connection.service_media_egress(
+                    &mut delivery.ledger, socket, writable, now,
+                    || !terminal() && authority.source_allowed(boot())
+                        && (!media || authority.media_allowed(boot())),
+                )
+            };
+            if result.is_err() { self.fence_delivery_at(boot())?; }
         }
         Ok(())
     }
@@ -291,7 +374,7 @@ mod tests {
         let fake = Fake { chunks: VecDeque::from([block]), fences: Arc::clone(&fences) };
         let mut source = SourceOwner::new(scope.clone(), Box::new(fake));
         source.install(native, binding, &grant, "127.0.0.1:44002".parse().unwrap(), 101).unwrap();
-        source.pump(&mut authority, || 102, || false).unwrap();
+        source.pump(&mut authority, || 102, || false, None).unwrap();
         assert_eq!(source.outstanding(), 1);
         source.block_egress(103).unwrap();
         assert!(source.sealed_pending());
@@ -309,7 +392,7 @@ mod tests {
         assert!(!source.sealed_pending());
         assert_eq!(*fences.lock().unwrap(), 1);
         assert_eq!(source.sequence, 1);
-        source.pump(&mut authority, || 105, || false).unwrap();
+        source.pump(&mut authority, || 105, || false, None).unwrap();
         assert_eq!(*fences.lock().unwrap(), 1);
     }
 }

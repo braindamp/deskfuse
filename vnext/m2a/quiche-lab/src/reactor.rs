@@ -309,7 +309,7 @@ pub struct WindowsEvents {
     socket:usize,event:isize,timer:*mut std::ffi::c_void,
 }
 #[cfg(windows)]
-pub struct ListenerReadiness { pub writable: bool, pub period: bool }
+pub struct ListenerReadiness { pub readable: bool, pub writable: bool, pub period: bool }
 #[cfg(windows)]
 impl WindowsEvents {
     /// Control/terminal precede source/network in the kernel wait. These are
@@ -363,15 +363,16 @@ impl WindowsEvents {
     }
     pub fn wait_listener(
         &self, control: *mut std::ffi::c_void, terminal: *mut std::ffi::c_void,
-        resume: *mut std::ffi::c_void, setup_wake: *mut std::ffi::c_void,
+        capacity: *mut std::ffi::c_void, resume: *mut std::ffi::c_void,
+        setup_wake: *mut std::ffi::c_void,
         source: Option<*mut std::ffi::c_void>, period: Option<*mut std::ffi::c_void>,
         setup_done: Option<std::os::windows::io::BorrowedHandle<'_>>, timeout_ms: u32,
     ) -> io::Result<ListenerReadiness> {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::{Networking::WinSock::*, System::Threading::*};
-        let mut handles = [std::ptr::null_mut(); 8];
-        handles[..4].copy_from_slice(&[terminal, control, resume, setup_wake]);
-        let mut count = 4;
+        let mut handles = [std::ptr::null_mut(); 9];
+        handles[..5].copy_from_slice(&[terminal, control, capacity, resume, setup_wake]);
+        let mut count = 5;
         if let Some(event) = source.filter(|handle| !handle.is_null()) {
             handles[count] = event;
             count += 1;
@@ -404,7 +405,7 @@ impl WindowsEvents {
             }
             let period_ready = period_index.is_some_and(|index| result == index as u32);
             if result != udp_index as u32 {
-                return Ok(ListenerReadiness { writable: false, period: period_ready });
+                return Ok(ListenerReadiness { readable: false, writable: false, period: period_ready });
             }
             let mut events: WSANETWORKEVENTS = std::mem::zeroed();
             if WSAEnumNetworkEvents(self.socket, self.event, &mut events) != 0 {
@@ -419,8 +420,34 @@ impl WindowsEvents {
                 }
             }
             Ok(ListenerReadiness {
+                readable: events.lNetworkEvents & FD_READ as i32 != 0,
                 writable: events.lNetworkEvents & FD_WRITE as i32 != 0,
                 period: period_ready,
+            })
+        }
+    }
+    pub fn poll_listener(&self, period: Option<*mut std::ffi::c_void>)
+        -> io::Result<ListenerReadiness> {
+        use windows_sys::Win32::{Networking::WinSock::*, System::Threading::*};
+        unsafe {
+            let mut events: WSANETWORKEVENTS = std::mem::zeroed();
+            if WSAEnumNetworkEvents(self.socket, self.event, &mut events) != 0 {
+                return Err(io::Error::from_raw_os_error(WSAGetLastError()));
+            }
+            if events.lNetworkEvents & FD_CLOSE as i32 != 0 {
+                return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "Listener UDP socket closed"));
+            }
+            for index in [FD_READ_BIT, FD_WRITE_BIT] {
+                if events.iErrorCode[index as usize] != 0 {
+                    return Err(io::Error::from_raw_os_error(events.iErrorCode[index as usize]));
+                }
+            }
+            let period = period.filter(|handle| !handle.is_null())
+                .is_some_and(|handle| WaitForSingleObject(handle, 0) == 0);
+            Ok(ListenerReadiness {
+                readable: events.lNetworkEvents & FD_READ as i32 != 0,
+                writable: events.lNetworkEvents & FD_WRITE as i32 != 0,
+                period,
             })
         }
     }
