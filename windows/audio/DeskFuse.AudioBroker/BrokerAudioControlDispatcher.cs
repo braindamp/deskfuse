@@ -192,7 +192,7 @@ internal sealed class BrokerAudioControlDispatcher : IAudioWorkerEventOwner
                 case AudioNetworkKind.AppliedResult:
                     var applied = AudioWorkerNetworkProtocol.Proof(b.AsSpan(32));
                     var retained = owner.GetAppliedResult(origin, b[..32], applied.Nonce, applied.Signature);
-                    return retained?.SignedReceipt(grants) ?? throw new UnauthorizedAccessException("No retained applied result.");
+                    return retained?.RetainedReceipt() ?? throw new UnauthorizedAccessException("No retained signed result.");
                 case AudioNetworkKind.Output:
                     if (acquisitionOnly) throw new UnauthorizedAccessException("Output is not yet enabled.");
                     owner.ObserveOutput(origin, b[..32], U64(b, 32), U64(b, 40), b[48] == 1);

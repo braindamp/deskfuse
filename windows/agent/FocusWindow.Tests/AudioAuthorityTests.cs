@@ -283,6 +283,52 @@ public sealed class AudioAuthorityTests
     }
 
     [Fact]
+    public async Task Applied_result_never_signs_during_protected_source_preparation()
+    {
+        using var f = new Fixture();
+        var entered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var invoked = 0;
+        var original = new Routing(f, acquisitionOnly: true, prepare: async committed =>
+        {
+            Interlocked.Increment(ref invoked);
+            f.Owner.ClaimPreparation(committed);
+            entered.TrySetResult(true);
+            await release.Task.ConfigureAwait(false);
+            Assert.True(f.Owner.CompletePreparation(committed, f.Observed));
+        });
+        var recovery = new Routing(f, acquisitionOnly: true);
+        try
+        {
+            Assert.True(original.Send(AudioNetworkKind.Issue, IssueBody(AudioOperationKind.AcquireSource, Request(1))));
+            var challenge = AudioRequestProtocol.ParseProof(EnrollmentFraming.ParseSigned((await original.Reply()).Body).Message);
+            var proof = ProofBody(challenge.Facts.Nonce,
+                f.Persistence.SignPhone(AudioRequestProtocol.Proof(challenge.Core, challenge.Binding)));
+            Assert.True(original.Send(AudioNetworkKind.Proof, proof));
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            var before = f.Owner.RequestCounts;
+            var query = Request(1).Concat(proof).ToArray();
+            Assert.True(recovery.Send(AudioNetworkKind.AppliedResult, query));
+            Assert.Equal((byte)255, (await recovery.Reply()).Kind);
+            Assert.Equal(AudioAuthorityPhase.Preparing, f.Owner.Snapshot().Phase);
+            Assert.Equal(before, f.Owner.RequestCounts);
+            release.TrySetResult(true);
+            var signed = (await original.Reply()).Body;
+            Assert.Equal(AudioAuthorityPhase.Prepared, f.Owner.Snapshot().Phase);
+            Assert.True(recovery.Send(AudioNetworkKind.AppliedResult, query));
+            Assert.Equal(signed, (await recovery.Reply()).Body);
+            Assert.Equal(before, f.Owner.RequestCounts);
+            Assert.Equal(1, Volatile.Read(ref invoked));
+        }
+        finally
+        {
+            release.TrySetResult(true);
+            await original.Dispatcher.StopAndJoinAsync();
+            await recovery.Dispatcher.StopAndJoinAsync();
+        }
+    }
+
+    [Fact]
     public async Task Protected_acquisition_rejects_foreign_proof_and_delivery_issue()
     {
         using var f = new Fixture();

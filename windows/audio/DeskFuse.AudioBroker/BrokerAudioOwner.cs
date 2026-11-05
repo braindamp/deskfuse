@@ -750,6 +750,14 @@ internal sealed class BrokerAudioOwner
                 record.SigningMaterialTaken = true; return record.ReceiptBytes.ToArray();
             }
         }
+        internal byte[]? RetainedReceipt()
+        {
+            lock (record.ReceiptGate)
+            {
+                _ = RequireReplyCurrent();
+                return record.SignedReceipt?.ToArray();
+            }
+        }
         internal byte[] SignedReceipt(IAudioGrantSigner signer)
         {
             lock (record.ReceiptGate)
