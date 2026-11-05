@@ -29,6 +29,14 @@ struct Nomination {
     request: [u8; 32],
     generation: u64,
     binding: DeliveryBinding,
+    pin_revision: Option<u64>,
+    pin_until: u64,
+}
+
+struct Promotion {
+    grant: ControlGrant,
+    frame: Vec<u8>,
+    requested: bool,
 }
 
 struct BoundListener {
@@ -69,6 +77,7 @@ struct NativeRuntime {
     source: Option<SourceOwner>,
     preparation: Option<Preparation>,
     prepared_binding: Option<[u8; 32]>,
+    promotion: Option<Promotion>,
     resume: ResumeWake,
     confirmations: VecDeque<Confirmation>,
     pipe_requests: PipeRequests,
@@ -112,7 +121,7 @@ impl NativeRuntime {
         let resume = ResumeWake::register()?;
         Ok(Self {
             client, authority, listener: None, source: None, resume,
-            preparation: None, prepared_binding: None,
+            preparation: None, prepared_binding: None, promotion: None,
             confirmations: VecDeque::new(),
             pipe_requests: PipeRequests::default(),
             pending_replies: VecDeque::new(),
@@ -174,6 +183,25 @@ impl NativeRuntime {
                     return Err(invalid());
                 }
                 let tick = self.clock();
+                let first = !grant.closed && grant.delivery_generation != 0
+                    && self.authority.grant().is_some_and(|previous| previous.delivery_generation == 0);
+                if first {
+                    let previous = self.authority.grant().ok_or_else(invalid)?;
+                    let owned = self.listener.as_ref().ok_or_else(invalid)?;
+                    let nomination = owned.nomination.as_ref().ok_or_else(invalid)?;
+                    if !self.authority.prepared() || self.promotion.is_some()
+                        || self.source.as_ref().is_none_or(SourceOwner::has_delivery)
+                        || owned.observed != Some(nomination.route)
+                        || owned.candidate.as_ref().is_none_or(CandidateSetup::finished)
+                        || nomination.pin_revision != Some(previous.revision)
+                        || grant.revision != previous.revision.checked_add(1).ok_or_else(invalid)?
+                        || grant.until > nomination.pin_until || grant.until > previous.until
+                        || grant.binding != previous.binding
+                        || grant.delivery_generation != nomination.generation
+                        || grant.delivery_digest != nomination.binding.digest
+                        || grant.ready || grant.output_generation != 0
+                    { return Err(invalid()); }
+                }
                 self.authority.apply(grant.clone(), tick)?;
                 if !grant.closed && grant.binding != [0; 32] {
                     if let Some(binding) = self.prepared_binding.take() {
@@ -184,6 +212,11 @@ impl NativeRuntime {
                     if grant.closed { source.fence_delivery()?; }
                     else { source.recheck(&grant, tick)?; }
                 }
+                if first {
+                    self.promotion = Some(Promotion { grant, frame: frame.body, requested: false });
+                    return Ok(None);
+                }
+                if self.promotion.is_some() { return Err(invalid()); }
                 Ok(Some((AUTHORITY_OBSERVED, frame.body)))
             }
             CONFIGURE_LISTENER => {
@@ -247,6 +280,7 @@ impl NativeRuntime {
                                 { return Err(invalid()); }
                                 owned.nomination = Some(Nomination {
                                     route: message.connection, request: n2, generation, binding,
+                                    pin_revision: None, pin_until: 0,
                                 });
                             }
                         }
@@ -634,6 +668,12 @@ impl NativeRuntime {
             self.live()?;
             let message = self.pending_replies.pop_front().unwrap();
             message.encode(true)?;
+            if self.promotion.is_some()
+                && self.listener.as_ref().is_some_and(|owned| owned.observed == Some(message.connection))
+            {
+                self.pending_replies.push_back(message);
+                continue;
+            }
             let active = self.listener.as_ref().is_some_and(|owned| {
                 owned.observed == Some(message.connection)
                     && owned.candidate.as_ref().is_some_and(|setup| !setup.finished())
@@ -857,6 +897,9 @@ impl NativeRuntime {
                     { return Err(invalid()); }
                     pending.confirmed = true;
                     owned.candidate_until = pending.parent.until;
+                    let nomination = owned.nomination.as_mut().ok_or_else(invalid)?;
+                    nomination.pin_revision = Some(pending.parent.revision);
+                    nomination.pin_until = pending.parent.until;
                 },
             }
         }
@@ -899,13 +942,30 @@ impl NativeRuntime {
             }
         }
 
+        if let Some(promotion) = self.promotion.as_mut() {
+            if !promotion.requested {
+                let owned = self.listener.as_ref().ok_or_else(invalid)?;
+                let candidate = owned.candidate.as_ref().ok_or_else(invalid)?;
+                let binding = owned.nomination.as_ref().ok_or_else(invalid)?.binding.clone();
+                if self.source.as_ref().is_none_or(SourceOwner::has_delivery) {
+                    return Err(invalid());
+                }
+                promotion.requested = candidate.try_promote_after_barrier(promotion.grant.clone(), binding)?;
+                progress |= promotion.requested;
+            }
+        }
         if self.listener.as_ref().unwrap().candidate.as_ref().is_some_and(CandidateSetup::finished) {
             let outcome = self.listener.as_mut().unwrap().candidate.as_mut().unwrap().take_finished()?;
             if let Some(outcome) = outcome {
-                if outcome.promoted || outcome.pinned_request.is_some() { return Err(invalid()); }
-                let owned = self.listener.as_mut().unwrap();
-                owned.candidate = None;
-                owned.joined = Some(outcome);
+                if self.promotion.is_some() {
+                    if !outcome.promoted { return Err(invalid()); }
+                    self.adopt_first_delivery(outcome)?;
+                } else {
+                    if outcome.promoted { return Err(invalid()); }
+                    let owned = self.listener.as_mut().unwrap();
+                    owned.candidate = None;
+                    owned.joined = Some(outcome);
+                }
                 progress = true;
             }
         }
@@ -940,6 +1000,46 @@ impl NativeRuntime {
             progress = true;
         }
         Ok(progress)
+    }
+
+    fn adopt_first_delivery(&mut self, mut outcome: CandidateOutcome) -> io::Result<()> {
+        let promotion = self.promotion.take().ok_or_else(invalid)?;
+        let owned = self.listener.as_ref().ok_or_else(invalid)?;
+        let nomination = owned.nomination.as_ref().ok_or_else(invalid)?;
+        if !promotion.requested || !outcome.promoted
+            || outcome.error.is_some() || outcome.pinned_request != Some(nomination.request)
+            || self.authority.grant() != Some(&promotion.grant)
+            || nomination.route != owned.observed.ok_or_else(invalid)?
+        { return Err(invalid()); }
+        let route = nomination.route;
+        let binding = nomination.binding.clone();
+        let local = owned._socket.local_addr()?;
+        let tick = self.clock();
+        let mut connection = outcome.connection.take().ok_or_else(invalid)?;
+        for packet in outcome.staged_packets { packet.receive(&mut connection, tick)?; }
+        let source = self.source.as_mut().ok_or_else(invalid)?;
+        source.install(connection, binding, &promotion.grant, local, tick)?;
+        self.authority.delivery_observed(promotion.grant.delivery_generation, promotion.grant.delivery_digest, tick)?;
+        for reply in outcome.staged_replies {
+            let key = (route, reply.request);
+            let accepted = source.reply(reply.clone(), tick)?;
+            if !source.has_delivery() { return Err(invalid()); }
+            if let Some(message) = self.reply_custody.remove(&key) {
+                if accepted { self.pipe_requests.disposition(&message)?; }
+                else { self.pending_replies.push_back(message); }
+            } else if !accepted {
+                if self.active_local.len() >= ac::MAX_PENDING + 1 { return Err(invalid()); }
+                self.active_local.push_back((route, reply, false));
+            }
+        }
+        let owned = self.listener.as_mut().unwrap();
+        owned.candidate = None;
+        owned.pin = None;
+        owned.nomination = None;
+        owned.nomination_pending = None;
+        owned.candidate_until = 0;
+        self.queue_confirmation(AUTHORITY_OBSERVED, promotion.frame)?;
+        Ok(())
     }
 
     fn drain_listener(&mut self) -> io::Result<bool> {
@@ -980,7 +1080,7 @@ impl NativeRuntime {
             }
         }
         let owned = self.listener.as_ref().unwrap();
-        if owned.joined.is_some() { return Ok(false); }
+        if owned.joined.is_some() || self.source.as_ref().is_some_and(SourceOwner::has_delivery) { return Ok(false); }
         if let Some(setup) = &owned.candidate {
             if setup.routes(header.dcid.as_ref(), info) && !setup.finished() {
                 let _ = setup.try_packet(bytes, quiche::RecvInfo { from, to });
