@@ -10,12 +10,16 @@ internal interface IBrokerEnrollmentRundown
     void RevokeAndJoinAll();
 }
 
-// Implemented by the actual native owner when acquiring its source/grant.
-// Normal return means confirmed source/kernel rundown, never just queued Stop.
+[SupportedOSPlatform("windows")]
+internal interface IBrokerRundownWorker : IBrokerAudioWorker, IDisposable
+{
+    void StopAndJoin();
+}
+// Normal return from resource rundown means confirmed source/kernel cleanup.
 [SupportedOSPlatform("windows")]
 internal interface IBrokerEnrollmentResourceOwner
 {
-    BrokerRegisteredWorker Worker { get; }
+    IBrokerRundownWorker Worker { get; }
     void CloseAdmission();
     void RevokeAndJoin(); // Must retain worker handles; this registry performs final job join.
 }
@@ -30,15 +34,16 @@ internal sealed class BrokerEnrollmentRundown(BrokerAuthorityState authority) : 
         internal readonly IBrokerEnrollmentResourceOwner Owner = owner;
         internal readonly object RetirementGate = new();
         internal bool Retired;
+        internal bool Released;
         internal Task? Stop;
     }
     internal sealed class Completed
     {
-        private readonly BrokerRegisteredWorker worker;
-        private Completed(BrokerRegisteredWorker worker) { this.worker = worker; }
+        private readonly IBrokerRundownWorker worker;
+        private Completed(IBrokerRundownWorker worker) { this.worker = worker; }
         internal bool Matches(IBrokerRegisteredWorker expected) => ReferenceEquals(worker, expected);
-        internal BrokerRegisteredWorker Worker => worker;
-        internal static Completed FromRetiredOwner(BrokerEnrollmentRundown owner, BrokerRegisteredWorker worker)
+        internal IBrokerRundownWorker Worker => worker;
+        internal static Completed FromRetiredOwner(BrokerEnrollmentRundown owner, IBrokerRundownWorker worker)
         {
             lock (owner.gate)
             {
@@ -53,14 +58,19 @@ internal sealed class BrokerEnrollmentRundown(BrokerAuthorityState authority) : 
     private readonly HashSet<Guid> closed = [];
     private bool closing;
 
-    internal void Track(Guid enrollment, IBrokerEnrollmentResourceOwner owner)
+    internal void RegisterAudio(BrokerAudioOwner audio, IBrokerEnrollmentResourceOwner owner)
     {
-        if (!authority.OwnsRegistration(enrollment, owner.Worker)) throw new UnauthorizedAccessException("Native owner has no matching trusted registration.");
+        var worker = owner.Worker;
+        var enrollment = audio.Source.Identity.Enrollment;
+        if (!audio.IsWorker(worker)) throw new UnauthorizedAccessException("Native owner has no matching worker.");
         lock (gate)
         {
-            if (closing || closed.Contains(enrollment) || owners.Count >= 128 || owners.ContainsKey(owner.Worker.Registration))
+            if (closing || closed.Contains(enrollment) || owners.Count >= 128 || owners.ContainsKey(worker.Registration))
                 throw new UnauthorizedAccessException("Native owner registration is closed or already retained.");
-            owners.Add(owner.Worker.Registration, new(enrollment, owner));
+            // Custody is present before the authority registry exposes a speaker.
+            owners.Add(worker.Registration, new(enrollment, owner));
+            try { authority.RegisterAudioOwner(worker, enrollment, audio); }
+            catch { owners.Remove(worker.Registration); throw; }
         }
     }
     public void CloseAdmission(Guid enrollment)
@@ -77,10 +87,11 @@ internal sealed class BrokerEnrollmentRundown(BrokerAuthorityState authority) : 
     public void RevokeAndJoin(Guid enrollment)
     {
         CloseAdmission(enrollment);
-        var workers = authority.CloseEnrollmentAdmission(enrollment);
         Retained[] snapshot;
         lock (gate)
         {
+            // Sample registration and custody in the same turn as owner removal.
+            var workers = authority.CloseEnrollmentAdmission(enrollment);
             if (workers.Any(w => !owners.TryGetValue(w.Registration, out var retained) ||
                     retained.Enrollment != enrollment || !ReferenceEquals(retained.Owner.Worker, w)))
                 throw new InvalidOperationException("Native owner custody is incomplete; replacement remains quarantined.");
@@ -108,6 +119,7 @@ internal sealed class BrokerEnrollmentRundown(BrokerAuthorityState authority) : 
                 return retained.Stop = Task.Run(() => Retire(retained));
             }
         }
+        if (audio.RundownComplete) return Task.CompletedTask;
         audio.QuarantineRundown();
         throw new InvalidOperationException("Source native resource custody is incomplete.");
     }
@@ -115,6 +127,7 @@ internal sealed class BrokerEnrollmentRundown(BrokerAuthorityState authority) : 
     {
         lock (retained.RetirementGate)
         {
+            if (retained.Released) return;
             try
             {
                 if (!retained.Retired)
@@ -125,7 +138,15 @@ internal sealed class BrokerEnrollmentRundown(BrokerAuthorityState authority) : 
                     retained.Owner.Worker.StopAndJoin(); // Actual exact job/process completion.
                     lock (gate) retained.Retired = true;
                 }
-                authority.ConfirmAudioRundown(Completed.FromRetiredOwner(this, retained.Owner.Worker));
+                var worker = retained.Owner.Worker;
+                var completed = Completed.FromRetiredOwner(this, worker);
+                worker.Dispose();
+                authority.ConfirmAudioRundown(completed);
+                lock (gate)
+                {
+                    owners.Remove(worker.Registration);
+                    retained.Released = true;
+                }
             }
             catch { authority.QuarantineAudioRundown(retained.Owner.Worker); throw; }
         }
@@ -139,10 +160,8 @@ internal sealed class BrokerEnrollmentRundown(BrokerAuthorityState authority) : 
     {
         CloseAllAdmission();
         foreach (var id in authority.EnrollmentsWithWorkers()) RevokeAndJoin(id);
-        lock (gate)
-        {
-            foreach (var owner in owners.Values) owner.Owner.Worker.Dispose();
-            owners.Clear();
-        }
+        Retained[] remaining;
+        lock (gate) remaining = owners.Values.ToArray();
+        foreach (var owner in remaining) Retire(owner);
     }
 }

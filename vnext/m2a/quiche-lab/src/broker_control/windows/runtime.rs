@@ -12,6 +12,12 @@ use std::collections::{BTreeMap, VecDeque};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
 
+#[derive(Clone, Copy)]
+enum AcquisitionRpc {
+    Issue(u64),
+    Proof(u64),
+}
+
 struct BoundListener {
     events: crate::reactor::WindowsEvents,
     bytes: Vec<u8>,
@@ -22,9 +28,8 @@ struct BoundListener {
     candidate: Option<CandidateSetup>,
     observation_pending: Option<[u8; 16]>,
     observed: Option<[u8; 16]>,
-    acquisition_issue: Option<u64>,
+    acquisition_rpc: Option<AcquisitionRpc>,
     acquisition_challenge: bool,
-    acquisition_proof: bool,
     pending_regular: VecDeque<Record>,
     pending_negative: Option<Record>,
     pending_local: VecDeque<(Record, bool)>,
@@ -188,9 +193,8 @@ impl NativeRuntime {
                     candidate: None,
                     observation_pending: None,
                     observed: None,
-                    acquisition_issue: None,
+                    acquisition_rpc: None,
                     acquisition_challenge: false,
-                    acquisition_proof: false,
                     pending_regular: VecDeque::new(),
                     pending_negative: None,
                     pending_local: VecDeque::new(),
@@ -202,14 +206,18 @@ impl NativeRuntime {
             }
             NETWORK_REPLY => {
                 let message = self.pipe_requests.reply(Message::parse(&frame.body, true)?)?;
-                if let Some(owned) = self.listener.as_mut().filter(|owned|
-                    owned.observed == Some(message.connection)
-                        && owned.acquisition_issue == Some(message.request)
-                ) {
-                    if message.kind == ac::ISSUE + 128 {
-                        owned.acquisition_challenge = true;
-                    } else {
-                        owned.acquisition_issue = None;
+                if let Some(owned) = self.listener.as_mut().filter(|owned| owned.observed == Some(message.connection)) {
+                    match owned.acquisition_rpc {
+                        Some(AcquisitionRpc::Issue(request)) if request == message.request => {
+                            owned.acquisition_rpc = None;
+                            if message.kind == ac::ISSUE + 128 { owned.acquisition_challenge = true; }
+                        }
+                        Some(AcquisitionRpc::Proof(request)) if request == message.request => {
+                            owned.acquisition_rpc = None;
+                            // A wrong nonce can leave the broker's challenge live.
+                            if message.kind == ac::PROOF + 128 { owned.acquisition_challenge = false; }
+                        }
+                        _ => {}
                     }
                 }
                 if self.pending_replies.len() >= ac::MAX_PENDING + 1 {
@@ -643,18 +651,17 @@ impl NativeRuntime {
         let owned = self.listener.as_ref().ok_or_else(invalid)?;
         let connection = owned.observed.ok_or_else(invalid)?;
         let negative = ac::negative(record.kind);
+        let acquiring = matches!(record.kind, ac::ISSUE | ac::PROOF);
         if matches!(record.kind, ac::PREPARE | ac::OUTPUT | ac::DETACH | ac::STOP)
-            || record.kind == ac::ISSUE && (
-                record.body.first() != Some(&1)
-                    || owned.acquisition_issue.is_some()
-                    || self.source.is_some()
-                    || self.authority.grant().is_some()
-            )
-            || record.kind == ac::PROOF && (
-                !owned.acquisition_challenge || owned.acquisition_proof
-            )
+            || acquiring && (self.source.is_some() || self.authority.grant().is_some())
+            || record.kind == ac::ISSUE && record.body.first() != Some(&1)
+            || record.kind == ac::PROOF && !owned.acquisition_challenge
         {
             self.local_reply(record, 4)?;
+            return Ok(true);
+        }
+        if acquiring && owned.acquisition_rpc.is_some() {
+            self.local_reply(record, 2)?;
             return Ok(true);
         }
         if !negative && (owned.joined.is_some()
@@ -669,9 +676,9 @@ impl NativeRuntime {
             if self.client.try_write(NETWORK_REQUEST, &pipe.encode(false)?)? {
                 self.pipe_requests.submitted(&tls, &pipe)?;
                 if tls.kind == ac::ISSUE {
-                    self.listener.as_mut().unwrap().acquisition_issue = Some(tls.request);
+                    self.listener.as_mut().unwrap().acquisition_rpc = Some(AcquisitionRpc::Issue(tls.request));
                 } else if tls.kind == ac::PROOF {
-                    self.listener.as_mut().unwrap().acquisition_proof = true;
+                    self.listener.as_mut().unwrap().acquisition_rpc = Some(AcquisitionRpc::Proof(tls.request));
                 }
                 return Ok(true);
             }
@@ -789,9 +796,8 @@ impl NativeRuntime {
             let owned = self.listener.as_mut().unwrap();
             owned.joined = None;
             owned.observed = None;
-            owned.acquisition_issue = None;
+            owned.acquisition_rpc = None;
             owned.acquisition_challenge = false;
-            owned.acquisition_proof = false;
             owned.candidate_until = 0;
             owned.pending_regular.clear();
             owned.pending_local.clear();
@@ -1307,7 +1313,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_acquire_issue_and_proof_follow_local_denial_over_real_tls() {
+    fn acquisition_retries_keep_the_same_tls_route_and_contiguous_pipe_ids() {
         use crate::audio_tls::Role;
         use crate::audio_transport::DeliveryTls;
         let (mut runtime, remote) = runtime();
@@ -1385,13 +1391,36 @@ mod tests {
                             assert_eq!(record.body, [42]);
                             assert!(sent_issue && !sent_proof);
                             conn.queue_control(Record {
-                                kind: ac::PROOF, request: 3, body: proof.clone(),
+                                kind: ac::ISSUE, request: 3, body: issue.clone(),
+                            }, now()).unwrap();
+                        }
+                        (131, 3) => {
+                            assert_eq!(record.body, [42]);
+                            assert!(sent_issue && !sent_proof);
+                            let mut wrong = proof.clone();
+                            wrong[0] ^= 1;
+                            conn.queue_control(Record {
+                                kind: ac::PROOF, request: 4, body: wrong,
                             }, now()).unwrap();
                             sent_proof = true;
                         }
-                        (ac::ERROR, 3) => {
+                        (ac::ERROR, 4) => {
                             assert_eq!(record.body, [1]);
                             assert!(sent_proof);
+                            conn.queue_control(Record {
+                                kind: ac::PROOF, request: 5, body: proof.clone(),
+                            }, now()).unwrap();
+                        }
+                        (ac::ERROR, 5) => {
+                            assert_eq!(record.body, [1]);
+                            let mut successor = issue.clone();
+                            successor[1..9].copy_from_slice(&2u64.to_be_bytes());
+                            conn.queue_control(Record {
+                                kind: ac::ISSUE, request: 6, body: successor,
+                            }, now()).unwrap();
+                        }
+                        (131, 6) => {
+                            assert_eq!(record.body, [43]);
                             return;
                         }
                         _ => panic!("unexpected pre-delivery RPC: {} {}", record.kind, record.request),
@@ -1410,14 +1439,24 @@ mod tests {
         remote.write(NETWORK_REPLY, &Message {
             kind: 131, body: vec![42], ..issued
         }.encode(true).unwrap()).unwrap();
-        let (kind, wire) = remote.read(3000).unwrap();
-        assert_eq!(kind, NETWORK_REQUEST);
-        let proved = Message::parse(&wire, false).unwrap();
-        assert_eq!((proved.kind, proved.request), (ac::PROOF, 2));
-        assert_eq!(proved.body, requested_proof);
-        remote.write(NETWORK_REPLY, &Message {
-            kind: ac::ERROR, body: vec![1], ..proved
-        }.encode(true).unwrap()).unwrap();
+        let mut wrong = requested_proof.clone();
+        wrong[0] ^= 1;
+        let mut successor = requested_issue.clone();
+        successor[1..9].copy_from_slice(&2u64.to_be_bytes());
+        for (number, kind, body, reply, result) in [
+            (2, ac::ISSUE, requested_issue, 131, 42),
+            (3, ac::PROOF, wrong, ac::ERROR, 1),
+            (4, ac::PROOF, requested_proof, ac::ERROR, 1),
+            (5, ac::ISSUE, successor, 131, 43),
+        ] {
+            let (frame, wire) = remote.read(3000).unwrap();
+            assert_eq!(frame, NETWORK_REQUEST);
+            let request = Message::parse(&wire, false).unwrap();
+            assert_eq!((request.kind, request.request, &request.body), (kind, number, &body));
+            remote.write(NETWORK_REPLY, &Message {
+                kind: reply, body: vec![result], ..request
+            }.encode(true).unwrap()).unwrap();
+        }
         phone.join().unwrap();
         remote.write(STOP, &[]).unwrap();
         assert!(thread.join().unwrap().is_ok());
@@ -1734,9 +1773,7 @@ mod tests {
             bytes, config, _socket: socket, acknowledgement,
             setup_wake: Arc::new(handle(unsafe { CreateEventW(null(), 0, 0, null()) }).unwrap()),
             candidate: None, observation_pending: None, observed: None,
-                    acquisition_issue: None,
-                    acquisition_challenge: false,
-                    acquisition_proof: false,
+            acquisition_rpc: None, acquisition_challenge: false,
             pending_regular: VecDeque::new(), pending_negative: None,
             pending_local: VecDeque::new(), joined: None,
             cooldown_until: 0, candidate_until: 0,
@@ -1771,9 +1808,7 @@ mod tests {
                 events: crate::reactor::WindowsEvents::new(&_socket)?,
                 bytes, config, _socket, acknowledgement, setup_wake,
                 candidate: None, observation_pending: None, observed: None,
-                    acquisition_issue: None,
-                    acquisition_challenge: false,
-                    acquisition_proof: false,
+                acquisition_rpc: None, acquisition_challenge: false,
                 pending_regular: VecDeque::new(), pending_negative: None,
                 pending_local: VecDeque::new(), joined: None,
                 cooldown_until: 0, candidate_until: 0,

@@ -35,7 +35,7 @@ internal sealed class BrokerCommittedAudioSource : IBrokerEnrollmentResourceOwne
             host.SignAudioRequestStatus, host.SignAudioSourceStopStatus, resource.PrepareAsync,
             resource.RequestRundown, () => session.PublishAuthorityAsync(authority, CancellationToken.None),
             session.SendReplyAsync, _ => resource.RequestRundown(), acquisitionOnly: true);
-        rundown.Track(authority.Source.Identity.Enrollment, resource);
+        rundown.RegisterAudio(authority, resource);
         onTracked?.Invoke();
         try { session.BindEvents(authority, dispatcher, resource.RequestRundown); }
         catch { resource.RequestRundown(); throw; }
@@ -43,6 +43,7 @@ internal sealed class BrokerCommittedAudioSource : IBrokerEnrollmentResourceOwne
     }
 
     public BrokerRegisteredWorker Worker => session.Worker;
+    IBrokerRundownWorker IBrokerEnrollmentResourceOwner.Worker => Worker;
 
     private Task PrepareAsync(BrokerAudioOwner.Committed acquisition)
     {

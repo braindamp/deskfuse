@@ -34,6 +34,7 @@ internal static class BrokerProtectedAudioAcquisition
         registry.RequireSpeakerSourceAvailable(association.DeviceKey);
         var image = deployment.Acquire(BrokerInstalledRole.AudioWorker);
         BrokerRegisteredWorker? worker = null;
+        BrokerAudioWorkerSession? session = null;
         BrokerAudioOwner? owner = null;
         BrokerCommittedAudioSource? resource = null;
         var tracked = false;
@@ -41,7 +42,7 @@ internal static class BrokerProtectedAudioAcquisition
         {
             worker = new BrokerWorkerLauncher().LaunchAudio(image, approvedLogon, AudioDeliveryMode.Game);
             image = null;
-            var session = await BrokerAudioWorkerSession.ConnectAsync(worker, serviceBoot, cancellation)
+            session = await BrokerAudioWorkerSession.ConnectAsync(worker, serviceBoot, cancellation)
                 .ConfigureAwait(false);
             owner = new(registry, worker, session.Caller, enrollmentId, association,
                 AudioSourceBackend.Committed, lease, minimumPeriod, wire, serviceBoot,
@@ -68,8 +69,12 @@ internal static class BrokerProtectedAudioAcquisition
             else if (worker is not null)
             {
                 owner?.CloseAdmission();
-                registry.CloseRegistration(worker.Registration);
-                try { worker.StopAndJoin(); worker.Dispose(); }
+                try
+                {
+                    if (session is not null) await session.StopAndJoinAsync().ConfigureAwait(false);
+                    else worker.StopAndJoin();
+                    worker.Dispose();
+                }
                 catch (Exception cleanup)
                 {
                     throw new BrokerWorkerLaunchIncompleteException(worker, failure, cleanup);

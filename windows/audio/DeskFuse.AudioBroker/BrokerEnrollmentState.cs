@@ -327,6 +327,8 @@ internal sealed class BrokerAuthorityState(IBrokerEnrollments enrollments)
     }
     internal void RegisterAudioOwner(IBrokerAudioWorker worker, Guid enrollment, BrokerAudioOwner owner)
     {
+        if (!owner.UsesRegistry(this) || !owner.IsWorker(worker))
+            throw new UnauthorizedAccessException("Audio ownership is outside this registry or worker.");
         lock (gate)
         {
             var current = CaptureAudioIdentity(worker, enrollment);
@@ -360,13 +362,14 @@ internal sealed class BrokerAuthorityState(IBrokerEnrollments enrollments)
                 throw new UnauthorizedAccessException("Native rundown has no exact retained registration.");
             audio = registration.Audio;
         }
-        if (audio is null) return;
+        if (audio is null) throw new UnauthorizedAccessException("Native rundown has no registered audio owner.");
         audio.ConfirmRundown(completed);
         lock (gate)
         {
             var key = audio.Source.Intent.DeviceKey;
             if (audioSources.TryGetValue(key, out var current) && ReferenceEquals(current, audio))
             { audioSources.Remove(key); completedAudioSources[key] = audio; }
+            registrations.Remove(completed.Worker.Registration);
         }
     }
     internal void QuarantineAudioRundown(IBrokerRegisteredWorker worker)

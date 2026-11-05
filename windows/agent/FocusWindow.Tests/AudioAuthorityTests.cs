@@ -345,6 +345,11 @@ public sealed class AudioAuthorityTests
             Assert.True(foreign.Send(AudioNetworkKind.Proof, proof));
             Assert.Equal((byte)255, (await foreign.Reply()).Kind);
             Assert.Equal(AudioAuthorityPhase.Idle, f.Owner.Snapshot().Phase);
+            var wrongNonce = proof.ToArray();
+            wrongNonce[0] ^= 1;
+            Assert.True(h.Send(AudioNetworkKind.Proof, wrongNonce));
+            Assert.Equal((byte)255, (await h.Reply()).Kind);
+            Assert.Equal(AudioAuthorityPhase.Idle, f.Owner.Snapshot().Phase);
             Assert.True(h.Send(AudioNetworkKind.Proof, proof));
             var receipt = await h.Reply();
             Assert.Equal((byte)132, receipt.Kind);
@@ -1032,13 +1037,105 @@ public sealed class AudioAuthorityTests
         Assert.Equal(receipt, applied.SignedReceipt(signer)); Assert.Equal(1, signer.Calls);
         Assert.Throws<UnauthorizedAccessException>(() => applied.TakeReceiptBytesForSigning());
     }
-    private sealed class Worker : IBrokerAudioWorker
+    [Fact]
+    public async Task Failed_startup_does_not_publish_a_speaker_without_rundown_custody()
+    {
+        using var f = new Fixture();
+        var rundown = new BrokerEnrollmentRundown(f.Registry);
+        var worker = new Worker();
+        var audio = f.CreateOwner(worker);
+        var resource = new TestResource(worker);
+        // The authority registry rejects the occupied speaker after the
+        // rundown owner has reserved its private slot.
+        Assert.Throws<InvalidOperationException>(() => rundown.RegisterAudio(audio, resource));
+        Assert.False(f.Registry.OwnsRegistration(f.Persistence.Id, worker));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => rundown.StopSource(audio));
+        Assert.Equal(0, resource.Joins);
+
+        using var fresh = new EnrollmentDurabilityTests.Fixture();
+        using var store = fresh.Open();
+        var registry = new BrokerAuthorityState(store);
+        var foreign = CreateRundownSource(fresh, store, new BrokerAuthorityState(store), worker);
+        Assert.Throws<UnauthorizedAccessException>(() => new BrokerEnrollmentRundown(registry).RegisterAudio(foreign, resource));
+        registry.RequireSpeakerSourceAvailable(foreign.Source.Intent.DeviceKey);
+        var closed = new BrokerEnrollmentRundown(registry);
+        closed.CloseAllAdmission();
+        var untracked = CreateRundownSource(fresh, store, registry, worker);
+        Assert.Throws<UnauthorizedAccessException>(() => closed.RegisterAudio(untracked, resource));
+        registry.RequireSpeakerSourceAvailable(untracked.Source.Intent.DeviceKey);
+        closed.RevokeAndJoin(fresh.Id);
+        Assert.Equal(0, resource.Joins);
+    }
+
+    [Fact]
+    public async Task Confirmed_rundown_reclaims_worker_slots_and_keeps_terminal_status()
+    {
+        using var persistence = new EnrollmentDurabilityTests.Fixture();
+        using var store = persistence.Open();
+        var registry = new BrokerAuthorityState(store);
+        var rundown = new BrokerEnrollmentRundown(registry);
+        for (var i = 0; i < 129; i++)
+        {
+            var worker = new Worker();
+            var audio = CreateRundownSource(persistence, store, registry, worker);
+            var resource = new TestResource(worker);
+            rundown.RegisterAudio(audio, resource);
+            if (i == 0)
+            {
+                worker.FailJoin = true;
+                await Assert.ThrowsAsync<IOException>(() => rundown.StopSource(audio));
+                Assert.False(worker.Disposed);
+                Assert.Throws<InvalidOperationException>(() => registry.RequireSpeakerSourceAvailable(audio.Source.Intent.DeviceKey));
+                worker.FailJoin = false;
+            }
+            await rundown.StopSource(audio);
+            await rundown.StopSource(audio);
+            Assert.True(worker.Disposed);
+            Assert.Equal(i == 0 ? 2 : 1, resource.Joins);
+            registry.RequireSpeakerSourceAvailable(audio.Source.Intent.DeviceKey);
+            var target = AudioSourceStopProtocol.Target(audio.Source, Nonce(3));
+            var reply = registry.QueryAudioStopStatus(AudioSourceStopProtocol.StatusQuery(Nonce(91), target),
+                status => persistence.SignHost(AudioSourceStopProtocol.Status(status.Snapshot)));
+            Assert.Equal(AudioSourceStopState.RundownComplete,
+                AudioSourceStopProtocol.ParseStatus(EnrollmentFraming.ParseSigned(reply).Message).State);
+        }
+        rundown.RevokeAndJoin(persistence.Id);
+    }
+
+    private static BrokerAudioOwner CreateRundownSource(EnrollmentDurabilityTests.Fixture persistence,
+        TrustedBrokerEnrollmentStore store, BrokerAuthorityState registry, Worker worker) =>
+        new(registry, worker, new Caller(worker), persistence.Id, store.GetSpeakerAssociation(persistence.Id),
+            AudioSourceBackend.Committed, new(1000, 200), false, new(2, 3, 4), Nonce(3), () => 10000000,
+            challenge => persistence.SignHost(AudioRequestProtocol.ChallengeMessage(challenge.Transcript)));
+
+    private sealed class TestResource(Worker worker) : IBrokerEnrollmentResourceOwner
+    {
+        public IBrokerRundownWorker Worker => worker;
+        internal int Joins;
+        public void CloseAdmission() { }
+        public void RevokeAndJoin() => Joins++;
+    }
+
+    private sealed class Worker : IBrokerRundownWorker
     {
         public Guid Registration { get; } = Guid.NewGuid();
         public BrokerLogonIdentity Logon { get; } = new(TrustedEnrollmentProtocolTests.User, TrustedEnrollmentProtocolTests.Logon, 42, 1);
         public uint ProcessId => 101; public ulong CreationFileTime => 200;
         public byte[] InstalledProfileSha256 => Nonce(7);
-        public bool IsAlive() => true;
+        private bool stopped;
+        internal bool FailJoin;
+        internal bool Disposed;
+        public bool IsAlive() => !stopped;
+        public void StopAndJoin()
+        {
+            if (FailJoin) throw new IOException("Worker exit is unconfirmed.");
+            stopped = true;
+        }
+        public void Dispose()
+        {
+            if (!stopped) throw new InvalidOperationException("Worker still owns its job.");
+            Disposed = true;
+        }
     }
     private sealed class Caller(IBrokerRegisteredWorker worker, Action? before = null) : IBrokerObservedCaller
     { public bool Matches(IBrokerRegisteredWorker actual) { before?.Invoke(); return ReferenceEquals(worker, actual); } }
@@ -1056,9 +1153,15 @@ public sealed class AudioAuthorityTests
         internal readonly BrokerAudioOwner Owner;
         private readonly Worker worker;
         internal IBrokerAudioWorker AudioWorker => worker;
-        internal BrokerAudioOwner ReplacementOwner(Worker replacement) => new(Registry, replacement, new Caller(replacement), Persistence.Id,
+        internal BrokerAudioOwner CreateOwner(Worker replacement) => new(Registry, replacement, new Caller(replacement), Persistence.Id,
             store.GetSpeakerAssociation(Persistence.Id), AudioSourceBackend.Committed, new(1000, 200), false, new(2, 3, 4), Nonce(3), () => Now,
             challenge => Persistence.SignHost(AudioRequestProtocol.ChallengeMessage(challenge.Transcript)));
+        internal BrokerAudioOwner ReplacementOwner(Worker replacement)
+        {
+            var owner = CreateOwner(replacement);
+            Registry.RegisterAudioOwner(replacement, Persistence.Id, owner);
+            return owner;
+        }
         internal BrokerAudioOwner.Connection Origin;
         internal ulong Now = 10000000;
         internal byte[]? LastProof;
@@ -1073,6 +1176,7 @@ public sealed class AudioAuthorityTests
             Owner = new(Registry, worker, new Caller(worker, () => BeforeCallerMatch?.Invoke()), Persistence.Id, store.GetSpeakerAssociation(Persistence.Id), AudioSourceBackend.Committed,
                 new(1000, 200), false, new(2, 3, 4), Nonce(3), () => { var hook = BeforeClockRead; BeforeClockRead = null; hook?.Invoke(); return Now; },
                 challenge => { BeforeChallengeSign?.Invoke(); return Persistence.SignHost(AudioRequestProtocol.ChallengeMessage(challenge.Transcript)); });
+            Registry.RegisterAudioOwner(worker, Persistence.Id, Owner);
             Origin = NewConnection(4, 5, 6);
         }
         internal BrokerAudioOwner.Connection NewConnection(byte native, byte phone, byte nonce)

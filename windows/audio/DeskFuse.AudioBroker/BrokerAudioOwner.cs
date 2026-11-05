@@ -120,10 +120,12 @@ internal sealed class BrokerAudioOwner
         this.registry = registry; this.caller = caller; this.worker = worker; clock = suspendInclusive100ns; boot = serviceBoot.ToArray();
         var identity = registry.CaptureAudioIdentity(worker, enrollment); association.RequireMatch(identity);
         Source = new(identity, new(Guid.NewGuid(), 1, association.DeviceKey, backend, worker.InstalledProfileSha256, minimumPeriod, policy, wire));
-        registry.RegisterAudioOwner(worker, enrollment, this);
         authority = new(registry.BindCaller(caller), () => checked((long)(Now() / 10000)), signChallenge);
     }
     internal bool IsWorker(IBrokerRegisteredWorker expected) => ReferenceEquals(worker, expected);
+    internal bool UsesRegistry(BrokerAuthorityState expected) => ReferenceEquals(registry, expected);
+    internal bool RundownComplete
+    { get { lock (gate) return stopState == AudioSourceStopState.RundownComplete; } }
 
     private ulong Now()
     {

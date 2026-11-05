@@ -415,7 +415,7 @@ internal sealed class BrokerWorkerLauncher
 
 /// <summary>Retained process object created by the broker. No public PID-based registration path exists.</summary>
 [SupportedOSPlatform("windows")]
-internal sealed class BrokerRegisteredWorker : IBrokerAudioWorker, IDisposable
+internal sealed class BrokerRegisteredWorker : IBrokerRundownWorker
 {
     internal SafeProcessHandle ProcessHandle { get; }
     internal SafeWaitHandle ThreadHandle { get; }
@@ -461,6 +461,7 @@ internal sealed class BrokerRegisteredWorker : IBrokerAudioWorker, IDisposable
         job.RequireEmpty();
         stopped = true;
     }
+    void IBrokerRundownWorker.StopAndJoin() => StopAndJoin();
     public void Dispose()
     {
         if (disposed) return;
