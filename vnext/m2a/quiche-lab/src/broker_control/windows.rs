@@ -20,6 +20,7 @@ struct Control {
     server: OwnedHandle,
     server_pid: u32,
     server_created: u64,
+    cancelled: OwnedHandle,
 }
 
 impl Control {
@@ -62,11 +63,13 @@ impl Control {
         let mut again = 0;
         if created == 0 || unsafe { WaitForSingleObject(server.as_raw_handle(), 0) } != WAIT_TIMEOUT ||
             unsafe { GetNamedPipeServerProcessId(pipe.as_raw_handle(), &mut again) } == 0 || again != pid { return Err(invalid()); }
-        Ok(Self { pipe, server, server_pid: pid, server_created: created })
+        let cancelled=handle(unsafe{CreateEventW(null(),1,0,null())})?;
+        Ok(Self { pipe, server, server_pid: pid, server_created: created,cancelled })
     }
 
     fn transfer(&self, buffer: &mut [u8], write: bool, timeout_ms: u32) -> io::Result<usize> {
         if buffer.is_empty() || buffer.len() > MAX_FRAME + 4 { return Err(invalid()); }
+        if unsafe{WaitForSingleObject(self.cancelled.as_raw_handle(),0)}!=WAIT_TIMEOUT {return Err(io::Error::new(io::ErrorKind::BrokenPipe,"Control retired"));}
         let event = handle(unsafe { CreateEventW(null(), 1, 0, null()) })?;
         let mut operation: OVERLAPPED = unsafe { std::mem::zeroed() }; operation.hEvent = event.as_raw_handle();
         let mut count = 0;
@@ -78,8 +81,8 @@ impl Control {
         if ok == 0 {
             let error = io::Error::last_os_error();
             if error.raw_os_error() != Some(ERROR_IO_PENDING as i32) { return Err(error); }
-            let handles = [event.as_raw_handle(), self.server.as_raw_handle()];
-            let result = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, timeout_ms) };
+            let handles = [event.as_raw_handle(), self.server.as_raw_handle(),self.cancelled.as_raw_handle()];
+            let result = unsafe { WaitForMultipleObjects(3, handles.as_ptr(), 0, timeout_ms) };
             if result != WAIT_OBJECT_0 {
                 // Even cancellation rejection/late completion does not permit
                 // releasing operation storage until GetOverlappedResult joins.
@@ -120,7 +123,14 @@ impl Control {
         record.extend_from_slice(&((body.len() + 1) as u32).to_be_bytes()); record.push(kind); record.extend_from_slice(body);
         self.exact(&mut record, true, 3000)
     }
+    fn cancel(&self) {
+        // Persistent cancellation also covers a reader between header/body or
+        // successive transfers; a single CancelIoEx call alone has that race.
+        unsafe{SetEvent(self.cancelled.as_raw_handle());CancelIoEx(self.pipe.as_raw_handle(),null());}
+    }
 }
+
+pub mod channel;
 
 unsafe fn require_descriptor(pipe: HANDLE) -> io::Result<()> {
     let mut descriptor = null_mut();

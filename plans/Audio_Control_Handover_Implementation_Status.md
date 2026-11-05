@@ -176,6 +176,30 @@ broker custody/index changes (`phone-termination-interop.trx`, one exchange).
 The configured listener, old-egress barrier and source/native media-owner
 composition are still open; the component tests do not qualify those actions.
 
+## Iteration 6 — actual native control I/O and completion wait
+
+Added the native process-bound client component with one cold reader, one ordered
+writer, retained actual I/O, eight regular/one negative write slots and bounded
+internal observations. Stop/closed projection/transport failure latch terminal
+independently of blocked writes. Persistent cancellation covers header/body and
+successive-transfer races, with actual overlapped completion and both threads
+joined. Control publication/reset is serialized with mailbox state; actual
+write completion wakes capacity retries and is never treated as an ACK.
+
+Added optional borrowed candidate-thread completion to the existing Windows
+socket/source/control wait using a fixed stack handle array, preserving
+control/terminal precedence and source event behavior. This avoids a lost finish
+edge or polling while waiting for real setup termination. Details and remaining
+composition obligations: [Audio_Native_Broker_IO.md](Audio_Native_Broker_IO.md).
+
+**All 73 offline native library checks passed**, zero ignored/filtered/failures.
+This includes actual synthetic local pipe I/O, thread handles, full TLS/candidate
+coverage and the existing source freshness/frontier/ciphertext checks. Built DLL
+export validation used the real staged DLL with invalid/no-device arguments.
+Evidence: `out/control-handover-checks/native-control-all.log`.
+The native entrypoint still needs the configured listener/source composition;
+the new components have not activated production authority or physical media.
+
 ## Continue on High
 
 The single broker-pipe reader/demultiplexer and bounded broker observation/request

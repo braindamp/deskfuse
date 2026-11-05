@@ -246,11 +246,43 @@ pub struct AudioReadiness {
     pub terminal:bool,
     pub source:bool,
 }
+#[cfg(windows)]
+pub struct AudioSetupReadiness {
+    pub audio: AudioReadiness,
+    pub setup_completed: bool,
+}
 
 #[cfg(all(windows,test))]
 mod audio_event_tests {
     use super::*;
     use windows_sys::Win32::{System::Threading::*,Foundation::CloseHandle};
+    #[test]
+    fn candidate_thread_termination_is_waited_without_polling_and_terminal_still_wins() {
+        use std::os::windows::io::{AsHandle,AsRawHandle,FromRawHandle,OwnedHandle};
+        fn event() -> OwnedHandle {unsafe{
+            let raw=CreateEventW(std::ptr::null(),1,0,std::ptr::null());assert!(!raw.is_null());OwnedHandle::from_raw_handle(raw)
+        }}
+        let socket=UdpSocket::bind("127.0.0.1:0").unwrap();socket.set_nonblocking(true).unwrap();
+        let events=WindowsEvents::new(&socket).unwrap();
+        let control=event();let terminal=event();let source=event();
+        let (release,wait)=std::sync::mpsc::channel();let worker=std::thread::spawn(move||{let _=wait.recv();});
+        unsafe{SetEvent(control.as_raw_handle());}
+        let first=events.wait_audio_with_setup(false,control.as_raw_handle(),terminal.as_raw_handle(),source.as_raw_handle(),Some(worker.as_handle()),None).unwrap();
+        assert!(first.audio.control);assert!(!first.setup_completed);assert!(!worker.is_finished());
+        unsafe{ResetEvent(control.as_raw_handle());}
+        release.send(()).unwrap();let until=Instant::now()+Duration::from_secs(3);
+        loop{
+            let wake=events.wait_audio_with_setup(false,control.as_raw_handle(),terminal.as_raw_handle(),source.as_raw_handle(),Some(worker.as_handle()),Some(until)).unwrap();
+            if wake.setup_completed {break;}
+            assert!(Instant::now()<until);
+        }
+        assert!(worker.is_finished());
+        unsafe{SetEvent(terminal.as_raw_handle());}
+        let both=events.wait_audio_with_setup(false,control.as_raw_handle(),terminal.as_raw_handle(),source.as_raw_handle(),Some(worker.as_handle()),None).unwrap();
+        assert!(both.audio.terminal && both.setup_completed);
+        assert!(events.wait_audio_with_setup(false,control.as_raw_handle(),terminal.as_raw_handle(),source.as_raw_handle(),Some(control.as_handle()),None).is_err());
+        worker.join().unwrap();
+    }
     #[test]
     fn control_terminal_and_auto_reset_source_wakes_share_the_socket_wait() {
         let socket=UdpSocket::bind("127.0.0.1:0").unwrap();socket.set_nonblocking(true).unwrap();
@@ -285,9 +317,21 @@ impl WindowsEvents {
     pub fn wait_audio(&self,want_write:bool,control:*mut std::ffi::c_void,
         terminal:*mut std::ffi::c_void,source:*mut std::ffi::c_void,deadline:Option<Instant>)
         ->io::Result<AudioReadiness> {
+        Ok(self.wait_audio_with_setup(want_write,control,terminal,source,None,deadline)?.audio)
+    }
+    /// Wait on the actual candidate thread handle as well as the source/socket
+    /// events. Logical completion notification can race thread exit; the handle
+    /// prevents a lost finish edge without a polling timer or detached joiner.
+    pub fn wait_audio_with_setup(&self,want_write:bool,control:*mut std::ffi::c_void,
+        terminal:*mut std::ffi::c_void,source:*mut std::ffi::c_void,
+        setup:Option<std::os::windows::io::BorrowedHandle<'_>>,deadline:Option<Instant>)
+        ->io::Result<AudioSetupReadiness> {
+        use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::{Networking::WinSock::*,System::Threading::*};
-        let handles=[control,terminal,source,self.event as *mut std::ffi::c_void,self.timer];
-        if handles.iter().enumerate().any(|(i,h)|h.is_null() || handles[..i].contains(h)) {
+        let handles=[control,terminal,source,self.event as *mut std::ffi::c_void,self.timer,
+            setup.map(|handle|handle.as_raw_handle()).unwrap_or(std::ptr::null_mut())];
+        let count=if setup.is_some(){6}else{5};
+        if handles[..count].iter().enumerate().any(|(i,h)|h.is_null() || handles[..i].contains(h)) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput,"audio wait requires distinct live events"));
         }
         unsafe {
@@ -296,9 +340,9 @@ impl WindowsEvents {
                 let due=-(((duration.as_nanos()+99)/100).max(1).min(i64::MAX as u128) as i64);
                 if SetWaitableTimer(self.timer,&due,0,None,std::ptr::null(),0)==0{return Err(io::Error::last_os_error())}
             } else {CancelWaitableTimer(self.timer);}
-            let result=WaitForMultipleObjects(handles.len() as u32,handles.as_ptr(),0,u32::MAX);
+            let result=WaitForMultipleObjects(count as u32,handles.as_ptr(),0,u32::MAX);
             if result==u32::MAX{return Err(io::Error::last_os_error())}
-            if result>=handles.len() as u32{return Err(io::Error::other("unexpected audio event wait result"))}
+            if result>=count as u32{return Err(io::Error::other("unexpected audio event wait result"))}
             let mut network:WSANETWORKEVENTS=std::mem::zeroed();
             if WSAEnumNetworkEvents(self.socket,self.event,&mut network)!=0 {
                 return Err(io::Error::from_raw_os_error(WSAGetLastError()))
@@ -310,9 +354,9 @@ impl WindowsEvents {
             // Never ResetEvent: an auto-reset publication between empty-check
             // and wait remains a persistent hint. Queue indices remain truth.
             let signaled=|index:usize|result==index as u32 || WaitForSingleObject(handles[index],0)==0;
-            Ok(AudioReadiness{network:Readiness{readable:network.lNetworkEvents&FD_READ as i32!=0,
+            Ok(AudioSetupReadiness{setup_completed:setup.is_some() && signaled(5),audio:AudioReadiness{network:Readiness{readable:network.lNetworkEvents&FD_READ as i32!=0,
                 writable:want_write && network.lNetworkEvents&FD_WRITE as i32!=0},
-                control:signaled(0),terminal:signaled(1),source:signaled(2)})
+                control:signaled(0),terminal:signaled(1),source:signaled(2)}})
         }
     }
     pub fn new(udp:&UdpSocket)->io::Result<Self> {
