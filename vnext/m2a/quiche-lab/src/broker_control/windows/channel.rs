@@ -562,7 +562,8 @@ pub(crate) mod tests {
         }.encode(false).unwrap();
         assert!(client.try_write(NETWORK_REQUEST, &stop).unwrap());
         assert_eq!(remote.read(3000).unwrap(), (NETWORK_REQUEST, stop));
-        issue[issue.len() - 32..].fill(0);
+        let digest_at = issue.len() - 32;
+        issue[digest_at..].fill(0);
         assert!(client.try_write(PINNED_ISSUE, &issue).is_err());
         client.stop_and_join().unwrap();
     }
