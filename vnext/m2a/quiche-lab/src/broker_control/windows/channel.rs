@@ -587,6 +587,61 @@ pub(crate) mod tests {
 
 
     #[test]
+    fn persistent_cancellation_joins_a_reader_between_header_and_body_without_reconnect() {
+        let (local, remote) = pair();
+        let grant =
+            crate::audio_authority::ControlGrant::parse(&fixture("control", "controlHex")).unwrap();
+        let mut client = BrokerControlClient::start(local, grant.boot, grant.worker).unwrap();
+        remote.exact(&mut 100u32.to_be_bytes(), true, 3000).unwrap(); // Real partial frame; body never arrives.
+        client.stop_and_join().unwrap();
+        client.stop_and_join().unwrap();
+        assert!(client.terminal());
+        assert!(client.reader.is_none() && client.writer.is_none());
+        assert!(client.try_write(CONNECTION_CLOSED, &[1; 16]).is_err());
+    }
+    #[test]
+    fn actual_write_completion_wakes_capacity_retry_without_fabricating_an_authority_ack() {
+        let (local, remote) = pair();
+        let grant =
+            crate::audio_authority::ControlGrant::parse(&fixture("control", "controlHex")).unwrap();
+        let mut client = BrokerControlClient::start(local, grant.boot, grant.worker).unwrap();
+        assert!(client.try_write(CONNECTION_CLOSED, &[19; 16]).unwrap());
+        let (kind, body) = remote.read(3000).unwrap();
+        assert_eq!(kind, CONNECTION_CLOSED);
+        assert_eq!(body, [19; 16]);
+        assert_eq!(
+            unsafe { WaitForSingleObject(client.control_event().as_raw_handle(), 3000) },
+            WAIT_OBJECT_0
+        );
+        assert!(client.drain(16).unwrap().is_empty());
+        assert_eq!(client.shared.lock().retained[Lane::Internal as usize], 0);
+        client.stop_and_join().unwrap();
+    }
+
+    #[test]
+    fn acknowledged_write_requires_real_io_completion_and_cancellation_joins_all_receipts() {
+        let (local, remote) = pair();
+        let grant = crate::audio_authority::ControlGrant::parse(&fixture("control", "controlHex")).unwrap();
+        let mut client = BrokerControlClient::start(local, grant.boot, grant.worker).unwrap();
+        let body = vec![17u8; 256];
+        let mut receipts = Vec::new();
+        let mut reached_capacity = false;
+        for _ in 0..64 {
+            match client.try_write_confirmed(LISTENER_CONFIGURED, &body).unwrap() {
+                Some(receipt) => receipts.push(receipt),
+                None => { reached_capacity = true; break; }
+            }
+        }
+        assert!(reached_capacity);
+        assert!(receipts.iter().any(|receipt| receipt.0.result.lock().unwrap().is_none()));
+        remote.write(STOP, &[]).unwrap();
+        assert_eq!(unsafe { WaitForSingleObject(client.terminal_event().as_raw_handle(), 3000) }, WAIT_OBJECT_0);
+        client.stop_and_join().unwrap();
+        assert!(receipts.iter().all(|receipt| receipt.0.result.lock().unwrap().is_some()));
+        assert!(client.reader.is_none() && client.writer.is_none());
+    }
+
+    #[test]
     fn terminal_rejects_raced_enqueue_and_a_queued_unadmitted_ack_without_writing() {
         let grant = crate::audio_authority::ControlGrant::parse(&fixture("control", "controlHex")).unwrap();
         let (local, remote) = pair();
