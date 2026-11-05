@@ -1307,6 +1307,121 @@ mod tests {
     }
 
     #[test]
+    fn exact_acquire_issue_and_proof_follow_local_denial_over_real_tls() {
+        use crate::audio_tls::Role;
+        use crate::audio_transport::DeliveryTls;
+        let (mut runtime, remote) = runtime();
+        let mut config = listener_bytes();
+        let warm = config.len() - 26;
+        config[warm..warm + 4].copy_from_slice(&10_000u32.to_be_bytes());
+        let (kind, ack) = runtime.process(Frame {
+            kind: CONFIGURE_LISTENER, body: config,
+        }).unwrap().unwrap();
+        assert_eq!(kind, LISTENER_CONFIGURED);
+        let thread = spawn_offline(runtime);
+        let server = SocketAddr::from((
+            [ack[34], ack[35], ack[36], ack[37]],
+            u16::from_be_bytes([ack[38], ack[39]]),
+        ));
+        let mut request_id = [0x12u8; 32];
+        request_id[..8].copy_from_slice(&1u64.to_be_bytes());
+        let mut issue = vec![1u8];
+        issue.extend_from_slice(&request_id);
+        issue.extend_from_slice(&1_000u32.to_be_bytes());
+        issue.extend_from_slice(&[0u8; 16]);
+        let mut proof = vec![0x21u8; 32];
+        proof.push(8);
+        proof.extend_from_slice(&[0x42u8; 8]);
+        let requested_issue = issue.clone();
+        let requested_proof = proof.clone();
+        let phone = std::thread::spawn(move || {
+            let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+            socket.set_nonblocking(true).unwrap();
+            let mut conn = DeliveryTls::generate(Role::Phone).unwrap()
+                .connect(socket.local_addr().unwrap(), server, now() + 200_000_000, 10_000).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(8);
+            let mut sent_prepare = false;
+            let mut sent_issue = false;
+            let mut sent_proof = false;
+            let mut buf = [0u8; 1350];
+            loop {
+                assert!(Instant::now() < deadline, "acquisition candidate deadline");
+                conn.service_timeout(now()).unwrap();
+                for _ in 0..16 {
+                    match socket.recv_from(&mut buf) {
+                        Ok((n, from)) => conn.receive(
+                            &mut buf[..n], quiche::RecvInfo {
+                                from, to: socket.local_addr().unwrap()
+                            }, now(),
+                        ).unwrap(),
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(e) => panic!("{e}"),
+                    }
+                }
+                if !sent_prepare && conn.facts(now()).unwrap().is_some() {
+                    let mut prepare = vec![0u8; 56];
+                    prepare[..8].copy_from_slice(&1u64.to_be_bytes());
+                    prepare[8..40].copy_from_slice(&request_id);
+                    prepare[40..].copy_from_slice(&[3u8; 16]);
+                    conn.queue_control(Record {
+                        kind: ac::PREPARE, request: 1, body: prepare,
+                    }, now()).unwrap();
+                    sent_prepare = true;
+                }
+                for record in conn.read_control(now()).unwrap() {
+                    match (record.kind, record.request) {
+                        (ac::NOTICE, 0) => {},
+                        (ac::ERROR, 1) => {
+                            assert_eq!(record.body, [4]);
+                            assert!(!sent_issue);
+                            conn.queue_control(Record {
+                                kind: ac::ISSUE, request: 2, body: issue.clone(),
+                            }, now()).unwrap();
+                            sent_issue = true;
+                        }
+                        (131, 2) => {
+                            assert_eq!(record.body, [42]);
+                            assert!(sent_issue && !sent_proof);
+                            conn.queue_control(Record {
+                                kind: ac::PROOF, request: 3, body: proof.clone(),
+                            }, now()).unwrap();
+                            sent_proof = true;
+                        }
+                        (ac::ERROR, 3) => {
+                            assert_eq!(record.body, [1]);
+                            assert!(sent_proof);
+                            return;
+                        }
+                        _ => panic!("unexpected pre-delivery RPC: {} {}", record.kind, record.request),
+                    }
+                }
+                conn.service_egress(&socket, true, now()).unwrap();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        assert_eq!(remote.read(3000).unwrap().0, CONNECTION_OBSERVED);
+        let (kind, wire) = remote.read(3000).unwrap();
+        assert_eq!(kind, NETWORK_REQUEST);
+        let issued = Message::parse(&wire, false).unwrap();
+        assert_eq!((issued.kind, issued.request), (ac::ISSUE, 1));
+        assert_eq!(issued.body, requested_issue);
+        remote.write(NETWORK_REPLY, &Message {
+            kind: 131, body: vec![42], ..issued
+        }.encode(true).unwrap()).unwrap();
+        let (kind, wire) = remote.read(3000).unwrap();
+        assert_eq!(kind, NETWORK_REQUEST);
+        let proved = Message::parse(&wire, false).unwrap();
+        assert_eq!((proved.kind, proved.request), (ac::PROOF, 2));
+        assert_eq!(proved.body, requested_proof);
+        remote.write(NETWORK_REPLY, &Message {
+            kind: ac::ERROR, body: vec![1], ..proved
+        }.encode(true).unwrap()).unwrap();
+        phone.join().unwrap();
+        remote.write(STOP, &[]).unwrap();
+        assert!(thread.join().unwrap().is_ok());
+    }
+
+    #[test]
     fn joined_candidate_owns_slot_until_ordered_close_is_queued() {
         use crate::audio_tls::Role;
         use crate::audio_transport::DeliveryTls;

@@ -210,6 +210,129 @@ public sealed class AudioAuthorityTests
         finally { await h.Dispatcher.StopAndJoinAsync(); }
     }
     [Fact]
+    public async Task Protected_acquisition_recovers_exact_receipt_after_route_loss()
+    {
+        using var f = new Fixture();
+        var entered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var resume = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var attempts = 0;
+        var h = new Routing(f, acquisitionOnly: true, prepare: async committed =>
+        {
+            Interlocked.Increment(ref attempts);
+            f.Owner.ClaimPreparation(committed);
+            entered.TrySetResult(true);
+            await resume.Task.ConfigureAwait(false);
+            Assert.True(f.Owner.CompletePreparation(committed, f.Observed));
+        });
+        try
+        {
+            Assert.True(h.Send(AudioNetworkKind.Issue, IssueBody(AudioOperationKind.AcquireSource, Request(1))));
+            var challenge = AudioRequestProtocol.ParseProof(EnrollmentFraming.ParseSigned((await h.Reply()).Body).Message);
+            var proof = ProofBody(challenge.Facts.Nonce,
+                f.Persistence.SignPhone(AudioRequestProtocol.Proof(challenge.Core, challenge.Binding)));
+            Assert.True(h.Send(AudioNetworkKind.Proof, proof));
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(AudioAuthorityPhase.Preparing, f.Owner.Snapshot().Phase);
+            Assert.True(h.Dispatcher.TryPost(new(AudioWorkerFrameKind.ConnectionClosed, h.Connection.ToByteArray(bigEndian: true))));
+            Assert.Equal(1, Volatile.Read(ref attempts));
+            Assert.Equal(AudioAuthorityPhase.Preparing, f.Owner.Snapshot().Phase);
+            resume.SetResult(true);
+            var original = (await h.Reply()).Body;
+            Assert.Equal(AudioOperationKind.AcquireSource,
+                AudioAuthorityProtocol.ParseReceipt(EnrollmentFraming.ParseSigned(original).Message).Operation);
+            Assert.Equal(AudioAuthorityPhase.Prepared, f.Owner.Snapshot().Phase);
+            var before = f.Owner.RequestCounts;
+            var recovery = new Routing(f, acquisitionOnly: true);
+            try
+            {
+                Assert.True(recovery.Send(AudioNetworkKind.AppliedResult, Request(1).Concat(proof).ToArray()));
+                Assert.Equal(original, (await recovery.Reply()).Body);
+                Assert.Equal(before, f.Owner.RequestCounts);
+                Assert.Equal(1, Volatile.Read(ref attempts));
+                var wrong = proof.ToArray(); wrong[0] ^= 1;
+                Assert.True(recovery.Send(AudioNetworkKind.AppliedResult, Request(1).Concat(wrong).ToArray()));
+                Assert.Equal((byte)255, (await recovery.Reply()).Kind);
+                Assert.Equal(before, f.Owner.RequestCounts);
+            }
+            finally { await recovery.Dispatcher.StopAndJoinAsync(); }
+        }
+        finally
+        {
+            resume.TrySetResult(true);
+            await h.Dispatcher.StopAndJoinAsync();
+        }
+    }
+
+    [Fact]
+    public async Task Protected_acquisition_rejects_foreign_proof_and_delivery_issue()
+    {
+        using var f = new Fixture();
+        var h = new Routing(f, acquisitionOnly: true);
+        var foreign = new Routing(f, acquisitionOnly: true);
+        try
+        {
+            Assert.True(h.Send(AudioNetworkKind.Issue, IssueBody(AudioOperationKind.AcquireSource, Request(1))));
+            var challenge = AudioRequestProtocol.ParseProof(EnrollmentFraming.ParseSigned((await h.Reply()).Body).Message);
+            var proof = ProofBody(challenge.Facts.Nonce,
+                f.Persistence.SignPhone(AudioRequestProtocol.Proof(challenge.Core, challenge.Binding)));
+            Assert.True(foreign.Send(AudioNetworkKind.Proof, proof));
+            Assert.Equal((byte)255, (await foreign.Reply()).Kind);
+            Assert.Equal(AudioAuthorityPhase.Idle, f.Owner.Snapshot().Phase);
+            Assert.True(h.Send(AudioNetworkKind.Proof, proof));
+            var receipt = await h.Reply();
+            Assert.Equal((byte)132, receipt.Kind);
+            Assert.Equal(AudioAuthorityPhase.Prepared, f.Owner.Snapshot().Phase);
+            Assert.True(h.Send(AudioNetworkKind.Issue,
+                IssueBody(AudioOperationKind.AttachDelivery, Request(2), h.Connection)));
+            Assert.Equal((byte)255, (await h.Reply()).Kind);
+            Assert.Equal((ulong)0, f.Owner.Snapshot().DeliveryGeneration);
+        }
+        finally
+        {
+            await h.Dispatcher.StopAndJoinAsync();
+            await foreign.Dispatcher.StopAndJoinAsync();
+        }
+    }
+
+    [Fact]
+    public async Task Protected_source_Stop_fences_an_inflight_preparation_before_receipt()
+    {
+        using var f = new Fixture();
+        var entered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var resume = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var h = new Routing(f, acquisitionOnly: true, prepare: async committed =>
+        {
+            f.Owner.ClaimPreparation(committed);
+            entered.TrySetResult(true);
+            await resume.Task.ConfigureAwait(false);
+            Assert.True(f.Owner.CompletePreparation(committed, f.Observed));
+        });
+        try
+        {
+            Assert.True(h.Send(AudioNetworkKind.Issue, IssueBody(AudioOperationKind.AcquireSource, Request(1))));
+            var challenge = AudioRequestProtocol.ParseProof(EnrollmentFraming.ParseSigned((await h.Reply()).Body).Message);
+            var proof = ProofBody(challenge.Facts.Nonce,
+                f.Persistence.SignPhone(AudioRequestProtocol.Proof(challenge.Core, challenge.Binding)));
+            Assert.True(h.Send(AudioNetworkKind.Proof, proof));
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            var stop = new AudioSourceStop(AudioSourceStopProtocol.Target(f.Owner.Source, Nonce(3)),
+                Nonce(90), h.Connection, Nonce(4), Nonce(5), Nonce(6));
+            Assert.True(h.Send(AudioNetworkKind.SignedSourceStop, StopEnvelope(f, stop)));
+            var stopped = await h.Reply();
+            Assert.Equal((byte)137, stopped.Kind);
+            Assert.Equal(AudioAuthorityPhase.Closed, f.Owner.Snapshot().Phase);
+            resume.TrySetResult(true);
+            Assert.Equal((byte)255, (await h.Reply()).Kind);
+            Assert.NotEqual(AudioAuthorityPhase.Prepared, f.Owner.Snapshot().Phase);
+        }
+        finally
+        {
+            resume.TrySetResult(true);
+            await h.Dispatcher.StopAndJoinAsync();
+        }
+    }
+
+    [Fact]
     public async Task Dispatcher_enforces_contiguous_pipe_ids_after_native_local_denial()
     {
         using var f = new Fixture(); var h = new Routing(f);
@@ -301,14 +424,15 @@ public sealed class AudioAuthorityTests
         private readonly System.Threading.Channels.Channel<AudioNetworkMessage> replies = System.Threading.Channels.Channel.CreateBounded<AudioNetworkMessage>(16);
         private ulong sequence;
         internal Routing(Fixture f, Func<byte[], bool, Task>? send = null, Action<Exception>? fail = null,
-            Func<byte[], bool, Action<AudioWorkerControlPump.ReplyPermit>, Task>? sendWithPermit = null)
+            Func<byte[], bool, Action<AudioWorkerControlPump.ReplyPermit>, Task>? sendWithPermit = null,
+            Func<BrokerAudioOwner.Committed, Task>? prepare = null, bool acquisitionOnly = false)
         {
             var regularReplies = new SemaphoreSlim(8, 8);
             var negativeReply = new SemaphoreSlim(1, 1);
             Dispatcher = new(f.Owner, f.AudioWorker, new Signer(f),
                 s => f.Persistence.SignHost(AudioRequestProtocol.Status(s.Snapshot)),
                 s => f.Persistence.SignHost(AudioSourceStopProtocol.Status(s.Snapshot)),
-                c => { f.Owner.ClaimPreparation(c); Assert.True(f.Owner.CompletePreparation(c, f.Observed)); return Task.CompletedTask; },
+                prepare ?? (c => { f.Owner.ClaimPreparation(c); Assert.True(f.Owner.CompletePreparation(c, f.Observed)); return Task.CompletedTask; }),
                 () => { }, // Actual resource rundown has its own separately retained owner.
                 () => Task.FromResult(true), // Unit authority routing, not native I/O or physical qualification.
                 sendWithPermit ?? (async (bytes, negative, reserved) =>
@@ -320,7 +444,7 @@ public sealed class AudioAuthorityTests
                         ? replies.Writer.WriteAsync(AudioWorkerNetworkProtocol.Parse(bytes, reply: true)).AsTask()
                         : send(bytes, negative));
                 }),
-                fail ?? (_ => { }));
+                fail ?? (_ => { }), acquisitionOnly);
             var observation = Connection.ToByteArray(bigEndian: true).Concat(Nonce(4)).Concat(Nonce(5)).Concat(Nonce(6)).ToArray();
             Assert.True(Dispatcher.TryPost(new(AudioWorkerFrameKind.ConnectionObserved, observation)));
         }
