@@ -360,26 +360,25 @@ impl WindowsEvents {
         }
     }
     /// Unconfigured media has no source handle. Listen for broker and UDP
-    /// readiness without a timer tick or a synthetic source event.
+    /// readiness and resume notifications without a periodic timer tick.
     pub fn wait_listener(&self, control: *mut std::ffi::c_void,
-        terminal: *mut std::ffi::c_void, timeout_ms: u32) -> io::Result<()> {
+        terminal: *mut std::ffi::c_void, resume: *mut std::ffi::c_void,
+        timeout_ms: u32) -> io::Result<()> {
         use windows_sys::Win32::{Networking::WinSock::*, System::Threading::*};
-        let handles = [terminal, control, self.event as *mut std::ffi::c_void];
-        if handles.iter().any(|h| h.is_null()) ||
-            handles[0] == handles[1] || handles[0] == handles[2] ||
-            handles[1] == handles[2] {
+        let handles = [terminal, control, resume, self.event as *mut std::ffi::c_void];
+        if handles.iter().enumerate().any(|(index, h)| h.is_null() || handles[..index].contains(h)) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "listener requires distinct live events"));
         }
         unsafe {
-            let result = WaitForMultipleObjects(3, handles.as_ptr(), 0, timeout_ms);
+            let result = WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, timeout_ms);
             if result == 258 {
                 return Err(io::Error::new(io::ErrorKind::TimedOut, "Listener authority deadline"));
             }
             if result == u32::MAX { return Err(io::Error::last_os_error()); }
-            if result >= 3 {
+            if result >= handles.len() as u32 {
                 return Err(io::Error::other("Unexpected listener readiness"));
             }
-            if result < 2 {
+            if result < 3 {
                 return Ok(());
             }
             let mut events: WSANETWORKEVENTS = std::mem::zeroed();

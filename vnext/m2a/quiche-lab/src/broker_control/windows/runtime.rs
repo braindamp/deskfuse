@@ -1,5 +1,6 @@
 use super::*;
 use super::channel::{BrokerControlClient, Frame};
+use super::resume::ResumeWake;
 use crate::audio_authority::{AudioAuthority, ControlGrant};
 use crate::audio_listener_config::ListenerConfig;
 use std::collections::VecDeque;
@@ -18,6 +19,7 @@ struct NativeRuntime {
     client: BrokerControlClient,
     authority: AudioAuthority,
     listener: Option<BoundListener>,
+    resume: ResumeWake,
 }
 
 fn now() -> u64 {
@@ -39,7 +41,8 @@ pub(super) fn run(registration: [u8; 16]) -> io::Result<()> {
 impl NativeRuntime {
     fn new(client: BrokerControlClient) -> io::Result<Self> {
         let authority = AudioAuthority::new(client.boot(), client.worker())?;
-        Ok(Self { client, authority, listener: None })
+        let resume = ResumeWake::register()?;
+        Ok(Self { client, authority, listener: None, resume })
     }
 
     fn run(mut self) -> io::Result<()> {
@@ -47,7 +50,8 @@ impl NativeRuntime {
         self.authority.close();
         self.listener = None;
         let joined = self.client.stop_and_join();
-        outcome.and(joined)
+        let unregistered = self.resume.unregister();
+        outcome.and(joined).and(unregistered)
     }
 
     fn live(&mut self) -> io::Result<()> {
@@ -161,7 +165,7 @@ impl NativeRuntime {
                     let timeout = self.timeout(None)?;
                     self.listener.as_ref().unwrap().events.wait_listener(
                         self.client.control_event().as_raw_handle(),
-                        self.client.terminal_event().as_raw_handle(), timeout)?;
+                        self.client.terminal_event().as_raw_handle(), self.resume.event(), timeout)?;
                 } else {
                     self.wait(self.client.control_event().as_raw_handle(), None, false)?;
                 }
@@ -215,16 +219,12 @@ impl NativeRuntime {
 
     fn wait(&self, event: HANDLE, until: Option<Instant>, after_terminal: bool) -> io::Result<()> {
         let ms = self.timeout(until)?;
-        let result = if after_terminal {
-            unsafe { WaitForSingleObject(event, ms) }
-        } else {
-            let handles = [self.client.terminal_event().as_raw_handle(), event];
-            unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, ms) }
-        };
+        let handles = [self.client.terminal_event().as_raw_handle(), event, self.resume.event()];
+        let handles = if after_terminal { &handles[1..] } else { &handles[..] };
+        let result = unsafe { WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, ms) };
         if result == WAIT_TIMEOUT { return Err(io::Error::new(io::ErrorKind::TimedOut, "Native control wait deadline")); }
         if result == WAIT_FAILED { return Err(io::Error::last_os_error()); }
-        if after_terminal && result == WAIT_OBJECT_0 { return Ok(()); }
-        if !after_terminal && (result == WAIT_OBJECT_0 || result == WAIT_OBJECT_0 + 1) {
+        if result < WAIT_OBJECT_0 + handles.len() as u32 {
             return Ok(());
         }
         Err(invalid())

@@ -25,6 +25,7 @@ enum Lane {
 struct Outbound {
     frame: Frame,
     lane: Lane,
+    closed_ack: bool,
     completion: Option<Arc<Completion>>,
 }
 struct Completion {
@@ -230,6 +231,7 @@ impl BrokerControlClient {
         if body.len() >= MAX_FRAME {
             return Err(invalid());
         }
+        let mut closed_ack = false;
         let lane = match kind {
             NETWORK_REQUEST => {
                 let message = crate::audio_rpc::Message::parse(body, false)?;
@@ -250,7 +252,7 @@ impl BrokerControlClient {
                 Lane::Internal
             }
             AUTHORITY_OBSERVED => {
-                crate::audio_authority::ControlGrant::parse(body)?;
+                closed_ack = crate::audio_authority::ControlGrant::parse(body)?.closed;
                 Lane::Internal
             }
             // Listener observation is public cold metadata; its concrete codec
@@ -264,7 +266,7 @@ impl BrokerControlClient {
             _ => return Err(invalid()),
         };
         let mut q = self.shared.lock();
-        if self.shared.stopping.load(Ordering::Acquire) {
+        if self.shared.stopping.load(Ordering::Acquire) || (self.terminal() && !closed_ack) {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "Broker control retired",
@@ -286,16 +288,17 @@ impl BrokerControlClient {
                 body: body.to_vec(),
             },
             lane,
+            closed_ack,
             completion,
         });
         self.shared.changed.notify_one();
         Ok(true)
     }
     pub fn stop_and_join(&mut self) -> io::Result<()> {
-        self.shared.terminal();
-        self.shared.stopping.store(true, Ordering::Release);
         {
             let mut q = self.shared.lock();
+            self.shared.terminal();
+            self.shared.stopping.store(true, Ordering::Release);
             for outgoing in q.outgoing.drain(..) {
                 if let Some(completion) = outgoing.completion {
                     completion.finish(Err(io::Error::new(io::ErrorKind::BrokenPipe, "Control cancelled")));
@@ -364,7 +367,7 @@ fn read_loop(
 }
 fn write_loop(control: &Control, shared: &Shared) -> io::Result<()> {
     loop {
-        let value = {
+        let (value, rejected) = {
             let mut q = shared.lock();
             while q.outgoing.is_empty() && !shared.stopping.load(Ordering::Acquire) {
                 q = shared.changed.wait(q).unwrap_or_else(|p| p.into_inner());
@@ -372,11 +375,19 @@ fn write_loop(control: &Control, shared: &Shared) -> io::Result<()> {
             if shared.stopping.load(Ordering::Acquire) {
                 return Ok(());
             }
-            q.outgoing.pop_front().unwrap()
+            let value = q.outgoing.pop_front().unwrap();
+            // Dequeue admits the write under the same gate that publishes the
+            // terminal fence. An admitted operation keeps its actual I/O custody.
+            let rejected = shared.terminal.load(Ordering::Acquire) && !value.closed_ack;
+            (value, rejected)
         };
         // Class capacity includes this actual write until completed/cancelled.
         // FIFO preserves already admitted request IDs/frame ordering.
-        let outcome = control.write(value.frame.kind, &value.frame.body);
+        let outcome = if rejected {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "Broker control retired"))
+        } else {
+            control.write(value.frame.kind, &value.frame.body)
+        };
         #[cfg(test)]
         {
             let gate = shared.completion_gate.lock().unwrap().take();
@@ -391,7 +402,9 @@ fn write_loop(control: &Control, shared: &Shared) -> io::Result<()> {
                 Err(error) => Err(io::Error::new(error.kind(), error.to_string())),
             });
         }
-        outcome?;
+        if !rejected {
+            outcome?;
+        }
         let mut q = shared.lock();
         q.retained[value.lane as usize] -= 1;
         unsafe { SetEvent(shared.capacity_event.as_raw_handle()); }
