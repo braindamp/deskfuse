@@ -335,9 +335,12 @@ impl CandidateSetup {
             None => Ok(None),
         }
     }
-    pub fn cancel_and_join(&mut self) -> io::Result<Option<CandidateOutcome>> {
+    pub fn cancel(&self) {
         self.shared.stopping.store(true, Ordering::Release);
         self.shared.changed.notify_one();
+    }
+    pub fn cancel_and_join(&mut self) -> io::Result<Option<CandidateOutcome>> {
+        self.cancel();
         match self.worker.take() {
             Some(worker) => {
                 let mut result = worker.join().map_err(|_| retired())?;

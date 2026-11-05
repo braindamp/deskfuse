@@ -126,6 +126,15 @@ impl Forwarding {
         self.pending.insert(key, message.kind);
         Ok(true)
     }
+    pub(crate) fn abort_unpublished(&mut self, message: &Message) -> io::Result<()> {
+        message.encode(false)?;
+        let key = (message.connection, message.request);
+        if self.pending.get(&key) != Some(&message.kind) {
+            return Err(c::invalid());
+        }
+        self.pending.remove(&key);
+        Ok(())
+    }
     pub fn validate_reply(&self, message: &Message) -> io::Result<()> {
         message.encode(true)?;
         let key = (message.connection, message.request);

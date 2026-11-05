@@ -21,6 +21,7 @@ struct BoundListener {
     observed: Option<[u8; 16]>,
     pending_event: Option<(SetupEvent, bool)>,
     cooldown_until: u64,
+    candidate_until: u64,
 }
 
 struct NativeRuntime {
@@ -136,6 +137,7 @@ impl NativeRuntime {
                     observed: None,
                     pending_event: None,
                     cooldown_until: 0,
+                    candidate_until: 0,
                 });
                 Ok(Some((LISTENER_CONFIGURED, acknowledgement)))
             }
@@ -183,14 +185,16 @@ impl NativeRuntime {
             }
         }
         self.authority.close();
+        let retiring = self.listener.as_mut().and_then(|owned| owned.candidate.take());
+        if let Some(setup) = &retiring { setup.cancel(); }
         self.listener = None;
-        if let Some(body) = closed {
-            // This is a control acknowledgement, not a rundown observation.
-            self.acknowledge(AUTHORITY_OBSERVED, &body, true)?;
-            Ok(())
+        let published = if let Some(body) = closed {
+            self.acknowledge(AUTHORITY_OBSERVED, &body, true)
         } else {
             Err(retired())
-        }
+        };
+        drop(retiring);
+        published
     }
 
     fn serve(&mut self) -> io::Result<()> {
@@ -296,6 +300,10 @@ impl NativeRuntime {
         if !self.listener.as_ref().is_some_and(|owned| owned.candidate.is_some()) {
             return Ok(false);
         }
+        let expired = self.listener.as_ref().is_some_and(|owned| self.clock() >= owned.candidate_until);
+        if expired {
+            self.listener.as_ref().unwrap().candidate.as_ref().unwrap().cancel();
+        }
         {
             let owned = self.listener.as_mut().unwrap();
             if owned.pending_event.is_none() {
@@ -334,6 +342,12 @@ impl NativeRuntime {
                         kind: record.kind,
                         body: record.body.clone(),
                     };
+                    if (expired || self.listener.as_ref().unwrap().candidate.as_ref().unwrap().finished())
+                        && !ac::negative(record.kind)
+                    {
+                        if credited { self.forwarding.abort_unpublished(&message)?; }
+                        return Ok(true);
+                    }
                     if !credited && !self.forwarding.admit(&message)? {
                         self.listener.as_mut().unwrap().pending_event = Some((SetupEvent::Request(record), false));
                         return Ok(false);
@@ -375,6 +389,7 @@ impl NativeRuntime {
         if outcome.promoted || outcome.pinned_request.is_some() { return Err(invalid()); }
         owned.candidate = None;
         owned.observed = None;
+        owned.candidate_until = 0;
         owned.cooldown_until = next_at.saturating_add(owned.config.policy.cooldown100ns());
         Ok(true)
     }
@@ -437,6 +452,7 @@ impl NativeRuntime {
         if let Ok(setup) = started {
             setup.writable();
             owned.candidate = Some(setup);
+            owned.candidate_until = limits.until100ns;
         }
         Ok(())
     }
