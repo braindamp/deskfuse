@@ -98,7 +98,16 @@ jobs:
       - name: Compile host and bundled production GPU DLL (never install FocusIdd)
         run: python -B tools/build-receipt.py check --name host-build --kind build --report out/provenance/host-build.json --log out/provenance/host-build.log -- dotnet build windows/agent/FocusWindow.Agent/FocusWindow.Agent.csproj -c Release -p:Platform=x64 -warnaserror
       - name: Publish standalone elevated audio broker (driver-free compile)
-        run: dotnet publish windows/audio/DeskFuse.AudioBroker/DeskFuse.AudioBroker.csproj -c Release -r win-x64 --self-contained true -p:Platform=x64 -warnaserror -o out/audio-broker
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsRoot = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1
+          if (-not $vsRoot) { throw 'MSVC x64 installation missing' }
+          Import-Module (Join-Path $vsRoot 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll')
+          Enter-VsDevShell -VsInstallPath $vsRoot -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64' | Out-Null
+          dotnet publish windows/audio/DeskFuse.AudioBroker/DeskFuse.AudioBroker.csproj -c Release -r win-x64 --self-contained true -p:Platform=x64 -warnaserror -o out/audio-broker
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Test-Path 'out/audio-broker/deskfuse-source-control.dll' -PathType Leaf)) { throw 'Published source-control DLL missing' }
       - uses: actions/upload-artifact@v4
         with:
           name: deskfuse-audio-broker-x64
@@ -181,9 +190,22 @@ jobs:
           SDK_ROOT="/usr/local/lib/android/sdk"
           MANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -name sdkmanager -print -quit)"
           test -n "$MANAGER"
-          "$MANAGER" --sdk_root="$SDK_ROOT" "platforms;android-35" "build-tools;35.0.0"
+          "$MANAGER" --sdk_root="$SDK_ROOT" \
+            "platforms;android-35" "build-tools;35.0.0" "ndk;30.0.16248370" "cmake;3.31.6"
+          test -f "$SDK_ROOT/ndk/30.0.16248370/build/cmake/android.toolchain.cmake"
+          test -x "$SDK_ROOT/cmake/3.31.6/bin/cmake"
           echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+      - name: Install Android native build prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build nasm clang
+          rustup toolchain install 1.99.1 --profile minimal --target aarch64-linux-android
+          rustup default 1.99.1
+          cargo install cargo-ndk --version 4.1.2 --locked
+          cargo ndk --version
       - name: Build and test Android without devices
         run: python -B tools/build-receipt.py check --name android-build-tests --kind build --report out/provenance/android-build.json --log out/provenance/android-build.log -- bash android/gradlew -p android :app:testDebugUnitTest :app:assembleDebug :protocol3:check :protocol3:interopJar --no-daemon
       - name: Exchange encrypted records between actual Kotlin and C# implementations
