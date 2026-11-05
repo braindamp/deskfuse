@@ -98,15 +98,27 @@ object TrustedEnrollmentKotlinCheck {
         val sourceWindow = audioOwner.accept(active, sourcePending, sourceReceipt, 1000)
         check(sourceWindow === audioOwner.accept(active, sourcePending, sourceReceipt, 1000))
         check(sourceWindow.deadlineNanos == 1499500000L)
+        var lateNow = sourcePending.firstSendNanos
+        var advanceDuringVerification = false
+        val lateOwner = AudioPhoneRequests(audioSource) { lateNow.also { if (advanceDuringVerification) lateNow++ } }
+        val latePending = lateOwner.begin(audioApproval)
+        latePending.setChallenge(audioChallenge, audioHostSignature)
+        signer.signAudioProof(active, latePending)
+        lateOwner.confirmProof(latePending)
+        lateNow = sourceWindow.deadlineNanos - 1
+        advanceDuringVerification = true
+        check(runCatching { lateOwner.accept(active, latePending, sourceReceipt, 1000) }.isFailure)
         check(runCatching { AudioSourceApproval(audioSourceBytes + 0) }.isFailure)
         println("AUDIO_SOURCE_PASS")
         val audioBinding = hex.parseHex(readln()); val deliveryBytes = hex.parseHex(readln())
         val deliveryChallenge = hex.parseHex(readln()); val deliveryHostSignature = hex.parseHex(readln())
         val deliveryRequest = AudioFrozenProof(deliveryChallenge).requestId()
         val deliveryApproval = AudioProofApproval.delivery(audioSource, audioBinding, deliveryBytes, AudioOperation.ATTACH_DELIVERY,
-            ByteArray(32) { 4 }, ByteArray(32) { 5 }, deliveryRequest)
+            ByteArray(32) { 4 }, ByteArray(32) { 5 }, ByteArray(32) { 6 }, deliveryRequest)
         check(runCatching { AudioProofApproval.delivery(audioSource, audioBinding, deliveryBytes, AudioOperation.ATTACH_DELIVERY,
-            ByteArray(32) { 8 }, ByteArray(32) { 5 }, deliveryRequest) }.isFailure)
+            ByteArray(32) { 8 }, ByteArray(32) { 5 }, ByteArray(32) { 6 }, deliveryRequest) }.isFailure)
+        check(runCatching { AudioProofApproval.delivery(audioSource, audioBinding, deliveryBytes, AudioOperation.ATTACH_DELIVERY,
+            ByteArray(32) { 4 }, ByteArray(32) { 5 }, ByteArray(32) { 8 }, deliveryRequest) }.isFailure)
         val deliveryPending = audioOwner.begin(deliveryApproval)
         deliveryPending.setChallenge(deliveryChallenge, deliveryHostSignature)
         println(hex.formatHex(signer.signAudioProof(active, deliveryPending)))
@@ -114,6 +126,7 @@ object TrustedEnrollmentKotlinCheck {
         val deliveryReceipt = hex.parseHex(readln())
         val window = audioOwner.accept(active, deliveryPending, deliveryReceipt, 1000)
         check(window.revision == 3uL)
+        check(runCatching { sourceWindow.requireCurrent(audioNow) }.isFailure)
         check(window === audioOwner.accept(active, deliveryPending, deliveryReceipt, 1000))
         val tampered = deliveryReceipt.copyOf().also { it[it.lastIndex] = (it.last().toInt() xor 1).toByte() }
         check(runCatching { audioOwner.accept(active, deliveryPending, tampered, 1000) }.isFailure)
@@ -128,7 +141,7 @@ object TrustedEnrollmentKotlinCheck {
         audioOwner.resync(active, statusOne)
         check(AudioRequestId(audioOwner.nextRequestId()).sequence == 3uL)
         fun renewal(id: ByteArray) = AudioProofApproval.delivery(audioSource, audioBinding, deliveryBytes, AudioOperation.RENEW,
-            ByteArray(32) { 4 }, ByteArray(32) { 5 }, id, TrustedEnrollmentProtocol.hash(deliveryBytes))
+            ByteArray(32) { 4 }, ByteArray(32) { 5 }, ByteArray(32) { 6 }, id, TrustedEnrollmentProtocol.hash(deliveryBytes))
         val renewalApproval = renewal(audioOwner.nextRequestId())
         val renewalPending = audioOwner.begin(renewalApproval)
         println(hex.formatHex(audioOwner.beginResync()))
@@ -176,7 +189,7 @@ object TrustedEnrollmentKotlinCheck {
         val replacementChallenge = hex.parseHex(readln()); val replacementRoot = hex.parseHex(readln())
         val replacementId = AudioFrozenProof(replacementChallenge).requestId()
         val replacementApproval = AudioProofApproval.delivery(audioSource, audioBinding, replacementBytes,
-            AudioOperation.SUPERSEDE_DELIVERY, ByteArray(32) { 10 }, ByteArray(32) { 11 }, replacementId)
+            AudioOperation.SUPERSEDE_DELIVERY, ByteArray(32) { 10 }, ByteArray(32) { 11 }, ByteArray(32) { 13 }, replacementId)
         val replacement = audioOwner.begin(replacementApproval)
         replacement.setChallenge(replacementChallenge, replacementRoot)
         val replacementSignature = signer.signAudioProof(active, replacement); audioOwner.confirmProof(replacement)
@@ -188,11 +201,13 @@ object TrustedEnrollmentKotlinCheck {
         val replacementReceipt = hex.parseHex(readln()); audioNow = 1200000000L
         val replacementWindow = audioOwner.accept(active, replacement, replacementReceipt, 1000)
         check(replacementWindow.deadlineNanos == 1549600000L)
+        check(runCatching { window.requireCurrent(audioNow) }.isFailure)
         audioNow = 1250000000L
         check(replacementWindow === audioOwner.accept(active, replacement, replacementReceipt, 1000))
         check(runCatching { replacement.appliedResultRequest() }.isFailure) // No longer a pending recovery.
         println("AUDIO_HANDOVER_RESULT_PASS")
         val stopIntent = audioOwner.beginStop(active, AudioFrozenProof(replacementChallenge).boot())
+        check(runCatching { replacementWindow.requireCurrent(audioNow) }.isFailure)
         check(stopIntent === audioOwner.beginStop(active, AudioFrozenProof(replacementChallenge).boot()))
         check(runCatching { audioOwner.nextRequestId() }.isFailure)
         val stopObservation = AudioStopObservation(java.util.UUID.fromString("99998888-7777-6666-5555-444433332222"),

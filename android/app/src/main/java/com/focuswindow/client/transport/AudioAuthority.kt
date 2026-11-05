@@ -83,7 +83,8 @@ internal class AudioProofApproval private constructor(val source: AudioSourceApp
         fun acquire(source: AudioSourceApproval, freshRequestNonce: ByteArray) =
             AudioProofApproval(source, AudioOperation.ACQUIRE_SOURCE, source.digest(), source.generation, freshRequestNonce)
         fun delivery(source: AudioSourceApproval, bindingBytes: ByteArray, deliveryBytes: ByteArray, operation: AudioOperation,
-            nativeTlsHash: ByteArray, phoneTlsHash: ByteArray, freshRequestNonce: ByteArray, currentDeliveryDigest: ByteArray? = null): AudioProofApproval {
+            nativeTlsHash: ByteArray, phoneTlsHash: ByteArray, nativeNonce: ByteArray,
+            freshRequestNonce: ByteArray, currentDeliveryDigest: ByteArray? = null): AudioProofApproval {
             require(operation != AudioOperation.ACQUIRE_SOURCE)
             val binding = bindingBytes.copyOf(); val delivery = deliveryBytes.copyOf()
             val b = AudioReader(binding, "Binding")
@@ -95,7 +96,8 @@ internal class AudioProofApproval private constructor(val source: AudioSourceApp
             require(d.hash().contentEquals(TrustedEnrollmentProtocol.hash(binding)) && d.id() == source.worker)
             val generation = d.nonzero(); require(d.wire() == source.wire)
             require(d.hash().contentEquals(nativeTlsHash.copyOf()) && d.hash().contentEquals(phoneTlsHash.copyOf())) { "Actual TLS identity changed" }
-            val descriptorRequest = d.hash(); d.hash()
+            val descriptorRequest = d.hash()
+            require(d.hash().contentEquals(nativeNonce)) { "Actual TLS connection nonce changed" }
             require(d.text(64) == "df-audio-authority-2" && d.byte() == 1); d.end()
             val digest = TrustedEnrollmentProtocol.hash(delivery)
             if (operation == AudioOperation.RENEW) require(currentDeliveryDigest != null && digest.contentEquals(currentDeliveryDigest))
@@ -112,6 +114,7 @@ internal class AudioGrantWindow private constructor(boot: ByteArray, val revisio
     private var terminal = false
     private var lastNanos = sentNanos
     fun boot() = boot.copyOf()
+    @Synchronized internal fun retire() { terminal = true }
     @Synchronized fun requireCurrent(nowElapsedRealtimeNanos: Long) {
         if (terminal || nowElapsedRealtimeNanos < lastNanos || nowElapsedRealtimeNanos >= deadlineNanos) {
             terminal = true; error("Audio grant is terminal/expired")

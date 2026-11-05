@@ -148,9 +148,9 @@ internal class AudioPhoneRequests(private val source: AudioSourceApproval, priva
     private var stopBoot: ByteArray? = null
     private fun now(): Long {
         val now = clock()
-        if (terminal || now < lastNow || now < 0) { terminal = true; error("Phone audio owner is terminal") }
+        if (terminal || now < lastNow || now < 0) { close(); error("Phone audio owner is terminal") }
         lastNow = now
-        try { window?.requireCurrent(now) } catch (error: Exception) { terminal = true; throw error }
+        try { window?.requireCurrent(now) } catch (error: Exception) { close(); throw error }
         return now
     }
     fun nextRequestId(): ByteArray = synchronized(gate) {
@@ -183,9 +183,12 @@ internal class AudioPhoneRequests(private val source: AudioSourceApproval, priva
         try {
             val result = value.accept(active, receipt, sampled, margin)
             return synchronized(gate) {
-                now(); require(pending === value || lastAccepted === value)
+                val publishedAt = now()
+                require(pending === value || lastAccepted === value)
+                result.requireCurrent(publishedAt)
                 if (lastAccepted === value) { require(window === result); return@synchronized result }
                 require(result.revision > highestRevision)
+                window?.retire()
                 highestRevision = result.revision; boot = result.boot(); issuedThrough = maxOf(issuedThrough, value.sequence)
                 window = result; lastAccepted = value; pending = null; result
             }
@@ -199,7 +202,7 @@ internal class AudioPhoneRequests(private val source: AudioSourceApproval, priva
     fun retirePending() = synchronized(gate) {
         pending?.let { it.retire(); if (!it.isSigning()) pending = null }
     }
-    fun close() = synchronized(gate) { terminal = true; retirePending() }
+    fun close() = synchronized(gate) { terminal = true; window?.retire(); retirePending() }
     fun beginStop(active: TrustedCommittedEnrollment, observedBoot: ByteArray): AudioSourceStopIntent {
         val snapshot = observedBoot.copyOf()
         synchronized(gate) {
