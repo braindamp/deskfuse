@@ -7,6 +7,55 @@ namespace FocusWindow.Tests;
 public sealed class AudioWorkerControlTests
 {
     [Fact]
+    public void Partial_kernel_bind_retains_broker_file_until_revoke_succeeds()
+    {
+        using var file = new Microsoft.Win32.SafeHandles.SafeFileHandle((nint)4, ownsHandle: false);
+        var attempts = 0;
+        var grant = new PcmGrant(file, _ =>
+        {
+            if (++attempts == 1) throw new IOException("Revoke unconfirmed.");
+        });
+        var size = System.Runtime.InteropServices.Marshal.SizeOf<PcmGrant.Reply>();
+        var bound = new PcmGrant.Reply { Size = (uint)size, Abi = 2, Section = 8, Event = 12, Generation = 1 };
+        Assert.Throws<IOException>(() => grant.BindAndDuplicate(() => (bound, size),
+            () => throw new IOException("Duplicate failed.")));
+        Assert.Throws<IOException>(grant.Dispose);
+        Assert.False(file.IsClosed);
+        grant.Dispose();
+        Assert.True(file.IsClosed);
+        Assert.Equal(2, attempts);
+    }
+
+    [Fact]
+    public async Task Source_exchange_requires_actual_write_and_exact_preparation_context()
+    {
+        var (local, peer) = Duplex.Pair();
+        var remote = new AudioWorkerControl(peer);
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(6));
+        var barrier = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        local.WriteCompletion = barrier.Task;
+        var pump = new AudioWorkerControlPump(new(local), _ => false, _ => { });
+        byte[] context = [1, 2, 3];
+        try
+        {
+            var open = pump.ExchangeSourceAsync(AudioWorkerFrameKind.OpenSource, context, [4], TimeSpan.FromSeconds(3));
+            var request = await remote.ReadAsync(deadline.Token);
+            Assert.Equal(AudioWorkerFrameKind.OpenSource, request.Kind);
+            Assert.Equal(new byte[] {1, 2, 3, 4}, request.Body);
+            await remote.WriteAsync(AudioWorkerFrameKind.SourceOpened, new byte[] {1, 2, 3, 5}, deadline.Token);
+            Assert.False(open.IsCompleted);
+            barrier.SetResult(true);
+            Assert.Equal(new byte[] {5}, await open.WaitAsync(deadline.Token));
+
+            var map = pump.ExchangeSourceAsync(AudioWorkerFrameKind.AttachPcm, context, [6], TimeSpan.FromSeconds(3));
+            Assert.Equal(AudioWorkerFrameKind.AttachPcm, (await remote.ReadAsync(deadline.Token)).Kind);
+            await remote.WriteAsync(AudioWorkerFrameKind.SourceMapped, new byte[] {1, 2, 9, 7}, deadline.Token);
+            await Assert.ThrowsAsync<InvalidDataException>(() => map.WaitAsync(deadline.Token));
+        }
+        finally { barrier.TrySetResult(true); await pump.StopAndJoinAsync(); }
+    }
+
+    [Fact]
     public async Task Pipe_replies_keep_a_negative_slot_when_eight_regular_writes_are_retained()
     {
         var (local, peer) = Duplex.Pair(); var remote = new AudioWorkerControl(peer);

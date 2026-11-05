@@ -272,6 +272,7 @@ impl BrokerControlClient {
                 }
                 Lane::Internal
             }
+            SOURCE_OPENED | SOURCE_MAPPED => Lane::Internal,
             AUTHORITY_OBSERVED => {
                 closed_ack = crate::audio_authority::ControlGrant::parse(body)?.closed;
                 Lane::Internal
@@ -375,6 +376,13 @@ fn read_loop(
             }
             CONFIGURE_LISTENER => {
                 crate::audio_listener_config::ListenerConfig::parse(&body,worker)?;
+                false
+            }
+            OPEN_SOURCE | ATTACH_PCM => {
+                let (grant, _, payload) = super::source_attach::envelope(&body)?;
+                if grant.boot != boot || grant.worker != worker { return Err(invalid()); }
+                if kind == OPEN_SOURCE { super::source_attach::endpoint(payload)?; }
+                else { super::source_attach::pcm_handles(payload)?; }
                 false
             }
             _ => return Err(invalid()),

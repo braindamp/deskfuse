@@ -1,6 +1,7 @@
 //! Retained Windows pipe/server custody. Every overlapped request is completed
 //! or cancelled AND joined before its buffer/event/OVERLAPPED can be released.
 use super::*;
+mod source_attach;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::ptr::{null, null_mut};

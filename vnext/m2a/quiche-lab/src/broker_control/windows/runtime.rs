@@ -2,6 +2,7 @@ use super::*;
 use super::channel::{BrokerControlClient, Frame, WriteReceipt};
 use super::resume::ResumeWake;
 use super::source::SourceOwner;
+use super::source_attach::{self, Preparation};
 use crate::audio_authority::{AudioAuthority, ControlGrant};
 use crate::audio_candidate::{CandidateOutcome, CandidateSetup, SetupEvent};
 use crate::audio_control::{self as ac, Record};
@@ -41,6 +42,8 @@ struct NativeRuntime {
     authority: AudioAuthority,
     listener: Option<BoundListener>,
     source: Option<SourceOwner>,
+    preparation: Option<Preparation>,
+    prepared_binding: Option<[u8; 32]>,
     resume: ResumeWake,
     confirmations: VecDeque<Confirmation>,
     pipe_requests: PipeRequests,
@@ -57,6 +60,8 @@ struct NativeRuntime {
     test_datagram: Option<std::sync::mpsc::Sender<usize>>,
     #[cfg(test)]
     test_source: Option<std::sync::mpsc::SyncSender<(bool, usize, bool)>>,
+    #[cfg(test)]
+    test_open: Option<source_attach::TestOpen>,
 }
 
 pub(super) fn now() -> u64 {
@@ -82,6 +87,7 @@ impl NativeRuntime {
         let resume = ResumeWake::register()?;
         Ok(Self {
             client, authority, listener: None, source: None, resume,
+            preparation: None, prepared_binding: None,
             confirmations: VecDeque::new(),
             pipe_requests: PipeRequests::default(),
             pending_replies: VecDeque::new(),
@@ -97,6 +103,8 @@ impl NativeRuntime {
             test_datagram: None,
             #[cfg(test)]
             test_source: None,
+            #[cfg(test)]
+            test_open: None,
         })
     }
 
@@ -111,6 +119,7 @@ impl NativeRuntime {
     fn run(mut self) -> io::Result<()> {
         let outcome = self.serve();
         self.authority.close();
+        self.preparation = None;
         if let Some(source) = self.source.as_mut() { let _ = source.fence_delivery(); }
         self.source = None;
         self.listener = None;
@@ -141,6 +150,11 @@ impl NativeRuntime {
                 }
                 let tick = self.clock();
                 self.authority.apply(grant.clone(), tick)?;
+                if !grant.closed && grant.binding != [0; 32] {
+                    if let Some(binding) = self.prepared_binding.take() {
+                        self.authority.source_observed(binding, tick)?;
+                    }
+                }
                 if let Some(source) = self.source.as_mut() {
                     if grant.closed { source.fence_delivery()?; }
                     else { source.recheck(&grant, tick)?; }
@@ -188,6 +202,37 @@ impl NativeRuntime {
                 self.pending_replies.push_back(message);
                 Ok(None)
             }
+            OPEN_SOURCE => {
+                let (grant, prefix, payload) = source_attach::envelope(&frame.body)?;
+                let endpoint = source_attach::endpoint(payload)?;
+                self.live()?;
+                let scope = self.listener.as_ref().ok_or_else(invalid)?.config.scope.clone();
+                if self.preparation.is_some() || self.source.is_some() || scope.backend != 1
+                    || !scope.matches(&grant) || self.authority.grant() != Some(&grant) {
+                    return Err(invalid());
+                }
+                self.preparation = Some(Preparation::start(grant, scope, prefix, endpoint,
+                    #[cfg(test)]
+                    self.test_open.take(),
+                )?);
+                Ok(None)
+            }
+            ATTACH_PCM => {
+                let (grant, _, payload) = source_attach::envelope(&frame.body)?;
+                let handles = source_attach::pcm_handles(payload)?;
+                self.live()?;
+                if self.source.is_some() || self.authority.grant() != Some(&grant)
+                    || !self.preparation.as_ref().is_some_and(|setup| setup.grant == grant) {
+                    return Err(invalid());
+                }
+                let setup = self.preparation.take().unwrap();
+                let scope = setup.scope.clone();
+                let (source, mapped, digest) = setup.map(handles)?;
+                self.live()?;
+                self.source = Some(SourceOwner::new(scope, Box::new(source)));
+                self.prepared_binding = Some(digest);
+                Ok(Some((SOURCE_MAPPED, mapped)))
+            }
             STOP if frame.body.is_empty() => {
                 self.authority.close();
                 Ok(None)
@@ -197,6 +242,7 @@ impl NativeRuntime {
     }
 
     fn handle_terminal(&mut self, mut already: VecDeque<Frame>) -> io::Result<()> {
+        if let Some(setup) = &self.preparation { setup.cancel(); }
         // The channel still owns and joins submitted writes. Late completion
         // cannot publish a candidate or restart normal work after this fence.
         self.confirmations.clear();
@@ -262,6 +308,13 @@ impl NativeRuntime {
                 self.live()?;
                 if let Some((kind, body)) = self.process(frame)? {
                     self.queue_confirmation(kind, body)?;
+                }
+            }
+            if let Some(setup) = &mut self.preparation {
+                if self.authority.grant() != Some(&setup.grant) { return Err(invalid()); }
+                if let Some(body) = setup.opened()? {
+                    self.live()?;
+                    self.queue_confirmation(SOURCE_OPENED, body)?;
                 }
             }
             self.service_confirmations()?;
@@ -348,7 +401,7 @@ impl NativeRuntime {
                     self.resume.event(),
                     owned.setup_wake.as_raw_handle(),
                     source_event, period_event,
-                    completed, timeout,
+                    completed, self.preparation.as_ref().and_then(Preparation::completion), timeout,
                 ) {
                     Ok(ready) => ready,
                     Err(error) if error.kind() == io::ErrorKind::TimedOut => {
@@ -1392,6 +1445,82 @@ mod tests {
         bytes.push(grant.closed as u8);
         bytes
     }
+    fn source_setup_fixture() -> (NativeRuntime, Control, ControlGrant, Vec<u8>) {
+        let (mut runtime, remote) = runtime();
+        let body = listener_bytes();
+        let config = ListenerConfig::parse(&body, runtime.client.worker()).unwrap();
+        let mut grant = ControlGrant::parse(&grant_for(&config, 12, false)).unwrap();
+        grant.binding = [0; 32];
+        grant.delivery_generation = 0;
+        grant.delivery_digest = [0; 32];
+        grant.output_generation = 0;
+        grant.ready = false;
+        let bytes = encode_control(&grant);
+        let mut context = vec![1];
+        context.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+        context.extend_from_slice(&bytes);
+        runtime.process(Frame { kind: CONFIGURE_LISTENER, body }).unwrap();
+        (runtime, remote, grant, context)
+    }
+    fn open_fixture(remote: &Control, grant: &ControlGrant, context: &[u8]) {
+        let bytes = encode_control(grant);
+        remote.write(AUTHORITY, &bytes).unwrap();
+        assert_eq!(remote.read(3000).unwrap(), (AUTHORITY_OBSERVED, bytes));
+        remote.write(OPEN_SOURCE, &[context, b"\x00\x05owned"].concat()).unwrap();
+    }
+    #[test]
+    fn worker_binds_exact_source_only_after_the_readonly_mapping() {
+        use crate::committed_source::{fixture_pcm, OpenedPeriod};
+        for matches in [true, false] {
+            let (mut runtime, remote, mut grant, context) = source_setup_fixture();
+            runtime.test_open = Some(Box::new(|_| Ok(OpenedPeriod::fixture([7; 16]))));
+            let thread = spawn_offline(runtime);
+            open_fixture(&remote, &grant, &context);
+            let (kind, opened) = remote.read(3000).unwrap();
+            assert_eq!(kind, SOURCE_OPENED);
+            assert_eq!(&opened[..context.len()], &context);
+            assert_eq!(&opened[context.len()..context.len() + 16], &[7; 16]);
+            let mut handles = fixture_pcm([7; 16], 4);
+            if !matches { handles[3] += 1; }
+            let mut attach = context.clone();
+            for value in handles { attach.extend_from_slice(&value.to_be_bytes()); }
+            remote.write(ATTACH_PCM, &attach).unwrap();
+            if !matches {
+                assert!(thread.join().unwrap().is_err());
+                assert!(remote.read(100).is_err());
+                continue;
+            }
+            let (kind, mapped) = remote.read(3000).unwrap();
+            assert_eq!(kind, SOURCE_MAPPED);
+            assert_eq!(&mapped[..context.len()], &context);
+            let binding = &mapped[context.len()..];
+            assert!(binding.starts_with(b"DeskFuse.Audio.Binding.v1\0"));
+            assert!(binding.ends_with(&4u64.to_be_bytes()));
+            grant.binding = boring::sha::sha256(binding);
+            grant.revision += 1;
+            let bytes = encode_control(&grant);
+            remote.write(AUTHORITY, &bytes).unwrap();
+            assert_eq!(remote.read(3000).unwrap(), (AUTHORITY_OBSERVED, bytes));
+            remote.write(STOP, &[]).unwrap();
+            assert!(thread.join().unwrap().is_ok());
+        }
+    }
+    #[test]
+    fn stop_joins_an_outstanding_period_open_without_source_observation() {
+        let (mut runtime, remote, grant, context) = source_setup_fixture();
+        let (entered, opened) = std::sync::mpsc::sync_channel(1);
+        runtime.test_open = Some(Box::new(move |cancel| {
+            entered.send(()).unwrap();
+            assert_eq!(unsafe { WaitForSingleObject(cancel, 3000) }, WAIT_OBJECT_0);
+            Ok(crate::committed_source::OpenedPeriod::fixture([7; 16]))
+        }));
+        let thread = spawn_offline(runtime);
+        open_fixture(&remote, &grant, &context);
+        opened.recv_timeout(Duration::from_secs(3)).unwrap();
+        remote.write(STOP, &[]).unwrap();
+        assert!(thread.join().unwrap().is_ok());
+        assert!(remote.read(100).is_err());
+    }
     fn offline_incumbent(
         ready: bool, blocked: bool, idle_ms: u32,
     ) -> (
@@ -1475,6 +1604,7 @@ mod tests {
         let clock = runtime.test_clock;
         let test_source = runtime.test_source;
         let test_idle = runtime.test_idle;
+        let test_open = runtime.test_open;
         std::thread::spawn(move || {
             let mut runtime = NativeRuntime::new(client)?;
             runtime.authority = authority;
@@ -1482,6 +1612,7 @@ mod tests {
             runtime.test_clock = clock;
             runtime.test_source = test_source;
             runtime.test_idle = test_idle;
+            runtime.test_open = test_open;
             runtime.listener = Some(BoundListener {
                 events: crate::reactor::WindowsEvents::new(&_socket)?,
                 bytes, config, _socket, acknowledgement, setup_wake,

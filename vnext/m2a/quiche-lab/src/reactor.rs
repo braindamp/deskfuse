@@ -384,11 +384,12 @@ impl WindowsEvents {
         capacity: *mut std::ffi::c_void, resume: *mut std::ffi::c_void,
         setup_wake: *mut std::ffi::c_void,
         source: Option<*mut std::ffi::c_void>, period: Option<*mut std::ffi::c_void>,
-        setup_done: Option<std::os::windows::io::BorrowedHandle<'_>>, timeout_ms: u32,
+        setup_done: Option<std::os::windows::io::BorrowedHandle<'_>>,
+        source_setup_done: Option<std::os::windows::io::BorrowedHandle<'_>>, timeout_ms: u32,
     ) -> io::Result<ListenerReadiness> {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::{Networking::WinSock::*, System::Threading::*};
-        let mut handles = [std::ptr::null_mut(); 9];
+        let mut handles = [std::ptr::null_mut(); 10];
         handles[..5].copy_from_slice(&[terminal, control, capacity, resume, setup_wake]);
         let mut count = 5;
         if let Some(event) = source.filter(|handle| !handle.is_null()) {
@@ -401,6 +402,10 @@ impl WindowsEvents {
             Some(count - 1)
         } else { None };
         if let Some(done) = setup_done {
+            handles[count] = done.as_raw_handle();
+            count += 1;
+        }
+        if let Some(done) = source_setup_done {
             handles[count] = done.as_raw_handle();
             count += 1;
         }

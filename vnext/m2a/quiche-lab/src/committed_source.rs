@@ -27,17 +27,36 @@ struct SlotHeader {ticket:u64,generation:u64,commit:u64,qpc:u64,frame:u64,frames
 #[repr(C)] struct Slot {header:SlotHeader,pcm:[u8;3840]}
 #[repr(C)] struct Mapping {control:Control,slots:[Slot;8]}
 #[repr(C)] #[derive(Default)] struct Timing {size:u32,abi:u32,build:u64,source:[u8;16],flags:u32,export_abi:u32}
+pub(crate) struct OpenedPeriod { native: NativeControl, timing: Timing, frames: u32 }
+impl OpenedPeriod {
+    pub(crate) fn facts(&self) -> ([u8; 16], u32, u64, u32) {
+        let mut source = self.timing.source;
+        source[..4].reverse(); source[4..6].reverse(); source[6..8].reverse();
+        (source, self.timing.abi, self.timing.build, self.frames)
+    }
+    #[cfg(test)]
+    pub(crate) fn fixture(source: [u8; 16]) -> Self {
+        unsafe extern "C" fn service(_: *mut c_void) -> i32 { 0 }
+        unsafe extern "C" fn close(_: *mut c_void) {}
+        Self {
+            native: NativeControl { module: std::ptr::null_mut(), object: std::ptr::null_mut(),
+                event: std::ptr::null_mut(), service, close },
+            timing: Timing { source, abi: 1, build: 0x2026102502, ..Timing::default() },
+            frames: 240,
+        }
+    }
+}
 #[repr(C)] struct Ack {generation:u64,ticket:u64,control:u64}
 pub struct Block {pub first_frame:u64,pub timing:CommitTiming,pub min_commit:u64,pub generation:u64,pub pcm:[u8;960]}
 struct NativeControl {
     module:HMODULE,object:*mut c_void,pub event:HANDLE,
     service:unsafe extern "C" fn(*mut c_void)->i32,close:unsafe extern "C" fn(*mut c_void),
 }
-impl Drop for NativeControl {fn drop(&mut self){unsafe{if !self.object.is_null(){(self.close)(self.object);}FreeLibrary(self.module);}}}
+impl Drop for NativeControl {fn drop(&mut self){unsafe{if !self.object.is_null(){(self.close)(self.object);}if !self.module.is_null(){FreeLibrary(self.module);}}}}
 unsafe impl Send for NativeControl {} // opaque event/thread owner; no COM services cross threads
 pub struct Source {
     file:std::fs::File,section:HANDLE,pub event:HANDLE,map:*const Mapping,native:NativeControl,
-    lease:Option<EndpointLease>,generation:u64,ticket:u64,offset:usize,slot:Option<SlotHeader>,
+    lease:Option<EndpointLease>,broker_owned:bool,generation:u64,ticket:u64,offset:usize,slot:Option<SlotHeader>,
     geometry_reported:bool,have:usize,next_frame:Option<u64>,first:u64,oldest:u64,min_commit:u64,pcm:[u8;960],
 }
 unsafe impl Send for Source {} // transferred once from setup; used by ONE owner thereafter
@@ -45,36 +64,76 @@ fn invalid(s:&str)->io::Error {io::Error::new(io::ErrorKind::InvalidData,s)}
 impl Source {
     pub fn open(peer:&str,dll:&str,minimum:bool,cancel:&AtomicBool)->io::Result<Self> {
         let lease=EndpointLease::provision(peer,cancel)?;
-        let path:Vec<u16>=dll.encode_utf16().chain(Some(0)).collect();
-        if !std::path::Path::new(dll).is_absolute() {return Err(invalid("source DLL requires absolute path"))}
+        let period=Self::open_period(&lease.endpoint_id,std::path::Path::new(dll),minimum,None)?;
+        let handles=lease.grant_pcm(&guid_text(period.timing.source))?;
+        let source=Self::map_period(period,handles,Some(lease))?;
+        crate::session_control::source_ready(peer,&source.lease.as_ref().unwrap().endpoint_id)?;
+        Ok(source)
+    }
+    pub(crate) fn open_prepared(endpoint:&str,minimum:bool,cancelled:HANDLE,until:u64)->io::Result<OpenedPeriod> {
+        let image=std::env::current_exe()?;
+        let dll=image.parent().ok_or_else(||invalid("worker directory missing"))?.join("deskfuse-source-control.dll");
+        Self::open_period(endpoint,&dll,minimum,Some((cancelled,until)))
+    }
+    fn open_period(endpoint:&str,dll:&std::path::Path,minimum:bool,authority:Option<(HANDLE,u64)>)->io::Result<OpenedPeriod> {
+        use std::os::windows::ffi::OsStrExt;
+        if !dll.is_absolute() {return Err(invalid("source DLL requires absolute path"))}
+        let path:Vec<u16>=dll.as_os_str().encode_wide().chain(Some(0)).collect();
         unsafe {
             let module=LoadLibraryExW(path.as_ptr(),std::ptr::null_mut(),LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR|LOAD_LIBRARY_SEARCH_SYSTEM32);
             if module.is_null(){return Err(io::Error::last_os_error())}
-            let open=GetProcAddress(module,b"deskfuse_source_open\0".as_ptr());
+            let symbol = if authority.is_some() { b"deskfuse_source_open_prepared\0".as_slice() }
+                else { b"deskfuse_source_open\0".as_slice() };
+            let open=GetProcAddress(module,symbol.as_ptr());
             let service=GetProcAddress(module,b"deskfuse_source_service\0".as_ptr());
             let close=GetProcAddress(module,b"deskfuse_source_close\0".as_ptr());
             let period=GetProcAddress(module,b"deskfuse_source_period_frames\0".as_ptr());
             if open.is_none() || service.is_none() || close.is_none() || period.is_none(){FreeLibrary(module);return Err(invalid("source DLL ABI unavailable"))}
-            let open:unsafe extern "C" fn(*const u16,u32,*mut Timing,*mut HANDLE)->*mut c_void=std::mem::transmute(open);
-            let endpoint:Vec<u16>=lease.endpoint_id.encode_utf16().chain(Some(0)).collect();
+            let endpoint:Vec<u16>=endpoint.encode_utf16().chain(Some(0)).collect();
             let mut timing=Timing::default();let mut event=std::ptr::null_mut();
-            let object=open(endpoint.as_ptr(),minimum as u32,&mut timing,&mut event);
+            let object=if let Some((cancelled,until))=authority {
+                let open:unsafe extern "C" fn(*const u16,u32,HANDLE,u64,*mut Timing,*mut HANDLE)->*mut c_void=std::mem::transmute(open);
+                open(endpoint.as_ptr(),minimum as u32,cancelled,until,&mut timing,&mut event)
+            } else {
+                let open:unsafe extern "C" fn(*const u16,u32,*mut Timing,*mut HANDLE)->*mut c_void=std::mem::transmute(open);
+                open(endpoint.as_ptr(),minimum as u32,&mut timing,&mut event)
+            };
             if object.is_null(){FreeLibrary(module);return Err(invalid("running endpoint/period/export contract refused"))}
             let native=NativeControl{module,object,event,service:std::mem::transmute(service),close:std::mem::transmute(close)};
             let period:unsafe extern "C" fn(*mut c_void)->u32=std::mem::transmute(period);
-            if !(1..=240).contains(&period(object)){return Err(invalid("actual direct engine period not qualified"))}
+            let frames=period(object);
+            if event.is_null() || !(1..=240).contains(&frames){return Err(invalid("actual direct engine period not qualified"))}
             if timing.size as usize!=std::mem::size_of::<Timing>() || timing.abi!=1 || timing.build!=0x2026102502 ||
                 timing.flags&3!=3 || timing.export_abi!=ABI || timing.source==[0;16] {return Err(invalid("driver timing/source ABI mismatch"))}
-            let handles=lease.grant_pcm(&guid_text(timing.source))?;
+            Ok(OpenedPeriod{native,timing,frames})
+        }
+    }
+    pub(crate) fn map_prepared(period:OpenedPeriod,handles:[u64;4])->io::Result<Self> {
+        Self::map_period(period,handles,None)
+    }
+    fn map_period(period:OpenedPeriod,handles:[u64;4],lease:Option<EndpointLease>)->io::Result<Self> {
+        let [file,section,event]=handles[..3] else { unreachable!() };
+        if [file,section,event].iter().any(|&h| h==0 || h>isize::MAX as u64)
+            || file==section || file==event || section==event || handles[3]==0 {
+            return Err(invalid("invalid PCM handle offer"));
+        }
+        unsafe {
             let file=std::fs::File::from_raw_handle(handles[0] as HANDLE);
             let section=handles[1] as HANDLE;let source_event=handles[2] as HANDLE;
             let view=MapViewOfFile(section,FILE_MAP_READ,0,0,std::mem::size_of::<Mapping>());
             if view.Value.is_null(){CloseHandle(section);CloseHandle(source_event);return Err(io::Error::last_os_error())}
-            let source=Self{file,section,event:source_event,map:view.Value.cast(),native,lease:Some(lease),generation:handles[3],
+            let broker_owned=lease.is_none();
+            let source=Self{file,section,event:source_event,map:view.Value.cast(),native:period.native,lease,broker_owned,generation:handles[3],
                 ticket:0,offset:0,slot:None,geometry_reported:false,have:0,next_frame:None,first:0,oldest:0,min_commit:0,pcm:[0;960]};
             let control=source.snapshot()?;
-            if control.source!=timing.source{return Err(invalid("mapped source differs from exact endpoint"))}
-            crate::session_control::source_ready(peer,&source.lease.as_ref().unwrap().endpoint_id)?;
+            let header = std::ptr::addr_of!((*source.map).control);
+            if control.source != period.timing.source ||
+                std::ptr::read_volatile(std::ptr::addr_of!((*header).source)) != control.source ||
+                std::ptr::read_volatile(std::ptr::addr_of!((*header).generation)) != control.generation ||
+                std::ptr::read_volatile(std::ptr::addr_of!((*header).abi)) != control.abi ||
+                std::ptr::read_volatile(std::ptr::addr_of!((*header).size)) != control.size {
+                return Err(invalid("mapped source differs from exact endpoint or file"));
+            }
             Ok(source)
         }
     }
@@ -90,7 +149,12 @@ impl Source {
         Ok(())
     }
     pub fn snapshot(&self)->io::Result<Control> {
-        let mut c=Control::default();self.ioctl(SNAPSHOT,None,&mut c)?;
+        let mut c=Control::default();
+        #[cfg(test)]
+        if self.native.module.is_null() { c = unsafe { std::ptr::read_volatile(&(*self.map).control) }; }
+        else { self.ioctl(SNAPSHOT,None,&mut c)?; }
+        #[cfg(not(test))]
+        self.ioctl(SNAPSHOT,None,&mut c)?;
         c.geometry.validate()?;
         if c.size as usize!=std::mem::size_of::<Control>() || c.abi!=ABI || c.generation!=self.generation || c.state>1 ||
             c.acknowledged>c.published || c.published-c.acknowledged>8 {return Err(invalid("source control retired/incompatible"))}Ok(c)
@@ -102,6 +166,8 @@ impl Source {
         Ok(CommitFence{generation:c.generation,accepted:c.accepted_commit,end_frame:c.accepted_end_frame,request_qpc})
     }
     fn acknowledge(&self,c:&Control)->io::Result<()> {
+        #[cfg(test)]
+        if self.native.module.is_null() { return Ok(()); }
         self.ioctl(ACK,Some(&Ack{generation:self.generation,ticket:self.ticket,control:c.control_sequence}),&mut 0u64)
     }
     pub fn arm(&self)->io::Result<()> {let c=self.snapshot()?;self.acknowledge(&c)}
@@ -144,7 +210,9 @@ impl Source {
     pub fn release_lease(&mut self){drop(self.lease.take());}
     pub fn stop(&mut self) {
         let mut returned=0;
-        unsafe {DeviceIoControl(self.file.as_raw_handle(),REVOKE,std::ptr::null(),0,std::ptr::null_mut(),0,&mut returned,std::ptr::null_mut());}
+        if !self.broker_owned {
+            unsafe {DeviceIoControl(self.file.as_raw_handle(),REVOKE,std::ptr::null(),0,std::ptr::null_mut(),0,&mut returned,std::ptr::null_mut());}
+        }
         if !self.native.object.is_null(){unsafe{(self.native.close)(self.native.object);}self.native.object=std::ptr::null_mut();}
     }
 }
@@ -153,6 +221,25 @@ fn guid_text(g:[u8;16])->String {
     format!("{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
         u32::from_le_bytes(g[0..4].try_into().unwrap()),u16::from_le_bytes(g[4..6].try_into().unwrap()),
         u16::from_le_bytes(g[6..8].try_into().unwrap()),g[8],g[9],g[10],g[11],g[12],g[13],g[14],g[15])
+}
+
+#[cfg(test)]
+pub(crate) fn fixture_pcm(source: [u8; 16], generation: u64) -> [u64; 4] {
+    use windows_sys::Win32::System::Threading::CreateEventW;
+    unsafe {
+        let file = CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
+        let ready = CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
+        let section = CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE,
+            0, std::mem::size_of::<Mapping>() as u32, std::ptr::null());
+        assert!(!file.is_null() && !ready.is_null() && !section.is_null());
+        let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, std::mem::size_of::<Mapping>());
+        assert!(!view.Value.is_null());
+        (*view.Value.cast::<Mapping>()).control = Control {
+            size: std::mem::size_of::<Control>() as u32, abi: ABI, source, generation, ..Control::default()
+        };
+        UnmapViewOfFile(view);
+        [file as u64, section as u64, ready as u64, generation]
+    }
 }
 
 /// Endpoint/COM/mapping setup is off the QUIC owner. This one-item channel

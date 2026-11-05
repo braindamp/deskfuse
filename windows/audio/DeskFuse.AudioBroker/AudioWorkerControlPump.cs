@@ -15,6 +15,14 @@ internal sealed class AudioWorkerControlPump
         internal byte[]? Observed;
     }
     private Listener? listener;
+    private sealed class SourceExchange(AudioWorkerFrameKind expected, byte[] prefix)
+    {
+        internal readonly AudioWorkerFrameKind Expected = expected;
+        internal readonly byte[] Prefix = prefix;
+        internal readonly TaskCompletionSource<byte[]> Ack = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal readonly TaskCompletionSource<byte[]> Done = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    }
+    private SourceExchange? sourceExchange;
     private sealed class Pending(byte[] bytes, bool closed)
     {
         internal readonly byte[] Bytes = bytes;
@@ -122,6 +130,48 @@ internal sealed class AudioWorkerControlPump
             if (failure is null) value.Done.TrySetResult(true); else value.Done.TrySetException(failure);
         }
     }
+    internal Task<byte[]> ExchangeSourceAsync(AudioWorkerFrameKind kind, byte[] context, byte[] payload, TimeSpan timeout)
+    {
+        var expected = kind switch
+        {
+            AudioWorkerFrameKind.OpenSource => AudioWorkerFrameKind.SourceOpened,
+            AudioWorkerFrameKind.AttachPcm => AudioWorkerFrameKind.SourceMapped,
+            _ => throw new InvalidDataException("Invalid source setup operation.")
+        };
+        var snapshot = context.ToArray();
+        var bytes = snapshot.Concat(payload).ToArray();
+        SourceExchange exchange;
+        lock (gate)
+        {
+            RequireLive();
+            if (sourceExchange is not null) throw new InvalidOperationException("Source setup write is already owned.");
+            sourceExchange = exchange = new(expected, snapshot);
+        }
+        _ = CompleteSourceExchange(exchange, kind, bytes, timeout);
+        return exchange.Done.Task;
+    }
+    private async Task CompleteSourceExchange(SourceExchange exchange, AudioWorkerFrameKind kind, byte[] body, TimeSpan timeout)
+    {
+        byte[]? result = null;
+        Exception? error = null;
+        try
+        {
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
+            deadline.CancelAfter(timeout);
+            await control.WriteAsync(kind, body, deadline.Token).ConfigureAwait(false);
+            result = await exchange.Ack.Task.WaitAsync(deadline.Token).ConfigureAwait(false);
+        }
+        catch (Exception failure) { lock (gate) error = failed ?? failure; Fail(error); }
+        finally
+        {
+            lock (gate)
+            {
+                sourceExchange = null;
+                if (exchange.Ack.Task.IsFaulted) _ = exchange.Ack.Task.Exception;
+                if (error is null) exchange.Done.TrySetResult(result!); else exchange.Done.TrySetException(error);
+            }
+        }
+    }
     private async Task ReadLoop()
     {
         try
@@ -151,9 +201,20 @@ internal sealed class AudioWorkerControlPump
                         value.Ack.TrySetResult(true);
                     }
                 }
+                else if (frame.Kind is AudioWorkerFrameKind.SourceOpened or AudioWorkerFrameKind.SourceMapped)
+                {
+                    lock (gate)
+                    {
+                        var exchange = sourceExchange;
+                        if (exchange is null || exchange.Expected != frame.Kind ||
+                            !frame.Body.AsSpan().StartsWith(exchange.Prefix) ||
+                            !exchange.Ack.TrySetResult(frame.Body.AsSpan(exchange.Prefix.Length).ToArray()))
+                            throw new InvalidDataException("Unmatched native source observation.");
+                    }
+                }
                 else if (frame.Kind is AudioWorkerFrameKind.Hello or AudioWorkerFrameKind.Ready or
                     AudioWorkerFrameKind.Authority or AudioWorkerFrameKind.Stop or AudioWorkerFrameKind.NetworkReply or
-                    AudioWorkerFrameKind.ConfigureListener || !post(frame))
+                    AudioWorkerFrameKind.ConfigureListener or AudioWorkerFrameKind.OpenSource or AudioWorkerFrameKind.AttachPcm || !post(frame))
                     throw new InvalidDataException("Unroutable native control event.");
             }
         }
@@ -239,10 +300,12 @@ internal sealed class AudioWorkerControlPump
             var work = pending.Values.Select(p => p.Done.Task).Cast<Task>().Append(reader).ToList();
             work.AddRange(replies.Select(p => p.Done.Task));
             if (listener is not null) work.Add(listener.Done.Task);
+            if (sourceExchange is not null) work.Add(sourceExchange.Done.Task);
             if (stopWrite is not null) work.Add(stopWrite);
             if (!lifetime.IsCancellationRequested) lifetime.Cancel();
             foreach (var p in pending.Values) p.Ack.TrySetException(new IOException("Native control retired."));
             listener?.Ack.TrySetException(new IOException("Native control retired."));
+            sourceExchange?.Ack.TrySetException(new IOException("Native control retired."));
             return join = Join(work);
         }
     }
@@ -259,6 +322,7 @@ internal sealed class AudioWorkerControlPump
             notify = failed is null && !stopping; failed ??= error;
             foreach (var value in pending.Values) value.Ack.TrySetException(error);
             listener?.Ack.TrySetException(error);
+            sourceExchange?.Ack.TrySetException(error);
             if (!lifetime.IsCancellationRequested) lifetime.Cancel();
         }
         if (notify) onFailure(error);

@@ -17,10 +17,17 @@ struct SourceControl {
     DeskFuseTimingCapabilities identity{};
     UINT32 period_frames=0;
     std::thread worker;
-    SourceControl(const wchar_t* id,bool minimum) {
+    SourceControl(const wchar_t* id,bool minimum,HANDLE cancelled=nullptr,ULONGLONG until=0) {
         if (!id || !*id || !ready.get() || !stop.get() || !failed.get()) throw std::runtime_error("source control setup failed");
-        worker=std::thread([this,id=std::wstring(id),minimum]{
+        worker=std::thread([this,id=std::wstring(id),minimum,cancelled,until]{
             try {
+                auto require_live=[&] {
+                    if (!cancelled) return;
+                    ULONGLONG now=0; QueryInterruptTimePrecise(&now);
+                    if (WaitForSingleObject(cancelled,0)!=WAIT_TIMEOUT || now>=until)
+                        throw std::runtime_error("source preparation retired");
+                };
+                require_live();
                 ComApartment com;
                 AudioMmcssTask scheduling;
                 auto endpoint=exact_endpoint(id.c_str());
@@ -33,7 +40,8 @@ struct SourceControl {
                     WAVEFORMATEX* raw=nullptr;check(audio->GetMixFormat(&raw),"source mix format");
                     std::unique_ptr<WAVEFORMATEX,decltype(&CoTaskMemFree)> format(raw,CoTaskMemFree);
                     if (minimum) {
-                        period.initialize(*endpoint.Get(),*format,engine_periods(*audio.Get(),*format));period.start();
+                        period.initialize(*endpoint.Get(),*format,engine_periods(*audio.Get(),*format));
+                        require_live(); period.start();
                         period.verify_driver(*endpoint.Get());
                     }
                     const auto granted=engine_periods(*audio.Get(),*format);
@@ -48,7 +56,7 @@ struct SourceControl {
                           << " period_verified=1";
                 std::cerr << " current_period_frames=" << period_frames;
                 std::cerr << "\n";
-                SetEvent(ready.get());
+                require_live(); SetEvent(ready.get());
                 HANDLE waits[]={stop.get(),period.event()};
                 for (;;) {
                     const auto result=WaitForMultipleObjects(minimum?2:1,waits,FALSE,INFINITE);
@@ -85,6 +93,13 @@ extern "C" __declspec(dllexport) int deskfuse_owned_endpoint_query(const wchar_t
 extern "C" __declspec(dllexport) void* deskfuse_source_open(const wchar_t* id,unsigned minimum,DeskFuseTimingCapabilities* result,HANDLE* event) noexcept {
     if (!result || !event || minimum>1) return nullptr;
     try {auto source=std::make_unique<SourceControl>(id,minimum!=0);*result=source->identity;*event=source->failed.get();return source.release();}
+    catch (...) {return nullptr;}
+}
+extern "C" __declspec(dllexport) void* deskfuse_source_open_prepared(const wchar_t* id,unsigned minimum,
+    HANDLE cancelled,ULONGLONG until,DeskFuseTimingCapabilities* result,HANDLE* event) noexcept {
+    if (!cancelled || !until || !result || !event || minimum>1) return nullptr;
+    try {auto source=std::make_unique<SourceControl>(id,minimum!=0,cancelled,until);
+        *result=source->identity;*event=source->failed.get();return source.release();}
     catch (...) {return nullptr;}
 }
 extern "C" __declspec(dllexport) int deskfuse_source_service(void* value) noexcept {

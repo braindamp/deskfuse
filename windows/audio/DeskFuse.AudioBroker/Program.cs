@@ -586,21 +586,21 @@ internal sealed class EndpointBroker
 internal static class EndpointResolver
 {
     internal static async Task<string?> ResolveAsync(string instancePath,
-        TimeSpan timeout, CancellationToken cancellationToken)
+        TimeSpan timeout, CancellationToken cancellationToken, bool requireUnique = false)
     {
         var deadline = DateTime.UtcNow + timeout;
         while (DateTime.UtcNow < deadline && !cancellationToken.IsCancellationRequested)
         {
-            var found = TryResolve(instancePath);
+            var found = TryResolve(instancePath, requireUnique);
             if (found is not null) return found;
             await Task.Delay(250, cancellationToken).ConfigureAwait(false);
         }
         return null;
     }
 
-    private static string? TryResolve(string instancePath)
+    private static string? TryResolve(string instancePath, bool requireUnique)
     {
-        try { return FindActiveEndpoint(instancePath); }
+        try { return FindActiveEndpoint(instancePath, requireUnique); }
         catch (System.Runtime.InteropServices.COMException)
         {
             // The audio service can be busy; try again on the next tick.
@@ -610,17 +610,21 @@ internal static class EndpointResolver
 
     // Removal requires a successful scan. A COM failure must never be
     // mistaken for proof that the old endpoint has departed.
-    internal static string? FindActiveEndpoint(string instancePath)
+    internal static string? FindActiveEndpoint(string instancePath, bool requireUnique = false)
     {
+        string? match = null;
         using var enumerator = new MMDeviceEnumerator();
         foreach (var device in enumerator.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active))
         {
             using (device)
             {
-                if (Mentions(device, instancePath)) return device.ID;
+                if (!Mentions(device, instancePath)) continue;
+                if (!requireUnique) return device.ID;
+                if (match is not null) throw new InvalidOperationException("The owned speaker resolved to multiple endpoints.");
+                match = device.ID;
             }
         }
-        return null;
+        return match;
     }
 
     /// <summary>True when one of the endpoint's properties names the device.</summary>

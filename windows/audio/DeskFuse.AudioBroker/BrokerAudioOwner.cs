@@ -447,6 +447,16 @@ internal sealed class BrokerAudioOwner
     {
         lock (gate) { RequirePreparation(acquisition); acquisition.ClaimPreparation(this); }
     }
+    internal TimeSpan PreparationBudget(Committed acquisition, TimeSpan limit)
+    {
+        lock (gate)
+        {
+            RequirePreparation(acquisition);
+            var now = Now();
+            RequireLive(now);
+            return TimeSpan.FromTicks((long)Math.Min(until - now, (ulong)limit.Ticks));
+        }
+    }
     internal bool CompletePreparation(Committed acquisition, AudioObservedSource observed)
     {
         var encoded = AudioAuthorityProtocol.Binding(Source, observed); var digest = SHA256.HashData(encoded);

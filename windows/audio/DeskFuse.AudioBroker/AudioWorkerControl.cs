@@ -9,8 +9,60 @@ internal enum AudioWorkerFrameKind : byte {
     Hello = 1, Ready = 2, Stop = 3, Authority = 4, AuthorityObserved = 5,
     ConfigureListener = 6, ListenerConfigured = 7, ConnectionObserved = 8, ConnectionClosed = 9,
     NetworkRequest = 10, NetworkReply = 11, RundownObserved = 12,
+    OpenSource = 13, SourceOpened = 14, AttachPcm = 15, SourceMapped = 16,
 }
 internal sealed record AudioWorkerFrame(AudioWorkerFrameKind Kind, byte[] Body);
+
+internal static class AudioSourceAttachment
+{
+    internal static byte[] Context(AudioControlGrant preparing)
+    {
+        if (preparing.Closed || preparing.OutputReady || preparing.DeliveryGeneration != 0 ||
+            preparing.OutputGeneration != 0 || preparing.BindingDigest.Any(b => b != 0))
+            throw new InvalidDataException("Source preparation requires an unbound projection.");
+        var grant = AudioAuthorityProtocol.Control(preparing);
+        var bytes = new byte[grant.Length + 3];
+        bytes[0] = 1;
+        BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(1), checked((ushort)grant.Length));
+        grant.CopyTo(bytes, 3);
+        return bytes;
+    }
+    internal static byte[] Endpoint(string endpoint)
+    {
+        var utf8 = new System.Text.UTF8Encoding(false, true).GetBytes(endpoint);
+        if (utf8.Length is < 1 or > 1024 || endpoint.Any(char.IsControl))
+            throw new InvalidDataException("Invalid exact audio endpoint.");
+        var bytes = new byte[2 + utf8.Length];
+        BinaryPrimitives.WriteUInt16BigEndian(bytes, checked((ushort)utf8.Length));
+        utf8.CopyTo(bytes, 2);
+        return bytes;
+    }
+    internal static AudioObservedSource Opened(byte[] payload, Guid device, string endpoint)
+    {
+        if (payload.Length != 40) throw new InvalidDataException("Invalid source period observation.");
+        var source = new Guid(payload.AsSpan(0, 16), bigEndian: true);
+        var abi = BinaryPrimitives.ReadUInt32BigEndian(payload.AsSpan(16));
+        var build = BinaryPrimitives.ReadUInt64BigEndian(payload.AsSpan(20));
+        var incarnation = BinaryPrimitives.ReadUInt64BigEndian(payload.AsSpan(28));
+        var period = BinaryPrimitives.ReadUInt32BigEndian(payload.AsSpan(36));
+        if (source == Guid.Empty || abi != 1 || build != 0x2026102502UL || incarnation == 0 || period is < 1 or > 240)
+            throw new InvalidDataException("Invalid native source identity or period.");
+        return new(device, endpoint, source, abi, build, incarnation, 0);
+    }
+    internal static byte[] Handles(ulong file, ulong section, ulong ready, ulong generation)
+    {
+        if (file == 0 || section == 0 || ready == 0 || generation == 0 ||
+            file > long.MaxValue || section > long.MaxValue || ready > long.MaxValue ||
+            file == section || file == ready || section == ready)
+            throw new InvalidDataException("Invalid PCM handle offer.");
+        var bytes = new byte[32];
+        BinaryPrimitives.WriteUInt64BigEndian(bytes, file);
+        BinaryPrimitives.WriteUInt64BigEndian(bytes.AsSpan(8), section);
+        BinaryPrimitives.WriteUInt64BigEndian(bytes.AsSpan(16), ready);
+        BinaryPrimitives.WriteUInt64BigEndian(bytes.AsSpan(24), generation);
+        return bytes;
+    }
+}
 
 /// <summary>Bounded local native control, distinct from enrollment/network framing.</summary>
 internal sealed class AudioWorkerControl(IEnrollmentChannel channel)
@@ -89,6 +141,7 @@ internal sealed class BrokerAudioWorkerSession
     private Task<System.Net.IPEndPoint>? listenerConfiguration;
     private AudioListenerConfiguration? retainedListener;
     private IAudioWorkerEventOwner? eventOwner;
+    private Action? retireOwner;
     private Task? stopOperation;
     private BrokerAudioOwner? audioOwner;
     private bool stopping;
@@ -101,17 +154,20 @@ internal sealed class BrokerAudioWorkerSession
         pump = new(control, frame => {
             if (!caller.Matches(worker)) throw new UnauthorizedAccessException("Native event caller changed.");
             return Volatile.Read(ref eventOwner)?.TryPost(frame) == true;
-        }, _ => Volatile.Read(ref audioOwner)?.CloseAdmission());
+        }, _ => {
+            Volatile.Read(ref audioOwner)?.CloseAdmission();
+            Volatile.Read(ref retireOwner)?.Invoke();
+        });
     }
 
-    internal void BindEvents(BrokerAudioOwner owner, IAudioWorkerEventOwner events)
+    internal void BindEvents(BrokerAudioOwner owner, IAudioWorkerEventOwner events, Action? retire = null)
     {
         ArgumentNullException.ThrowIfNull(events);
         lock (publicationGate)
         {
             RequireOwner(owner);
             if (stopping || eventOwner is not null) throw new InvalidOperationException("Native event owner is already bound or stopping.");
-            audioOwner = owner; Volatile.Write(ref eventOwner, events);
+            audioOwner = owner; Volatile.Write(ref retireOwner, retire); Volatile.Write(ref eventOwner, events);
         }
     }
     private void RequireOwner(BrokerAudioOwner owner)
@@ -121,6 +177,22 @@ internal sealed class BrokerAudioWorkerSession
     }
     internal Task SendReplyAsync(byte[] bytes, bool negative, Action<AudioWorkerControlPump.ReplyPermit> reserved) =>
         pump.SendReplyAsync(bytes, negative, reserved);
+    internal async Task<byte[]> ExchangeSourceAsync(BrokerAudioOwner owner, BrokerAudioOwner.Committed acquisition,
+        AudioWorkerFrameKind kind, byte[] context, byte[] body, TimeSpan timeout)
+    {
+        Task<byte[]> operation;
+        lock (publicationGate)
+        {
+            RequireOwner(owner);
+            if (stopping || eventOwner is null) throw new IOException("Source control is unavailable.");
+            owner.RequirePreparation(acquisition);
+            operation = pump.ExchangeSourceAsync(kind, context, body, timeout);
+        }
+        var result = await operation.ConfigureAwait(false);
+        if (!caller.Matches(Worker)) throw new UnauthorizedAccessException("Source observation changed caller.");
+        owner.RequirePreparation(acquisition);
+        return result;
+    }
     internal Task<System.Net.IPEndPoint> ConfigureListenerAsync(BrokerAudioOwner owner, AudioListenerConfiguration configuration, CancellationToken ct)
     {
         Task<System.Net.IPEndPoint> operation;
@@ -304,8 +376,8 @@ internal sealed class BrokerAudioWorkerSession
         try { await pump.SendStopAsync().ConfigureAwait(false); }
         catch (Exception error) when (error is IOException or OperationCanceledException or ObjectDisposedException) { }
         Worker.StopAndJoin(); // Actual retained job/process completion, regardless of cooperative reply.
-        if (eventOwner is not null) await eventOwner.StopAndJoinAsync().ConfigureAwait(false);
         await pump.StopAndJoinAsync().ConfigureAwait(false);
+        if (eventOwner is not null) await eventOwner.StopAndJoinAsync().ConfigureAwait(false);
         try { await Task.WhenAll(pending).ConfigureAwait(false); } catch { /* Actual retained I/O has completed. */ }
         caller.Dispose(); lock (publicationGate) stopped = true;
     }

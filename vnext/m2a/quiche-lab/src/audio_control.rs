@@ -158,6 +158,8 @@ pub struct SourceScope {
     pub source: [u8; 16],
     pub generation: u64,
     pub device_key: [u8; 16],
+    pub backend: u8,
+    pub minimum_period: bool,
     pub digest: [u8; 32],
     pub wire: [u32; 3],
     pub grace100ns: u64,
@@ -183,14 +185,16 @@ impl SourceScope {
         let source = r.nonzero()?;
         let generation = r.nonzero_u64()?;
         let device_key = r.nonzero::<16>()?;
-        if !matches!(r.byte()?, 1 | 2) {
+        let backend = r.byte()?;
+        if !matches!(backend, 1 | 2) {
             return Err(invalid());
         }
         r.nonzero::<32>()?;
-        if r.u32()? != 48000 || r.u16()? != 2 || r.u16()? != 16 || r.u16()? != 240 || r.byte()? > 1
+        if r.u32()? != 48000 || r.u16()? != 2 || r.u16()? != 16 || r.u16()? != 240
         {
             return Err(invalid());
         }
+        let minimum_period = match r.byte()? { 0 => false, 1 => true, _ => return Err(invalid()) };
         let duration = r.nonzero_u32()?;
         let grace = r.u32()?;
         if grace > duration {
@@ -206,6 +210,8 @@ impl SourceScope {
             source,
             generation,
             device_key,
+            backend,
+            minimum_period,
             digest: boring::sha::sha256(b),
             wire,
             grace100ns: u64::from(grace) * 10000,
