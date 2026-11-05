@@ -239,9 +239,10 @@ impl NativeRuntime {
             if self.dispatch_replies()? || self.service_candidate()? {
                 continue;
             }
+            let mut source_work = false;
             if let Some(source) = self.source.as_mut() {
                 let client = &self.client;
-                if source.pump(&mut self.authority, now, || client.terminal())? { continue; }
+                source_work = source.pump(&mut self.authority, now, || client.terminal())?;
                 if let Some(listener) = &self.listener {
                     source.service_egress(
                         &mut self.authority, &listener._socket, false,
@@ -251,6 +252,7 @@ impl NativeRuntime {
             }
             if self.listener.is_some() {
                 if self.drain_listener()? { continue; }
+                if source_work { continue; }
                 self.live()?;
                 let timeout = match self.timeout(self.source.as_ref().and_then(SourceOwner::deadline)) {
                     Ok(ms) => ms,

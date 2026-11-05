@@ -718,6 +718,7 @@ impl ControlConnection {
         self.egress = Egress::default();
         let _ = self.conn.close(true, 0, b"");
     }
+    pub(crate) fn local_endpoint(&self) -> SocketAddr { self.local }
     pub(crate) fn approved_for(&self, grant: &ControlGrant, binding: &DeliveryBinding) -> bool {
         self.approved.as_ref().is_some_and(|current| {
             !self.retired && current.binding == *binding

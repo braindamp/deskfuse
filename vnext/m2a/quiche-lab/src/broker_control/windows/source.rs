@@ -7,7 +7,7 @@ use crate::plaintext_expiry::{PcmTiming, PlaintextExpiry};
 use crate::source_age;
 use crate::{Header, HEADER_BYTES, KIND_AUDIO, VERSION};
 use std::io;
-use std::net::UdpSocket;
+use std::net::{SocketAddr, UdpSocket};
 use std::time::Instant;
 use windows_sys::Win32::Foundation::HANDLE;
 
@@ -62,9 +62,10 @@ impl SourceOwner {
     }
     pub(super) fn install(
         &mut self, mut connection: ControlConnection, binding: DeliveryBinding,
-        grant: &ControlGrant, now: u64,
+        grant: &ControlGrant, local: SocketAddr, now: u64,
     ) -> io::Result<()> {
         if self.delivery.is_some() || !self.scope.matches(grant)
+            || connection.local_endpoint() != local
             || !connection.approved_for(grant, &binding)
         {
             connection.retire();
@@ -289,7 +290,7 @@ mod tests {
         let fences = Arc::new(Mutex::new(0));
         let fake = Fake { chunks: VecDeque::from([block]), fences: Arc::clone(&fences) };
         let mut source = SourceOwner::new(scope.clone(), Box::new(fake));
-        source.install(native, binding, &grant, 101).unwrap();
+        source.install(native, binding, &grant, "127.0.0.1:44002".parse().unwrap(), 101).unwrap();
         source.pump(&mut authority, || 102, || false).unwrap();
         assert_eq!(source.outstanding(), 1);
         source.block_egress(103).unwrap();
