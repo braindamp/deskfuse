@@ -126,16 +126,18 @@ impl Forwarding {
         self.pending.insert(key, message.kind);
         Ok(true)
     }
-    /// Validate before touching the live/quarantined TLS object. A missing TLS
-    /// object does not prevent releasing this completed pipe operation.
-    pub fn complete(&mut self, message: &Message) -> io::Result<()> {
+    pub fn validate_reply(&self, message: &Message) -> io::Result<()> {
         message.encode(true)?;
         let key = (message.connection, message.request);
         let kind = *self.pending.get(&key).ok_or_else(c::invalid)?;
         if message.kind != c::ERROR && message.kind != kind + 128 {
             return Err(c::invalid());
         }
-        self.pending.remove(&key);
+        Ok(())
+    }
+    pub fn complete(&mut self, message: &Message) -> io::Result<()> {
+        self.validate_reply(message)?;
+        self.pending.remove(&(message.connection, message.request));
         Ok(())
     }
 }

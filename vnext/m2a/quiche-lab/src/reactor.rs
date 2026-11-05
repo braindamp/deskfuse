@@ -359,28 +359,37 @@ impl WindowsEvents {
                 control:signaled(0),terminal:signaled(1),source:signaled(2)}})
         }
     }
-    /// Unconfigured media has no source handle. Listen for broker and UDP
-    /// readiness and resume notifications without a periodic timer tick.
-    pub fn wait_listener(&self, control: *mut std::ffi::c_void,
-        terminal: *mut std::ffi::c_void, resume: *mut std::ffi::c_void,
-        timeout_ms: u32) -> io::Result<()> {
+    pub fn wait_listener(
+        &self, control: *mut std::ffi::c_void, terminal: *mut std::ffi::c_void,
+        resume: *mut std::ffi::c_void, setup_wake: *mut std::ffi::c_void,
+        setup_done: Option<std::os::windows::io::BorrowedHandle<'_>>, timeout_ms: u32,
+    ) -> io::Result<bool> {
+        use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::{Networking::WinSock::*, System::Threading::*};
-        let handles = [terminal, control, resume, self.event as *mut std::ffi::c_void];
-        if handles.iter().enumerate().any(|(index, h)| h.is_null() || handles[..index].contains(h)) {
+        let mut handles = [
+            terminal, control, resume, setup_wake,
+            self.event as *mut std::ffi::c_void, std::ptr::null_mut()
+        ];
+        let count = if let Some(done) = setup_done {
+            handles[5] = handles[4];
+            handles[4] = done.as_raw_handle();
+            6
+        } else { 5 };
+        if handles[..count].iter().enumerate().any(|(at, handle)| {
+            handle.is_null() || handles[..at].contains(handle)
+        }) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "listener requires distinct live events"));
         }
         unsafe {
-            let result = WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, timeout_ms);
+            let result = WaitForMultipleObjects(count as u32, handles.as_ptr(), 0, timeout_ms);
             if result == 258 {
                 return Err(io::Error::new(io::ErrorKind::TimedOut, "Listener authority deadline"));
             }
             if result == u32::MAX { return Err(io::Error::last_os_error()); }
-            if result >= handles.len() as u32 {
+            if result >= count as u32 {
                 return Err(io::Error::other("Unexpected listener readiness"));
             }
-            if result < 3 {
-                return Ok(());
-            }
+            if result != (count - 1) as u32 { return Ok(false); }
             let mut events: WSANETWORKEVENTS = std::mem::zeroed();
             if WSAEnumNetworkEvents(self.socket, self.event, &mut events) != 0 {
                 return Err(io::Error::from_raw_os_error(WSAGetLastError()));
@@ -393,7 +402,7 @@ impl WindowsEvents {
                     return Err(io::Error::from_raw_os_error(events.iErrorCode[index as usize]));
                 }
             }
-            Ok(())
+            Ok(events.lNetworkEvents & FD_WRITE as i32 != 0)
         }
     }
     pub fn new(udp:&UdpSocket)->io::Result<Self> {

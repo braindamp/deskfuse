@@ -2,9 +2,12 @@ use super::*;
 use super::channel::{BrokerControlClient, Frame};
 use super::resume::ResumeWake;
 use crate::audio_authority::{AudioAuthority, ControlGrant};
+use crate::audio_candidate::{CandidateSetup, SetupEvent};
+use crate::audio_control::{self as ac, Record};
 use crate::audio_listener_config::ListenerConfig;
-use std::collections::VecDeque;
-use std::net::UdpSocket;
+use crate::audio_rpc::{Forwarding, Message};
+use std::collections::{BTreeMap, VecDeque};
+use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
 
 struct BoundListener {
@@ -13,6 +16,11 @@ struct BoundListener {
     config: ListenerConfig,
     _socket: Arc<UdpSocket>,
     acknowledgement: Vec<u8>,
+    setup_wake: Arc<OwnedHandle>,
+    candidate: Option<CandidateSetup>,
+    observed: Option<[u8; 16]>,
+    pending_event: Option<(SetupEvent, bool)>,
+    cooldown_until: u64,
 }
 
 struct NativeRuntime {
@@ -20,6 +28,9 @@ struct NativeRuntime {
     authority: AudioAuthority,
     listener: Option<BoundListener>,
     resume: ResumeWake,
+    forwarding: Forwarding,
+    pending_replies: VecDeque<Message>,
+    reply_custody: BTreeMap<([u8; 16], u64), Message>,
     #[cfg(test)]
     test_clock: Option<Arc<std::sync::atomic::AtomicU64>>,
     #[cfg(test)]
@@ -33,6 +44,7 @@ fn now() -> u64 {
     unsafe { QueryInterruptTimePrecise(&mut value); }
     value
 }
+fn setup_clock() -> io::Result<u64> { Ok(now()) }
 fn retired() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "Native authority retired")
 }
@@ -50,6 +62,9 @@ impl NativeRuntime {
         let resume = ResumeWake::register()?;
         Ok(Self {
             client, authority, listener: None, resume,
+            forwarding: Forwarding::default(),
+            pending_replies: VecDeque::new(),
+            reply_custody: BTreeMap::new(),
             #[cfg(test)]
             test_clock: None,
             #[cfg(test)]
@@ -108,6 +123,7 @@ impl NativeRuntime {
                 self.live()?;
                 let (socket, acknowledgement) = config.bind()?;
                 let events = crate::reactor::WindowsEvents::new(&socket)?;
+                let setup_wake = Arc::new(handle(unsafe { CreateEventW(null(), 0, 0, null()) })?);
                 self.live()?;
                 self.listener = Some(BoundListener {
                     events,
@@ -115,8 +131,22 @@ impl NativeRuntime {
                     config,
                     _socket: socket,
                     acknowledgement: acknowledgement.clone(),
+                    setup_wake,
+                    candidate: None,
+                    observed: None,
+                    pending_event: None,
+                    cooldown_until: 0,
                 });
                 Ok(Some((LISTENER_CONFIGURED, acknowledgement)))
+            }
+            NETWORK_REPLY => {
+                let message = Message::parse(&frame.body, true)?;
+                self.forwarding.validate_reply(&message)?;
+                if self.pending_replies.len() >= ac::MAX_PENDING + 1 {
+                    return Err(invalid());
+                }
+                self.pending_replies.push_back(message);
+                Ok(None)
             }
             STOP if frame.body.is_empty() => {
                 self.authority.close();
@@ -177,27 +207,8 @@ impl NativeRuntime {
 
     fn serve_live(&mut self, pending: &mut VecDeque<Frame>) -> io::Result<()> {
         loop {
-            if self.client.terminal() {
-                return Err(retired());
-            }
             self.live()?;
-            let frames = self.client.drain(8)?;
-            if frames.is_empty() {
-                if self.listener.is_some() {
-                    if self.drain_listener()? { continue; }
-                    self.live()?;
-                    let timeout = self.timeout(None)?;
-                    #[cfg(test)]
-                    if let Some(sender) = &self.test_idle { let _ = sender.send(()); }
-                    self.listener.as_ref().unwrap().events.wait_listener(
-                        self.client.control_event().as_raw_handle(),
-                        self.client.terminal_event().as_raw_handle(), self.resume.event(), timeout)?;
-                } else {
-                    self.wait(self.client.control_event().as_raw_handle(), None, false)?;
-                }
-                continue;
-            }
-            pending.extend(frames);
+            pending.extend(self.client.drain(8)?);
             while let Some(frame) = pending.pop_front() {
                 if self.client.terminal() {
                     pending.push_front(frame);
@@ -208,30 +219,226 @@ impl NativeRuntime {
                     self.acknowledge(kind, &body, false)?;
                 }
             }
+            if self.dispatch_replies()? || self.service_candidate()? {
+                continue;
+            }
+            if self.listener.is_some() {
+                if self.drain_listener()? { continue; }
+                self.live()?;
+                let timeout = self.timeout(None)?;
+                #[cfg(test)]
+                if let Some(sender) = &self.test_idle { let _ = sender.send(()); }
+                let owned = self.listener.as_ref().unwrap();
+                let completed = owned.candidate.as_ref()
+                    .filter(|setup| !setup.finished())
+                    .and_then(CandidateSetup::completion_handle);
+                let writable = owned.events.wait_listener(
+                    self.client.control_event().as_raw_handle(),
+                    self.client.terminal_event().as_raw_handle(),
+                    self.resume.event(),
+                    owned.setup_wake.as_raw_handle(),
+                    completed, timeout,
+                )?;
+                self.live()?;
+                if writable {
+                    if let Some(setup) = self.listener.as_ref().and_then(|owned| owned.candidate.as_ref()) {
+                        setup.writable();
+                    }
+                }
+            } else {
+                self.wait(self.client.control_event().as_raw_handle(), None, false)?;
+            }
         }
+    }
+
+    fn dispatch_replies(&mut self) -> io::Result<bool> {
+        let count = self.pending_replies.len();
+        let mut dispatched = false;
+        for _ in 0..count {
+            self.live()?;
+            let message = self.pending_replies.pop_front().unwrap();
+            self.forwarding.validate_reply(&message)?;
+            let active = self.listener.as_ref().is_some_and(|owned| {
+                owned.observed == Some(message.connection)
+                    && owned.candidate.as_ref().is_some_and(|setup| !setup.finished())
+            });
+            if active {
+                let reply = Record {
+                    kind: message.kind,
+                    request: message.request,
+                    body: message.body.clone(),
+                };
+                let result = self.listener.as_ref().unwrap().candidate.as_ref().unwrap().try_reply(&reply);
+                match result {
+                    Ok(true) => {
+                        let key = (message.connection, message.request);
+                        if self.reply_custody.insert(key, message).is_some() {
+                            return Err(invalid());
+                        }
+                        dispatched = true;
+                    }
+                    Ok(false) => self.pending_replies.push_back(message),
+                    Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+                        self.forwarding.complete(&message)?;
+                        dispatched = true;
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else {
+                self.forwarding.complete(&message)?;
+                dispatched = true;
+            }
+        }
+        Ok(dispatched)
+    }
+
+    fn service_candidate(&mut self) -> io::Result<bool> {
+        if !self.listener.as_ref().is_some_and(|owned| owned.candidate.is_some()) {
+            return Ok(false);
+        }
+        {
+            let owned = self.listener.as_mut().unwrap();
+            if owned.pending_event.is_none() {
+                if let Some(event) = owned.candidate.as_ref().unwrap().drain_events(1)?.pop() {
+                    owned.pending_event = Some((event, false));
+                }
+            }
+        }
+        if let Some((event, credited)) = self.listener.as_mut().unwrap().pending_event.take() {
+            self.live()?;
+            match event {
+                SetupEvent::Observed(observation) => {
+                    if self.listener.as_ref().unwrap().observed.is_some() { return Err(invalid()); }
+                    self.acknowledge(CONNECTION_OBSERVED, &observation.encode()?, false)?;
+                    self.listener.as_mut().unwrap().observed = Some(observation.connection);
+                }
+                SetupEvent::Request(record) => {
+                    let connection = self.listener.as_ref().unwrap().observed.ok_or_else(invalid)?;
+                    if matches!(record.kind, ac::PREPARE | ac::ISSUE | ac::PROOF | ac::OUTPUT | ac::DETACH | ac::STOP) {
+                        let unavailable = Record { kind: ac::ERROR, request: record.request, body: vec![4] };
+                        let setup = self.listener.as_ref().unwrap().candidate.as_ref().unwrap();
+                        if setup.finished() { return Ok(true); }
+                        match setup.try_reply(&unavailable) {
+                            Ok(true) => return Ok(true),
+                            Ok(false) => {
+                                self.listener.as_mut().unwrap().pending_event = Some((SetupEvent::Request(record), false));
+                                return Ok(false);
+                            }
+                            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => return Ok(true),
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    let message = Message {
+                        request: record.request,
+                        connection,
+                        kind: record.kind,
+                        body: record.body.clone(),
+                    };
+                    if !credited && !self.forwarding.admit(&message)? {
+                        self.listener.as_mut().unwrap().pending_event = Some((SetupEvent::Request(record), false));
+                        return Ok(false);
+                    }
+                    if !self.client.try_write(NETWORK_REQUEST, &message.encode(false)?)? {
+                        self.listener.as_mut().unwrap().pending_event = Some((SetupEvent::Request(record), true));
+                        return Ok(false);
+                    }
+                }
+                SetupEvent::ReplyQueued(request) => {
+                    let connection = self.listener.as_ref().unwrap().observed.ok_or_else(invalid)?;
+                    if let Some(message) = self.reply_custody.remove(&(connection, request)) {
+                        self.forwarding.complete(&message)?;
+                    }
+                }
+                SetupEvent::Pinned(_) => return Err(invalid()),
+            }
+            return Ok(true);
+        }
+        let observed = self.listener.as_ref().unwrap().observed;
+        if !self.listener.as_ref().unwrap().candidate.as_ref().unwrap().finished() {
+            return Ok(false);
+        }
+        if let Some(connection) = observed {
+            if !self.client.try_write(CONNECTION_CLOSED, &connection)? {
+                return Ok(false);
+            }
+            let keys: Vec<_> = self.reply_custody.keys()
+                .filter(|(id, _)| *id == connection).copied().collect();
+            for key in keys {
+                let message = self.reply_custody.remove(&key).unwrap();
+                self.forwarding.complete(&message)?;
+            }
+        }
+        let next_at = self.clock();
+        let owned = self.listener.as_mut().unwrap();
+        let outcome = owned.candidate.as_mut().unwrap().take_finished()?;
+        let Some(outcome) = outcome else { return Err(invalid()); };
+        if outcome.promoted || outcome.pinned_request.is_some() { return Err(invalid()); }
+        owned.candidate = None;
+        owned.observed = None;
+        owned.cooldown_until = next_at.saturating_add(owned.config.policy.cooldown100ns());
+        Ok(true)
     }
 
     fn drain_listener(&mut self) -> io::Result<bool> {
         let limit = self.listener.as_ref().unwrap().config.policy.packet_work as usize;
+        let to = self.listener.as_ref().unwrap()._socket.local_addr()?;
         let mut bytes = [0u8; crate::reactor::MAX_QUIC_UDP_BYTES + 1];
         for _ in 0..limit {
             self.live()?;
             let received = self.listener.as_ref().unwrap()._socket.recv_from(&mut bytes);
             match received {
-                Ok((size, _)) => {
+                Ok((size, from)) => {
                     #[cfg(test)]
                     if let Some(sender) = &self.test_datagram { let _ = sender.send(size); }
-                    #[cfg(not(test))]
-                    let _ = size;
+                    if size <= crate::reactor::MAX_QUIC_UDP_BYTES {
+                        self.route_packet(&mut bytes[..size], from, to)?;
+                    }
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
                 Err(error) if error.raw_os_error() == Some(10040) => {}
                 Err(error) => return Err(error),
             }
         }
-        // No candidate/active route is authorized by this ingress slice.
-        // Every packet is discarded without source, delivery or readiness side effects.
         Ok(true)
+    }
+
+    fn route_packet(&mut self, bytes: &mut [u8], from: SocketAddr, to: SocketAddr) -> io::Result<()> {
+        if bytes.is_empty() { return Ok(()); }
+        let header = match quiche::Header::from_slice(bytes, 16) {
+            Ok(header) => header,
+            Err(_) => return Ok(()),
+        };
+        let info = quiche::RecvInfo { from, to };
+        let owned = self.listener.as_ref().unwrap();
+        if let Some(setup) = &owned.candidate {
+            if setup.routes(header.dcid.as_ref(), info) && !setup.finished() {
+                let _ = setup.try_packet(bytes, quiche::RecvInfo { from, to });
+            }
+            return Ok(());
+        }
+        if bytes.len() < 1200 || header.ty != quiche::Type::Initial
+            || header.version != quiche::PROTOCOL_VERSION || header.dcid.len() != 16
+            || self.clock() < owned.cooldown_until
+        {
+            return Ok(());
+        }
+        let limits = owned.config.policy.limits(self.clock())?;
+        let wake = Arc::clone(&owned.setup_wake);
+        let signal: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            unsafe { SetEvent(wake.as_raw_handle()); }
+        });
+        let started = CandidateSetup::start(
+            bytes, info, Arc::clone(&owned._socket), owned.config.scope.clone(),
+            self.client.boot(), limits, setup_clock, signal,
+        );
+        let tick = self.clock();
+        let owned = self.listener.as_mut().unwrap();
+        owned.cooldown_until = tick.saturating_add(owned.config.policy.cooldown100ns());
+        if let Ok(setup) = started {
+            setup.writable();
+            owned.candidate = Some(setup);
+        }
+        Ok(())
     }
 
     fn timeout(&self, until: Option<Instant>) -> io::Result<u32> {
@@ -425,6 +632,110 @@ mod tests {
         assert!(remote.read(100).is_err());
         remote.write(STOP, &[]).unwrap();
         assert_eq!(done_rx.recv_timeout(Duration::from_secs(3)).unwrap(), None);
+        assert!(thread.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn candidate_observation_precedes_info_and_readonly_applied_lookup() {
+        use crate::audio_tls::Role;
+        use crate::audio_transport::DeliveryTls;
+        let (runtime, remote) = runtime();
+        let mut config = listener_bytes();
+        let policy_at = config.len() - 26;
+        config[policy_at..policy_at + 4].copy_from_slice(&10_000u32.to_be_bytes());
+        let thread = spawn_runtime(runtime);
+        remote.write(CONFIGURE_LISTENER, &config).unwrap();
+        let (kind, ack) = remote.read(3000).unwrap();
+        assert_eq!(kind, LISTENER_CONFIGURED);
+        let server = SocketAddr::from((
+            [ack[34], ack[35], ack[36], ack[37]],
+            u16::from_be_bytes([ack[38], ack[39]]),
+        ));
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../../../tools/protocol3/audio-source-stop-v1.json"
+        )).unwrap();
+        let hex = fixture["appliedResultHex"].as_str().unwrap();
+        let applied: Vec<u8> = (0..hex.len()).step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect();
+        let source: Vec<u8> = config[4..4 + u16::from_be_bytes([config[2], config[3]]) as usize].to_vec();
+        let phone_source = source.clone();
+        let phone = std::thread::spawn(move || {
+            let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+            socket.set_nonblocking(true).unwrap();
+            let mut conn = DeliveryTls::generate(Role::Phone).unwrap()
+                .connect(socket.local_addr().unwrap(), server, now() + 200_000_000, 10_000).unwrap();
+            let mut observed = false;
+            let mut info_sent = false;
+            let mut applied_sent = false;
+            let deadline = Instant::now() + Duration::from_secs(8);
+            let mut buf = [0u8; 1350];
+            loop {
+                assert!(Instant::now() < deadline, "candidate control integration deadline");
+                let tick = now();
+                conn.service_timeout(tick).unwrap();
+                for _ in 0..16 {
+                    match socket.recv_from(&mut buf) {
+                        Ok((n, from)) => {
+                            conn.receive(&mut buf[..n], quiche::RecvInfo {
+                                from, to: socket.local_addr().unwrap()
+                            }, now()).unwrap();
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(error) => panic!("{error}"),
+                    }
+                }
+                if !info_sent && conn.facts(now()).unwrap().is_some() {
+                    conn.queue_control(Record { kind: ac::INFO, request: 1, body: Vec::new() }, now()).unwrap();
+                    info_sent = true;
+                }
+                for record in conn.read_control(now()).unwrap() {
+                    match record.kind {
+                        ac::NOTICE => {
+                            assert!(crate::audio_control::Observation::parse(&record.body).is_ok());
+                            observed = true;
+                        }
+                        129 => {
+                            assert!(observed);
+                            assert_eq!(record.request, 1);
+                            assert_eq!(record.body, phone_source);
+                            assert!(!applied_sent);
+                            conn.queue_control(Record {
+                                kind: ac::APPLIED_RESULT, request: 2, body: applied.clone()
+                            }, now()).unwrap();
+                            applied_sent = true;
+                        }
+                        ac::ERROR => {
+                            assert!(observed && info_sent && applied_sent);
+                            assert_eq!(record.request, 2);
+                            assert_eq!(record.body, [1]);
+                            return;
+                        }
+                        other => panic!("unexpected candidate reply: {other}"),
+                    }
+                }
+                conn.service_egress(&socket, true, now()).unwrap();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let (kind, body) = remote.read(3000).unwrap();
+        assert_eq!(kind, CONNECTION_OBSERVED);
+        let observation = crate::audio_control::Observation::parse(&body).unwrap();
+        let (kind, body) = remote.read(3000).unwrap();
+        assert_eq!(kind, NETWORK_REQUEST);
+        let info = Message::parse(&body, false).unwrap();
+        assert_eq!(info.connection, observation.connection);
+        assert_eq!((info.kind, info.request), (ac::INFO, 1));
+        let reply = Message { kind: 129, body: source.clone(), ..info };
+        remote.write(NETWORK_REPLY, &reply.encode(true).unwrap()).unwrap();
+        let (kind, body) = remote.read(3000).unwrap();
+        assert_eq!(kind, NETWORK_REQUEST);
+        let applied_request = Message::parse(&body, false).unwrap();
+        assert_eq!(applied_request.connection, observation.connection);
+        assert_eq!((applied_request.kind, applied_request.request), (ac::APPLIED_RESULT, 2));
+        let miss = Message { kind: ac::ERROR, body: vec![1], ..applied_request };
+        remote.write(NETWORK_REPLY, &miss.encode(true).unwrap()).unwrap();
+        phone.join().unwrap();
+        remote.write(STOP, &[]).unwrap();
         assert!(thread.join().unwrap().is_ok());
     }
 
