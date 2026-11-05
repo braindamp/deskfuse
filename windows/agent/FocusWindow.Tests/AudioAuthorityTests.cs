@@ -315,9 +315,11 @@ public sealed class AudioAuthorityTests
             release.TrySetResult(true);
             var signed = (await original.Reply()).Body;
             Assert.Equal(AudioAuthorityPhase.Prepared, f.Owner.Snapshot().Phase);
+            var signedCounts = f.Owner.RequestCounts;
+            Assert.Equal(0, signedCounts.Pending);
             Assert.True(recovery.Send(AudioNetworkKind.AppliedResult, query));
             Assert.Equal(signed, (await recovery.Reply()).Body);
-            Assert.Equal(before, f.Owner.RequestCounts);
+            Assert.Equal(signedCounts, f.Owner.RequestCounts);
             Assert.Equal(1, Volatile.Read(ref invoked));
         }
         finally
