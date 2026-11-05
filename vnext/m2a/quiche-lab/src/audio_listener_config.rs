@@ -99,6 +99,21 @@ impl ListenerConfig {
     }
     pub fn bind(&self) -> io::Result<(Arc<UdpSocket>, Vec<u8>)> {
         let socket = Arc::new(UdpSocket::bind(self.address)?);
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawSocket;
+            use windows_sys::Win32::Networking::WinSock::{WSAGetLastError, WSAIoctl, SIO_UDP_CONNRESET};
+            // A delayed ICMP error on this shared socket cannot name a QUIC route.
+            let enabled = 0u32;
+            let mut returned = 0;
+            if unsafe { WSAIoctl(
+                socket.as_raw_socket() as usize, SIO_UDP_CONNRESET, (&enabled as *const u32).cast(),
+                std::mem::size_of_val(&enabled) as u32, std::ptr::null_mut(), 0,
+                &mut returned, std::ptr::null_mut(), None,
+            ) } != 0 {
+                return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
+            }
+        }
         socket.set_nonblocking(true)?;
         let acknowledgement = self.acknowledgement(socket.local_addr()?)?;
         Ok((socket, acknowledgement))

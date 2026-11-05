@@ -13,6 +13,7 @@ const MAX_BURST: usize = 128;
 
 struct Pending {
     len: usize,
+    may_contain_media: bool,
     to: SocketAddr,
     at: Instant,
     created: Instant,
@@ -50,6 +51,10 @@ impl Egress {
 
     pub fn has_pending_ciphertext(&self) -> bool {
         self.pending.is_some()
+    }
+
+    pub(crate) fn has_pending_media(&self) -> bool {
+        self.pending.as_ref().is_some_and(|packet| packet.may_contain_media)
     }
 
     /// Pacing deadline only; if blocked, wait for OS socket writability.
@@ -99,6 +104,15 @@ impl Egress {
     pub fn service_with_io(
         &mut self, local: SocketAddr, conn: &mut quiche::Connection,
         writable: bool,
+        maintain: impl FnMut(&mut quiche::Connection) -> Result<(), Box<dyn std::error::Error>>,
+        send: impl FnMut(&[u8], SocketAddr) -> io::Result<usize>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.service_with_media_tracking::<false>(local, conn, writable, maintain, send)
+    }
+
+    pub(crate) fn service_with_media_tracking<const TRACK_MEDIA: bool>(
+        &mut self, local: SocketAddr, conn: &mut quiche::Connection,
+        writable: bool,
         mut maintain: impl FnMut(&mut quiche::Connection)
             -> Result<(), Box<dyn std::error::Error>>,
         mut send: impl FnMut(&[u8], SocketAddr) -> io::Result<usize>,
@@ -112,6 +126,7 @@ impl Egress {
             if self.pending.is_none() {
                 self.maintenance_calls += 1;
                 maintain(conn)?;
+                let before = if TRACK_MEDIA { conn.dgram_send_queue_len() } else { 0 };
                 let (len, info) = match conn.send(&mut self.bytes) {
                     Ok(packet) => packet,
                     Err(quiche::Error::Done) => return Ok(()),
@@ -125,7 +140,10 @@ impl Egress {
                 }
                 let created = Instant::now();
                 self.pacing_max_us = self.pacing_max_us.max(info.at.saturating_duration_since(created).as_micros() as u64);
-                self.pending = Some(Pending { len, to: info.to, at: info.at, created, blocked_since: None });
+                // Active outgoing DATAGRAMs are PCM. Quiche may also drop one
+                // while sealing, so a decrease conservatively tags this slot.
+                let may_contain_media = TRACK_MEDIA && before != 0 && conn.dgram_send_queue_len() < before;
+                self.pending = Some(Pending { len, may_contain_media, to: info.to, at: info.at, created, blocked_since: None });
                 self.blocked = false;
             }
 
@@ -182,7 +200,7 @@ mod ciphertext_slot_tests {
         let sealed=vec![0x64u8;1200];
         let mut e=Egress::default();
         e.bytes[..sealed.len()].copy_from_slice(&sealed);
-        e.pending=Some(Pending{len:sealed.len(),to:remote,at:Instant::now(),created:Instant::now(),blocked_since:None});
+        e.pending=Some(Pending{len:sealed.len(),may_contain_media:false,to:remote,at:Instant::now(),created:Instant::now(),blocked_since:None});
         e.blocked=true;
         let mut hooks=0;
         let constructed = conn.stats().sent;
@@ -208,7 +226,7 @@ mod ciphertext_slot_tests {
         let original=vec![0x4au8;1200];
         let mut e=Egress::default();
         e.bytes[..original.len()].copy_from_slice(&original);
-        e.pending=Some(Pending{len:original.len(),to:target,at:Instant::now(),created:Instant::now(),blocked_since:None});
+        e.pending=Some(Pending{len:original.len(),may_contain_media:false,to:target,at:Instant::now(),created:Instant::now(),blocked_since:None});
         for _ in 0..12 {
             let mut called=0;
             assert!(!e.flush_owned_slot(|bytes,to|{

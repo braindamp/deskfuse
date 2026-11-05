@@ -413,7 +413,7 @@ impl ControlConnection {
         if self.facts.is_none() {
             return Ok(vec![]);
         }
-        let mut result = Vec::with_capacity(MAX_PENDING);
+        let mut result = Vec::new();
         while result.len() < limit {
             if let Some(record) = self.read_backlog.pop_front() {
                 result.push(record);
@@ -749,7 +749,7 @@ impl ControlConnection {
     ) -> io::Result<()> {
         self.service_timeout(now)?;
         self.flush_stream()?;
-        let result = self.egress.service_with_io(
+        let result = self.egress.service_with_media_tracking::<true>(
             self.local, &mut self.conn, writable,
             |conn| {
                 ledger.purge(conn, crate::source_age::local_qpc_100ns()?);
@@ -771,7 +771,7 @@ impl ControlConnection {
     ) -> io::Result<()> {
         self.advance(now)?;
         self.flush_stream()?;
-        let result = self.egress.service_with_io(
+        let result = self.egress.service_with_media_tracking::<true>(
             self.local, &mut self.conn, writable,
             |conn| {
                 ledger.purge(conn, crate::source_age::local_qpc_100ns()?);
@@ -783,6 +783,13 @@ impl ControlConnection {
     }
     pub(crate) fn sealed_pending(&self) -> bool {
         self.egress.has_pending_ciphertext()
+    }
+    pub(crate) fn sealed_media_pending(&self) -> bool {
+        self.egress.has_pending_media()
+    }
+    pub(crate) fn discard_plaintext_media(&mut self, ledger: &mut crate::plaintext_expiry::PlaintextExpiry) {
+        self.conn.dgram_purge_outgoing(|_| true);
+        ledger.clear();
     }
     pub fn is_approved(&self) -> bool {
         self.approved.is_some() && !self.retired
@@ -894,6 +901,21 @@ pub(crate) mod tests {
                 Err(e) => panic!("{e:?}"),
             }
         }
+    }
+    pub(crate) fn send_one(from: &mut ControlConnection, socket: &UdpSocket) {
+        from.flush_stream().unwrap();
+        let mut bytes = [0u8; 1350];
+        let (size, info) = from.conn.send(&mut bytes).unwrap();
+        assert_eq!(socket.send_to(&bytes[..size], info.to).unwrap(), size);
+    }
+    #[cfg(windows)]
+    pub(crate) fn receive_media(connection: &mut ControlConnection, socket: &UdpSocket) -> bool {
+        let mut bytes = [0u8; 1350];
+        let (size, from) = socket.recv_from(&mut bytes).unwrap();
+        connection.receive(&mut bytes[..size], quiche::RecvInfo {
+            from, to: socket.local_addr().unwrap(),
+        }, 101).unwrap();
+        connection.conn.dgram_recv(&mut bytes).is_ok()
     }
     pub(crate) fn pair() -> (ControlConnection, ControlConnection) {
         pair_at("127.0.0.1:44001".parse().unwrap(),

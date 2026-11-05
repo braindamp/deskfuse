@@ -30,24 +30,32 @@ struct Outbound {
 }
 struct Completion {
     event: OwnedHandle,
+    finished: AtomicBool,
     result: Mutex<Option<io::Result<()>>>,
 }
 impl Completion {
     fn new() -> io::Result<Self> {
-        Ok(Self { event: handle(unsafe { CreateEventW(null(), 1, 0, null()) })?, result: Mutex::new(None) })
+        Ok(Self {
+            event: handle(unsafe { CreateEventW(null(), 1, 0, null()) })?,
+            finished: AtomicBool::new(false),
+            result: Mutex::new(None),
+        })
     }
     fn finish(&self, result: io::Result<()>) {
         *self.result.lock().unwrap_or_else(|p| p.into_inner()) = Some(result);
+        self.finished.store(true, Ordering::Release);
         unsafe { SetEvent(self.event.as_raw_handle()); }
     }
 }
 pub struct WriteReceipt(Arc<Completion>);
 impl WriteReceipt {
+    pub(super) fn new() -> io::Result<Self> { Ok(Self(Arc::new(Completion::new()?))) }
     pub fn event(&self) -> std::os::windows::io::BorrowedHandle<'_> {
         use std::os::windows::io::AsHandle;
         self.0.event.as_handle()
     }
     pub fn take_result(&self) -> Option<io::Result<()>> {
+        if !self.0.finished.load(Ordering::Acquire) { return None; }
         self.0.result.lock().unwrap_or_else(|p| p.into_inner()).take()
     }
 }
@@ -233,10 +241,12 @@ impl BrokerControlClient {
         self.enqueue(kind, body, None)
     }
     pub fn try_write_confirmed(&self, kind: u8, body: &[u8]) -> io::Result<Option<WriteReceipt>> {
-        let completion = Arc::new(Completion::new()?);
-        if self.enqueue(kind, body, Some(Arc::clone(&completion)))? {
-            Ok(Some(WriteReceipt(completion)))
-        } else { Ok(None) }
+        let receipt = WriteReceipt::new()?;
+        Ok(self.try_write_with_receipt(kind, body, &receipt)?.then_some(receipt))
+    }
+    // Keep one receipt across full-queue retries. The owner submits it once.
+    pub(super) fn try_write_with_receipt(&self, kind: u8, body: &[u8], receipt: &WriteReceipt) -> io::Result<bool> {
+        self.enqueue(kind, body, Some(Arc::clone(&receipt.0)))
     }
     fn enqueue(&self, kind: u8, body: &[u8], completion: Option<Arc<Completion>>) -> io::Result<bool> {
         if body.len() >= MAX_FRAME {

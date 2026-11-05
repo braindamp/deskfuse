@@ -40,7 +40,7 @@ struct Delivery {
     ledger: PlaintextExpiry,
     generation: u64,
     digest: [u8; 32],
-    media_queued: bool,
+    ready_output: Option<u64>,
 }
 
 pub(super) struct SourceOwner {
@@ -84,10 +84,6 @@ impl SourceOwner {
     pub(super) fn grace_expired(&self, now: u64) -> bool {
         self.delivery.is_none() && self.reconnect_until.is_some_and(|until| now >= until)
     }
-    pub(super) fn has_queued_media(&self) -> bool {
-        self.delivery.as_ref().is_some_and(|d|
-            d.media_queued || d.ledger.len() != 0)
-    }
     pub(super) fn read_control(&mut self, now: u64) -> io::Result<Vec<Record>> {
         let Some(delivery) = self.delivery.as_mut() else { return Ok(Vec::new()); };
         match delivery.connection.read_control_limited(now, ac::MAX_PENDING) {
@@ -119,7 +115,7 @@ impl SourceOwner {
         self.delivery = Some(Delivery {
             connection, binding, ledger: PlaintextExpiry::default(),
             generation: grant.delivery_generation, digest: grant.delivery_digest,
-            media_queued: false,
+            ready_output: grant.ready.then_some(grant.output_generation),
         });
         self.authority_until = grant.until;
         self.reconnect_until = None;
@@ -150,7 +146,20 @@ impl SourceOwner {
                 }
             }
         }
-        if !grant.ready && self.has_queued_media() { self.fence_delivery_at(now)?; }
+        if let Some(delivery) = self.delivery.as_mut() {
+            let ready = grant.ready.then_some(grant.output_generation);
+            let withdrawn = delivery.ready_output.is_some() && delivery.ready_output != ready;
+            delivery.ready_output = ready;
+            if withdrawn { self.pause_media(now)?; }
+        }
+        Ok(())
+    }
+    fn pause_media(&mut self, now: u64) -> io::Result<()> {
+        if let Some(delivery) = self.delivery.as_mut() {
+            if delivery.connection.sealed_media_pending() { return self.fence_delivery_at(now); }
+            delivery.connection.discard_plaintext_media(&mut delivery.ledger);
+            self.fence = Some(self.input.discard_partial(source_age::local_qpc_100ns()?)?);
+        }
         Ok(())
     }
     pub(super) fn fence_delivery(&mut self) -> io::Result<()> {
@@ -174,13 +183,14 @@ impl SourceOwner {
     }
     pub(super) fn receive(
         &mut self, ciphertext: &mut [u8], info: quiche::RecvInfo, now: u64,
-    ) -> io::Result<()> {
+    ) -> io::Result<bool> {
         if let Some(delivery) = self.delivery.as_mut() {
-            if delivery.connection.receive(ciphertext, info, now).is_err() {
-                self.fence_delivery_at(now)?;
+            match delivery.connection.receive(ciphertext, info, now) {
+                Ok(received) => return Ok(received),
+                Err(_) => { self.fence_delivery_at(now)?; return Ok(true); }
             }
         }
-        Ok(())
+        Ok(false)
     }
     pub(super) fn pump(
         &mut self, authority: &mut AudioAuthority,
@@ -215,13 +225,12 @@ impl SourceOwner {
             };
             self.sequence += 1;
             let delivery = self.delivery.as_mut().unwrap();
-            match delivery.connection.queue_media(
+            if delivery.connection.queue_media(
                 &mut delivery.ledger, &header, &block.pcm,
                 PcmTiming::Committed(block.timing), boot(),
-            ) {
-                Ok(crate::plaintext_expiry::QueueAdmission::Queued) => delivery.media_queued = true,
-                Ok(_) => {},
-                Err(_) => { self.fence_delivery_at(boot())?; break; }
+            ).is_err() {
+                self.fence_delivery_at(boot())?;
+                break;
             }
             if let Some(socket) = socket {
                 self.service_egress(authority, socket, false, &mut boot, &mut terminal)?;
@@ -241,9 +250,10 @@ impl SourceOwner {
             return Ok(());
         }
         let media = authority.media_allowed(now);
-        if !media && self.has_queued_media() {
-            self.fence_delivery_at(now)?;
-            return Ok(());
+        if !media && self.delivery.as_ref().is_some_and(|delivery|
+            delivery.connection.sealed_media_pending() || delivery.ledger.len() != 0)
+        {
+            self.pause_media(now)?;
         }
         if let Some(delivery) = self.delivery.as_mut() {
             #[cfg(test)]
@@ -341,7 +351,11 @@ mod tests {
     }
 
     #[test]
-    fn output_withdrawal_retires_delivery_after_plaintext_ledger_is_drained() {
+    fn output_withdrawal_retires_blocked_media_and_preserves_a_drained_delivery() {
+        for blocked in [true, false] { check_output_withdrawal(blocked); }
+    }
+
+    fn check_output_withdrawal(blocked: bool) {
         let f: serde_json::Value = serde_json::from_str(include_str!(
             "../../../../../../tools/protocol3/audio-transport-v1.json"
         )).unwrap();
@@ -386,18 +400,24 @@ mod tests {
             native, binding, &grant, "127.0.0.1:44002".parse().unwrap(), 101,
         ).unwrap();
         source.pump(&mut authority, || 102, || false, None).unwrap();
-        let incumbent = source.delivery.as_mut().unwrap();
-        assert!(incumbent.media_queued);
-        incumbent.ledger.clear();
-        assert!(!incumbent.connection.sealed_pending());
-        assert!(source.has_queued_media());
+        source.block_egress(103).unwrap();
+        assert!(source.delivery.as_ref().unwrap().connection.sealed_media_pending());
+        if !blocked {
+            let incumbent = source.delivery.as_mut().unwrap();
+            incumbent.connection.service_media_with_io(
+                &mut incumbent.ledger, true, 103, |bytes, _| Ok(bytes.len()),
+            ).unwrap();
+            assert!(!incumbent.connection.sealed_pending());
+            assert_eq!(incumbent.ledger.len(), 0);
+        }
 
         let mut withdrawn = grant;
         withdrawn.revision += 1;
         withdrawn.ready = false;
         authority.apply(withdrawn.clone(), 103).unwrap();
         source.recheck(&withdrawn, 103).unwrap();
-        assert!(!source.has_delivery());
+        assert_eq!(source.has_delivery(), !blocked);
+        assert_eq!(source.pending_close().is_some(), blocked);
         assert_eq!(*fences.lock().unwrap(), 1);
     }
 

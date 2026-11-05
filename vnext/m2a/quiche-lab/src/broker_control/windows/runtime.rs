@@ -1,5 +1,5 @@
 use super::*;
-use super::channel::{BrokerControlClient, Frame};
+use super::channel::{BrokerControlClient, Frame, WriteReceipt};
 use super::resume::ResumeWake;
 use super::source::SourceOwner;
 use crate::audio_authority::{AudioAuthority, ControlGrant};
@@ -19,6 +19,7 @@ struct BoundListener {
     acknowledgement: Vec<u8>,
     setup_wake: Arc<OwnedHandle>,
     candidate: Option<CandidateSetup>,
+    observation_pending: Option<[u8; 16]>,
     observed: Option<[u8; 16]>,
     pending_regular: VecDeque<Record>,
     pending_negative: Option<Record>,
@@ -28,12 +29,20 @@ struct BoundListener {
     candidate_until: u64,
 }
 
+struct Confirmation {
+    frame: Frame,
+    deadline: Instant,
+    receipt: WriteReceipt,
+    submitted: bool,
+}
+
 struct NativeRuntime {
     client: BrokerControlClient,
     authority: AudioAuthority,
     listener: Option<BoundListener>,
     source: Option<SourceOwner>,
     resume: ResumeWake,
+    confirmations: VecDeque<Confirmation>,
     pipe_requests: PipeRequests,
     pending_replies: VecDeque<Message>,
     reply_custody: BTreeMap<([u8; 16], u64), Message>,
@@ -73,6 +82,7 @@ impl NativeRuntime {
         let resume = ResumeWake::register()?;
         Ok(Self {
             client, authority, listener: None, source: None, resume,
+            confirmations: VecDeque::new(),
             pipe_requests: PipeRequests::default(),
             pending_replies: VecDeque::new(),
             reply_custody: BTreeMap::new(),
@@ -159,6 +169,7 @@ impl NativeRuntime {
                     acknowledgement: acknowledgement.clone(),
                     setup_wake,
                     candidate: None,
+                    observation_pending: None,
                     observed: None,
                     pending_regular: VecDeque::new(),
                     pending_negative: None,
@@ -186,6 +197,9 @@ impl NativeRuntime {
     }
 
     fn handle_terminal(&mut self, mut already: VecDeque<Frame>) -> io::Result<()> {
+        // The channel still owns and joins submitted writes. Late completion
+        // cannot publish a candidate or restart normal work after this fence.
+        self.confirmations.clear();
         if let Some(error) = self.client.failure() { return Err(error); }
         already.extend(self.client.drain(16)?);
         if already.iter().any(|frame| frame.kind == STOP) {
@@ -216,7 +230,7 @@ impl NativeRuntime {
         if let Some(setup) = &retiring { setup.cancel(); }
         self.listener = None;
         let published = if let Some(body) = closed {
-            self.acknowledge(AUTHORITY_OBSERVED, &body, true)
+            self.acknowledge_closed(&body)
         } else {
             Err(retired())
         };
@@ -247,12 +261,14 @@ impl NativeRuntime {
                 }
                 self.live()?;
                 if let Some((kind, body)) = self.process(frame)? {
-                    self.acknowledge(kind, &body, false)?;
+                    self.queue_confirmation(kind, body)?;
                 }
             }
+            self.service_confirmations()?;
             let mut work = self.dispatch_replies()?;
             work |= self.service_candidate()?;
             work |= self.service_active()?;
+            let pending_close = self.source.as_ref().and_then(SourceOwner::pending_close);
             let mut source_work = false;
             #[cfg(test)]
             let synthetic_clock = self.test_clock.clone();
@@ -301,9 +317,14 @@ impl NativeRuntime {
                         setup.writable();
                     }
                 }
-                if drained || ready.readable || work || source_work { continue; }
+                let retired_delivery = pending_close != self.source.as_ref().and_then(SourceOwner::pending_close);
+                if drained || ready.readable || work || source_work || retired_delivery { continue; }
                 self.live()?;
-                let timeout = match self.timeout(self.source.as_ref().and_then(SourceOwner::deadline)) {
+                let deadline = crate::reactor::next_deadline(
+                    self.source.as_ref().and_then(SourceOwner::deadline),
+                    self.confirmations.front().map(|pending| pending.deadline), None,
+                );
+                let timeout = match self.timeout(deadline) {
                     Ok(ms) => ms,
                     Err(error) if error.kind() == io::ErrorKind::TimedOut => {
                         self.live()?;
@@ -315,7 +336,9 @@ impl NativeRuntime {
                 if let Some(sender) = &self.test_idle { let _ = sender.send(()); }
                 let owned = self.listener.as_ref().unwrap();
                 let socket = Arc::clone(&owned._socket);
-                let completed = owned.candidate.as_ref().and_then(CandidateSetup::completion_handle);
+                let completed = owned.candidate.as_ref()
+                    .filter(|_| owned.observation_pending.is_none())
+                    .and_then(CandidateSetup::completion_handle);
                 let source_event = self.source.as_ref().map(SourceOwner::source_event);
                 let period_event = self.source.as_ref().map(SourceOwner::period_event);
                 let ready = match owned.events.wait_listener(
@@ -352,9 +375,47 @@ impl NativeRuntime {
                 }
                 if ready.readable { continue; }
             } else {
-                self.wait(self.client.control_event().as_raw_handle(), None, false)?;
+                let deadline = self.confirmations.front().map(|pending| pending.deadline);
+                match self.wait(self.client.control_event().as_raw_handle(), deadline, false) {
+                    Err(error) if error.kind() == io::ErrorKind::TimedOut => self.live()?,
+                    other => other?,
+                }
             }
         }
+    }
+
+    fn queue_confirmation(&mut self, kind: u8, body: Vec<u8>) -> io::Result<()> {
+        if self.confirmations.len() >= 8 { return Err(invalid()); }
+        self.confirmations.push_back(Confirmation {
+            frame: Frame { kind, body },
+            deadline: Instant::now() + Duration::from_secs(3),
+            receipt: WriteReceipt::new()?,
+            submitted: false,
+        });
+        Ok(())
+    }
+
+    fn service_confirmations(&mut self) -> io::Result<()> {
+        while let Some(pending) = self.confirmations.front_mut() {
+            if self.client.terminal() { return Err(retired()); }
+            if Instant::now() >= pending.deadline {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "Native acknowledgement deadline"));
+            }
+            if !pending.submitted {
+                pending.submitted = self.client.try_write_with_receipt(
+                    pending.frame.kind, &pending.frame.body, &pending.receipt,
+                )?;
+                if !pending.submitted { break; }
+            }
+            let Some(result) = pending.receipt.take_result() else { break; };
+            result?;
+            if pending.frame.kind == CONNECTION_OBSERVED {
+                let owned = self.listener.as_mut().ok_or_else(invalid)?;
+                owned.observed = Some(owned.observation_pending.take().ok_or_else(invalid)?);
+            }
+            self.confirmations.pop_front();
+        }
+        Ok(())
     }
 
     fn active_local_reply(&mut self, id: [u8; 16], record: Record, reason: u8) -> io::Result<()> {
@@ -557,13 +618,14 @@ impl NativeRuntime {
             self.live()?;
             match event {
                 SetupEvent::Observed(observation) => {
-                    if self.listener.as_ref().unwrap().observed.is_some() { return Err(invalid()); }
-                    self.acknowledge(CONNECTION_OBSERVED, &observation.encode()?, false)?;
-                    self.listener.as_mut().unwrap().observed = Some(observation.connection);
+                    let owned = self.listener.as_ref().unwrap();
+                    if owned.observed.is_some() || owned.observation_pending.is_some() { return Err(invalid()); }
+                    self.queue_confirmation(CONNECTION_OBSERVED, observation.encode()?)?;
+                    self.listener.as_mut().unwrap().observation_pending = Some(observation.connection);
                 }
                 SetupEvent::Request(record) => {
                     let owned = self.listener.as_mut().unwrap();
-                    if owned.observed.is_none() { return Err(invalid()); }
+                    if owned.observed.is_none() && owned.observation_pending.is_none() { return Err(invalid()); }
                     if ac::negative(record.kind) {
                         if owned.pending_negative.is_some() { return Err(invalid()); }
                         owned.pending_negative = Some(record);
@@ -582,6 +644,7 @@ impl NativeRuntime {
             }
         }
 
+        if self.listener.as_ref().unwrap().observation_pending.is_some() { return Ok(progress); }
         if let Some(record) = self.listener.as_mut().unwrap().pending_negative.take() {
             progress |= self.forward_request(record)?;
         }
@@ -655,6 +718,7 @@ impl NativeRuntime {
         let limit = self.listener.as_ref().unwrap().config.policy.packet_work as usize;
         let to = self.listener.as_ref().unwrap()._socket.local_addr()?;
         let mut bytes = [0u8; crate::reactor::MAX_QUIC_UDP_BYTES + 1];
+        let mut active_ingress = false;
         for _ in 0..limit {
             self.live()?;
             let received = self.listener.as_ref().unwrap()._socket.recv_from(&mut bytes);
@@ -663,10 +727,10 @@ impl NativeRuntime {
                     #[cfg(test)]
                     if let Some(sender) = &self.test_datagram { let _ = sender.send(size); }
                     if size <= crate::reactor::MAX_QUIC_UDP_BYTES {
-                        self.route_packet(&mut bytes[..size], from, to)?;
+                        active_ingress |= self.route_packet(&mut bytes[..size], from, to)?;
                     }
                 }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(active_ingress),
                 Err(error) if error.raw_os_error() == Some(10040) => {}
                 Err(error) => return Err(error),
             }
@@ -674,33 +738,32 @@ impl NativeRuntime {
         Ok(true)
     }
 
-    fn route_packet(&mut self, bytes: &mut [u8], from: SocketAddr, to: SocketAddr) -> io::Result<()> {
-        if bytes.is_empty() { return Ok(()); }
+    fn route_packet(&mut self, bytes: &mut [u8], from: SocketAddr, to: SocketAddr) -> io::Result<bool> {
+        if bytes.is_empty() { return Ok(false); }
         let header = match quiche::Header::from_slice(bytes, 16) {
             Ok(header) => header,
-            Err(_) => return Ok(()),
+            Err(_) => return Ok(false),
         };
         let tick = self.clock();
         let info = quiche::RecvInfo { from, to };
         if let Some(source) = self.source.as_mut() {
             if source.routes(header.dcid.as_ref(), info) {
-                source.receive(bytes, quiche::RecvInfo { from, to }, tick)?;
-                return Ok(());
+                return source.receive(bytes, info, tick);
             }
         }
         let owned = self.listener.as_ref().unwrap();
-        if owned.joined.is_some() { return Ok(()); }
+        if owned.joined.is_some() { return Ok(false); }
         if let Some(setup) = &owned.candidate {
             if setup.routes(header.dcid.as_ref(), info) && !setup.finished() {
                 let _ = setup.try_packet(bytes, quiche::RecvInfo { from, to });
             }
-            return Ok(());
+            return Ok(false);
         }
         if bytes.len() < 1200 || header.ty != quiche::Type::Initial
             || header.version != quiche::PROTOCOL_VERSION || header.dcid.len() != 16
             || self.clock() < owned.cooldown_until
         {
-            return Ok(());
+            return Ok(false);
         }
         let limits = owned.config.policy.limits(self.clock())?;
         let wake = Arc::clone(&owned.setup_wake);
@@ -719,7 +782,7 @@ impl NativeRuntime {
             owned.candidate = Some(setup);
             owned.candidate_until = limits.until100ns;
         }
-        Ok(())
+        Ok(false)
     }
 
     fn timeout(&self, until: Option<Instant>) -> io::Result<u32> {
@@ -754,24 +817,22 @@ impl NativeRuntime {
         Err(invalid())
     }
 
-    fn acknowledge(&mut self, kind: u8, body: &[u8], after_terminal: bool) -> io::Result<()> {
+    fn acknowledge_closed(&self, body: &[u8]) -> io::Result<()> {
         let deadline = Instant::now() + Duration::from_secs(3);
         let receipt = loop {
-            if !after_terminal { self.live()?; }
-            else if let Some(error) = self.client.failure() { return Err(error); }
+            if let Some(error) = self.client.failure() { return Err(error); }
             if Instant::now() >= deadline {
                 return Err(io::Error::new(io::ErrorKind::TimedOut, "Native acknowledgement deadline"));
             }
-            match self.client.try_write_confirmed(kind, body)? {
+            match self.client.try_write_confirmed(AUTHORITY_OBSERVED, body)? {
                 Some(receipt) => break receipt,
-                None => self.wait(self.client.capacity_event().as_raw_handle(), Some(deadline), after_terminal)?,
+                None => self.wait(self.client.capacity_event().as_raw_handle(), Some(deadline), true)?,
             }
         };
         loop {
-            if !after_terminal { self.live()?; }
-            else if let Some(error) = self.client.failure() { return Err(error); }
+            if let Some(error) = self.client.failure() { return Err(error); }
             if let Some(result) = receipt.take_result() { return result; }
-            self.wait(receipt.event().as_raw_handle(), Some(deadline), after_terminal)?;
+            self.wait(receipt.event().as_raw_handle(), Some(deadline), true)?;
         }
     }
 }
@@ -1054,14 +1115,15 @@ mod tests {
     fn candidate_observation_precedes_info_and_readonly_applied_lookup() {
         use crate::audio_tls::Role;
         use crate::audio_transport::DeliveryTls;
-        let (runtime, remote) = runtime();
+        let (mut runtime, remote) = runtime();
         let mut config = listener_bytes();
         let policy_at = config.len() - 26;
         config[policy_at..policy_at + 4].copy_from_slice(&10_000u32.to_be_bytes());
-        let thread = spawn_runtime(runtime);
-        remote.write(CONFIGURE_LISTENER, &config).unwrap();
-        let (kind, ack) = remote.read(3000).unwrap();
+        let (kind, ack) = runtime.process(Frame { kind: CONFIGURE_LISTENER, body: config.clone() })
+            .unwrap().unwrap();
         assert_eq!(kind, LISTENER_CONFIGURED);
+        let (entered, release) = runtime.client.delay_next_write_completion();
+        let thread = spawn_offline(runtime);
         let server = SocketAddr::from((
             [ack[34], ack[35], ack[36], ack[37]],
             u16::from_be_bytes([ack[38], ack[39]]),
@@ -1135,6 +1197,9 @@ mod tests {
         let (kind, body) = remote.read(3000).unwrap();
         assert_eq!(kind, CONNECTION_OBSERVED);
         let observation = crate::audio_control::Observation::parse(&body).unwrap();
+        entered.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(remote.read(100).is_err(), "RPC preceded actual observation completion");
+        release.send(()).unwrap();
         let (kind, body) = remote.read(3000).unwrap();
         assert_eq!(kind, NETWORK_REQUEST);
         let info = Message::parse(&body, false).unwrap();
@@ -1256,8 +1321,22 @@ mod tests {
         assert!(UdpSocket::bind(address).is_ok());
     }
 
+    struct OfflinePcm {
+        chunks: std::sync::Mutex<VecDeque<crate::committed_source::Block>>,
+        event: OwnedHandle,
+    }
+    impl OfflinePcm {
+        fn push(&self, first_frame: u64) {
+            self.chunks.lock().unwrap().push_back(crate::committed_source::Block {
+                first_frame, generation: 1, min_commit: 1,
+                timing: crate::source_age::CommitTiming { commit_qpc: 0, presentation_qpc: 0 },
+                pcm: [7; 960],
+            });
+            unsafe { SetEvent(self.event.as_raw_handle()); }
+        }
+    }
     struct OfflineInput {
-        chunks: VecDeque<crate::committed_source::Block>,
+        pcm: Arc<OfflinePcm>,
         fences: Arc<std::sync::atomic::AtomicUsize>,
         drops: Arc<std::sync::atomic::AtomicUsize>,
     }
@@ -1268,7 +1347,7 @@ mod tests {
     }
     impl super::super::source::Input for OfflineInput {
         fn next_block(&mut self) -> io::Result<Option<crate::committed_source::Block>> {
-            let mut block = self.chunks.pop_front();
+            let mut block = self.pcm.chunks.lock().unwrap().pop_front();
             if let Some(block) = block.as_mut() {
                 let qpc = crate::source_age::local_qpc_100ns()?;
                 block.timing.commit_qpc = qpc.saturating_sub(1000);
@@ -1277,12 +1356,12 @@ mod tests {
             Ok(block)
         }
         fn arm(&self) -> io::Result<()> { Ok(()) }
-        fn event(&self) -> HANDLE { std::ptr::null_mut() }
+        fn event(&self) -> HANDLE { self.pcm.event.as_raw_handle() }
         fn period(&self) -> HANDLE { std::ptr::null_mut() }
         fn service_period(&self) -> io::Result<()> { Ok(()) }
         fn discard_partial(&mut self, qpc: u64) -> io::Result<crate::fresh_anchor::CommitFence> {
             self.fences.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.chunks.clear();
+            self.pcm.chunks.lock().unwrap().clear();
             Ok(crate::fresh_anchor::CommitFence {
                 generation: 1, accepted: 1, end_frame: 480, request_qpc: qpc,
             })
@@ -1314,15 +1393,15 @@ mod tests {
         bytes
     }
     fn offline_incumbent(
-        ready: bool, blocked: bool, idle_ms: u32, staged_info: bool,
+        ready: bool, blocked: bool, idle_ms: u32,
     ) -> (
         NativeRuntime, Control, crate::audio_transport::ControlConnection, UdpSocket,
         ControlGrant, [u8; 16], Arc<std::sync::atomic::AtomicUsize>,
         Arc<std::sync::atomic::AtomicUsize>,
-        Arc<std::sync::atomic::AtomicU64>,
+        Arc<OfflinePcm>,
     ) {
         use crate::audio_control::{DeliveryBinding, SourceScope};
-        use crate::audio_transport::tests::{pair_at, pump};
+        use crate::audio_transport::tests::pair_at;
         use std::sync::atomic::{AtomicU64, AtomicUsize};
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
             "../../../../../../tools/protocol3/audio-transport-v1.json"
@@ -1341,7 +1420,7 @@ mod tests {
         let endpoint = socket.local_addr().unwrap();
         let phone_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         phone_socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-        let (mut phone, mut native) = pair_at(phone_socket.local_addr().unwrap(), endpoint, idle_ms);
+        let (phone, mut native) = pair_at(phone_socket.local_addr().unwrap(), endpoint, idle_ms);
         let observed = native.observation(100).unwrap().unwrap();
         let mut delivery = offline_bytes(fixture["deliveryHex"].as_str().unwrap());
         for (old, new) in [
@@ -1352,22 +1431,15 @@ mod tests {
         }
         let binding = DeliveryBinding::parse(&delivery).unwrap();
         grant.delivery_digest = binding.digest;
-        if staged_info {
-            phone.queue_control(Record { kind: ac::INFO, request: 1, body: Vec::new() }, 100).unwrap();
-            pump(&mut phone, &mut native);
-        }
         native.install_native(&scope, grant.boot, binding.clone(), &grant, 100).unwrap();
         let fences = Arc::new(AtomicUsize::new(0));
         let drops = Arc::new(AtomicUsize::new(0));
-        let qpc = crate::source_age::local_qpc_100ns().unwrap();
-        let block = crate::committed_source::Block {
-            first_frame: 240, generation: 1, min_commit: 1,
-            timing: crate::source_age::CommitTiming {
-                commit_qpc: qpc.saturating_sub(1_000), presentation_qpc: qpc,
-            }, pcm: [7; 960],
-        };
+        let pcm = Arc::new(OfflinePcm {
+            chunks: std::sync::Mutex::new(VecDeque::new()),
+            event: handle(unsafe { CreateEventW(null(), 0, 0, null()) }).unwrap(),
+        });
         let input = OfflineInput {
-            chunks: if ready { VecDeque::from([block]) } else { VecDeque::new() },
+            pcm: Arc::clone(&pcm),
             fences: Arc::clone(&fences), drops: Arc::clone(&drops),
         };
         let mut source = SourceOwner::new(scope, Box::new(input));
@@ -1381,15 +1453,14 @@ mod tests {
             events: crate::reactor::WindowsEvents::new(&socket).unwrap(),
             bytes, config, _socket: socket, acknowledgement,
             setup_wake: Arc::new(handle(unsafe { CreateEventW(null(), 0, 0, null()) }).unwrap()),
-            candidate: None, observed: None,
+            candidate: None, observation_pending: None, observed: None,
             pending_regular: VecDeque::new(), pending_negative: None,
             pending_local: VecDeque::new(), joined: None,
             cooldown_until: 0, candidate_until: 0,
         });
         runtime.source = Some(source);
-        let clock = Arc::new(AtomicU64::new(100));
-        runtime.test_clock = Some(Arc::clone(&clock));
-        (runtime, remote, phone, phone_socket, grant, observed.connection, fences, drops, clock)
+        runtime.test_clock = Some(Arc::new(AtomicU64::new(100)));
+        (runtime, remote, phone, phone_socket, grant, observed.connection, fences, drops, pcm)
     }
     fn spawn_offline(mut runtime: NativeRuntime) -> std::thread::JoinHandle<io::Result<()>> {
         let listener = runtime.listener.take().unwrap();
@@ -1403,16 +1474,18 @@ mod tests {
         let source = runtime.source;
         let clock = runtime.test_clock;
         let test_source = runtime.test_source;
+        let test_idle = runtime.test_idle;
         std::thread::spawn(move || {
             let mut runtime = NativeRuntime::new(client)?;
             runtime.authority = authority;
             runtime.source = source;
             runtime.test_clock = clock;
             runtime.test_source = test_source;
+            runtime.test_idle = test_idle;
             runtime.listener = Some(BoundListener {
                 events: crate::reactor::WindowsEvents::new(&_socket)?,
                 bytes, config, _socket, acknowledgement, setup_wake,
-                candidate: None, observed: None,
+                candidate: None, observation_pending: None, observed: None,
                 pending_regular: VecDeque::new(), pending_negative: None,
                 pending_local: VecDeque::new(), joined: None,
                 cooldown_until: 0, candidate_until: 0,
@@ -1423,14 +1496,15 @@ mod tests {
     #[test]
     fn real_worker_loop_fences_blocked_incumbent_and_retains_source_until_stop() {
         use std::sync::atomic::Ordering;
-        let (mut runtime, remote, _, _, grant, connection, fences, drops, _clock) =
-            offline_incumbent(true, true, 10000, false);
+        let (mut runtime, remote, _, _, grant, connection, fences, drops, pcm) =
+            offline_incumbent(true, true, 10000);
+        pcm.push(240);
         let (tx, rx) = std::sync::mpsc::sync_channel(32);
         runtime.test_source = Some(tx);
         let thread = spawn_offline(runtime);
         let mut pending = false;
         for _ in 0..64 {
-            let (active, queued, sealed) = rx.recv_timeout(Duration::from_millis(100)).unwrap();
+            let (active, _, sealed) = rx.recv_timeout(Duration::from_millis(100)).unwrap();
             if active && sealed { pending = true; break; }
         }
         assert!(pending, "real owner never retained blocked ciphertext");
@@ -1457,12 +1531,52 @@ mod tests {
         assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
     #[test]
+    fn worker_sends_pcm_during_projection_and_keeps_drained_delivery_on_pause() {
+        let (runtime, remote, mut phone, phone_socket, mut grant, connection, _, _, pcm) =
+            offline_incumbent(true, false, 10000);
+        phone_socket.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let (entered, release) = runtime.client.delay_next_write_completion();
+        let thread = spawn_offline(runtime);
+        grant.revision += 1;
+        let update = encode_control(&grant);
+        remote.write(AUTHORITY, &update).unwrap();
+        entered.recv_timeout(Duration::from_secs(3)).unwrap();
+        pcm.push(240);
+        assert!((0..8).any(|_| crate::audio_transport::tests::receive_media(&mut phone, &phone_socket)));
+        release.send(()).unwrap();
+        assert_eq!(remote.read(3000).unwrap(), (AUTHORITY_OBSERVED, update));
+
+        grant.revision += 1;
+        grant.ready = false;
+        let withdrawal = encode_control(&grant);
+        remote.write(AUTHORITY, &withdrawal).unwrap();
+        assert_eq!(remote.read(3000).unwrap(), (AUTHORITY_OBSERVED, withdrawal));
+        phone.queue_control(Record { kind: ac::INFO, request: 1, body: Vec::new() }, 101).unwrap();
+        crate::audio_transport::tests::send_one(&mut phone, &phone_socket);
+        let (kind, body) = remote.read(3000).unwrap();
+        assert_eq!(kind, NETWORK_REQUEST);
+        assert_eq!(Message::parse(&body, false).unwrap().connection, connection);
+        remote.write(STOP, &[]).unwrap();
+        assert!(thread.join().unwrap().is_ok());
+    }
+
+    #[test]
     fn real_worker_sends_control_before_output_ready_and_retires_idle_delivery_only() {
         use crate::audio_rpc::Message;
         use std::sync::atomic::Ordering;
-        let (runtime, remote, mut phone, phone_socket, _grant, connection, fences, drops, _clock) =
-            offline_incumbent(false, false, 1000, true);
+        let (mut runtime, remote, mut phone, phone_socket, _grant, connection, fences, drops, _) =
+            offline_incumbent(false, false, 1500);
+        let (idle_tx, idle) = std::sync::mpsc::channel();
+        runtime.test_idle = Some(idle_tx);
+        let shared = Arc::clone(&runtime.listener.as_ref().unwrap()._socket);
         let thread = spawn_offline(runtime);
+        idle.recv_timeout(Duration::from_secs(3)).unwrap();
+        let closed = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let unreachable = closed.local_addr().unwrap();
+        drop(closed);
+        shared.send_to(&[1], unreachable).unwrap();
+        phone.queue_control(Record { kind: ac::INFO, request: 1, body: Vec::new() }, 100).unwrap();
+        crate::audio_transport::tests::send_one(&mut phone, &phone_socket);
         let (kind, wire) = remote.read(3000).unwrap();
         assert_eq!(kind, NETWORK_REQUEST);
         let request = Message::parse(&wire, false).unwrap();
