@@ -375,11 +375,11 @@ impl WindowsEvents {
             if result == WAIT_TIMEOUT {
                 return Err(io::Error::new(io::ErrorKind::TimedOut, "Listener authority deadline"));
             }
-            if result == WAIT_FAILED { return Err(io::Error::last_os_error()); }
-            if !(WAIT_OBJECT_0..WAIT_OBJECT_0 + 3).contains(&result) {
+            if result == u32::MAX { return Err(io::Error::last_os_error()); }
+            if result >= 3 {
                 return Err(io::Error::other("Unexpected listener readiness"));
             }
-            if result == WAIT_OBJECT_0 || result == WAIT_OBJECT_0 + 1 {
+            if result < 2 {
                 return Ok(());
             }
             let mut events: WSANETWORKEVENTS = std::mem::zeroed();

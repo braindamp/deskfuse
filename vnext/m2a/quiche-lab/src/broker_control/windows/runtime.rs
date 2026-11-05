@@ -277,13 +277,18 @@ mod tests {
         let client = BrokerControlClient::start_synthetic(local, grant.boot, grant.worker).unwrap();
         (NativeRuntime::new(client).unwrap(), remote)
     }
+    fn spawn_runtime(runtime: NativeRuntime) -> std::thread::JoinHandle<io::Result<()>> {
+        assert!(runtime.listener.is_none());
+        let client = runtime.client;
+        std::thread::spawn(move || NativeRuntime::new(client).and_then(NativeRuntime::run))
+    }
     #[test]
     fn sole_client_reader_binds_once_and_retries_exact_endpoint_ack() {
         let (runtime, remote) = runtime();
         let worker = runtime.client.worker();
         let bytes = listener_bytes();
         let config = ListenerConfig::parse(&bytes, worker).unwrap();
-        let thread = std::thread::spawn(move || runtime.run());
+        let thread = spawn_runtime(runtime);
         remote.write(CONFIGURE_LISTENER, &bytes).unwrap();
         let (kind, ack) = remote.read(3000).unwrap();
         assert_eq!(kind, LISTENER_CONFIGURED);
@@ -341,7 +346,7 @@ mod tests {
     #[test]
     fn queued_config_does_not_bind_after_stop_and_idle_wait_wakes_from_client_terminal() {
         let (runtime, remote) = runtime();
-        let thread = std::thread::spawn(move || runtime.run());
+        let thread = spawn_runtime(runtime);
         remote.write(STOP, &[]).unwrap();
         remote.write(CONFIGURE_LISTENER, &listener_bytes()).ok();
         assert!(thread.join().unwrap().is_ok());
@@ -352,7 +357,7 @@ mod tests {
         let (runtime, remote) = runtime();
         let config = ListenerConfig::parse(&listener_bytes(), runtime.client.worker()).unwrap();
         let closed = grant_for(&config, 12, true);
-        let thread = std::thread::spawn(move || runtime.run());
+        let thread = spawn_runtime(runtime);
         remote.write(AUTHORITY, &closed).unwrap();
         let _ = remote.write(CONFIGURE_LISTENER, &listener_bytes());
         assert_eq!(remote.read(3000).unwrap(), (AUTHORITY_OBSERVED, closed));
@@ -361,7 +366,7 @@ mod tests {
     #[test]
     fn lost_service_wakes_otherwise_idle_runtime() {
         let (runtime, remote) = runtime();
-        let thread = std::thread::spawn(move || runtime.run());
+        let thread = spawn_runtime(runtime);
         drop(remote);
         assert!(thread.join().unwrap().is_err());
     }
@@ -372,7 +377,7 @@ mod tests {
         let mut bytes = grant_for(&config, 12, false);
         let offset = bytes.len() - 18;
         bytes[offset..offset + 8].copy_from_slice(&(now() + 20_000_000).to_be_bytes());
-        let thread = std::thread::spawn(move || runtime.run());
+        let thread = spawn_runtime(runtime);
         remote.write(AUTHORITY, &bytes).unwrap();
         assert_eq!(remote.read(3000).unwrap(), (AUTHORITY_OBSERVED, bytes));
         assert!(thread.join().unwrap().is_err());
@@ -400,7 +405,7 @@ mod tests {
     fn configured_listener_wakes_for_stop_during_bounded_udp_ingress() {
         let (runtime, remote) = runtime();
         let config = listener_bytes();
-        let thread = std::thread::spawn(move || runtime.run());
+        let thread = spawn_runtime(runtime);
         remote.write(CONFIGURE_LISTENER, &config).unwrap();
         let (kind, ack) = remote.read(3000).unwrap();
         assert_eq!(kind, LISTENER_CONFIGURED);
@@ -419,7 +424,7 @@ mod tests {
         let (runtime, remote) = runtime();
         let config = ListenerConfig::parse(&listener_bytes(), runtime.client.worker()).unwrap();
         let grant = grant_for(&config, 12, false);
-        let thread = std::thread::spawn(move || runtime.run());
+        let thread = spawn_runtime(runtime);
         remote.write(AUTHORITY, &grant).unwrap();
         assert_eq!(remote.read(3000).unwrap(), (AUTHORITY_OBSERVED, grant.clone()));
         remote.write(AUTHORITY, &grant).unwrap();
@@ -435,7 +440,7 @@ mod tests {
         let closed = grant_for(&config, 13, true);
         let terminal = runtime.client.terminal_event().try_clone_to_owned().unwrap();
         let (entered, resume) = runtime.client.delay_next_write_completion();
-        let thread = std::thread::spawn(move || runtime.run());
+        let thread = spawn_runtime(runtime);
         remote.write(AUTHORITY, &grant).unwrap();
         entered.recv_timeout(Duration::from_secs(3)).unwrap();
         remote.write(AUTHORITY, &closed).unwrap();
@@ -451,7 +456,7 @@ mod tests {
         let (runtime, remote) = runtime();
         let terminal = runtime.client.terminal_event().try_clone_to_owned().unwrap();
         let (entered, resume) = runtime.client.delay_next_write_completion();
-        let thread = std::thread::spawn(move || runtime.run());
+        let thread = spawn_runtime(runtime);
         remote.write(CONFIGURE_LISTENER, &listener_bytes()).unwrap();
         entered.recv_timeout(Duration::from_secs(3)).unwrap();
         remote.write(STOP, &[]).unwrap();
