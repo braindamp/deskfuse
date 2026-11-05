@@ -501,7 +501,13 @@ public sealed class AudioAuthorityTests
             Assert.Equal((byte)130, (await first.Reply()).Kind);
             Assert.True(first.Dispatcher.TryPost(new(AudioWorkerFrameKind.ConnectionClosed,
                 first.Connection.ToByteArray(bigEndian: true))));
-            Assert.Equal(parent, f.Owner.Snapshot());
+            Assert.Equal(parent.Phase, f.Owner.Snapshot().Phase);
+            Assert.Equal(parent.Revision, f.Owner.Snapshot().Revision);
+            Assert.Equal(parent.AuthorityUntil, f.Owner.Snapshot().AuthorityUntil);
+            Assert.Equal(parent.DeliveryGeneration, f.Owner.Snapshot().DeliveryGeneration);
+            Assert.Equal(parent.OutputReady, f.Owner.Snapshot().OutputReady);
+            Assert.Equal(parent.BindingDigest, f.Owner.Snapshot().BindingDigest);
+            Assert.Equal(parent.DeliveryDigest, f.Owner.Snapshot().DeliveryDigest);
             Assert.Equal(1UL, f.Owner.RequestCounts.IssuedThrough);
             var next = new Routing(f, acquisitionOnly: true);
             try
@@ -509,7 +515,13 @@ public sealed class AudioAuthorityTests
                 next.Connection.TryWriteBytes(prepare.AsSpan(40), bigEndian: true, out _);
                 Assert.True(next.Send(AudioNetworkKind.Prepare, prepare));
                 Assert.Equal((byte)130, (await next.Reply()).Kind);
-                Assert.Equal(parent, f.Owner.Snapshot());
+                Assert.Equal(parent.Phase, f.Owner.Snapshot().Phase);
+            Assert.Equal(parent.Revision, f.Owner.Snapshot().Revision);
+            Assert.Equal(parent.AuthorityUntil, f.Owner.Snapshot().AuthorityUntil);
+            Assert.Equal(parent.DeliveryGeneration, f.Owner.Snapshot().DeliveryGeneration);
+            Assert.Equal(parent.OutputReady, f.Owner.Snapshot().OutputReady);
+            Assert.Equal(parent.BindingDigest, f.Owner.Snapshot().BindingDigest);
+            Assert.Equal(parent.DeliveryDigest, f.Owner.Snapshot().DeliveryDigest);
                 Assert.Equal(1UL, f.Owner.RequestCounts.IssuedThrough);
             }
             finally { await next.Dispatcher.StopAndJoinAsync(); }

@@ -2110,7 +2110,7 @@ mod tests {
             kind: 130, body: bytes, ..prepare
         }.encode(true).unwrap()).unwrap();
         let (kind, pinned) = remote.read(3000).unwrap_or_else(|error|
-            panic!("Pin issuance channel failed: {error}; worker outcome: {:?}", worker.join().unwrap().err()));
+            panic!("Pin issuance channel failed: {error}; worker finished: {}", worker.is_finished()));
         assert_eq!(kind, PINNED_ISSUE);
         assert_eq!(pinned.len(), 25 + 53 + 40);
         let issue = Message::parse(&pinned[..78], false).unwrap();
