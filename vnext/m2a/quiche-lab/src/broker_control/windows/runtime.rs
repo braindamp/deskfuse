@@ -98,6 +98,8 @@ struct NativeRuntime {
     test_open: Option<source_attach::TestOpen>,
     #[cfg(test)]
     test_cancel_first_promotion: bool,
+    #[cfg(test)]
+    test_before_pinned_issue: Option<fn(&mut Self)>,
 }
 
 pub(super) fn now() -> u64 {
@@ -143,6 +145,8 @@ impl NativeRuntime {
             test_open: None,
             #[cfg(test)]
             test_cancel_first_promotion: false,
+            #[cfg(test)]
+            test_before_pinned_issue: None,
         })
     }
 
@@ -851,6 +855,9 @@ impl NativeRuntime {
         let mut evidence = pipe.encode(false)?;
         evidence.extend_from_slice(&pin.parent.revision.to_be_bytes());
         evidence.extend_from_slice(&nomination.binding.digest);
+        // A captured pin may outlive its worker while the pipe is full. Leave
+        // the pin in custody for the ordered connection-close path to retire.
+        if owned.candidate.as_ref().is_none_or(CandidateSetup::finished) { return Ok(false); }
         if !self.client.try_write(PINNED_ISSUE, &evidence)? { return Ok(false); }
         self.pipe_requests.submitted(&tls, &pipe)?;
         let owned = self.listener.as_mut().unwrap();
@@ -921,6 +928,12 @@ impl NativeRuntime {
             progress |= self.forward_request(record)?;
         }
         if self.listener.as_ref().unwrap().pending_negative.is_none() {
+            #[cfg(test)]
+            if self.listener.as_ref().unwrap().pin.as_ref().is_some_and(|pin| pin.confirmed) {
+                if let Some(before_issue) = self.test_before_pinned_issue.take() {
+                    before_issue(self);
+                }
+            }
             progress |= self.forward_pinned_issue()?;
         }
         if self.listener.as_ref().unwrap().pending_negative.is_none()
@@ -1960,14 +1973,45 @@ mod tests {
     }
 
     #[test]
-    fn real_worker_moves_first_pinned_tls_and_keeps_pcm_gated() { first_delivery_fixture(false, false); }
+    fn real_worker_moves_first_pinned_tls_and_keeps_pcm_gated() { first_delivery_fixture(FirstDelivery::Attach); }
     #[test]
-    fn stop_after_first_pin_joins_worker_without_a_delivery_receipt() { first_delivery_fixture(true, false); }
+    fn stop_after_first_pin_joins_worker_without_a_delivery_receipt() { first_delivery_fixture(FirstDelivery::StopAtPin); }
     #[test]
     fn committed_first_delivery_candidate_failure_retires_worker_without_ack() {
-        first_delivery_fixture(false, true);
+        first_delivery_fixture(FirstDelivery::FailPromotion);
     }
-    fn first_delivery_fixture(stop_at_pin: bool, fail_on_promotion: bool) {
+    #[test]
+    fn finished_first_candidate_does_not_issue_after_pipe_backpressure() {
+        first_delivery_fixture(FirstDelivery::CloseUnderBackpressure);
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum FirstDelivery { Attach, StopAtPin, FailPromotion, CloseUnderBackpressure }
+
+    fn finish_pin_after_backpressure(runtime: &mut NativeRuntime) {
+        use windows_sys::Win32::System::Threading::ResetEvent;
+
+        let (entered, resume) = runtime.client.delay_next_write_completion();
+        for request in 1..=8 {
+            let filler = Message {
+                request, connection: [0x62; 16], kind: ac::INFO, body: vec![],
+            };
+            assert!(runtime.client.try_write(NETWORK_REQUEST, &filler.encode(false).unwrap()).unwrap());
+            if request == 1 { entered.recv_timeout(Duration::from_secs(3)).unwrap(); }
+        }
+        let setup = runtime.listener.as_ref().unwrap().candidate.as_ref().unwrap();
+        assert!(!setup.finished());
+        assert!(!runtime.forward_pinned_issue().unwrap());
+        let setup = runtime.listener.as_ref().unwrap().candidate.as_ref().unwrap();
+        setup.cancel();
+        assert_eq!(unsafe { WaitForSingleObject(setup.completion_handle().unwrap().as_raw_handle(), 3000) }, WAIT_OBJECT_0);
+        let capacity = runtime.client.capacity_event().as_raw_handle();
+        assert_ne!(unsafe { ResetEvent(capacity) }, 0);
+        resume.send(()).unwrap();
+        assert_eq!(unsafe { WaitForSingleObject(capacity, 3000) }, WAIT_OBJECT_0);
+    }
+
+    fn first_delivery_fixture(scenario: FirstDelivery) {
         use crate::audio_tls::{Role, ALPN};
         use crate::audio_transport::DeliveryTls;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2000,7 +2044,10 @@ mod tests {
         runtime.source = Some(SourceOwner::new(config.scope.clone(), Box::new(input)));
         let (source_tx, source_rx) = sync_channel(64);
         runtime.test_source = Some(source_tx);
-        runtime.test_cancel_first_promotion = fail_on_promotion;
+        runtime.test_cancel_first_promotion = scenario == FirstDelivery::FailPromotion;
+        if scenario == FirstDelivery::CloseUnderBackpressure {
+            runtime.test_before_pinned_issue = Some(finish_pin_after_backpressure);
+        }
         let worker = spawn_offline(runtime);
         let source_bytes = bytes[4..4 + u16::from_be_bytes([bytes[2], bytes[3]]) as usize].to_vec();
         let mut n2 = [0x72; 32];
@@ -2122,6 +2169,24 @@ mod tests {
         remote.write(NETWORK_REPLY, &Message {
             kind: 130, body: bytes, ..prepare
         }.encode(true).unwrap()).unwrap();
+        if scenario == FirstDelivery::CloseUnderBackpressure {
+            for expected in 1..=8 {
+                let (kind, filler) = remote.read(3000).unwrap();
+                assert_eq!(kind, NETWORK_REQUEST);
+                let filler = Message::parse(&filler, false).unwrap();
+                assert_eq!((filler.kind, filler.request, filler.connection), (ac::INFO, expected, [0x62; 16]));
+            }
+            let (kind, route) = remote.read(3000).unwrap();
+            assert_eq!(kind, CONNECTION_CLOSED, "a finished candidate must not issue a new request");
+            assert_eq!(route, observed.connection);
+            assert_eq!(drops.load(Ordering::SeqCst), 0, "candidate loss must retain the prepared source");
+            stop_phone.store(true, Ordering::SeqCst);
+            remote.write(STOP, &[]).unwrap();
+            phone.join().unwrap();
+            assert!(worker.join().unwrap().is_ok());
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            return;
+        }
         let (kind, pinned) = match remote.read(3000) {
             Ok(reply) => reply,
             Err(error) => panic!("Pin issuance channel failed: {error}; worker outcome: {:?}", worker.join()),
@@ -2133,7 +2198,7 @@ mod tests {
         assert_eq!(&issue.body[1..33], &n2);
         assert_eq!(u64::from_be_bytes(pinned[78..86].try_into().unwrap()), parent.revision);
         assert_eq!(pinned[86..], nominated.digest);
-        if stop_at_pin {
+        if scenario == FirstDelivery::StopAtPin {
             stop_phone.store(true, Ordering::SeqCst);
             remote.write(STOP, &[]).unwrap();
             phone.join().unwrap();
@@ -2155,7 +2220,7 @@ mod tests {
         delivery.delivery_digest = nominated.digest;
         let published = encode_control(&delivery);
         remote.write(AUTHORITY, &published).unwrap();
-        if fail_on_promotion {
+        if scenario == FirstDelivery::FailPromotion {
             stop_phone.store(true, Ordering::SeqCst);
             let outcome = worker.join().unwrap();
             assert!(outcome.is_err());
@@ -2288,6 +2353,7 @@ mod tests {
         let test_idle = runtime.test_idle;
         let test_open = runtime.test_open;
         let test_cancel_first_promotion = runtime.test_cancel_first_promotion;
+        let test_before_pinned_issue = runtime.test_before_pinned_issue;
         std::thread::spawn(move || {
             let mut runtime = NativeRuntime::new(client)?;
             runtime.authority = authority;
@@ -2297,6 +2363,7 @@ mod tests {
             runtime.test_idle = test_idle;
             runtime.test_open = test_open;
             runtime.test_cancel_first_promotion = test_cancel_first_promotion;
+            runtime.test_before_pinned_issue = test_before_pinned_issue;
             runtime.listener = Some(BoundListener {
                 events: crate::reactor::WindowsEvents::new(&_socket)?,
                 bytes, config, _socket, acknowledgement, setup_wake,
