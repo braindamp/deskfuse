@@ -65,6 +65,8 @@ struct Shared {
     control_event: OwnedHandle,
     terminal_event: OwnedHandle,
     capacity_event: OwnedHandle,
+    #[cfg(test)]
+    completion_gate: Mutex<Option<(std::sync::mpsc::SyncSender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 impl Shared {
     fn lock(&self) -> std::sync::MutexGuard<'_, Queue> {
@@ -130,6 +132,8 @@ impl BrokerControlClient {
             control_event: handle(unsafe { CreateEventW(null(), 1, 0, null()) })?,
             terminal_event: handle(unsafe { CreateEventW(null(), 1, 0, null()) })?,
             capacity_event: handle(unsafe { CreateEventW(null(), 0, 0, null()) })?,
+            #[cfg(test)]
+            completion_gate: Mutex::new(None),
         });
         let r = Arc::clone(&shared);
         let rc = Arc::clone(&control);
@@ -186,6 +190,13 @@ impl BrokerControlClient {
     pub fn capacity_event(&self) -> std::os::windows::io::BorrowedHandle<'_> {
         use std::os::windows::io::AsHandle;
         self.shared.capacity_event.as_handle()
+    }
+    #[cfg(test)]
+    pub(super) fn delay_next_write_completion(&self) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::SyncSender<()>) {
+        let (entered, observed) = std::sync::mpsc::sync_channel(1);
+        let (resume, released) = std::sync::mpsc::sync_channel(1);
+        *self.shared.completion_gate.lock().unwrap() = Some((entered, released));
+        (observed, resume)
     }
     pub fn failure(&self) -> Option<io::Error> {
         self.shared.lock().error.as_ref().map(|message| io::Error::other(message.clone()))
@@ -366,6 +377,14 @@ fn write_loop(control: &Control, shared: &Shared) -> io::Result<()> {
         // Class capacity includes this actual write until completed/cancelled.
         // FIFO preserves already admitted request IDs/frame ordering.
         let outcome = control.write(value.frame.kind, &value.frame.body);
+        #[cfg(test)]
+        {
+            let gate = shared.completion_gate.lock().unwrap().take();
+            if let Some((entered, released)) = gate {
+                let _ = entered.send(());
+                let _ = released.recv_timeout(Duration::from_secs(3));
+            }
+        }
         if let Some(completion) = value.completion {
             completion.finish(match &outcome {
                 Ok(()) => Ok(()),

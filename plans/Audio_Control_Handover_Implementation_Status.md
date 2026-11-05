@@ -302,6 +302,16 @@ driver, source, endpoint and physical gates. The separate unified CI run
 failed in unchanged Windows C++ thread-handle conversions and Android
 `cargo ndk` environment setup; those are not H2a runtime-test results.
 
+Local Windows PR #32 verification, 5 November: `tools/build-audio-worker.ps1`
+passed after fixing a reproduced terminal/ACK race. A closed projection arriving
+during ordinary ACK completion previously exited the runtime before sending its
+closed ACK. Pending frames now survive the interrupted turn and enter restrictive
+dispatch before pipe cancellation. Two deterministic synthetic-pipe regression
+tests cover closed authority and Stop during ACK completion. All **86 native
+library checks** and **60 focused broker control/listener/authority checks** passed,
+zero failures/skips. Logs: `out/control-handover-checks/pr32-native-tests.log` and
+`pr32-broker-control.trx`. No installed/physical operations were performed.
+
 The rest of H2 still requires one UDP receive/routing owner, bounded candidate
 dispatch, actual global RPC forwarding, nomination/pin/transfer, native source
 preparation and old-egress/assembly/ledger retirement. H3/H4, real N4/N5

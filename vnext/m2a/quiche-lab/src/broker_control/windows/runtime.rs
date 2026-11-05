@@ -133,9 +133,21 @@ impl NativeRuntime {
     }
 
     fn serve(&mut self) -> io::Result<()> {
+        let mut pending = VecDeque::new();
+        let outcome = self.serve_live(&mut pending);
+        // Terminal may interrupt any ordinary turn, including an ACK waiting
+        // for real write completion. Preserve frames already drained locally
+        // and dispatch the restrictive frame before cancelling the pipe.
+        if outcome.is_err() && self.client.terminal() {
+            return self.handle_terminal(pending);
+        }
+        outcome
+    }
+
+    fn serve_live(&mut self, pending: &mut VecDeque<Frame>) -> io::Result<()> {
         loop {
             if self.client.terminal() {
-                return self.handle_terminal(VecDeque::new());
+                return Err(retired());
             }
             self.live()?;
             let frames = self.client.drain(8)?;
@@ -143,11 +155,11 @@ impl NativeRuntime {
                 self.wait(self.client.control_event().as_raw_handle(), None, false)?;
                 continue;
             }
-            let mut pending: VecDeque<_> = frames.into();
+            pending.extend(frames);
             while let Some(frame) = pending.pop_front() {
                 if self.client.terminal() {
                     pending.push_front(frame);
-                    return self.handle_terminal(pending);
+                    return Err(retired());
                 }
                 self.live()?;
                 if let Some((kind, body)) = self.process(frame)? {
@@ -347,5 +359,42 @@ mod tests {
         assert_eq!(remote.read(3000).unwrap(), (AUTHORITY_OBSERVED, grant));
         remote.write(STOP, &[]).unwrap();
         assert!(thread.join().unwrap().is_ok());
+    }
+    #[test]
+    fn closed_projection_during_positive_ack_completion_is_still_acknowledged() {
+        let (runtime, remote) = runtime();
+        let config = ListenerConfig::parse(&listener_bytes(), runtime.client.worker()).unwrap();
+        let grant = grant_for(&config, 12, false);
+        let closed = grant_for(&config, 13, true);
+        let terminal = runtime.client.terminal_event().try_clone_to_owned().unwrap();
+        let (entered, resume) = runtime.client.delay_next_write_completion();
+        let thread = std::thread::spawn(move || runtime.run());
+        remote.write(AUTHORITY, &grant).unwrap();
+        entered.recv_timeout(Duration::from_secs(3)).unwrap();
+        remote.write(AUTHORITY, &closed).unwrap();
+        let observed = unsafe { WaitForSingleObject(terminal.as_raw_handle(), 3000) };
+        resume.send(()).unwrap();
+        assert_eq!(observed, WAIT_OBJECT_0);
+        assert_eq!(remote.read(3000).unwrap(), (AUTHORITY_OBSERVED, grant));
+        assert_eq!(remote.read(3000).unwrap(), (AUTHORITY_OBSERVED, closed));
+        assert!(thread.join().unwrap().is_ok());
+    }
+    #[test]
+    fn stop_during_listener_ack_completion_retires_the_socket_and_joins() {
+        let (runtime, remote) = runtime();
+        let terminal = runtime.client.terminal_event().try_clone_to_owned().unwrap();
+        let (entered, resume) = runtime.client.delay_next_write_completion();
+        let thread = std::thread::spawn(move || runtime.run());
+        remote.write(CONFIGURE_LISTENER, &listener_bytes()).unwrap();
+        entered.recv_timeout(Duration::from_secs(3)).unwrap();
+        remote.write(STOP, &[]).unwrap();
+        let observed = unsafe { WaitForSingleObject(terminal.as_raw_handle(), 3000) };
+        resume.send(()).unwrap();
+        assert_eq!(observed, WAIT_OBJECT_0);
+        let (kind, ack) = remote.read(3000).unwrap();
+        assert_eq!(kind, LISTENER_CONFIGURED);
+        let address = std::net::SocketAddr::from(([ack[34], ack[35], ack[36], ack[37]], u16::from_be_bytes([ack[38], ack[39]])));
+        assert!(thread.join().unwrap().is_ok());
+        assert!(UdpSocket::bind(address).is_ok());
     }
 }
