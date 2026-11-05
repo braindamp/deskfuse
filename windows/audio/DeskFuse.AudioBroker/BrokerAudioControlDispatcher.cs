@@ -69,6 +69,7 @@ internal sealed class BrokerAudioControlDispatcher : IAudioWorkerEventOwner
             if (frame.Kind == AudioWorkerFrameKind.ConnectionClosed)
             {
                 if (!routes.Remove(AudioWorkerNetworkProtocol.Closed(frame.Body), out var route)) return false;
+                if (nomination?.Connection is not null && ReferenceEquals(nomination.Connection, route.Origin)) nomination = null;
                 if (owner.ConnectionClosed(route.Origin))
                 {
                     lifecycleDirty = true;
@@ -160,10 +161,19 @@ internal sealed class BrokerAudioControlDispatcher : IAudioWorkerEventOwner
             switch ((AudioNetworkKind)m.Kind)
             {
                 case AudioNetworkKind.Prepare:
-                    if (acquisitionOnly) throw new UnauthorizedAccessException("Delivery nomination is not yet admitted.");
                     Route target; lock (gate) target = routes.TryGetValue(new(b.AsSpan(40), bigEndian: true), out var route) ? route : throw new UnauthorizedAccessException("Unobserved target.");
+                    if (acquisitionOnly && (owner.Snapshot() is not { Phase: AudioAuthorityPhase.Prepared, DeliveryGeneration: 0 } ||
+                        !ReferenceEquals(origin, target.Origin)))
+                        throw new UnauthorizedAccessException("First delivery requires its prepared observed route.");
                     var prepared = owner.NominateDelivery(origin, target.Origin, U64(b, 0), b[8..40]);
-                    lock (gate) nomination = prepared; return prepared.Bytes;
+                    lock (gate)
+                    {
+                        if (acquisitionOnly && nomination is not null &&
+                            (!ReferenceEquals(nomination.Connection, target.Origin) || !nomination.Digest.AsSpan().SequenceEqual(prepared.Digest)))
+                            throw new UnauthorizedAccessException("Another first delivery was already nominated.");
+                        nomination = prepared;
+                    }
+                    return prepared.Bytes;
                 case AudioNetworkKind.Issue:
                     var operation = (AudioOperationKind)b[0]; AudioDeliveryDescriptor? candidate = null;
                     if (acquisitionOnly && operation != AudioOperationKind.AcquireSource)

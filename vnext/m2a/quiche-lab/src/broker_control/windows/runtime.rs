@@ -5,7 +5,7 @@ use super::source::SourceOwner;
 use super::source_attach::{self, Preparation};
 use crate::audio_authority::{AudioAuthority, ControlGrant};
 use crate::audio_candidate::{CandidateOutcome, CandidateSetup, SetupEvent};
-use crate::audio_control::{self as ac, Record};
+use crate::audio_control::{self as ac, DeliveryBinding, Observation, Record};
 use crate::audio_listener_config::ListenerConfig;
 use crate::audio_rpc::{Message, PipeRequests};
 use std::collections::{BTreeMap, VecDeque};
@@ -18,6 +18,13 @@ enum AcquisitionRpc {
     Proof(u64),
 }
 
+struct Nomination {
+    route: [u8; 16],
+    request: [u8; 32],
+    generation: u64,
+    binding: DeliveryBinding,
+}
+
 struct BoundListener {
     events: crate::reactor::WindowsEvents,
     bytes: Vec<u8>,
@@ -28,6 +35,9 @@ struct BoundListener {
     candidate: Option<CandidateSetup>,
     observation_pending: Option<[u8; 16]>,
     observed: Option<[u8; 16]>,
+    tls_observation: Option<Observation>,
+    nomination_pending: Option<(u64, u64, [u8; 32])>,
+    nomination: Option<Nomination>,
     acquisition_rpc: Option<AcquisitionRpc>,
     acquisition_challenge: bool,
     pending_regular: VecDeque<Record>,
@@ -193,6 +203,9 @@ impl NativeRuntime {
                     candidate: None,
                     observation_pending: None,
                     observed: None,
+                    tls_observation: None,
+                    nomination_pending: None,
+                    nomination: None,
                     acquisition_rpc: None,
                     acquisition_challenge: false,
                     pending_regular: VecDeque::new(),
@@ -206,6 +219,31 @@ impl NativeRuntime {
             }
             NETWORK_REPLY => {
                 let message = self.pipe_requests.reply(Message::parse(&frame.body, true)?)?;
+                if let Some(owned) = self.listener.as_mut().filter(|owned|
+                    owned.observed == Some(message.connection)
+                ) {
+                    if let Some((request, generation, n2)) = owned.nomination_pending {
+                        if message.request == request {
+                            owned.nomination_pending = None;
+                            if message.kind == ac::PREPARE + 128 {
+                                let binding = DeliveryBinding::parse(&message.body)?;
+                                let parent = self.authority.grant().ok_or_else(invalid)?;
+                                let observation = owned.tls_observation.as_ref().ok_or_else(invalid)?;
+                                let mut prospective = parent.clone();
+                                prospective.delivery_generation = generation;
+                                prospective.delivery_digest = binding.digest;
+                                if !self.authority.prepared() || self.source.is_none()
+                                    || owned.observed != Some(message.connection)
+                                    || binding.request != n2 || binding.generation != generation
+                                    || !binding.matches(&owned.config.scope, observation, &prospective)
+                                { return Err(invalid()); }
+                                owned.nomination = Some(Nomination {
+                                    route: message.connection, request: n2, generation, binding,
+                                });
+                            }
+                        }
+                    }
+                }
                 if let Some(owned) = self.listener.as_mut().filter(|owned| owned.observed == Some(message.connection)) {
                     match owned.acquisition_rpc {
                         Some(AcquisitionRpc::Issue(request)) if request == message.request => {
@@ -652,7 +690,13 @@ impl NativeRuntime {
         let connection = owned.observed.ok_or_else(invalid)?;
         let negative = ac::negative(record.kind);
         let acquiring = matches!(record.kind, ac::ISSUE | ac::PROOF);
-        if matches!(record.kind, ac::PREPARE | ac::OUTPUT | ac::DETACH | ac::STOP)
+        let first_nomination = record.kind == ac::PREPARE
+            && self.authority.prepared() && self.source.as_ref().is_some_and(|s| !s.has_delivery())
+            && owned.nomination_pending.is_none() && owned.nomination.is_none()
+            && record.body[40..56] == connection
+            && owned.tls_observation.as_ref().is_some_and(|o| o.connection == connection);
+        if matches!(record.kind, ac::OUTPUT | ac::DETACH | ac::STOP)
+            || record.kind == ac::PREPARE && !first_nomination
             || acquiring && (self.source.is_some() || self.authority.grant().is_some())
             || record.kind == ac::ISSUE && record.body.first() != Some(&1)
             || record.kind == ac::PROOF && !owned.acquisition_challenge
@@ -675,7 +719,11 @@ impl NativeRuntime {
         if let Some(pipe) = pipe {
             if self.client.try_write(NETWORK_REQUEST, &pipe.encode(false)?)? {
                 self.pipe_requests.submitted(&tls, &pipe)?;
-                if tls.kind == ac::ISSUE {
+                if tls.kind == ac::PREPARE {
+                    let generation = u64::from_be_bytes(tls.body[..8].try_into().unwrap());
+                    let request = tls.body[8..40].try_into().unwrap();
+                    self.listener.as_mut().unwrap().nomination_pending = Some((tls.request, generation, request));
+                } else if tls.kind == ac::ISSUE {
                     self.listener.as_mut().unwrap().acquisition_rpc = Some(AcquisitionRpc::Issue(tls.request));
                 } else if tls.kind == ac::PROOF {
                     self.listener.as_mut().unwrap().acquisition_rpc = Some(AcquisitionRpc::Proof(tls.request));
@@ -712,7 +760,9 @@ impl NativeRuntime {
                     let owned = self.listener.as_ref().unwrap();
                     if owned.observed.is_some() || owned.observation_pending.is_some() { return Err(invalid()); }
                     self.queue_confirmation(CONNECTION_OBSERVED, observation.encode()?)?;
-                    self.listener.as_mut().unwrap().observation_pending = Some(observation.connection);
+                    let owned = self.listener.as_mut().unwrap();
+                    owned.observation_pending = Some(observation.connection);
+                    owned.tls_observation = Some(observation);
                 }
                 SetupEvent::Request(record) => {
                     let owned = self.listener.as_mut().unwrap();
@@ -796,6 +846,9 @@ impl NativeRuntime {
             let owned = self.listener.as_mut().unwrap();
             owned.joined = None;
             owned.observed = None;
+            owned.tls_observation = None;
+            owned.nomination_pending = None;
+            owned.nomination = None;
             owned.acquisition_rpc = None;
             owned.acquisition_challenge = false;
             owned.candidate_until = 0;
