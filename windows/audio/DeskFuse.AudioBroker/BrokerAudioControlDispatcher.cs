@@ -32,6 +32,7 @@ internal sealed class BrokerAudioControlDispatcher : IAudioWorkerEventOwner
     private readonly Func<byte[], bool, Action<AudioWorkerControlPump.ReplyPermit>, Task> send;
     private readonly Action<Exception> fail;
     private readonly Action requestRundown;
+    private readonly bool acquisitionOnly;
     private int rundownRequested;
     private readonly Dictionary<Guid, Route> routes = [];
     private readonly HashSet<Job> jobs = [];
@@ -45,12 +46,13 @@ internal sealed class BrokerAudioControlDispatcher : IAudioWorkerEventOwner
     internal BrokerAudioControlDispatcher(BrokerAudioOwner owner, IBrokerAudioWorker worker, IAudioGrantSigner grants,
         Func<BrokerAudioOwner.RequestStatus, byte[]> signStatus, Func<BrokerAudioOwner.StopStatus, byte[]> signStopStatus,
         Func<BrokerAudioOwner.Committed, Task> prepareSource, Action requestRundown, Func<Task<bool>> publish,
-        Func<byte[], bool, Action<AudioWorkerControlPump.ReplyPermit>, Task> send, Action<Exception> fail)
+        Func<byte[], bool, Action<AudioWorkerControlPump.ReplyPermit>, Task> send, Action<Exception> fail,
+        bool acquisitionOnly = false)
     {
         if (!owner.IsWorker(worker)) throw new UnauthorizedAccessException("Foreign control worker.");
         this.owner = owner; this.worker = worker; this.grants = grants; this.signStatus = signStatus; this.signStopStatus = signStopStatus;
         this.prepareSource = prepareSource; this.publish = publish; this.send = send; this.fail = fail;
-        this.requestRundown = requestRundown;
+        this.requestRundown = requestRundown; this.acquisitionOnly = acquisitionOnly;
     }
     public bool TryPost(AudioWorkerFrame frame)
     {
@@ -158,11 +160,14 @@ internal sealed class BrokerAudioControlDispatcher : IAudioWorkerEventOwner
             switch ((AudioNetworkKind)m.Kind)
             {
                 case AudioNetworkKind.Prepare:
+                    if (acquisitionOnly) throw new UnauthorizedAccessException("Delivery nomination is not yet admitted.");
                     Route target; lock (gate) target = routes.TryGetValue(new(b.AsSpan(40), bigEndian: true), out var route) ? route : throw new UnauthorizedAccessException("Unobserved target.");
                     var prepared = owner.NominateDelivery(origin, target.Origin, U64(b, 0), b[8..40]);
                     lock (gate) nomination = prepared; return prepared.Bytes;
                 case AudioNetworkKind.Issue:
                     var operation = (AudioOperationKind)b[0]; AudioDeliveryDescriptor? candidate = null;
+                    if (acquisitionOnly && operation != AudioOperationKind.AcquireSource)
+                        throw new UnauthorizedAccessException("Only source acquisition is enabled.");
                     if (operation is AudioOperationKind.AttachDelivery or AudioOperationKind.SupersedeDelivery)
                     {
                         lock (gate) candidate = nomination;
@@ -174,6 +179,8 @@ internal sealed class BrokerAudioControlDispatcher : IAudioWorkerEventOwner
                 case AudioNetworkKind.Proof:
                     var proof = AudioWorkerNetworkProtocol.Proof(b);
                     var committed = owner.Admit(origin, proof.Nonce, proof.Signature) ?? throw new UnauthorizedAccessException("Audio proof rejected.");
+                    if (acquisitionOnly && committed.Kind != AudioOperationKind.AcquireSource)
+                        throw new UnauthorizedAccessException("Delivery proof is not enabled.");
                     if (committed.Kind == AudioOperationKind.AcquireSource && owner.Snapshot().Phase == AudioAuthorityPhase.Preparing)
                     {
                         try { await prepareSource(committed).ConfigureAwait(false); }
@@ -185,9 +192,11 @@ internal sealed class BrokerAudioControlDispatcher : IAudioWorkerEventOwner
                     var retained = owner.GetAppliedResult(origin, b[..32], applied.Nonce, applied.Signature);
                     return retained?.SignedReceipt(grants) ?? throw new UnauthorizedAccessException("No retained applied result.");
                 case AudioNetworkKind.Output:
+                    if (acquisitionOnly) throw new UnauthorizedAccessException("Output is not yet enabled.");
                     owner.ObserveOutput(origin, b[..32], U64(b, 32), U64(b, 40), b[48] == 1);
                     await Publish().ConfigureAwait(false); return [];
                 case AudioNetworkKind.Detach:
+                    if (acquisitionOnly) throw new UnauthorizedAccessException("Delivery detach is not yet enabled.");
                     owner.ObserveDetach(origin, b[..32], U64(b, 32));
                     await Publish().ConfigureAwait(false); return [];
                 default: throw new InvalidDataException("Unsupported native request.");

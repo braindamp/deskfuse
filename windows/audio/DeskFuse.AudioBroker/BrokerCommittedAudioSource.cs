@@ -16,6 +16,7 @@ internal sealed class BrokerCommittedAudioSource : IBrokerEnrollmentResourceOwne
     private readonly BrokerEnrollmentRundown rundown;
     private readonly CancellationTokenSource closing = new();
     private Task? preparation;
+    private BrokerAudioOwner.Committed? preparationCommit;
     private Task? cancel;
     private PhoneDevice? device;
     private PcmGrant? pcm;
@@ -25,7 +26,7 @@ internal sealed class BrokerCommittedAudioSource : IBrokerEnrollmentResourceOwne
     { this.authority = authority; this.session = session; this.rundown = rundown; }
 
     internal static BrokerCommittedAudioSource Bind(BrokerAudioOwner authority, BrokerAudioWorkerSession session,
-        BrokerEnrollmentRundown rundown, BrokerHostIdentity host)
+        BrokerEnrollmentRundown rundown, BrokerHostIdentity host, Action? onTracked = null)
     {
         if (authority.Source.Intent.Backend != AudioSourceBackend.Committed || !authority.IsWorker(session.Worker))
             throw new UnauthorizedAccessException("A registered committed-source worker is required.");
@@ -33,8 +34,9 @@ internal sealed class BrokerCommittedAudioSource : IBrokerEnrollmentResourceOwne
         var dispatcher = new BrokerAudioControlDispatcher(authority, session.Worker, host,
             host.SignAudioRequestStatus, host.SignAudioSourceStopStatus, resource.PrepareAsync,
             resource.RequestRundown, () => session.PublishAuthorityAsync(authority, CancellationToken.None),
-            session.SendReplyAsync, _ => resource.RequestRundown());
+            session.SendReplyAsync, _ => resource.RequestRundown(), acquisitionOnly: true);
         rundown.Track(authority.Source.Identity.Enrollment, resource);
+        onTracked?.Invoke();
         try { session.BindEvents(authority, dispatcher, resource.RequestRundown); }
         catch { resource.RequestRundown(); throw; }
         return resource;
@@ -46,8 +48,12 @@ internal sealed class BrokerCommittedAudioSource : IBrokerEnrollmentResourceOwne
     {
         lock (gate)
         {
-            if (fenced || preparation is not null) throw new UnauthorizedAccessException("Source preparation is unavailable.");
+            if (fenced) throw new UnauthorizedAccessException("Source preparation is unavailable.");
+            if (preparation is not null)
+                return ReferenceEquals(preparationCommit, acquisition) ? preparation
+                    : throw new UnauthorizedAccessException("A different source preparation was already claimed.");
             authority.ClaimPreparation(acquisition);
+            preparationCommit = acquisition;
             return preparation = Task.Run(() => PrepareCore(acquisition));
         }
     }
