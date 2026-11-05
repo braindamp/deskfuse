@@ -1462,7 +1462,7 @@ mod tests {
         use std::sync::atomic::Ordering;
         let (runtime, remote, mut phone, phone_socket, _grant, connection, fences, drops, _clock) =
             offline_incumbent(false, false, 1000, true);
-        let thread = std::thread::spawn(move || runtime.run());
+        let thread = spawn_offline(runtime);
         let (kind, wire) = remote.read(3000).unwrap();
         assert_eq!(kind, NETWORK_REQUEST);
         let request = Message::parse(&wire, false).unwrap();
