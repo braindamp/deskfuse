@@ -294,10 +294,11 @@ internal sealed class BrokerAudioOwner
             var generation = kind == AudioOperationKind.AcquireSource ? Source.Intent.Generation : candidate?.Intent.Generation ?? delivery!.Intent.Generation;
             var proposed = checked(now + Source.Intent.Policy.Duration100ns);
             var bound = phase == AudioAuthorityPhase.Idle ? proposed : Math.Min(proposed, until);
+            var issuedUntil = kind == AudioOperationKind.AttachDelivery && lastDeliveryGeneration == 0 ? bound : proposed;
             var expiry = checked((long)Math.Min(bound / 10000, checked(now / 10000 + (ulong)challengeLifetimeMs)));
             if ((ulong)expiry <= now / 10000) throw new UnauthorizedAccessException("No remaining proof time.");
             reservation = new(kind, new(Source.Identity.Worker, resource, AudioRequestProtocol.GenericOperation(kind), BrokerProofScope.Speaker, generation),
-                requestNonce, revision, proposed, candidate) { Proof = new(boot, Source.Intent.Grant, Source.Intent.Generation, Source.Digest, kind, requestNonce, revision, proposed),
+                requestNonce, revision, issuedUntil, candidate) { Proof = new(boot, Source.Intent.Grant, Source.Intent.Generation, Source.Digest, kind, requestNonce, revision, issuedUntil),
                 Expiry = expiry, Origin = origin, Issuing = true };
             issuedThrough = id.Sequence; active = reservation; Publish();
         }
