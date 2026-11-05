@@ -209,6 +209,25 @@ public sealed class AudioAuthorityTests
         }
         finally { await h.Dispatcher.StopAndJoinAsync(); }
     }
+    [Fact]
+    public async Task Dispatcher_enforces_contiguous_pipe_ids_after_native_local_denial()
+    {
+        using var f = new Fixture(); var h = new Routing(f);
+        try
+        {
+            Assert.True(h.Send(AudioNetworkKind.Info, []));
+            Assert.Equal(1UL, (await h.Reply()).Request);
+            Assert.True(h.Send(AudioNetworkKind.Info, []));
+            Assert.Equal(2UL, (await h.Reply()).Request);
+            var stop = new AudioSourceStop(AudioSourceStopProtocol.Target(f.Owner.Source, Nonce(3)),
+                Nonce(90), h.Connection, Nonce(4), Nonce(5), Nonce(6));
+            Assert.True(h.Send(AudioNetworkKind.SignedSourceStop, StopEnvelope(f, stop)));
+            var response = await h.Reply();
+            Assert.Equal(3UL, response.Request);
+            Assert.Equal((byte)137, response.Kind);
+        }
+        finally { await h.Dispatcher.StopAndJoinAsync(); }
+    }
     private static byte[] IssueBody(AudioOperationKind kind, byte[] request, Guid target = default)
     {
         var b = new byte[53]; b[0] = (byte)kind; request.CopyTo(b, 1); BinaryPrimitives.WriteUInt32BigEndian(b.AsSpan(33), 1000);
