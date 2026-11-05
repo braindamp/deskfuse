@@ -252,21 +252,36 @@ impl NativeRuntime {
             if self.listener.is_some() {
                 if self.drain_listener()? { continue; }
                 self.live()?;
-                let timeout = self.timeout(self.source.as_ref().and_then(SourceOwner::deadline))?;
+                let timeout = match self.timeout(self.source.as_ref().and_then(SourceOwner::deadline)) {
+                    Ok(ms) => ms,
+                    Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+                        self.live()?;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 #[cfg(test)]
                 if let Some(sender) = &self.test_idle { let _ = sender.send(()); }
                 let owned = self.listener.as_ref().unwrap();
+                let socket = Arc::clone(&owned._socket);
                 let completed = owned.candidate.as_ref().and_then(CandidateSetup::completion_handle);
                 let source_event = self.source.as_ref().map(SourceOwner::source_event);
                 let period_event = self.source.as_ref().map(SourceOwner::period_event);
-                let ready = owned.events.wait_listener(
+                let ready = match owned.events.wait_listener(
                     self.client.control_event().as_raw_handle(),
                     self.client.terminal_event().as_raw_handle(),
                     self.resume.event(),
                     owned.setup_wake.as_raw_handle(),
                     source_event, period_event,
                     completed, timeout,
-                )?;
+                ) {
+                    Ok(ready) => ready,
+                    Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+                        self.live()?;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 self.live()?;
                 if ready.period {
                     if let Some(source) = self.source.as_ref() { source.service_period()?; }
@@ -275,7 +290,7 @@ impl NativeRuntime {
                     if let Some(source) = self.source.as_mut() {
                         let client = &self.client;
                         source.service_egress(
-                            &mut self.authority, &owned._socket, true,
+                            &mut self.authority, &socket, true,
                             now, || client.terminal(),
                         )?;
                     }
@@ -514,7 +529,7 @@ impl NativeRuntime {
         let info = quiche::RecvInfo { from, to };
         if let Some(source) = self.source.as_mut() {
             if source.routes(header.dcid.as_ref(), info) {
-                source.receive(bytes, info, tick)?;
+                source.receive(bytes, quiche::RecvInfo { from, to }, tick)?;
                 return Ok(());
             }
         }

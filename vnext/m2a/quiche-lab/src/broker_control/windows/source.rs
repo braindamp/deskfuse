@@ -2,11 +2,12 @@ use crate::audio_authority::{AudioAuthority, ControlGrant};
 use crate::audio_control::{DeliveryBinding, SourceScope};
 use crate::audio_transport::ControlConnection;
 use crate::committed_source::{Block, Source};
-use crate::plaintext_expiry::{PcmTiming, PlaintextExpiry, QueueAdmission};
+use crate::fresh_anchor::CommitFence;
+use crate::plaintext_expiry::{PcmTiming, PlaintextExpiry};
 use crate::source_age;
 use crate::{Header, HEADER_BYTES, KIND_AUDIO, VERSION};
 use std::io;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::UdpSocket;
 use std::time::Instant;
 use windows_sys::Win32::Foundation::HANDLE;
 
@@ -20,7 +21,7 @@ pub(super) trait Input: Send {
     fn event(&self) -> HANDLE;
     fn period(&self) -> HANDLE;
     fn service_period(&self) -> io::Result<()>;
-    fn discard_partial(&mut self, qpc: u64) -> io::Result<()>;
+    fn discard_partial(&mut self, qpc: u64) -> io::Result<CommitFence>;
 }
 impl Input for Source {
     fn next_block(&mut self) -> io::Result<Option<Block>> { Source::next_block(self) }
@@ -28,8 +29,8 @@ impl Input for Source {
     fn event(&self) -> HANDLE { self.event }
     fn period(&self) -> HANDLE { self.period_event() }
     fn service_period(&self) -> io::Result<()> { Source::service_period(self) }
-    fn discard_partial(&mut self, qpc: u64) -> io::Result<()> {
-        self.fence(qpc).map(|_| ())
+    fn discard_partial(&mut self, qpc: u64) -> io::Result<CommitFence> {
+        self.fence(qpc)
     }
 }
 
@@ -46,10 +47,11 @@ pub(super) struct SourceOwner {
     input: Box<dyn Input>,
     delivery: Option<Delivery>,
     sequence: u64,
+    fence: Option<CommitFence>,
 }
 impl SourceOwner {
     pub(super) fn new(scope: SourceScope, input: Box<dyn Input>) -> Self {
-        Self { scope, input, delivery: None, sequence: 0 }
+        Self { scope, input, delivery: None, sequence: 0, fence: None }
     }
     pub(super) fn source_event(&self) -> HANDLE { self.input.event() }
     pub(super) fn period_event(&self) -> HANDLE { self.input.period() }
@@ -104,7 +106,7 @@ impl SourceOwner {
         if let Some(mut delivery) = self.delivery.take() {
             delivery.connection.retire();
             delivery.ledger.clear();
-            self.input.discard_partial(source_age::local_qpc_100ns()?)?;
+            self.fence = Some(self.input.discard_partial(source_age::local_qpc_100ns()?)?);
         }
         Ok(())
     }
@@ -128,6 +130,10 @@ impl SourceOwner {
         for _ in 0..8 {
             let Some(block) = self.input.next_block()? else { break };
             consumed = true;
+            if self.fence.is_some_and(|fence| !fence.accepts(
+                block.generation, block.min_commit,
+                block.timing.commit_qpc, block.first_frame,
+            )) { continue; }
             if !allowed || self.delivery.is_none() { continue; }
             if terminal() || !authority.media_allowed(boot()) {
                 self.fence_delivery()?;
@@ -233,10 +239,12 @@ mod tests {
         fn event(&self) -> HANDLE { std::ptr::null_mut() }
         fn period(&self) -> HANDLE { std::ptr::null_mut() }
         fn service_period(&self) -> io::Result<()> { Ok(()) }
-        fn discard_partial(&mut self, _: u64) -> io::Result<()> {
+        fn discard_partial(&mut self, qpc: u64) -> io::Result<CommitFence> {
             *self.fences.lock().unwrap() += 1;
             self.chunks.clear();
-            Ok(())
+            Ok(CommitFence {
+                generation: 1, accepted: 1, end_frame: 480, request_qpc: qpc,
+            })
         }
     }
 

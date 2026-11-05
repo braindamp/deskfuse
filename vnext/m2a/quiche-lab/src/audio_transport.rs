@@ -743,7 +743,7 @@ impl ControlConnection {
         socket: &UdpSocket, writable: bool, now: u64,
         mut permitted: impl FnMut() -> bool,
     ) -> io::Result<()> {
-        self.advance(now)?;
+        self.service_timeout(now)?;
         self.flush_stream()?;
         let result = self.egress.service_with_io(
             self.local, &mut self.conn, writable,
