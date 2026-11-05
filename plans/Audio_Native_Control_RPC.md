@@ -89,5 +89,6 @@ terminal. Cancellation retains actual write completion and fences the source.
 Bind the event owner before configuration so no observation can arrive unowned.
 
 This is public setup metadata over the existing trusted local pipe. It supplies
-no source/delivery authority or physical rundown claim. The configured native
-runtime still needs to consume this codec and compose the single UDP owner.
+no source/delivery authority or physical rundown claim. H2a consumes this codec in the production native runtime and retains its
+exact bind acknowledgement through actual pipe write completion. The sole UDP
+receive/routing owner and media-source integration remain pending.

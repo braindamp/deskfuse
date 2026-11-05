@@ -263,6 +263,41 @@ Evidence: `android/app/build/test-results/testDebugUnitTest/TEST-com.focuswindow
 and `TEST-com.focuswindow.client.transport.AudioCellularRequestTest.xml` beside it.
 No actual cellular request, DNS, radio, JNI playback or device operation ran.
 
+
+## H2a — native bootstrap and listener-ownership implementation
+
+5 November 2026. The fixed Windows worker entrypoint now runs through
+`BrokerControlClient::connect`, retaining its verified SYSTEM bootstrap and a
+single post-bootstrap reader and FIFO writer. One serialized native runtime
+holds the immutable validated listener configuration, actual nonblocking UDP
+socket and first assigned endpoint ACK. Exact configuration retries return the
+same ACK without another bind. Configuration may precede the first grant but
+does not confer source/output authority. The runtime rejects mismatched
+prior/later authority sources and conflicting listener configuration.
+
+The client additionally retains a per-write completion event for native
+authority/listener acknowledgements; queue acceptance is not actual I/O
+completion. Capacity exhaustion is retried on a wake, and terminal failure
+cancels and joins queued/in-flight writes. Stop, closed grants, service death,
+malformed trusted frames and authority expiry fence the listener, with
+event-driven waits. Closed-grant ACK is control metadata only, not proof of
+source, kernel or endpoint rundown. No UDP reader, candidate dispatch,
+activation, source creation or physical qualification is added.
+
+Focused Rust synthetic Windows-pipe/loopback tests were added for sole-reader
+dispatch, exact retries and endpoint ACKs, conflicting/foreign configuration,
+unchanged authority projection bytes, terminal precedence, idle shutdown,
+cutoff and blocked completion/cancellation. **Validation: NOT RUN** in this
+implementation environment (no Windows Rust/.NET toolchain). Existing earlier
+checkpoints and their recorded results are unchanged; the new tests do not
+inherit those historical passes.
+
+The rest of H2 still requires one UDP receive/routing owner, bounded candidate
+dispatch, actual global RPC forwarding, nomination/pin/transfer, native source
+preparation and old-egress/assembly/ledger retirement. H3/H4, real N4/N5
+rundown, H5 and installed/physical qualification remain pending. Production
+authority stays disabled.
+
 ## Continue on High
 
 The single broker-pipe reader/demultiplexer and bounded broker observation/request
