@@ -289,6 +289,8 @@ impl SourceOwner {
         })
     }
     #[cfg(test)]
+    pub(super) fn block_sends(&mut self) { self.block_io = true; }
+    #[cfg(test)]
     pub(super) fn block_egress(&mut self, now: u64) -> io::Result<()> {
         if let Some(d) = self.delivery.as_mut() {
             d.connection.service_media_with_io(

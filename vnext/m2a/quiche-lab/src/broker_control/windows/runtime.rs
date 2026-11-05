@@ -46,9 +46,11 @@ struct NativeRuntime {
     test_idle: Option<std::sync::mpsc::Sender<()>>,
     #[cfg(test)]
     test_datagram: Option<std::sync::mpsc::Sender<usize>>,
+    #[cfg(test)]
+    test_source: Option<std::sync::mpsc::SyncSender<(bool, usize, bool)>>,
 }
 
-pub(super) fn now() -> u64 {
+fn now() -> u64 {
     let mut value = 0;
     unsafe { QueryInterruptTimePrecise(&mut value); }
     value
@@ -83,6 +85,8 @@ impl NativeRuntime {
             test_idle: None,
             #[cfg(test)]
             test_datagram: None,
+            #[cfg(test)]
+            test_source: None,
         })
     }
 
@@ -250,18 +254,31 @@ impl NativeRuntime {
             work |= self.service_candidate()?;
             work |= self.service_active()?;
             let mut source_work = false;
+            #[cfg(test)]
+            let synthetic_clock = self.test_clock.as_deref();
+            let boot = || {
+                #[cfg(test)]
+                if let Some(clock) = synthetic_clock {
+                    return clock.load(std::sync::atomic::Ordering::SeqCst);
+                }
+                now()
+            };
             if let Some(source) = self.source.as_mut() {
                 let client = &self.client;
                 source_work = source.pump(
-                    &mut self.authority, now, || client.terminal(),
+                    &mut self.authority, &boot, || client.terminal(),
                     self.listener.as_ref().map(|owned| owned._socket.as_ref()),
                 )?;
                 if let Some(listener) = &self.listener {
                     source.service_egress(
                         &mut self.authority, &listener._socket, false,
-                        now, || client.terminal(),
+                        &boot, || client.terminal(),
                     )?;
                 }
+            }
+            #[cfg(test)]
+            if let (Some(source), Some(sender)) = (self.source.as_ref(), self.test_source.as_ref()) {
+                let _ = sender.try_send((source.has_delivery(), source.outstanding(), source.sealed_pending()));
             }
             if self.listener.is_some() {
                 let drained = self.drain_listener()?;
@@ -277,7 +294,7 @@ impl NativeRuntime {
                         let client = &self.client;
                         source.service_egress(
                             &mut self.authority, &owned._socket, true,
-                            now, || client.terminal(),
+                            &boot, || client.terminal(),
                         )?;
                     }
                     if let Some(setup) = self.listener.as_ref().and_then(|owned| owned.candidate.as_ref()) {
@@ -327,7 +344,7 @@ impl NativeRuntime {
                         let client = &self.client;
                         source.service_egress(
                             &mut self.authority, &socket, true,
-                            now, || client.terminal(),
+                            &boot, || client.terminal(),
                         )?;
                     }
                     if let Some(setup) = self.listener.as_ref().and_then(|owned| owned.candidate.as_ref()) {
@@ -1238,4 +1255,212 @@ mod tests {
         assert!(thread.join().unwrap().is_ok());
         assert!(UdpSocket::bind(address).is_ok());
     }
+
+    struct OfflineInput {
+        chunks: VecDeque<crate::committed_source::Block>,
+        fences: Arc<std::sync::atomic::AtomicUsize>,
+        drops: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl Drop for OfflineInput {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    impl super::super::source::Input for OfflineInput {
+        fn next_block(&mut self) -> io::Result<Option<crate::committed_source::Block>> {
+            Ok(self.chunks.pop_front())
+        }
+        fn arm(&self) -> io::Result<()> { Ok(()) }
+        fn event(&self) -> HANDLE { std::ptr::null_mut() }
+        fn period(&self) -> HANDLE { std::ptr::null_mut() }
+        fn service_period(&self) -> io::Result<()> { Ok(()) }
+        fn discard_partial(&mut self, qpc: u64) -> io::Result<crate::fresh_anchor::CommitFence> {
+            self.fences.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.chunks.clear();
+            Ok(crate::fresh_anchor::CommitFence {
+                generation: 1, accepted: 1, end_frame: 480, request_qpc: qpc,
+            })
+        }
+    }
+    fn offline_bytes(hex: &str) -> Vec<u8> {
+        (0..hex.len()).step_by(2)
+            .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).unwrap())
+            .collect()
+    }
+    fn encode_control(grant: &ControlGrant) -> Vec<u8> {
+        let mut bytes = b"DeskFuse.Audio.Control.v1\0".to_vec();
+        bytes.extend_from_slice(&grant.host);
+        bytes.extend_from_slice(&grant.namespace);
+        bytes.extend_from_slice(&grant.enrollment);
+        bytes.extend_from_slice(&grant.boot);
+        bytes.extend_from_slice(&grant.worker);
+        bytes.extend_from_slice(&grant.source);
+        bytes.extend_from_slice(&grant.source_generation.to_be_bytes());
+        bytes.extend_from_slice(&grant.source_digest);
+        bytes.extend_from_slice(&grant.binding);
+        bytes.extend_from_slice(&grant.delivery_generation.to_be_bytes());
+        bytes.extend_from_slice(&grant.delivery_digest);
+        bytes.extend_from_slice(&grant.revision.to_be_bytes());
+        bytes.extend_from_slice(&grant.until.to_be_bytes());
+        bytes.extend_from_slice(&grant.output_generation.to_be_bytes());
+        bytes.push(grant.ready as u8);
+        bytes.push(grant.closed as u8);
+        bytes
+    }
+    fn offline_incumbent(
+        ready: bool, blocked: bool, idle_ms: u32, staged_info: bool,
+    ) -> (
+        NativeRuntime, Control, crate::audio_transport::ControlConnection, UdpSocket,
+        ControlGrant, [u8; 16], Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        use crate::audio_control::{DeliveryBinding, SourceScope};
+        use crate::audio_transport::tests::{pair_at, pump};
+        use std::sync::atomic::{AtomicU64, AtomicUsize};
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../../../tools/protocol3/audio-transport-v1.json"
+        )).unwrap();
+        let scope = SourceScope::parse(&offline_bytes(fixture["sourceHex"].as_str().unwrap())).unwrap();
+        let mut grant = ControlGrant::parse(&offline_bytes(fixture["controlHex"].as_str().unwrap())).unwrap();
+        grant.until = 100_000_000;
+        grant.ready = ready;
+        grant.output_generation = if ready { 13 } else { 0 };
+        let (local, remote) = pair();
+        let client = BrokerControlClient::start_synthetic(local, grant.boot, grant.worker).unwrap();
+        let mut runtime = NativeRuntime::new(client).unwrap();
+        let bytes = listener_bytes();
+        let config = ListenerConfig::parse(&bytes, grant.worker).unwrap();
+        let (socket, acknowledgement) = config.bind().unwrap();
+        let endpoint = socket.local_addr().unwrap();
+        let phone_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        phone_socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let (mut phone, mut native) = pair_at(phone_socket.local_addr().unwrap(), endpoint, idle_ms);
+        let observed = native.observation(100).unwrap().unwrap();
+        let mut delivery = offline_bytes(fixture["deliveryHex"].as_str().unwrap());
+        for (old, new) in [
+            (15, observed.native), (16, observed.phone), (17, observed.nonce),
+        ] {
+            let offset = delivery.windows(32).position(|bytes| bytes == [old; 32]).unwrap();
+            delivery[offset..offset + 32].copy_from_slice(&new);
+        }
+        let binding = DeliveryBinding::parse(&delivery).unwrap();
+        grant.delivery_digest = binding.digest;
+        if staged_info {
+            phone.queue_control(Record { kind: ac::INFO, request: 1, body: Vec::new() }, 100).unwrap();
+            pump(&mut phone, &mut native);
+        }
+        native.install_native(&scope, grant.boot, binding.clone(), &grant, 100).unwrap();
+        let fences = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let qpc = crate::source_age::local_qpc_100ns().unwrap();
+        let block = crate::committed_source::Block {
+            first_frame: 240, generation: 1, min_commit: 1,
+            timing: crate::source_age::CommitTiming {
+                commit_qpc: qpc.saturating_sub(1_000), presentation_qpc: qpc,
+            }, pcm: [7; 960],
+        };
+        let input = OfflineInput {
+            chunks: if ready { VecDeque::from([block]) } else { VecDeque::new() },
+            fences: Arc::clone(&fences), drops: Arc::clone(&drops),
+        };
+        let mut source = SourceOwner::new(scope, Box::new(input));
+        source.install(native, binding, &grant, endpoint, 100).unwrap();
+        if blocked { source.block_sends(); }
+        runtime.authority.apply(grant.clone(), 100).unwrap();
+        runtime.authority.source_observed(grant.binding, 100).unwrap();
+        runtime.authority.delivery_observed(grant.delivery_generation, grant.delivery_digest, 100).unwrap();
+        if ready { runtime.authority.output_observed(grant.delivery_generation, 13, 100).unwrap(); }
+        runtime.listener = Some(BoundListener {
+            events: crate::reactor::WindowsEvents::new(&socket).unwrap(),
+            bytes, config, _socket: socket, acknowledgement,
+            setup_wake: Arc::new(handle(unsafe { CreateEventW(null(), 0, 0, null()) }).unwrap()),
+            candidate: None, observed: None,
+            pending_regular: VecDeque::new(), pending_negative: None,
+            pending_local: VecDeque::new(), joined: None,
+            cooldown_until: 0, candidate_until: 0,
+        });
+        runtime.source = Some(source);
+        let clock = Arc::new(AtomicU64::new(100));
+        runtime.test_clock = Some(Arc::clone(&clock));
+        (runtime, remote, phone, phone_socket, grant, observed.connection, fences, drops, clock)
+    }
+    #[test]
+    fn real_worker_loop_fences_blocked_incumbent_and_retains_source_until_stop() {
+        use std::sync::atomic::Ordering;
+        let (mut runtime, remote, _, _, grant, connection, fences, drops, _clock) =
+            offline_incumbent(true, true, 10000, false);
+        let (tx, rx) = std::sync::mpsc::sync_channel(32);
+        runtime.test_source = Some(tx);
+        let thread = std::thread::spawn(move || runtime.run());
+        let mut pending = false;
+        for _ in 0..64 {
+            let (active, queued, sealed) = rx.recv_timeout(Duration::from_millis(100)).unwrap();
+            if active && queued != 0 && sealed { pending = true; break; }
+        }
+        assert!(pending, "real owner never retained blocked ciphertext");
+        let mut next = grant;
+        next.revision += 1;
+        next.delivery_generation += 1;
+        next.delivery_digest = [33; 32];
+        next.ready = false;
+        next.output_generation = 0;
+        let update = encode_control(&next);
+        remote.write(AUTHORITY, &update).unwrap();
+        assert_eq!(remote.read(3000).unwrap(), (AUTHORITY_OBSERVED, update));
+        assert_eq!(remote.read(3000).unwrap(), (CONNECTION_CLOSED, connection.to_vec()));
+        let mut retained = false;
+        for _ in 0..64 {
+            let (active, queued, sealed) = rx.recv_timeout(Duration::from_millis(100)).unwrap();
+            if !active && queued == 0 && !sealed { retained = true; break; }
+        }
+        assert!(retained, "newer grant did not fence old delivery in worker loop");
+        assert_eq!(fences.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        remote.write(STOP, &[]).unwrap();
+        assert!(thread.join().unwrap().is_ok());
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn real_worker_sends_control_before_output_ready_and_retires_idle_delivery_only() {
+        use crate::audio_rpc::Message;
+        use std::sync::atomic::Ordering;
+        let (runtime, remote, mut phone, phone_socket, _grant, connection, fences, drops, _clock) =
+            offline_incumbent(false, false, 300, true);
+        let thread = std::thread::spawn(move || runtime.run());
+        let (kind, wire) = remote.read(3000).unwrap();
+        assert_eq!(kind, NETWORK_REQUEST);
+        let request = Message::parse(&wire, false).unwrap();
+        assert_eq!((request.kind, request.request, request.connection),
+            (ac::INFO, 1, connection));
+        let reply = Message {
+            request: request.request, connection, kind: 129, body: vec![42],
+        };
+        remote.write(NETWORK_REPLY, &reply.encode(true).unwrap()).unwrap();
+        let mut got = false;
+        let mut wire = [0u8; 1350];
+        for _ in 0..32 {
+            let (size, from) = match phone_socket.recv_from(&mut wire) {
+                Ok(value) => value,
+                Err(_) => break,
+            };
+            phone.receive(&mut wire[..size], quiche::RecvInfo {
+                from, to: phone_socket.local_addr().unwrap(),
+            }, 101).unwrap();
+            if phone.read_control(101).unwrap().iter().any(|record|
+                record.request == 1 && record.kind == 129 && record.body == [42]
+            ) {
+                got = true;
+                break;
+            }
+        }
+        assert!(got, "native approved control reply stalled before OutputReady");
+        assert_eq!(remote.read(3000).unwrap(), (CONNECTION_CLOSED, connection.to_vec()));
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert_eq!(fences.load(Ordering::SeqCst), 1);
+        remote.write(STOP, &[]).unwrap();
+        assert!(thread.join().unwrap().is_ok());
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
 }

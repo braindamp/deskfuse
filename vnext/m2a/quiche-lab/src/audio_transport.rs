@@ -896,11 +896,15 @@ pub(crate) mod tests {
         }
     }
     pub(crate) fn pair() -> (ControlConnection, ControlConnection) {
-        let a = "127.0.0.1:44001".parse().unwrap();
-        let b = "127.0.0.1:44002".parse().unwrap();
+        pair_at("127.0.0.1:44001".parse().unwrap(),
+            "127.0.0.1:44002".parse().unwrap(), 10000)
+    }
+    pub(crate) fn pair_at(
+        a: SocketAddr, b: SocketAddr, idle_ms: u32,
+    ) -> (ControlConnection, ControlConnection) {
         let mut phone = DeliveryTls::generate(Role::Phone)
             .unwrap()
-            .connect(a, b, 10000, 10000)
+            .connect(a, b, 10000, idle_ms)
             .unwrap();
         let mut packet = [0u8; 1350];
         let (n, i) = phone.conn.send(&mut packet).unwrap();
@@ -913,7 +917,7 @@ pub(crate) mod tests {
                     to: i.to,
                 },
                 10000,
-                10000,
+                idle_ms,
             )
             .unwrap();
         for _ in 0..64 {
