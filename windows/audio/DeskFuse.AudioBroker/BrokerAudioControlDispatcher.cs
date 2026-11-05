@@ -194,14 +194,14 @@ internal sealed class BrokerAudioControlDispatcher : IAudioWorkerEventOwner
                 case AudioNetworkKind.Proof:
                     var proof = AudioWorkerNetworkProtocol.Proof(b);
                     var committed = owner.Admit(origin, proof.Nonce, proof.Signature) ?? throw new UnauthorizedAccessException("Audio proof rejected.");
-                    if (acquisitionOnly && committed.Kind != AudioOperationKind.AcquireSource)
-                        throw new UnauthorizedAccessException("Delivery proof is not enabled.");
+                    if (acquisitionOnly && committed.Kind is not (AudioOperationKind.AcquireSource or AudioOperationKind.AttachDelivery))
+                        throw new UnauthorizedAccessException("Only first delivery proof is enabled.");
                     if (committed.Kind == AudioOperationKind.AcquireSource && owner.Snapshot().Phase == AudioAuthorityPhase.Preparing)
                     {
                         try { await prepareSource(committed).ConfigureAwait(false); }
                         catch (Exception error) { owner.CloseAdmission(); fail(error); throw; }
                     }
-                    await Publish(requireCurrent: acquisitionOnly && committed.Kind == AudioOperationKind.AcquireSource)
+                    await Publish(requireCurrent: acquisitionOnly)
                         .ConfigureAwait(false);
                     return committed.SignedReceipt(grants);
                 case AudioNetworkKind.AppliedResult:
