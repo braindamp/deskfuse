@@ -1169,7 +1169,12 @@ public sealed class AudioAuthorityTests
         f.Now += 10000; f.Admit(f.Owner.Issue(original, AudioOperationKind.Renew, Request(4), 1000));
         candidate = f.NewConnection(30, 31, 32);
         descriptor = f.Owner.PrepareDelivery(new(2, Nonce(30), Nonce(31), Request(5), Nonce(32)), candidate);
-        f.Admit(f.Owner.Issue(original, AudioOperationKind.SupersedeDelivery, Request(5), 1000, descriptor));
+        var message = new AudioNetworkMessage(1, original.Incarnation, (byte)AudioNetworkKind.Issue,
+            IssueBody(AudioOperationKind.SupersedeDelivery, Request(5), candidate.Incarnation));
+        var pin = new AudioPinnedIssue(message, f.Owner.Snapshot().Revision, descriptor.Digest);
+        Assert.Throws<UnauthorizedAccessException>(() => f.Owner.Issue(original, AudioOperationKind.SupersedeDelivery,
+            Request(5), 1000, descriptor, pin with { Message = message with { Connection = candidate.Incarnation } }));
+        f.Admit(f.Owner.Issue(original, AudioOperationKind.SupersedeDelivery, Request(5), 1000, descriptor, pin));
         f.Origin = candidate;
         Assert.Throws<UnauthorizedAccessException>(() => f.Owner.Issue(original, AudioOperationKind.Renew, Request(6), 1000));
         f.Owner.ConnectionClosed(original); // Old native closure cannot detach the new child.

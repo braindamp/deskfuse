@@ -261,14 +261,25 @@ internal sealed class BrokerAudioOwner
         lock (gate)
         {
             var now = Now(); RequireOrigin(origin); RequireLive(now); Prune();
-            if (pin is not null && (kind != AudioOperationKind.AttachDelivery || candidate is null ||
-                phase != AudioAuthorityPhase.Prepared || delivery is not null || lastDeliveryGeneration != 0 ||
-                pin.ParentRevision != revision || pin.Message.Connection != origin.Incarnation ||
-                !ReferenceEquals(candidate.Connection, origin) ||
-                !pin.Digest.AsSpan().SequenceEqual(candidate.Digest) ||
-                !pin.Message.Body.AsSpan(1, 32).SequenceEqual(phoneRequestNonce) ||
-                !candidate.Intent.PhoneRequestNonce.AsSpan().SequenceEqual(phoneRequestNonce)))
-                throw new UnauthorizedAccessException("Pinned first delivery is stale or mismatched.");
+            if (pin is not null)
+            {
+                var validOrigin = kind switch
+                {
+                    AudioOperationKind.AttachDelivery => delivery is null && lastDeliveryGeneration == 0 &&
+                        ReferenceEquals(candidate?.Connection, origin),
+                    AudioOperationKind.SupersedeDelivery => delivery is not null && ReferenceEquals(origin, deliveryOrigin) &&
+                        !ReferenceEquals(candidate?.Connection, origin),
+                    _ => false,
+                };
+                if (!validOrigin || candidate?.Connection is not { } target || target.Closed ||
+                    phase != AudioAuthorityPhase.Prepared || pin.ParentRevision != revision ||
+                    pin.Message.Connection != origin.Incarnation || pin.Message.Body[0] != (byte)kind ||
+                    new Guid(pin.Message.Body.AsSpan(37), bigEndian: true) != target.Incarnation ||
+                    !pin.Digest.AsSpan().SequenceEqual(candidate.Digest) ||
+                    !pin.Message.Body.AsSpan(1, 32).SequenceEqual(phoneRequestNonce) ||
+                    !candidate.Intent.PhoneRequestNonce.AsSpan().SequenceEqual(phoneRequestNonce))
+                    throw new UnauthorizedAccessException("Pinned delivery is stale or mismatched.");
+            }
             var old = active is not null && new AudioRequestId(active.PhoneNonce).Sequence == id.Sequence ? active :
                 applied.Values.Select(v => v.Pending).SingleOrDefault(p => new AudioRequestId(p.PhoneNonce).Sequence == id.Sequence);
             if (old is not null)

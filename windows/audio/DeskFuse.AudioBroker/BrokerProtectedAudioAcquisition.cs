@@ -18,7 +18,7 @@ internal static class BrokerProtectedAudioAcquisition
         Guid enrollmentId, byte[] serviceBoot, AudioLeasePolicy lease,
         AudioWireContext wire, bool minimumPeriod, IPEndPoint bind,
         AudioCandidatePolicy candidatePolicy, Func<ulong> clock,
-        CancellationToken cancellation)
+        CancellationToken cancellation, bool handover = false)
     {
         cancellation.ThrowIfCancellationRequested();
         deployment.RequireSignedSetup();
@@ -48,8 +48,8 @@ internal static class BrokerProtectedAudioAcquisition
                 AudioSourceBackend.Committed, lease, minimumPeriod, wire, serviceBoot,
                 clock, host.SignIssuedAudioChallenge);
             resource = BrokerCommittedAudioSource.Bind(owner, session, rundown, host,
-                () => tracked = true);
-            var config = AudioListenerConfiguration.Create(owner.Source, bind, candidatePolicy);
+                () => tracked = true, handover: handover);
+            var config = AudioListenerConfiguration.Create(owner.Source, bind, candidatePolicy, handover: handover);
             var listener = await session.ConfigureListenerAsync(owner, config, cancellation)
                 .ConfigureAwait(false);
             return new(owner, resource, session, listener);

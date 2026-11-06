@@ -19,18 +19,28 @@ enum AcquisitionRpc {
 }
 
 struct PendingPin {
+    origin: [u8; 16],
     record: Record,
     parent: ControlGrant,
     confirmed: bool,
 }
 
 struct Nomination {
+    origin: [u8; 16],
     route: [u8; 16],
     request: [u8; 32],
     generation: u64,
     binding: DeliveryBinding,
     pin_revision: Option<u64>,
     pin_until: u64,
+}
+
+struct PendingNomination {
+    origin: [u8; 16],
+    target: [u8; 16],
+    rpc: u64,
+    generation: u64,
+    request: [u8; 32],
 }
 
 struct Promotion {
@@ -50,7 +60,7 @@ struct BoundListener {
     observation_pending: Option<[u8; 16]>,
     observed: Option<[u8; 16]>,
     tls_observation: Option<Observation>,
-    nomination_pending: Option<(u64, u64, [u8; 32])>,
+    nomination_pending: Option<PendingNomination>,
     nomination: Option<Nomination>,
     pin: Option<PendingPin>,
     acquisition_rpc: Option<AcquisitionRpc>,
@@ -209,9 +219,11 @@ impl NativeRuntime {
                     let first = previous.delivery_generation == 0;
                     let valid_origin = if first {
                         self.authority.prepared() && !source.has_delivery() && source.pending_close().is_none()
+                            && nomination.origin == nomination.route
                     } else {
-                        self.retired_route.is_none() && source.replacement_origin(previous, tick)
-                            .is_some_and(|id| id != nomination.route)
+                        owned.config.handover && self.retired_route.is_none()
+                            && source.replacement_origin(previous, tick) == Some(nomination.origin)
+                            && nomination.origin != nomination.route
                     };
                     if !valid_origin || owned.observed != Some(nomination.route)
                         || owned.candidate.as_ref().is_none_or(CandidateSetup::finished)
@@ -293,30 +305,41 @@ impl NativeRuntime {
                 Ok(Some((LISTENER_CONFIGURED, acknowledgement)))
             }
             NETWORK_REPLY => {
-                let message = self.pipe_requests.reply(Message::parse(&frame.body, true)?)?;
+                let mut message = self.pipe_requests.reply(Message::parse(&frame.body, true)?)?;
                 if let Some(owned) = self.listener.as_mut().filter(|owned|
-                    owned.observed == Some(message.connection)
+                    owned.nomination_pending.as_ref().is_some_and(|p|
+                        p.origin == message.connection && p.rpc == message.request)
                 ) {
-                    if let Some((request, generation, n2)) = owned.nomination_pending {
-                        if message.request == request {
-                            owned.nomination_pending = None;
-                            if message.kind == ac::PREPARE + 128 {
-                                let binding = DeliveryBinding::parse(&message.body)?;
-                                let parent = self.authority.grant().ok_or_else(invalid)?;
-                                let observation = owned.tls_observation.as_ref().ok_or_else(invalid)?;
-                                let mut prospective = parent.clone();
-                                prospective.delivery_generation = generation;
-                                prospective.delivery_digest = binding.digest;
-                                if !self.authority.prepared() || self.source.is_none()
-                                    || owned.observed != Some(message.connection)
-                                    || binding.request != n2 || binding.generation != generation
-                                    || !binding.matches(&owned.config.scope, observation, &prospective)
-                                { return Err(invalid()); }
-                                owned.nomination = Some(Nomination {
-                                    route: message.connection, request: n2, generation, binding,
-                                    pin_revision: None, pin_until: 0,
-                                });
-                            }
+                    let pending = owned.nomination_pending.take().unwrap();
+                    if message.kind == ac::PREPARE + 128 {
+                        let first = pending.origin == pending.target;
+                        let origin_live = self.source.as_ref().is_some_and(|source| if first {
+                            self.authority.prepared() && !source.has_delivery()
+                        } else {
+                            owned.config.handover && source.connection_id() == Some(pending.origin)
+                        });
+                        let target_observed = owned.observed == Some(pending.target);
+                        let target_live = target_observed
+                            && owned.candidate.as_ref().is_some_and(|candidate| !candidate.finished());
+                        if !first && !(origin_live && target_live) {
+                            // A candidate can finish while the broker's nomination is in flight.
+                            message.kind = ac::ERROR;
+                            message.body = vec![4];
+                        } else {
+                            let binding = DeliveryBinding::parse(&message.body)?;
+                            let parent = self.authority.grant().ok_or_else(invalid)?;
+                            let observation = owned.tls_observation.as_ref().ok_or_else(invalid)?;
+                            let mut prospective = parent.clone();
+                            prospective.delivery_generation = pending.generation;
+                            prospective.delivery_digest = binding.digest;
+                            if !origin_live || !target_observed || observation.connection != pending.target
+                                || binding.request != pending.request || binding.generation != pending.generation
+                                || !binding.matches(&owned.config.scope, observation, &prospective)
+                            { return Err(invalid()); }
+                            owned.nomination = Some(Nomination {
+                                origin: pending.origin, route: pending.target, request: pending.request,
+                                generation: pending.generation, binding, pin_revision: None, pin_until: 0,
+                            });
                         }
                     }
                 }
@@ -621,8 +644,30 @@ impl NativeRuntime {
     fn forward_active(&mut self, id: [u8; 16], record: Record) -> io::Result<bool> {
         let negative = ac::negative(record.kind);
         if record.kind == ac::PREPARE || record.kind == ac::ISSUE && record.body[0] != 3 {
-            self.active_local_reply(id, record, 4)?;
-            return Ok(true);
+            let owned = self.listener.as_ref().ok_or_else(invalid)?;
+            let target = owned.observed;
+            let eligible = owned.config.handover && owned.candidate.as_ref().is_some_and(|setup| !setup.finished())
+                && target.is_some_and(|target| target != id)
+                && self.retired_route.is_none() && self.promotion.is_none();
+            if eligible && record.kind == ac::ISSUE && record.body[0] == 4
+                && owned.pin.is_none()
+                && owned.nomination.as_ref().is_some_and(|n| n.origin == id && Some(n.route) == target
+                    && n.pin_revision.is_none() && n.request == record.body[1..33]
+                    && n.route == record.body[37..53])
+            {
+                let parent = self.authority.grant().ok_or_else(invalid)?.clone();
+                let request = record.body[1..33].try_into().unwrap();
+                if owned.candidate.as_ref().unwrap().try_pin(parent.clone(), request).unwrap_or(false) {
+                    self.listener.as_mut().unwrap().pin = Some(PendingPin { origin: id, record, parent, confirmed: false });
+                    return Ok(true);
+                }
+            }
+            if !(eligible && record.kind == ac::PREPARE && owned.nomination_pending.is_none() && owned.nomination.is_none()
+                && target.as_ref().is_some_and(|target| target == &record.body[40..56]))
+            {
+                self.active_local_reply(id, record, 4)?;
+                return Ok(true);
+            }
         }
         let output = if record.kind == ac::OUTPUT {
             let signal = crate::audio_rpc::OutputSignal::parse(&record.body)?;
@@ -636,6 +681,7 @@ impl NativeRuntime {
         if let Some(pipe) = self.pipe_requests.propose(&tls)? {
             if self.client.try_write(NETWORK_REQUEST, &pipe.encode(false)?)? {
                 self.pipe_requests.submitted(&tls, &pipe)?;
+                if tls.kind == ac::PREPARE { self.remember_nomination(&tls); }
                 if let Some(signal) = output.filter(|signal| signal.ready) {
                     self.source.as_mut().unwrap().submit_ready(signal.output);
                 }
@@ -839,7 +885,7 @@ impl NativeRuntime {
             let request = record.body[1..33].try_into().unwrap();
             match owned.candidate.as_ref().ok_or_else(invalid)?.try_pin(parent.clone(), request) {
                 Ok(true) => {
-                    self.listener.as_mut().unwrap().pin = Some(PendingPin { record, parent, confirmed: false });
+                    self.listener.as_mut().unwrap().pin = Some(PendingPin { origin: connection, record, parent, confirmed: false });
                     return Ok(true);
                 }
                 Ok(false) => { self.local_reply(record, 2)?; return Ok(true); }
@@ -858,9 +904,7 @@ impl NativeRuntime {
             if self.client.try_write(NETWORK_REQUEST, &pipe.encode(false)?)? {
                 self.pipe_requests.submitted(&tls, &pipe)?;
                 if tls.kind == ac::PREPARE {
-                    let generation = u64::from_be_bytes(tls.body[..8].try_into().unwrap());
-                    let request = tls.body[8..40].try_into().unwrap();
-                    self.listener.as_mut().unwrap().nomination_pending = Some((tls.request, generation, request));
+                    self.remember_nomination(&tls);
                 } else if tls.kind == ac::ISSUE {
                     self.listener.as_mut().unwrap().acquisition_rpc = Some(AcquisitionRpc::Issue(tls.request));
                 } else if tls.kind == ac::PROOF {
@@ -879,18 +923,43 @@ impl NativeRuntime {
         Ok(true)
     }
 
+    fn remember_nomination(&mut self, message: &Message) {
+        self.listener.as_mut().unwrap().nomination_pending = Some(PendingNomination {
+            origin: message.connection, target: message.body[40..56].try_into().unwrap(),
+            rpc: message.request, generation: u64::from_be_bytes(message.body[..8].try_into().unwrap()),
+            request: message.body[8..40].try_into().unwrap(),
+        });
+    }
+
+    fn reject_replacement_pin(&mut self) -> io::Result<()> {
+        let owned = self.listener.as_mut().ok_or_else(invalid)?;
+        let pin = owned.pin.take().ok_or_else(invalid)?;
+        if let Some(candidate) = &owned.candidate { candidate.cancel(); }
+        self.active_local_reply(pin.origin, pin.record, 4)
+    }
+
     fn forward_pinned_issue(&mut self) -> io::Result<bool> {
         let owned = self.listener.as_ref().ok_or_else(invalid)?;
         let Some(pin) = owned.pin.as_ref().filter(|pin| pin.confirmed) else { return Ok(false); };
         let nomination = owned.nomination.as_ref().ok_or_else(invalid)?;
         let route = owned.observed.ok_or_else(invalid)?;
-        if !self.authority.prepared() || self.authority.grant() != Some(&pin.parent)
-            || self.source.as_ref().is_none_or(SourceOwner::has_delivery)
+        let first = pin.origin == route;
+        let valid_origin = if first {
+            self.authority.prepared() && self.source.as_ref().is_some_and(|source| !source.has_delivery())
+        } else {
+            owned.config.handover && self.source.as_ref().and_then(SourceOwner::connection_id) == Some(pin.origin)
+        };
+        if !valid_origin || self.authority.grant() != Some(&pin.parent)
+            || nomination.origin != pin.origin
             || nomination.route != route || pin.record.body[1..33] != nomination.request
             || pin.record.body[37..53] != route || nomination.binding.binding != pin.parent.binding
-        { return Err(invalid()); }
+        {
+            if first { return Err(invalid()); }
+            self.reject_replacement_pin()?;
+            return Ok(true);
+        }
         let tls = Message {
-            request: pin.record.request, connection: route,
+            request: pin.record.request, connection: pin.origin,
             kind: ac::ISSUE, body: pin.record.body.clone(),
         };
         let Some(pipe) = self.pipe_requests.propose(&tls)? else { return Ok(false); };
@@ -899,12 +968,16 @@ impl NativeRuntime {
         evidence.extend_from_slice(&nomination.binding.digest);
         // A captured pin may outlive its worker while the pipe is full. Leave
         // the pin in custody for the ordered connection-close path to retire.
-        if owned.candidate.as_ref().is_none_or(CandidateSetup::finished) { return Ok(false); }
+        if owned.candidate.as_ref().is_none_or(CandidateSetup::finished) {
+            if first { return Ok(false); }
+            self.reject_replacement_pin()?;
+            return Ok(true);
+        }
         if !self.client.try_write(PINNED_ISSUE, &evidence)? { return Ok(false); }
         self.pipe_requests.submitted(&tls, &pipe)?;
         let owned = self.listener.as_mut().unwrap();
         owned.pin = None;
-        owned.acquisition_rpc = Some(AcquisitionRpc::Issue(tls.request));
+        if first { owned.acquisition_rpc = Some(AcquisitionRpc::Issue(tls.request)); }
         Ok(true)
     }
 
@@ -955,7 +1028,11 @@ impl NativeRuntime {
                     if pending.confirmed || pending.record.body[1..33] != request
                         || pending.parent.revision != self.authority.revision()
                         || self.authority.grant() != Some(&pending.parent)
-                    { return Err(invalid()); }
+                    {
+                        if Some(pending.origin) == owned.observed { return Err(invalid()); }
+                        self.reject_replacement_pin()?;
+                        continue;
+                    }
                     pending.confirmed = true;
                     owned.candidate_until = pending.parent.until;
                     let nomination = owned.nomination.as_mut().ok_or_else(invalid)?;
@@ -1031,6 +1108,10 @@ impl NativeRuntime {
                     self.adopt_delivery(outcome)?;
                 } else {
                     if outcome.promoted { return Err(invalid()); }
+                    let owned = self.listener.as_ref().unwrap();
+                    if owned.pin.as_ref().is_some_and(|pin| Some(pin.origin) != owned.observed) {
+                        self.reject_replacement_pin()?;
+                    }
                     let owned = self.listener.as_mut().unwrap();
                     owned.candidate = None;
                     owned.joined = Some(outcome);
@@ -1057,7 +1138,10 @@ impl NativeRuntime {
             owned.joined = None;
             owned.observed = None;
             owned.tls_observation = None;
-            owned.nomination_pending = None;
+            // A replacement PREPARE can still owe the incumbent a reply.
+            if owned.nomination_pending.as_ref().is_some_and(|p| p.origin == p.target) {
+                owned.nomination_pending = None;
+            }
             owned.nomination = None;
             owned.pin = None;
             owned.acquisition_rpc = None;
@@ -1103,7 +1187,15 @@ impl NativeRuntime {
             }
         }
         let owned = self.listener.as_mut().unwrap();
+        for (reply, negative) in owned.pending_local.drain(..) {
+            if self.active_local.len() >= ac::MAX_PENDING + 1 { return Err(invalid()); }
+            self.active_local.push_back((route, reply, negative));
+        }
         owned.candidate = None;
+        owned.observed = None;
+        owned.tls_observation = None;
+        owned.acquisition_rpc = None;
+        owned.acquisition_challenge = false;
         owned.pin = None;
         owned.nomination = None;
         owned.nomination_pending = None;
@@ -1156,7 +1248,9 @@ impl NativeRuntime {
             }
             return Ok(false);
         }
-        if owned.joined.is_some() || self.source.as_ref().is_some_and(SourceOwner::has_delivery) { return Ok(false); }
+        if owned.joined.is_some() || self.retired_route.is_some() || self.promotion.is_some()
+            || !owned.config.handover && self.source.as_ref().is_some_and(SourceOwner::has_delivery)
+        { return Ok(false); }
         if bytes.len() < 1200 || header.ty != quiche::Type::Initial
             || header.version != quiche::PROTOCOL_VERSION || header.dcid.len() != 16
             || self.clock() < owned.cooldown_until

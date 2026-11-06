@@ -123,7 +123,7 @@ pub fn pinned_issue(bytes: &[u8]) -> io::Result<(Message, u64, [u8; 32])> {
     let message = Message::parse(&bytes[..HEADER + 53], false)?;
     let revision = u64_at(bytes, HEADER + 53);
     let digest: [u8; 32] = bytes[HEADER + 61..].try_into().unwrap();
-    if message.kind != c::ISSUE || message.body[0] != 2 || revision == 0 || digest == [0; 32] {
+    if message.kind != c::ISSUE || !matches!(message.body[0], 2 | 4) || revision == 0 || digest == [0; 32] {
         return Err(c::invalid());
     }
     Ok((message, revision, digest))
@@ -240,6 +240,12 @@ mod tests {
         assert_eq!(parsed, issue);
         assert_eq!(revision, 12);
         assert_eq!(digest, [0xa5; 32]);
+        let mut replacement = frame.clone();
+        replacement[HEADER] = 4;
+        replacement[8..24].fill(18);
+        let (pinned, _, _) = pinned_issue(&replacement).unwrap();
+        assert_eq!(pinned.connection, [18; 16]);
+        assert_eq!(&pinned.body[37..53], &[19; 16]);
         for end in 0..frame.len() {
             assert!(pinned_issue(&frame[..end]).is_err(), "truncated at {end}");
         }

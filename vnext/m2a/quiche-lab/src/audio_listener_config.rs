@@ -56,6 +56,7 @@ pub struct ListenerConfig {
     pub scope: SourceScope,
     pub address: SocketAddr,
     pub policy: CandidatePolicy,
+    pub handover: bool,
     digest: [u8; 32],
 }
 impl ListenerConfig {
@@ -64,9 +65,11 @@ impl ListenerConfig {
             return Err(invalid());
         }
         let mut r = Reader(bytes);
-        if r.byte()? != 1 {
-            return Err(invalid());
-        }
+        let handover = match r.byte()? {
+            1 => false,
+            2 => true,
+            _ => return Err(invalid()),
+        };
         DeliveryMode::require_supported(r.byte()?)?;
         let n = r.u16()? as usize;
         if n > 2048 {
@@ -94,6 +97,7 @@ impl ListenerConfig {
             scope,
             address,
             policy,
+            handover,
             digest: boring::sha::sha256(bytes),
         })
     }
@@ -223,6 +227,7 @@ mod tests {
         for family in [4, 6] {
             let b = bytes(&format!("configuration{family}Hex"));
             let c = ListenerConfig::parse(&b, worker()).unwrap();
+            assert!(!c.handover);
             let actual = match family {
                 4 => "127.0.0.1:44002",
                 _ => "[::1]:44002",
@@ -233,6 +238,16 @@ mod tests {
                 c.acknowledgement(actual).unwrap(),
                 bytes(&format!("acknowledgement{family}Hex"))
             );
+            let mut handover = b.clone();
+            handover[0] = 2;
+            let enabled = ListenerConfig::parse(&handover, worker()).unwrap();
+            assert!(enabled.handover);
+            assert_ne!(
+                enabled.acknowledgement(actual).unwrap(),
+                c.acknowledgement(actual).unwrap()
+            );
+            handover[0] = 3;
+            assert!(ListenerConfig::parse(&handover, worker()).is_err());
             assert!(c
                 .acknowledgement("127.0.0.2:44002".parse().unwrap())
                 .is_err());

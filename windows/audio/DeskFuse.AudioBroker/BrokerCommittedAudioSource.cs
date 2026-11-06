@@ -26,7 +26,7 @@ internal sealed class BrokerCommittedAudioSource : IBrokerEnrollmentResourceOwne
     { this.authority = authority; this.session = session; this.rundown = rundown; }
 
     internal static BrokerCommittedAudioSource Bind(BrokerAudioOwner authority, BrokerAudioWorkerSession session,
-        BrokerEnrollmentRundown rundown, BrokerHostIdentity host, Action? onTracked = null)
+        BrokerEnrollmentRundown rundown, BrokerHostIdentity host, Action? onTracked = null, bool handover = false)
     {
         if (authority.Source.Intent.Backend != AudioSourceBackend.Committed || !authority.IsWorker(session.Worker))
             throw new UnauthorizedAccessException("A registered committed-source worker is required.");
@@ -34,7 +34,7 @@ internal sealed class BrokerCommittedAudioSource : IBrokerEnrollmentResourceOwne
         var dispatcher = new BrokerAudioControlDispatcher(authority, session.Worker, host,
             host.SignAudioRequestStatus, host.SignAudioSourceStopStatus, resource.PrepareAsync,
             resource.RequestRundown, () => session.PublishAuthorityAsync(authority, CancellationToken.None),
-            session.SendReplyAsync, _ => resource.RequestRundown(), acquisitionOnly: true);
+            session.SendReplyAsync, _ => resource.RequestRundown(), acquisitionOnly: true, handover: handover);
         rundown.RegisterAudio(authority, resource);
         onTracked?.Invoke();
         try { session.BindEvents(authority, dispatcher, resource.RequestRundown); }

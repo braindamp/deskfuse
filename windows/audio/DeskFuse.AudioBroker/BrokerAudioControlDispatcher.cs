@@ -34,6 +34,7 @@ internal sealed class BrokerAudioControlDispatcher : IAudioWorkerEventOwner
     private readonly Action<Exception> fail;
     private readonly Action requestRundown;
     private readonly bool acquisitionOnly;
+    private readonly bool handover;
     private int rundownRequested;
     private readonly Dictionary<Guid, Route> routes = [];
     private readonly HashSet<Job> jobs = [];
@@ -48,12 +49,14 @@ internal sealed class BrokerAudioControlDispatcher : IAudioWorkerEventOwner
         Func<BrokerAudioOwner.RequestStatus, byte[]> signStatus, Func<BrokerAudioOwner.StopStatus, byte[]> signStopStatus,
         Func<BrokerAudioOwner.Committed, Task> prepareSource, Action requestRundown, Func<Task<bool>> publish,
         Func<byte[], bool, Action<AudioWorkerControlPump.ReplyPermit>, Task> send, Action<Exception> fail,
-        bool acquisitionOnly = false)
+        bool acquisitionOnly = false, bool handover = false)
     {
         if (!owner.IsWorker(worker)) throw new UnauthorizedAccessException("Foreign control worker.");
         this.owner = owner; this.worker = worker; this.grants = grants; this.signStatus = signStatus; this.signStopStatus = signStopStatus;
         this.prepareSource = prepareSource; this.publish = publish; this.send = send; this.fail = fail;
         this.requestRundown = requestRundown; this.acquisitionOnly = acquisitionOnly;
+        if (handover && !acquisitionOnly) throw new ArgumentException("Handover requires the protected delivery path.", nameof(handover));
+        this.handover = handover;
     }
     public bool TryPost(AudioWorkerFrame frame)
     {
@@ -81,6 +84,7 @@ internal sealed class BrokerAudioControlDispatcher : IAudioWorkerEventOwner
             if (frame.Kind is not (AudioWorkerFrameKind.NetworkRequest or AudioWorkerFrameKind.PinnedIssue)) return false;
             if (frame.Kind == AudioWorkerFrameKind.PinnedIssue && !acquisitionOnly) return false;
             var pin = frame.Kind == AudioWorkerFrameKind.PinnedIssue ? AudioWorkerNetworkProtocol.ParsePinnedIssue(frame.Body) : null;
+            if (pin?.Message.Body[0] == (byte)AudioOperationKind.SupersedeDelivery && !handover) return false;
             var message = pin?.Message ?? AudioWorkerNetworkProtocol.Parse(frame.Body);
             if (!routes.TryGetValue(message.Connection, out var origin) || origin.LastRequest == ulong.MaxValue || message.Request != origin.LastRequest + 1)
                 return false;
@@ -165,13 +169,15 @@ internal sealed class BrokerAudioControlDispatcher : IAudioWorkerEventOwner
             {
                 case AudioNetworkKind.Prepare:
                     Route target; lock (gate) target = routes.TryGetValue(new(b.AsSpan(40), bigEndian: true), out var route) ? route : throw new UnauthorizedAccessException("Unobserved target.");
-                    if (acquisitionOnly && (owner.Snapshot() is not { Phase: AudioAuthorityPhase.Prepared, DeliveryGeneration: 0 } ||
-                        !ReferenceEquals(origin, target.Origin)))
-                        throw new UnauthorizedAccessException("First delivery requires its prepared observed route.");
+                    var current = owner.Snapshot();
+                    var first = current.DeliveryGeneration == 0;
+                    if (acquisitionOnly && (current.Phase != AudioAuthorityPhase.Prepared ||
+                        (first ? !ReferenceEquals(origin, target.Origin) : !handover || ReferenceEquals(origin, target.Origin))))
+                        throw new UnauthorizedAccessException("Delivery nomination requires an eligible observed route.");
                     var prepared = owner.NominateDelivery(origin, target.Origin, U64(b, 0), b[8..40]);
                     lock (gate)
                     {
-                        if (acquisitionOnly && nomination is not null &&
+                        if (acquisitionOnly && first && nomination is not null &&
                             (!ReferenceEquals(nomination.Connection, target.Origin) || !nomination.Digest.AsSpan().SequenceEqual(prepared.Digest)))
                             throw new UnauthorizedAccessException("Another first delivery was already nominated.");
                         nomination = prepared;
@@ -179,10 +185,10 @@ internal sealed class BrokerAudioControlDispatcher : IAudioWorkerEventOwner
                     return prepared.Bytes;
                 case AudioNetworkKind.Issue:
                     var operation = (AudioOperationKind)b[0]; AudioDeliveryDescriptor? candidate = null;
-                    if (acquisitionOnly && operation is not (AudioOperationKind.AcquireSource or AudioOperationKind.AttachDelivery or AudioOperationKind.Renew))
-                        throw new UnauthorizedAccessException("Only first delivery attachment and same-delivery renewal are enabled.");
-                    if (acquisitionOnly && (operation == AudioOperationKind.AttachDelivery) != (job.Pin is not null))
-                        throw new UnauthorizedAccessException("First delivery requires confirmed native pin evidence.");
+                    if (acquisitionOnly && operation == AudioOperationKind.SupersedeDelivery && !handover)
+                        throw new UnauthorizedAccessException("Handover is disabled.");
+                    if (acquisitionOnly && (operation is AudioOperationKind.AttachDelivery or AudioOperationKind.SupersedeDelivery) != (job.Pin is not null))
+                        throw new UnauthorizedAccessException("Delivery issuance requires confirmed native pin evidence.");
                     if (operation is AudioOperationKind.AttachDelivery or AudioOperationKind.SupersedeDelivery)
                     {
                         lock (gate) candidate = nomination;
@@ -194,8 +200,8 @@ internal sealed class BrokerAudioControlDispatcher : IAudioWorkerEventOwner
                 case AudioNetworkKind.Proof:
                     var proof = AudioWorkerNetworkProtocol.Proof(b);
                     var committed = owner.Admit(origin, proof.Nonce, proof.Signature) ?? throw new UnauthorizedAccessException("Audio proof rejected.");
-                    if (acquisitionOnly && committed.Kind is not (AudioOperationKind.AcquireSource or AudioOperationKind.AttachDelivery or AudioOperationKind.Renew))
-                        throw new UnauthorizedAccessException("Only first delivery and renewal proofs are enabled.");
+                    if (acquisitionOnly && committed.Kind == AudioOperationKind.SupersedeDelivery && !handover)
+                        throw new UnauthorizedAccessException("Handover is disabled.");
                     if (committed.Kind == AudioOperationKind.AcquireSource && owner.Snapshot().Phase == AudioAuthorityPhase.Preparing)
                     {
                         try { await prepareSource(committed).ConfigureAwait(false); }

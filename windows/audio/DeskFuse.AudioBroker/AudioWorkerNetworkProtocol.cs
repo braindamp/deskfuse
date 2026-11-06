@@ -38,7 +38,8 @@ internal static class AudioWorkerNetworkProtocol
         if (bytes.Length != HeaderBytes + 53 + 8 + 32) throw Invalid();
         var message = Parse(bytes[..(HeaderBytes + 53)]);
         var evidence = bytes.AsSpan(HeaderBytes + 53);
-        if (message.Kind != (byte)AudioNetworkKind.Issue || message.Body[0] != (byte)AudioOperationKind.AttachDelivery ||
+        if (message.Kind != (byte)AudioNetworkKind.Issue ||
+            (AudioOperationKind)message.Body[0] is not (AudioOperationKind.AttachDelivery or AudioOperationKind.SupersedeDelivery) ||
             BinaryPrimitives.ReadUInt64BigEndian(evidence) == 0) throw Invalid();
         Hash(evidence[8..]);
         return new(message, BinaryPrimitives.ReadUInt64BigEndian(evidence), evidence[8..].ToArray());

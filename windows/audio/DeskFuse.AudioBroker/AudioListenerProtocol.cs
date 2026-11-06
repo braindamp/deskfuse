@@ -19,13 +19,13 @@ internal sealed record AudioCandidatePolicy(uint WarmMilliseconds, uint IdleMill
 internal sealed class AudioListenerConfiguration
 {
     private readonly byte[] bytes, sourceDigest;
-    private AudioListenerConfiguration(AudioSourceDescriptor source, IPEndPoint bind, AudioCandidatePolicy policy)
-    { sourceDigest = source.Digest; bytes = AudioListenerProtocol.Encode(source.Bytes, bind, policy); }
+    private AudioListenerConfiguration(AudioSourceDescriptor source, IPEndPoint bind, AudioCandidatePolicy policy, bool handover)
+    { sourceDigest = source.Digest; bytes = AudioListenerProtocol.Encode(source.Bytes, bind, policy, handover); }
     internal static AudioListenerConfiguration Create(AudioSourceDescriptor source, IPEndPoint bind, AudioCandidatePolicy policy,
-        AudioDeliveryMode mode = AudioDeliveryMode.Game)
+        AudioDeliveryMode mode = AudioDeliveryMode.Game, bool handover = false)
     {
         AudioDeliveryModes.RequireSupported(mode); AudioDeliveryModes.RequireSupported(source.Mode);
-        return new(source, bind, policy);
+        return new(source, bind, policy, handover);
     }
     internal byte[] Bytes => bytes.ToArray();
     internal void RequireSource(AudioSourceDescriptor source)
@@ -35,13 +35,13 @@ internal sealed class AudioListenerConfiguration
 /// <summary>Local setup metadata only. The bound pipe supplies identity; these bytes never grant media.</summary>
 internal static class AudioListenerProtocol
 {
-    internal static byte[] Encode(byte[] source, IPEndPoint bind, AudioCandidatePolicy policy)
+    internal static byte[] Encode(byte[] source, IPEndPoint bind, AudioCandidatePolicy policy, bool handover = false)
     {
         if (source.Length > AudioAuthorityProtocol.MaxDescriptor || !source.AsSpan().StartsWith("DeskFuse.Audio.Source.v1\0"u8)) throw Invalid();
         var ip = bind.Address;
         bind = new(ip.AddressFamily == AddressFamily.InterNetworkV6 ? new IPAddress(ip.GetAddressBytes(), ip.ScopeId) : new IPAddress(ip.GetAddressBytes()), bind.Port);
         policy.Validate(); ValidateAddress(bind.Address);
-        using var stream = new MemoryStream(); stream.WriteByte(1); stream.WriteByte(1); U16(stream, checked((ushort)source.Length)); stream.Write(source);
+        using var stream = new MemoryStream(); stream.WriteByte(handover ? (byte)2 : (byte)1); stream.WriteByte(1); U16(stream, checked((ushort)source.Length)); stream.Write(source);
         Address(stream, bind); U32(stream, policy.WarmMilliseconds); U32(stream, policy.IdleMilliseconds); U16(stream, policy.QueuedPackets);
         U32(stream, policy.MaxPackets); U32(stream, policy.MaxBytes); U16(stream, policy.MaxControlMessages);
         stream.WriteByte(policy.PacketsPerTurn); stream.WriteByte(policy.ControlsPerTurn); U32(stream, policy.CooldownMilliseconds);
