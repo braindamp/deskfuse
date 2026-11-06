@@ -86,6 +86,7 @@ struct NativeRuntime {
     active_regular: VecDeque<([u8; 16], Record)>,
     active_negative: Option<([u8; 16], Record)>,
     active_local: VecDeque<([u8; 16], Record, bool)>,
+    retired_route: Option<[u8; 16]>,
     #[cfg(test)]
     test_clock: Option<Arc<std::sync::atomic::AtomicU64>>,
     #[cfg(test)]
@@ -132,7 +133,7 @@ impl NativeRuntime {
             reply_custody: BTreeMap::new(),
             active_regular: VecDeque::new(),
             active_negative: None,
-            active_local: VecDeque::new(),
+            active_local: VecDeque::new(), retired_route: None,
             #[cfg(test)]
             test_clock: None,
             #[cfg(test)]
@@ -191,26 +192,45 @@ impl NativeRuntime {
                     return Err(invalid());
                 }
                 let tick = self.clock();
-                let first = !grant.closed && grant.delivery_generation != 0
-                    && self.authority.grant().is_some_and(|previous| previous.delivery_generation == 0);
-                if first {
+                if let Some(promotion) = &self.promotion {
+                    // This exact acknowledgement is already owned by the
+                    // pending transfer. Never acknowledge before adoption.
+                    if promotion.grant == grant { return Ok(None); }
+                    return Err(invalid());
+                }
+                let promote = !grant.closed && grant.delivery_generation != 0
+                    && self.authority.grant().is_some_and(|previous| previous.delivery_generation != grant.delivery_generation);
+                let mut incumbent = None;
+                if promote {
                     let previous = self.authority.grant().ok_or_else(invalid)?;
                     let owned = self.listener.as_ref().ok_or_else(invalid)?;
                     let nomination = owned.nomination.as_ref().ok_or_else(invalid)?;
-                    if !self.authority.prepared() || self.promotion.is_some()
-                        || self.source.as_ref().is_none_or(SourceOwner::has_delivery)
-                        || owned.observed != Some(nomination.route)
+                    let source = self.source.as_ref().ok_or_else(invalid)?;
+                    let first = previous.delivery_generation == 0;
+                    let valid_origin = if first {
+                        self.authority.prepared() && !source.has_delivery() && source.pending_close().is_none()
+                    } else {
+                        self.retired_route.is_none() && source.replacement_origin(previous, tick)
+                            .is_some_and(|id| id != nomination.route)
+                    };
+                    if !valid_origin || owned.observed != Some(nomination.route)
                         || owned.candidate.as_ref().is_none_or(CandidateSetup::finished)
                         || nomination.pin_revision != Some(previous.revision)
+                        || nomination.pin_until != previous.until
                         || grant.revision != previous.revision.checked_add(1).ok_or_else(invalid)?
-                        || grant.until > nomination.pin_until || grant.until > previous.until
+                        || first && grant.until > previous.until
                         || grant.binding != previous.binding
                         || grant.delivery_generation != nomination.generation
                         || grant.delivery_digest != nomination.binding.digest
                         || grant.ready || grant.output_generation != 0
                     { return Err(invalid()); }
+                    if !first { incumbent = Some(previous.clone()); }
                 }
                 self.authority.apply(grant.clone(), tick)?;
+                if let Some(previous) = incumbent {
+                    self.retired_route = self.source.as_mut().ok_or_else(invalid)?
+                        .retire_for_replacement(&previous, tick)?;
+                }
                 if !grant.closed && grant.binding != [0; 32] {
                     if let Some(binding) = self.prepared_binding.take() {
                         self.authority.source_observed(binding, tick)?;
@@ -223,7 +243,7 @@ impl NativeRuntime {
                         source.confirm_output(&grant, &mut self.authority, tick)?;
                     }
                 }
-                if first {
+                if promote {
                     self.promotion = Some(Promotion { grant, frame: frame.body, requested: false });
                     #[cfg(test)]
                     if self.test_cancel_first_promotion {
@@ -231,7 +251,6 @@ impl NativeRuntime {
                     }
                     return Ok(None);
                 }
-                if self.promotion.is_some() { return Err(invalid()); }
                 Ok(Some((AUTHORITY_OBSERVED, frame.body)))
             }
             CONFIGURE_LISTENER => {
@@ -509,7 +528,7 @@ impl NativeRuntime {
                 let owned = self.listener.as_ref().unwrap();
                 let socket = Arc::clone(&owned._socket);
                 let completed = owned.candidate.as_ref()
-                    .filter(|_| owned.observation_pending.is_none())
+                    .filter(|_| owned.observation_pending.is_none() && owned.pending_negative.is_none())
                     .and_then(CandidateSetup::completion_handle);
                 let source_event = self.source.as_ref().map(SourceOwner::source_event);
                 let period_event = self.source.as_ref().map(SourceOwner::period_event);
@@ -680,10 +699,12 @@ impl NativeRuntime {
                 false => self.active_local.push_back((id, record, negative)),
             }
         }
-        if let Some(id) = self.source.as_ref().and_then(SourceOwner::pending_close) {
+        let lost_route = self.source.as_ref().and_then(SourceOwner::pending_close);
+        if let Some(id) = self.retired_route.or(lost_route) {
             if self.active_negative.as_ref().is_none_or(|(pending, _)| *pending != id) {
                 if self.client.try_write(CONNECTION_CLOSED, &id)? {
-                    self.source.as_mut().unwrap().close_submitted(id)?;
+                    if self.retired_route == Some(id) { self.retired_route = None; }
+                    else { self.source.as_mut().unwrap().close_submitted(id)?; }
                     self.pipe_requests.retire_route(id);
                     self.active_regular.retain(|(connection, _)| *connection != id);
                     self.active_local.retain(|(connection, _, _)| *connection != id);
@@ -989,7 +1010,7 @@ impl NativeRuntime {
         }
 
         if let Some(promotion) = self.promotion.as_mut() {
-            if !promotion.requested {
+            if !promotion.requested && self.listener.as_ref().unwrap().pending_negative.is_none() {
                 let owned = self.listener.as_ref().ok_or_else(invalid)?;
                 let candidate = owned.candidate.as_ref().ok_or_else(invalid)?;
                 let binding = owned.nomination.as_ref().ok_or_else(invalid)?.binding.clone();
@@ -1000,12 +1021,14 @@ impl NativeRuntime {
                 progress |= promotion.requested;
             }
         }
-        if self.listener.as_ref().unwrap().candidate.as_ref().is_some_and(CandidateSetup::finished) {
+        if self.listener.as_ref().unwrap().pending_negative.is_none()
+            && self.listener.as_ref().unwrap().candidate.as_ref().is_some_and(CandidateSetup::finished)
+        {
             let outcome = self.listener.as_mut().unwrap().candidate.as_mut().unwrap().take_finished()?;
             if let Some(outcome) = outcome {
                 if self.promotion.is_some() {
                     if !outcome.promoted { return Err(invalid()); }
-                    self.adopt_first_delivery(outcome)?;
+                    self.adopt_delivery(outcome)?;
                 } else {
                     if outcome.promoted { return Err(invalid()); }
                     let owned = self.listener.as_mut().unwrap();
@@ -1048,7 +1071,8 @@ impl NativeRuntime {
         Ok(progress)
     }
 
-    fn adopt_first_delivery(&mut self, mut outcome: CandidateOutcome) -> io::Result<()> {
+    fn adopt_delivery(&mut self, mut outcome: CandidateOutcome) -> io::Result<()> {
+        self.live()?;
         let promotion = self.promotion.take().ok_or_else(invalid)?;
         let owned = self.listener.as_ref().ok_or_else(invalid)?;
         let nomination = owned.nomination.as_ref().ok_or_else(invalid)?;
@@ -1126,13 +1150,13 @@ impl NativeRuntime {
             }
         }
         let owned = self.listener.as_ref().unwrap();
-        if owned.joined.is_some() || self.source.as_ref().is_some_and(SourceOwner::has_delivery) { return Ok(false); }
         if let Some(setup) = &owned.candidate {
             if setup.routes(header.dcid.as_ref(), info) && !setup.finished() {
                 let _ = setup.try_packet(bytes, quiche::RecvInfo { from, to });
             }
             return Ok(false);
         }
+        if owned.joined.is_some() || self.source.as_ref().is_some_and(SourceOwner::has_delivery) { return Ok(false); }
         if bytes.len() < 1200 || header.ty != quiche::Type::Initial
             || header.version != quiche::PROTOCOL_VERSION || header.dcid.len() != 16
             || self.clock() < owned.cooldown_until
@@ -2504,7 +2528,7 @@ mod tests {
         })
     }
     #[test]
-    fn real_worker_loop_fences_blocked_incumbent_and_retains_source_until_stop() {
+    fn real_worker_loop_fences_blocked_detached_delivery_and_retains_source_until_stop() {
         use std::sync::atomic::Ordering;
         let (mut runtime, remote, _, _, grant, connection, fences, drops, pcm) =
             offline_incumbent(true, true, 10000);
@@ -2520,8 +2544,8 @@ mod tests {
         assert!(pending, "real owner never retained blocked ciphertext");
         let mut next = grant;
         next.revision += 1;
-        next.delivery_generation += 1;
-        next.delivery_digest = [33; 32];
+        next.delivery_generation = 0;
+        next.delivery_digest = [0; 32];
         next.ready = false;
         next.output_generation = 0;
         let update = encode_control(&next);
@@ -2539,6 +2563,19 @@ mod tests {
         remote.write(STOP, &[]).unwrap();
         assert!(thread.join().unwrap().is_ok());
         assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn replacement_projection_without_a_pinned_candidate_has_no_positive_ack() {
+        let (runtime, remote, _, _, mut grant, _, _, _, _) = offline_incumbent(true, false, 10000);
+        let worker = spawn_offline(runtime);
+        grant.revision += 1;
+        grant.delivery_generation += 1;
+        grant.delivery_digest = [33; 32];
+        grant.ready = false;
+        grant.output_generation = 0;
+        remote.write(AUTHORITY, &encode_control(&grant)).unwrap();
+        assert!(remote.read(3000).is_err());
+        assert!(worker.join().unwrap().is_err());
     }
     #[test]
     fn worker_sends_pcm_during_projection_and_keeps_drained_delivery_on_pause() {

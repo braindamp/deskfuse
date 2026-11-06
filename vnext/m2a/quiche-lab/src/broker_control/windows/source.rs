@@ -46,6 +46,12 @@ struct Delivery {
     withdrawn_output: u64,
 }
 
+struct RetiredDelivery {
+    route: [u8; 16],
+    generation: u64,
+    digest: [u8; 32],
+}
+
 pub(super) struct SourceOwner {
     scope: SourceScope,
     input: Box<dyn Input>,
@@ -53,6 +59,7 @@ pub(super) struct SourceOwner {
     sequence: u64,
     fence: Option<CommitFence>,
     closed: Option<[u8; 16]>,
+    lost_delivery: Option<RetiredDelivery>,
     reconnect_until: Option<u64>,
     authority_until: u64,
     #[cfg(test)]
@@ -62,7 +69,7 @@ impl SourceOwner {
     pub(super) fn new(scope: SourceScope, input: Box<dyn Input>) -> Self {
         Self {
             scope, input, delivery: None, sequence: 0, fence: None,
-            closed: None, reconnect_until: None, authority_until: 0,
+            closed: None, lost_delivery: None, reconnect_until: None, authority_until: 0,
             #[cfg(test)]
             block_io: false,
         }
@@ -71,6 +78,18 @@ impl SourceOwner {
     pub(super) fn period_event(&self) -> HANDLE { self.input.period() }
     pub(super) fn service_period(&self) -> io::Result<()> { self.input.service_period() }
     pub(super) fn has_delivery(&self) -> bool { self.delivery.is_some() }
+    pub(super) fn replacement_origin(&self, grant: &ControlGrant, now: u64) -> Option<[u8; 16]> {
+        if !self.scope.matches(grant) || self.grace_expired(now) { return None; }
+        if let Some(delivery) = &self.delivery {
+            if delivery.generation != grant.delivery_generation || delivery.digest != grant.delivery_digest {
+                return None;
+            }
+            return delivery.connection.observed_id();
+        }
+        let lost = self.lost_delivery.as_ref()?;
+        (lost.generation == grant.delivery_generation && lost.digest == grant.delivery_digest)
+            .then_some(lost.route)
+    }
     pub(super) fn sealed_pending(&self) -> bool {
         self.delivery.as_ref().is_some_and(|d| d.connection.sealed_pending())
     }
@@ -124,6 +143,7 @@ impl SourceOwner {
         });
         self.authority_until = grant.until;
         self.reconnect_until = None;
+        self.lost_delivery = None;
         if let Err(error) = self.recheck(grant, now) {
             self.fence_delivery_at(now)?;
             return Err(error);
@@ -141,6 +161,7 @@ impl SourceOwner {
                 || delivery.digest != grant.delivery_digest
             {
                 self.fence_delivery_at(now)?;
+                if grant.delivery_generation != 0 { return Err(denied()); }
             } else if !delivery.connection.approved_for(grant, &delivery.binding) {
                 let delivery = self.delivery.as_mut().unwrap();
                 if delivery.connection.install_native(
@@ -200,17 +221,41 @@ impl SourceOwner {
         self.fence_delivery_at(super::runtime::now())
     }
     pub(super) fn fence_delivery_at(&mut self, now: u64) -> io::Result<()> {
-        if let Some(mut delivery) = self.delivery.take() {
-            let id = delivery.connection.observed_id().ok_or_else(denied)?;
-            if self.closed.replace(id).is_some() { return Err(denied()); }
-            delivery.connection.retire();
-            delivery.ledger.clear();
+        if let Some(retired) = self.retire_delivery()? {
+            if self.closed.replace(retired.route).is_some() { return Err(denied()); }
+            self.lost_delivery = Some(retired);
             self.reconnect_until = Some(
                 now.saturating_add(self.scope.grace100ns).min(self.authority_until)
             );
-            self.fence = Some(self.input.discard_partial(source_age::local_qpc_100ns()?)?);
         }
         Ok(())
+    }
+    /// Replacement has already committed. Its old close notice is control
+    /// bookkeeping, independent of the source's reconnect grace.
+    pub(super) fn retire_for_replacement(&mut self, previous: &ControlGrant, now: u64) -> io::Result<Option<[u8; 16]>> {
+        let route = self.replacement_origin(previous, now).ok_or_else(denied)?;
+        if let Some(retired) = self.retire_delivery()? {
+            return Ok(Some(retired.route));
+        }
+        // The same incumbent was lost locally while its exact committed
+        // replacement projection was in flight. Its send owner is gone.
+        if self.closed.is_some_and(|closed| closed != route) { return Err(denied()); }
+        self.lost_delivery = None;
+        self.reconnect_until = None;
+        Ok(self.closed.take())
+    }
+    fn retire_delivery(&mut self) -> io::Result<Option<RetiredDelivery>> {
+        let Some(delivery) = self.delivery.take() else { return Ok(None); };
+        let retired = RetiredDelivery {
+            route: delivery.connection.observed_id().ok_or_else(denied)?,
+            generation: delivery.generation,
+            digest: delivery.digest,
+        };
+        // The actor is the only sender. Dropping this owner discards QUIC,
+        // its sealed packet and the plaintext ledger without draining them.
+        drop(delivery);
+        self.fence = Some(self.input.discard_partial(source_age::local_qpc_100ns()?)?);
+        Ok(Some(retired))
     }
     pub(super) fn routes(&self, cid: &[u8], info: quiche::RecvInfo) -> bool {
         self.delivery.as_ref().is_some_and(|d| d.connection.routes(cid, info))
@@ -457,6 +502,9 @@ mod tests {
 
     #[test]
     fn approved_sender_fences_blocked_ciphertext_without_releasing_its_source() {
+        for lost in [false, true] { check_replacement_fence(lost); }
+    }
+    fn check_replacement_fence(lost: bool) {
         let f: serde_json::Value = serde_json::from_str(include_str!(
             "../../../../../../tools/protocol3/audio-transport-v1.json"
         )).unwrap();
@@ -502,9 +550,16 @@ mod tests {
         next.delivery_digest = [33; 32];
         next.output_generation = 0;
         next.ready = false;
+        if lost {
+            source.fence_delivery_at(103).unwrap();
+            source.close_submitted(observation.connection).unwrap();
+        }
         authority.apply(next.clone(), 104).unwrap();
+        assert_eq!(source.retire_for_replacement(&grant, 104).unwrap(), (!lost).then_some(observation.connection));
         source.recheck(&next, 104).unwrap();
         assert!(!source.has_delivery());
+        assert!(source.grace_deadline().is_none());
+        assert!(source.pending_close().is_none());
         assert_eq!(source.outstanding(), 0);
         assert!(!source.sealed_pending());
         assert_eq!(*fences.lock().unwrap(), 1);
