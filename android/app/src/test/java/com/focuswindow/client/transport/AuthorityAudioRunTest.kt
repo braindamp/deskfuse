@@ -29,4 +29,14 @@ class AuthorityAudioRunTest {
         assertEquals(0, secondFences)
         second.requireLive()
     }
+
+    @Test fun late_route_loss_cannot_stop_a_released_native_candidate() {
+        val candidate = AuthorityAudioRun()
+        var fences = 0
+        candidate.attach { fences++ }
+        candidate.detachFence()
+        candidate.stop()
+        assertEquals(0, fences)
+        assertTrue(candidate.isStopped)
+    }
 }

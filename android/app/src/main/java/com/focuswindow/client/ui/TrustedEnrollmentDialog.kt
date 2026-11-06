@@ -184,6 +184,18 @@ internal fun TrustedEnrollmentDialog(lifecycle: Lifecycle, onDismiss: () -> Unit
                 if (BuildConfig.DEBUG) when (audioState) {
                     AuthorityAudioState.STARTING, AuthorityAudioState.PLAYING -> {
                         Text(if (audioState == AuthorityAudioState.PLAYING) "Trusted speaker is playing." else "Connecting trusted speaker…")
+                        if (audioState == AuthorityAudioState.PLAYING) {
+                            OutlinedTextField(audioHost, { audioHost = it }, label = { Text("Approved alternate endpoint") }, singleLine = true)
+                            OutlinedTextField(audioPort, { audioPort = it }, label = { Text("Alternate listener port") }, singleLine = true)
+                            TextButton(onClick = {
+                                runCatching {
+                                    AuthorityAudioControl.prepareAlternate(context, audioHost.trim().removeSurrounding("[", "]"),
+                                        checkNotNull(audioPort.toIntOrNull()))
+                                }.onFailure { message = "Could not prepare the alternate route." }
+                            }, enabled = audioHost.isNotBlank() && audioPort.toIntOrNull() in 1..65535) {
+                                Text("Prepare alternate route and allow metered data")
+                            }
+                        }
                         TextButton(onClick = { AuthorityAudioControl.stop(context) }) { Text("Stop trusted speaker") }
                     }
                     AuthorityAudioState.STOPPING -> Text("Stopping trusted speaker…")

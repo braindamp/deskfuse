@@ -118,7 +118,7 @@ extern "C" JNIEXPORT jbyteArray JNICALL
 Java_com_focuswindow_client_transport_AuthorityPhoneBridge_call(JNIEnv* env, jobject, jlong handle,
     jint op, jbyteArray input, jlong deadline, jobject ready) {
     const auto call = phone_call.load();
-    if (!handle || !input || !call || op < 1 || op > 134 || deadline < 0) {
+    if (!handle || !input || !call || op < 1 || op > 135 || deadline < 0) {
         phone_error(env, "java/lang/IllegalArgumentException"); return nullptr;
     }
     jbyte in[8192], out[8192];

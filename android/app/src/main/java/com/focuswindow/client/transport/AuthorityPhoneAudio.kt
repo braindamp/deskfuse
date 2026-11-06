@@ -27,6 +27,7 @@ private enum class PhoneControl(val wire: Int) {
     INFO(1), PREPARE(2), ISSUE(3), PROOF(4), SIGNED_STOP(9), APPLIED_RESULT(11),
     OBSERVATION(128), INSTALL(129), PLAY(130),
     RENEW_ISSUE(131), RENEW_PROOF(132), RENEW_RESULT(133), RENEW_INSTALL(134),
+    WAIT_WARM(135),
 }
 
 /** One gated audio run. Renewal control uses the live native owner's mailbox.
@@ -42,6 +43,7 @@ internal class AuthorityPhoneAudio(
     private var handle = 0L
     private var started = false
     private var stopped = false
+    private var playingSource: ByteArray? = null
     private var stopTarget: StopTarget? = null
     private var stopWork: CompletableFuture<Void>? = null
 
@@ -52,6 +54,30 @@ internal class AuthorityPhoneAudio(
         stopped = true
         if (handle != 0L) AuthorityPhoneBridge.stop(handle)
         startStopWork()
+    }
+
+    fun warmCandidate(address: String, network: Long, until: Long, run: AuthorityAudioRun,
+        requireRoute: () -> Unit, ready: () -> Unit) {
+        val source = synchronized(lifetime) { check(!stopped); checkNotNull(playingSource) }
+        enrollment.requireCurrent()
+        requireRoute()
+        val native = AuthorityPhoneBridge.open(library, address, until, 5_000, network)
+        check(native != 0L) { "Could not open the candidate audio connection" }
+        try {
+            run.attach { AuthorityPhoneBridge.stop(native) }
+            val deadline = minOf(until, Math.addExact(SystemClock.elapsedRealtimeNanos(), 3_000_000_000L))
+            val observedSource = AuthorityPhoneBridge.call(native, PhoneControl.INFO.wire, byteArrayOf(), deadline, null)
+            // Discovery checks the source and live TLS observation. The signed proof would authorize a switch.
+            check(observedSource.contentEquals(source)) { "Candidate names a different audio source" }
+            check(AuthorityPhoneBridge.call(native, PhoneControl.OBSERVATION.wire, byteArrayOf(), deadline, null).size == 112)
+            enrollment.requireCurrent()
+            requireRoute()
+            ready()
+            AuthorityPhoneBridge.call(native, PhoneControl.WAIT_WARM.wire, byteArrayOf(), until, null)
+        } finally {
+            run.detachFence()
+            AuthorityPhoneBridge.close(native)
+        }
     }
 
     // Called under lifetime. The real signing and pipe outcome remain owned
@@ -192,6 +218,7 @@ internal class AuthorityPhoneAudio(
             }
             val config = ByteBuffer.allocate(16).putInt(bufferBursts).putInt(sharing).putInt(usage).putInt(reserveFrames).array()
             call(PhoneControl.PLAY, config + renderer.toByteArray(Charsets.UTF_8), Runnable {
+                synchronized(lifetime) { if (!stopped) playingSource = sourceBytes }
                 ready.run()
                 scheduleRenewal(initialDeadline)
             })
@@ -201,6 +228,7 @@ internal class AuthorityPhoneAudio(
                 throw error
             }
         } finally {
+            synchronized(lifetime) { playingSource = null }
             renewals?.let { executor ->
                 executor.shutdown()
                 var interrupted = false

@@ -57,6 +57,16 @@ internal object AuthorityAudioControl {
         context.startService(AuthorityAudioService.stopIntent(context, generation))
     }
 
+    fun prepareAlternate(context: Context, host: String, port: Int) {
+        check(BuildConfig.DEBUG)
+        val target = AudioCellularTarget(host, port)
+        val generation = synchronized(gate) {
+            check(status.value == AuthorityAudioState.PLAYING)
+            checkNotNull(active).generation
+        }
+        context.startService(AuthorityAudioService.prepareAlternateIntent(context, generation, target))
+    }
+
     private class Grant(private val enrollment: TrustedCommittedEnrollment) : IAuthorityAudioEnrollment.Stub() {
         val generation = UUID.randomUUID().toString()
         var opened = false

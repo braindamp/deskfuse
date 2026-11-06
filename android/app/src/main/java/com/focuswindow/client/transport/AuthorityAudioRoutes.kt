@@ -31,6 +31,8 @@ internal class AuthorityAudioRun {
 
     fun requireLive() = check(!isStopped) { "Audio run stopped" }
 
+    fun detachFence() = synchronized(gate) { fence = null }
+
     fun stop() = synchronized(gate) {
         if (isStopped) return@synchronized
         isStopped = true
@@ -43,8 +45,9 @@ internal class AuthorityAudioRoutes(private val context: Context) {
     private val manager = context.getSystemService(ConnectivityManager::class.java)
     private val main = Handler(Looper.getMainLooper())
 
-    fun lan(target: AudioCellularTarget, run: AuthorityAudioRun, play: (String, Long, () -> Unit) -> Unit) {
-        val network = checkNotNull(manager.activeNetwork) { "No selected LAN network" }
+    fun lan(target: AudioCellularTarget, run: AuthorityAudioRun, alternate: Boolean = false,
+        play: (String, Long, () -> Unit) -> Unit) {
+        var network = if (alternate) null else checkNotNull(manager.activeNetwork) { "No selected LAN network" }
         val gate = Any()
         var eligible = false
         var blocked: Boolean? = null
@@ -61,37 +64,57 @@ internal class AuthorityAudioRoutes(private val context: Context) {
             else if (!retired && eligible && blocked == false) run.wake.countDown()
         }
         val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(value: Network) = synchronized(gate) {
+                if (alternate && network == null && !retired) network = value
+            }
             override fun onCapabilitiesChanged(value: Network, caps: NetworkCapabilities) {
-                if (value != network) return
                 synchronized(gate) {
+                    if (value != network) return
                     eligible = caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
                         caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) ||
-                        caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+                        !alternate && caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
                     observe()
                 }
             }
             override fun onBlockedStatusChanged(value: Network, valueBlocked: Boolean) {
-                if (value != network) return
-                synchronized(gate) { blocked = valueBlocked; observe() }
+                synchronized(gate) { if (value == network) { blocked = valueBlocked; observe() } }
             }
             override fun onLost(value: Network) {
-                if (value != network) return
-                synchronized(gate) { retire() }
+                synchronized(gate) { if (value == network) retire() }
             }
         }
-        manager.registerNetworkCallback(NetworkRequest.Builder().clearCapabilities().build(), callback)
+        val request = NetworkRequest.Builder().clearCapabilities()
+        if (alternate) request.addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+            .addTransportType(NetworkCapabilities.TRANSPORT_ETHERNET)
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+        val policy = object : ConnectivityManager.NetworkCallback() {
+            override fun onCapabilitiesChanged(value: Network, caps: NetworkCapabilities) {
+                if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)) {
+                    synchronized(gate) { retire() }
+                }
+            }
+        }
+        manager.registerNetworkCallback(request.build(), callback)
+        var watchingPolicy = false
         try {
+            if (alternate) {
+                manager.registerDefaultNetworkCallback(policy)
+                watchingPolicy = true
+            }
             check(run.wake.await(ACQUIRE_MS.toLong(), TimeUnit.MILLISECONDS)) { "LAN network unavailable" }
             val requireRoute = {
                 run.requireLive()
                 synchronized(gate) { check(!retired && eligible && blocked == false) }
+                if (alternate) check(manager.activeNetwork?.let(manager::getNetworkCapabilities)
+                    ?.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN) == true) { "LAN route policy changed" }
             }
-            synchronized(gate) { requireRoute(); admitted = true }
-            val address = network.getAllByName(target.host).first()
+            val selected = synchronized(gate) { requireRoute(); admitted = true; checkNotNull(network) }
+            val address = selected.getAllByName(target.host).first()
             requireRoute()
-            play(endpoint(address, target.port), network.networkHandle, requireRoute)
+            play(endpoint(address, target.port), selected.networkHandle, requireRoute)
         } finally {
-            manager.unregisterNetworkCallback(callback)
+            try { if (watchingPolicy) manager.unregisterNetworkCallback(policy) }
+            finally { manager.unregisterNetworkCallback(callback) }
         }
     }
 

@@ -23,6 +23,7 @@ const RENEW_ISSUE: u8 = 131;
 const RENEW_PROOF: u8 = 132;
 const RENEW_RESULT: u8 = 133;
 const RENEW_INSTALL: u8 = 134;
+const WAIT_WARM: u8 = 135;
 
 fn denied() -> io::Error {
     io::Error::from(io::ErrorKind::PermissionDenied)
@@ -248,6 +249,23 @@ impl Owner {
 }
 
 impl Delivery {
+    fn wait_warm(&mut self, owner: &Owner, until: u64) -> io::Result<()> {
+        if self.connection.is_approved() || self.connection.observed_id().is_none() {
+            return Err(denied());
+        }
+        let until = until.min(owner.deadline.load(Ordering::Acquire));
+        while boot()? < until {
+            self.service(owner, false)?;
+            if self.discard()? {
+                if let Err(error) = owner.wait(self, until, false) {
+                    if boot()? >= until { return Ok(()); }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn service(&mut self, owner: &Owner, negative: bool) -> io::Result<Vec<Record>> {
         self.connection
             .service_timeout(owner.control_time(negative)?)?;
@@ -607,6 +625,10 @@ unsafe extern "C" fn deskfuse_phone_audio_call_v3(
                     run.play(owner, bytes, deadline / 100, || {
                         if let Some(ready) = ready { ready(context); }
                     })?;
+                    Vec::new()
+                }
+                WAIT_WARM if bytes.is_empty() && run.source.is_none() => {
+                    run.delivery.wait_warm(owner, deadline / 100)?;
                     Vec::new()
                 }
                 _ => return Err(denied()),

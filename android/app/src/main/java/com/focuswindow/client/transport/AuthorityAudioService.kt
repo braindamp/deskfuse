@@ -11,9 +11,14 @@ import android.net.Uri
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.SystemClock
 import com.focuswindow.client.BuildConfig
 import java.util.UUID
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.SynchronousQueue
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 
 /** Gated first delivery. A run owns its authority, route, socket and renderer until rundown. */
 class AuthorityAudioService : Service() {
@@ -33,6 +38,15 @@ class AuthorityAudioService : Service() {
                     it.run.stop()
                     it.report(AuthorityAudioState.STOPPING)
                     notify(it, "Stopping")
+                }
+                if (active == null) stopSelf(startId)
+            }
+            intent.action == PREPARE_ALTERNATE -> {
+                active?.takeIf { it.generation == generation }?.let { delivery ->
+                    runCatching {
+                        delivery.prepareAlternate(AudioCellularTarget(checkNotNull(intent.getStringExtra("host")),
+                            intent.getIntExtra("port", 0)))
+                    }
                 }
                 if (active == null) stopSelf(startId)
             }
@@ -94,6 +108,9 @@ class AuthorityAudioService : Service() {
         private val cellular: Boolean,
     ) {
         val run = AuthorityAudioRun()
+        private val candidateGate = Any()
+        private var candidate: AuthorityAudioRun? = null
+        private var playingAudio: AuthorityPhoneAudio? = null // Service main thread.
         private val died = IBinder.DeathRecipient { run.stop() }
         private val token = object : IAuthorityAudioRun.Stub() {
             override fun stop() { run.stop() }
@@ -101,6 +118,47 @@ class AuthorityAudioService : Service() {
 
         fun report(state: AuthorityAudioState) {
             runCatching { authority.status(generation, state.ordinal) }
+        }
+
+        fun prepareAlternate(route: AudioCellularTarget) {
+            val audio = playingAudio ?: return
+            val warm = synchronized(candidateGate) {
+                if (candidate != null || run.isStopped) return
+                AuthorityAudioRun().also { candidate = it }
+            }
+            val until = SystemClock.elapsedRealtimeNanos() + 15_000_000_000L
+            fun announce(text: String) = main.post {
+                if (active === this && !run.isStopped) notify(this, text)
+            }
+            try {
+                candidateWorker.execute {
+                    var warmed = false
+                    try {
+                        val routes = AuthorityAudioRoutes(this@AuthorityAudioService)
+                        fun open(address: String, network: Long, requireRoute: () -> Unit) {
+                            audio.warmCandidate(address, network, until, warm, requireRoute) {
+                                warmed = true
+                                announce("Playing · alternate route ready")
+                            }
+                        }
+                        if (cellular) routes.lan(route, warm, alternate = true, play = ::open)
+                        else routes.cellular(route, warm) { address, network, requireRoute, _, _ ->
+                            open(address, network, requireRoute)
+                        }
+                    } catch (_: Exception) {
+                        // Route/DNS/TLS failure belongs to the candidate.
+                    } finally {
+                        synchronized(candidateGate) {
+                            announce(if (warmed) "Playing · alternate route released" else "Playing · alternate route unavailable")
+                            candidate = null
+                        }
+                    }
+                }
+                notify(this, "Playing · preparing alternate route")
+            } catch (_: RejectedExecutionException) {
+                synchronized(candidateGate) { candidate = null }
+                notify(this, "Playing · alternate route busy")
+            }
         }
 
         fun execute() {
@@ -119,11 +177,15 @@ class AuthorityAudioService : Service() {
                     checkNotNull(evidence.getByteArray("receipt")), current)
                 require(BrokerScope.SPEAKER in enrollment.transcript().proposal.scopes)
                 val audio = AuthorityPhoneAudio(this@AuthorityAudioService, enrollment, BrokerDeviceSigner(AndroidBrokerSigningKeys()))
-                run.attach(audio::stop)
+                run.attach {
+                    audio.stop()
+                    synchronized(candidateGate) { candidate }?.stop()
+                }
                 val routes = AuthorityAudioRoutes(this@AuthorityAudioService)
                 val ready = Runnable {
                     main.post {
                         if (active === this && !run.isStopped) {
+                            playingAudio = audio
                             report(AuthorityAudioState.PLAYING)
                             notify(this, "Playing")
                         }
@@ -145,6 +207,7 @@ class AuthorityAudioService : Service() {
             } catch (_: Exception) {
                 if (run.isStopped) terminal = AuthorityAudioState.IDLE
             } finally {
+                run.stop()
                 if (linked) runCatching { binder.unlinkToDeath(died, 0) }
                 main.post {
                     if (active === this) {
@@ -161,12 +224,18 @@ class AuthorityAudioService : Service() {
     internal companion object {
         const val START = "com.focuswindow.client.authority.START_AUDIO"
         private const val STOP = "com.focuswindow.client.authority.STOP_AUDIO"
+        private const val PREPARE_ALTERNATE = "com.focuswindow.client.authority.PREPARE_ALTERNATE_AUDIO"
         private const val CHANNEL = "trusted_pc_speaker"
         private const val NOTIFICATION = 4214
         private val worker = Executors.newSingleThreadExecutor()
+        private val candidateWorker = ThreadPoolExecutor(0, 1, 15, TimeUnit.SECONDS, SynchronousQueue<Runnable>())
 
         fun stopIntent(context: Context, generation: String) =
             Intent(context, AuthorityAudioService::class.java).setAction(STOP)
                 .setData(Uri.fromParts("deskfuse-audio", generation, null)).putExtra("generation", generation)
+
+        fun prepareAlternateIntent(context: Context, generation: String, target: AudioCellularTarget) =
+            Intent(context, AuthorityAudioService::class.java).setAction(PREPARE_ALTERNATE)
+                .putExtra("generation", generation).putExtra("host", target.host).putExtra("port", target.port)
     }
 }
