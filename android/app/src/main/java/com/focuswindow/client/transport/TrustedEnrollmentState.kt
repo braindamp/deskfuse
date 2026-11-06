@@ -64,6 +64,7 @@ internal class TrustedCommittedEnrollment private constructor(
     fun requireCurrent() = current()
     fun transcript(): EnrollmentTranscript = prepared.transcript()
     fun receipt(): EnrollmentReceipt = TrustedEnrollmentProtocol.parseReceipt(TrustedSetupWire.parseSigned(encodedReceipt).first)
+    fun evidence(): Pair<ByteArray, ByteArray> = prepared.bytes() to encodedReceipt.copyOf()
     companion object {
         fun validate(prepared: TrustedPreparedEnrollment, receipt: ByteArray, requireCurrent: () -> Unit): TrustedCommittedEnrollment {
             prepared.requireCurrent()
@@ -173,7 +174,9 @@ internal class TrustedEnrollmentRepository(private val persistence: TrustedEnrol
         } catch (failure: Exception) { denied.add(key); throw failure }
     }
     fun remove(host: ByteArray, enrollment: UUID) {
-        denied.add(localKey(host, enrollment)) // Immediate memory fence cannot wait behind storage.
+        val key = localKey(host, enrollment)
+        denied.add(key) // Immediate memory fence cannot wait behind storage.
+        invalidateAudio(key)
         synchronized(writerGate) { persistence.writeOnce(host, enrollment, "revoked", byteArrayOf(1)) }
         // Keep keys and records for exact status/revocation recovery.
     }
@@ -181,10 +184,27 @@ internal class TrustedEnrollmentRepository(private val persistence: TrustedEnrol
         val offer = TrustedEnrollmentProtocol.parseOffer(TrustedSetupWire.parseSigned(value.envelopes().first).first)
         require(offer.enrollment == enrollment && MessageDigest.isEqual(TrustedEnrollmentProtocol.hash(offer.hostSpki), host))
     }
-    private companion object {
-        val writerGate = Any()
-        val denied = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
-        fun localKey(host: ByteArray, enrollment: UUID): String {
+    companion object {
+        private data class AudioWatch(val key: String, val stop: () -> Unit)
+        private val audioWatch = java.util.concurrent.atomic.AtomicReference<AudioWatch?>()
+
+        fun watchAudio(value: TrustedCommittedEnrollment, stop: () -> Unit): AutoCloseable {
+            val binding = TrustedEnrollmentProtocol.binding(value.transcript())
+            val watch = AudioWatch(localKey(binding.hostHash, binding.enrollment), stop)
+            check(audioWatch.compareAndSet(null, watch))
+            try { value.requireCurrent() }
+            catch (failure: Exception) { audioWatch.compareAndSet(watch, null); throw failure }
+            return AutoCloseable { audioWatch.compareAndSet(watch, null) }
+        }
+
+        fun invalidateAudio(key: String? = null) {
+            val watch = audioWatch.get() ?: return
+            if (key == null || key == watch.key) watch.stop()
+        }
+
+        private val writerGate = Any()
+        private val denied = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+        private fun localKey(host: ByteArray, enrollment: UUID): String {
             require(host.size == 32 && enrollment != UUID(0, 0))
             return host.joinToString("") { "%02x".format(it.toInt() and 255) } + enrollment.toString()
         }

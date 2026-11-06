@@ -14,8 +14,8 @@ import java.util.concurrent.CompletableFuture
 @Keep
 private object AuthorityPhoneBridge {
     init { System.loadLibrary("deskfuse_audio_jni") }
-    external fun open(library: String, address: String, deadline: Long, idleMs: Int): Long
-    external fun call(handle: Long, operation: Int, input: ByteArray, deadline: Long): ByteArray
+    external fun open(library: String, address: String, deadline: Long, idleMs: Int, network: Long): Long
+    external fun call(handle: Long, operation: Int, input: ByteArray, deadline: Long, ready: Runnable?): ByteArray
     external fun stop(handle: Long)
     external fun close(handle: Long)
 }
@@ -61,30 +61,37 @@ internal class AuthorityPhoneAudio(
                 val attempt = target.owner.beginStop(enrollment, target.boot).prepare(target.observation)
                 signer.signAudioSourceStop(enrollment, attempt)
                 AuthorityPhoneBridge.call(native, PhoneControl.SIGNED_STOP.wire, attempt.envelope(),
-                    Math.addExact(SystemClock.elapsedRealtimeNanos(), target.timeoutMs * 1_000_000L))
+                    Math.addExact(SystemClock.elapsedRealtimeNanos(), target.timeoutMs * 1_000_000L), null)
             }
         }
     }
 
-    fun run(address: String, setupMs: Int, rpcMs: Int, idleMs: Int, clockMarginPpm: Int,
-        bufferBursts: Int, sharing: Int, usage: Int, reserveFrames: Int) {
+    fun run(address: String, network: Long, setupMs: Int, rpcMs: Int, idleMs: Int, clockMarginPpm: Int,
+        bufferBursts: Int, sharing: Int, usage: Int, reserveFrames: Int, requireRoute: () -> Unit,
+        beforeAcquire: (ByteArray) -> Unit, deliveryAccepted: () -> Unit, ready: Runnable) {
         require(setupMs > 0 && rpcMs in 1..120000 && idleMs > 0 && clockMarginPpm in 0..999999)
         enrollment.requireCurrent()
         val setupDeadline = Math.addExact(SystemClock.elapsedRealtimeNanos(), setupMs * 1_000_000L)
-        val native = synchronized(lifetime) {
+        synchronized(lifetime) {
             check(!started && !stopped)
             started = true
-            AuthorityPhoneBridge.open(library, address, setupDeadline, idleMs).also {
-                check(it != 0L) { "Could not open authority audio connection" }
-                handle = it
-            }
         }
+        requireRoute()
+        val native = AuthorityPhoneBridge.open(library, address, setupDeadline, idleMs, network)
+        check(native != 0L) { "Could not open authority audio connection" }
         var requests: AudioPhoneRequests? = null
         try {
+            synchronized(lifetime) {
+                if (stopped) return
+                handle = native
+            }
             var cutoff = setupDeadline
             fun deadline() = minOf(cutoff, Math.addExact(SystemClock.elapsedRealtimeNanos(), rpcMs * 1_000_000L))
-            fun call(kind: PhoneControl, bytes: ByteArray = byteArrayOf()) =
-                AuthorityPhoneBridge.call(native, kind.wire, bytes, deadline())
+            fun call(kind: PhoneControl, bytes: ByteArray = byteArrayOf(), onReady: Runnable? = null): ByteArray {
+                requireRoute()
+                enrollment.requireCurrent()
+                return AuthorityPhoneBridge.call(native, kind.wire, bytes, deadline(), onReady)
+            }
 
             val sourceBytes = call(PhoneControl.INFO)
             val observation = call(PhoneControl.OBSERVATION)
@@ -111,6 +118,7 @@ internal class AuthorityPhoneAudio(
                     startStopWork()
                 }
                 val proof = frozen.brokerNonce() + byteArrayOf(signature.size.toByte()) + signature
+                if (approval.operation == AudioOperation.ACQUIRE_SOURCE) beforeAcquire(approval.nonce())
                 val receipt = try { call(PhoneControl.PROOF, proof) } catch (_: SocketTimeoutException) {
                     call(PhoneControl.APPLIED_RESULT, pending.appliedResultRequest())
                 }
@@ -126,6 +134,7 @@ internal class AuthorityPhoneAudio(
             val (window, receipt) = prove(approval, connection)
             window.requireCurrent(SystemClock.elapsedRealtimeNanos())
             enrollment.requireCurrent()
+            deliveryAccepted()
             val install = ByteArrayOutputStream()
             DataOutputStream(install).use { out ->
                 out.write(window.boot())
@@ -139,9 +148,12 @@ internal class AuthorityPhoneAudio(
             }
             call(PhoneControl.INSTALL, install.toByteArray())
             val config = ByteBuffer.allocate(16).putInt(bufferBursts).putInt(sharing).putInt(usage).putInt(reserveFrames).array()
-            call(PhoneControl.PLAY, config + renderer.toByteArray(Charsets.UTF_8))
+            call(PhoneControl.PLAY, config + renderer.toByteArray(Charsets.UTF_8), ready)
         } catch (error: Exception) {
-            if (!synchronized(lifetime) { stopped }) throw error
+            if (!synchronized(lifetime) { stopped }) {
+                stop()
+                throw error
+            }
         } finally {
             val pendingStop = synchronized(lifetime) {
                 stopWork.also { if (it == null) handle = 0 }

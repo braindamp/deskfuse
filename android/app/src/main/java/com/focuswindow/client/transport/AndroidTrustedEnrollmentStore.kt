@@ -117,6 +117,10 @@ internal class AndroidTrustedEnrollmentStore(context: Context) : TrustedEnrollme
     }
     private class Owner(private val parent: File, private val root: File) {
         @Volatile var failed = false
+            set(value) {
+                field = value
+                if (value) TrustedEnrollmentRepository.invalidateAudio()
+            }
         var directory: FileDescriptor? = null
         private var parentDirectory: FileDescriptor? = null
         private val held = mutableMapOf<String, Held>()

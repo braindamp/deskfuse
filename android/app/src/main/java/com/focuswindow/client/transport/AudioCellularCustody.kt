@@ -84,6 +84,7 @@ internal class AudioCellularCustody(
         sample(); check(state == Phase.WARMING && usable && network == handle && !workStarted)
         Work().also { work = it; workStarted = true }
     }
+    fun usable(): Boolean = synchronized(gate) { sample(); usable && state in livePhases }
     fun requireWork(value: Work, handle: Long) = synchronized(gate) {
         sample(); check(work === value && network == handle && usable && state in livePhases) { "Retired cellular setup" }
     }

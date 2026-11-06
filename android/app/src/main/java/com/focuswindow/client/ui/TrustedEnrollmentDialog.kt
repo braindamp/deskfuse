@@ -12,6 +12,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -22,11 +23,15 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import com.focuswindow.client.BuildConfig
 import com.focuswindow.client.transport.AndroidBrokerDeviceSigner
 import com.focuswindow.client.transport.AndroidTrustedEnrollmentStore
+import com.focuswindow.client.transport.AuthorityAudioControl
+import com.focuswindow.client.transport.AuthorityAudioState
 import com.focuswindow.client.transport.BrokerScope
 import com.focuswindow.client.transport.EnrollmentOutcome
 import com.focuswindow.client.transport.TrustedEnrollmentClient
+import com.focuswindow.client.transport.TrustedCommittedEnrollment
 import com.focuswindow.client.transport.TrustedEnrollmentProtocol
 import com.focuswindow.client.transport.TrustedEnrollmentRepository
 import com.focuswindow.client.transport.TrustedPreparedEnrollment
@@ -58,6 +63,11 @@ internal fun TrustedEnrollmentDialog(lifecycle: Lifecycle, onDismiss: () -> Unit
     var found by remember { mutableStateOf<List<TrustedSetupLocation>>(emptyList()) }
     var recoverable by remember { mutableStateOf<List<TrustedPreparedEnrollment>>(emptyList()) }
     var message by remember { mutableStateOf<String?>(null) }
+    var committed by remember { mutableStateOf<TrustedCommittedEnrollment?>(null) }
+    var audioHost by remember { mutableStateOf("") }
+    var audioPort by remember { mutableStateOf("") }
+    var cellular by remember { mutableStateOf(false) }
+    val audioState by AuthorityAudioControl.state.collectAsState()
 
     fun work(action: suspend () -> Unit) {
         if (busy) return
@@ -116,7 +126,12 @@ internal fun TrustedEnrollmentDialog(lifecycle: Lifecycle, onDismiss: () -> Unit
                         } }, enabled = !busy && selected.isNotEmpty()) { Text("Continue with these permissions") }
                         for (saved in recoverable) TextButton(onClick = { work {
                             when (connection.get()!!.recover(saved)) {
-                                EnrollmentOutcome.COMMITTED -> { step = 4; message = "Trusted pairing recovered." }
+                                EnrollmentOutcome.COMMITTED -> {
+                                    val binding = saved.binding()
+                                    committed = withContext(Dispatchers.IO) { repository.committed(binding.hostHash, binding.enrollment) }
+                                    audioHost = host
+                                    step = 4; message = "Trusted pairing recovered."
+                                }
                                 EnrollmentOutcome.REVOKED -> message = "That pairing was revoked. Start a new trusted setup on Windows."
                                 else -> message = "Pairing status is unresolved. Saved details are kept; retry trusted setup."
                             }
@@ -139,11 +154,41 @@ internal fun TrustedEnrollmentDialog(lifecycle: Lifecycle, onDismiss: () -> Unit
                         Text("Check the Windows account and approve on both devices.")
                         TextButton(onClick = { work {
                             message = "Waiting for confirmation in Windows setup…"
-                            connection.get()!!.approve { lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) }
+                            committed = connection.get()!!.approve { lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) }
+                            audioHost = host
                             step = 4; message = "Trusted pairing saved."
                         } }, enabled = !busy) { Text("Approve pairing") }
                     }
-                    4 -> Text("Trusted pairing is saved on this phone.")
+                    4 -> {
+                        Text("Trusted pairing is saved on this phone.")
+                        val enrollment = committed
+                        if (BuildConfig.DEBUG && enrollment != null && BrokerScope.SPEAKER in enrollment.transcript().proposal.scopes &&
+                            audioState in setOf(AuthorityAudioState.IDLE, AuthorityAudioState.FAILED)) {
+                            Text("Trusted speaker development test")
+                            OutlinedTextField(audioHost, { audioHost = it }, label = { Text("Approved audio route") }, singleLine = true)
+                            OutlinedTextField(audioPort, { audioPort = it }, label = { Text("Windows audio listener port") }, singleLine = true)
+                            Row {
+                                Checkbox(cellular, { cellular = it })
+                                Text("Use this approved cellular route and allow metered data")
+                            }
+                            TextButton(onClick = {
+                                runCatching {
+                                    check(lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED))
+                                    AuthorityAudioControl.start(context, enrollment, audioHost.trim().removeSurrounding("[", "]"),
+                                        checkNotNull(audioPort.toIntOrNull()), cellular)
+                                }.onFailure { message = "Trusted speaker could not start. Check the audio route and listener port." }
+                            }, enabled = audioHost.isNotBlank() && audioPort.toIntOrNull() in 1..65535) { Text("Start trusted speaker") }
+                        }
+                    }
+                }
+                if (BuildConfig.DEBUG) when (audioState) {
+                    AuthorityAudioState.STARTING, AuthorityAudioState.PLAYING -> {
+                        Text(if (audioState == AuthorityAudioState.PLAYING) "Trusted speaker is playing." else "Connecting trusted speaker…")
+                        TextButton(onClick = { AuthorityAudioControl.stop(context) }) { Text("Stop trusted speaker") }
+                    }
+                    AuthorityAudioState.STOPPING -> Text("Stopping trusted speaker…")
+                    AuthorityAudioState.FAILED -> Text("Trusted speaker ended before it could complete the session.")
+                    AuthorityAudioState.IDLE -> Unit
                 }
                 message?.let { Text(it) }
                 if (busy && message == null) Text("Working…")

@@ -115,6 +115,11 @@
             android:name=".session.SpeakerService"
             android:exported="false"
             android:foregroundServiceType="mediaPlayback" />
+        <service
+            android:name=".transport.AuthorityAudioService"
+            android:exported="false"
+            android:process=":audio"
+            android:foregroundServiceType="mediaPlayback" />
 
         <!-- No ADB, no root, no accessibility service. Asserted by CI. -->
         <meta-data android:name="com.focuswindow.posture.accessibility" android:value="none" />

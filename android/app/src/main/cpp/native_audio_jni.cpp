@@ -76,8 +76,10 @@ Java_com_focuswindow_client_media_NativeAudioBridge_observe(JNIEnv* env,jobject,
 }
 
 namespace {
-using PhoneOpen = void* (*)(const char*, uint64_t, uint32_t);
-using PhoneCall = int32_t (*)(const void*, uint8_t, const uint8_t*, size_t, uint64_t, uint8_t*, size_t);
+using PhoneOpen = void* (*)(const char*, uint64_t, uint32_t, uint64_t);
+using PhoneReady = void (*)(void*);
+using PhoneCall = int32_t (*)(const void*, uint8_t, const uint8_t*, size_t, uint64_t, uint8_t*, size_t,
+    PhoneReady, void*);
 using PhoneEnd = void (*)(void*);
 PhoneOpen phone_open = nullptr;
 std::atomic<PhoneCall> phone_call{nullptr};
@@ -86,16 +88,21 @@ std::atomic<PhoneEnd> phone_close{nullptr};
 void phone_error(JNIEnv* env, const char* type) {
     if (auto cls = env->FindClass(type)) env->ThrowNew(cls, "Native first audio delivery failed");
 }
+struct ReadyCallback { JNIEnv* env; jobject task; jmethodID run; };
+void notify_ready(void* context) {
+    const auto& callback = *static_cast<const ReadyCallback*>(context);
+    callback.env->CallVoidMethod(callback.task, callback.run);
+}
 }
 extern "C" JNIEXPORT jlong JNICALL
 Java_com_focuswindow_client_transport_AuthorityPhoneBridge_open(JNIEnv* env, jobject, jstring library,
-    jstring address, jlong deadline, jint idle) {
+    jstring address, jlong deadline, jint idle, jlong network) {
     PhoneOpen open;
     {
         std::lock_guard<std::mutex> lock(load_lock);
-        if (!library || !address || deadline <= 0 || idle <= 0 || !load(env, library)) return 0;
-        phone_open = reinterpret_cast<PhoneOpen>(dlsym(runtime, "deskfuse_phone_audio_open"));
-        phone_call.store(reinterpret_cast<PhoneCall>(dlsym(runtime, "deskfuse_phone_audio_call")));
+        if (!library || !address || deadline <= 0 || idle <= 0 || !network || !load(env, library)) return 0;
+        phone_open = reinterpret_cast<PhoneOpen>(dlsym(runtime, "deskfuse_phone_audio_open_bound_v1"));
+        phone_call.store(reinterpret_cast<PhoneCall>(dlsym(runtime, "deskfuse_phone_audio_call_v2")));
         phone_stop.store(reinterpret_cast<PhoneEnd>(dlsym(runtime, "deskfuse_phone_audio_stop")));
         phone_close.store(reinterpret_cast<PhoneEnd>(dlsym(runtime, "deskfuse_phone_audio_close")));
         open = phone_open;
@@ -103,13 +110,13 @@ Java_com_focuswindow_client_transport_AuthorityPhoneBridge_open(JNIEnv* env, job
     if (!open || !phone_call.load() || !phone_stop.load() || !phone_close.load()) return 0;
     const auto* endpoint = env->GetStringUTFChars(address, nullptr);
     if (!endpoint) return 0;
-    const auto handle = open(endpoint, uint64_t(deadline), uint32_t(idle));
+    const auto handle = open(endpoint, uint64_t(deadline), uint32_t(idle), uint64_t(network));
     env->ReleaseStringUTFChars(address, endpoint);
     return reinterpret_cast<jlong>(handle);
 }
 extern "C" JNIEXPORT jbyteArray JNICALL
 Java_com_focuswindow_client_transport_AuthorityPhoneBridge_call(JNIEnv* env, jobject, jlong handle,
-    jint op, jbyteArray input, jlong deadline) {
+    jint op, jbyteArray input, jlong deadline, jobject ready) {
     const auto call = phone_call.load();
     if (!handle || !input || !call || op < 1 || op > 130 || deadline < 0) {
         phone_error(env, "java/lang/IllegalArgumentException"); return nullptr;
@@ -119,8 +126,18 @@ Java_com_focuswindow_client_transport_AuthorityPhoneBridge_call(JNIEnv* env, job
     if (size > static_cast<jsize>(sizeof(in))) { phone_error(env, "java/lang/IllegalArgumentException"); return nullptr; }
     env->GetByteArrayRegion(input, 0, size, in);
     if (env->ExceptionCheck()) return nullptr;
+    ReadyCallback callback{env, ready, nullptr};
+    if (ready) {
+        const auto cls = env->GetObjectClass(ready);
+        if (!cls) return nullptr;
+        callback.run = env->GetMethodID(cls, "run", "()V");
+        env->DeleteLocalRef(cls);
+        if (!callback.run) return nullptr;
+    }
     const auto count = call(reinterpret_cast<void*>(handle), uint8_t(op), reinterpret_cast<const uint8_t*>(in),
-        size, uint64_t(deadline), reinterpret_cast<uint8_t*>(out), sizeof(out));
+        size, uint64_t(deadline), reinterpret_cast<uint8_t*>(out), sizeof(out),
+        ready ? notify_ready : nullptr, &callback);
+    if (env->ExceptionCheck()) return nullptr;
     if (count < 0) {
         phone_error(env, count == -2 ? "java/net/SocketTimeoutException" : "java/lang/IllegalStateException");
         return nullptr;

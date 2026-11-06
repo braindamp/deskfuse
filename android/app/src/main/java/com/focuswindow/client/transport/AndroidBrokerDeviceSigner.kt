@@ -36,7 +36,7 @@ class AndroidBrokerDeviceSigner {
         signer.signExisting(hostIdentitySha256, enrollmentId, approvedSpkiSha256, transcript, approval)
 }
 
-private class AndroidBrokerSigningKeys : BrokerSigningKeyStore {
+internal class AndroidBrokerSigningKeys : BrokerSigningKeyStore {
     private fun store(): KeyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
 
     override fun find(alias: String): BrokerSigningKey? {

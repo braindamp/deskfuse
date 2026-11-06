@@ -59,6 +59,7 @@ internal class AudioCellularRequest(
         private set
     val phase get() = custody.phase()
     fun deadline() = custody.deadline()
+    fun usable() = custody.usable()
 
     private val callback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
@@ -147,6 +148,7 @@ internal class AudioCellularRequest(
     }
     inner class Binding internal constructor(private val network: Network, private val work: AudioCellularCustody.Work) {
         fun requireCurrent() = custody.requireWork(work, network.networkHandle)
+        val networkHandle get() = network.networkHandle
         val port get() = target.port
         fun resolveTarget(): Array<InetAddress> {
             requireCurrent()

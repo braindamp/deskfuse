@@ -21,6 +21,13 @@ use std::time::Instant;
 fn denied() -> io::Error {
     io::Error::from(io::ErrorKind::PermissionDenied)
 }
+
+#[link(name = "android")]
+extern "C" {
+    fn android_setsocknetwork(network: u64, fd: libc::c_int) -> libc::c_int;
+}
+
+type Ready = extern "C" fn(*mut c_void);
 fn boot() -> io::Result<u64> {
     let mut time = libc::timespec {
         tv_sec: 0,
@@ -50,8 +57,8 @@ struct Session {
 }
 
 impl Owner {
-    fn new(peer: SocketAddr, until: u64, idle_ms: u32) -> io::Result<Self> {
-        if boot()? >= until
+    fn new(peer: SocketAddr, until: u64, idle_ms: u32, network: u64) -> io::Result<Self> {
+        if network == 0 || boot()? >= until
             || peer.port() == 0
             || peer.ip().is_unspecified()
             || peer.ip().is_multicast()
@@ -63,6 +70,9 @@ impl Owner {
         } else {
             "[::]:0"
         })?;
+        if unsafe { android_setsocknetwork(network, socket.as_raw_fd()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
         socket.connect(peer)?;
         socket.set_nonblocking(true)?;
         let connection = DeliveryTls::generate(Role::Phone)?.connect(
@@ -322,7 +332,7 @@ impl Session {
         self.receipt = None;
         Ok(())
     }
-    fn play(&mut self, owner: &Owner, bytes: &[u8], until: u64) -> io::Result<()> {
+    fn play(&mut self, owner: &Owner, bytes: &[u8], until: u64, on_ready: impl FnOnce()) -> io::Result<()> {
         let (source, generation) = self.source.as_ref().ok_or_else(denied)?;
         let generation = *generation;
         let [epoch, stream, format] = source.wire;
@@ -373,6 +383,7 @@ impl Session {
         }
         owner.live()?;
         owner.playing.store(true, Ordering::Release);
+        on_ready();
         let mut media = AuthorityMedia::new(
             renderer,
             Configuration {
@@ -436,10 +447,11 @@ extern "C" fn wake_owner(context: *const c_void) {
 }
 
 #[no_mangle]
-unsafe extern "C" fn deskfuse_phone_audio_open(
+unsafe extern "C" fn deskfuse_phone_audio_open_bound_v1(
     address: *const c_char,
     deadline: u64,
     idle_ms: u32,
+    network: u64,
 ) -> *mut c_void {
     std::panic::catch_unwind(|| {
         let address = unsafe { CStr::from_ptr(address) }
@@ -447,7 +459,7 @@ unsafe extern "C" fn deskfuse_phone_audio_open(
             .ok()?
             .parse()
             .ok()?;
-        Owner::new(address, deadline / 100, idle_ms)
+        Owner::new(address, deadline / 100, idle_ms, network)
             .ok()
             .map(|owner| Box::into_raw(Box::new(owner)).cast())
     })
@@ -456,7 +468,7 @@ unsafe extern "C" fn deskfuse_phone_audio_open(
     .unwrap_or(std::ptr::null_mut())
 }
 #[no_mangle]
-unsafe extern "C" fn deskfuse_phone_audio_call(
+unsafe extern "C" fn deskfuse_phone_audio_call_v2(
     handle: *const c_void,
     op: u8,
     input: *const u8,
@@ -464,6 +476,8 @@ unsafe extern "C" fn deskfuse_phone_audio_call(
     deadline: u64,
     output: *mut u8,
     capacity: usize,
+    ready: Option<Ready>,
+    context: *mut c_void,
 ) -> i32 {
     std::panic::catch_unwind(|| -> io::Result<i32> {
         let owner = unsafe { &*handle.cast::<Owner>() };
@@ -483,7 +497,9 @@ unsafe extern "C" fn deskfuse_phone_audio_call(
                 Vec::new()
             }
             130 => {
-                session.play(owner, bytes, deadline / 100)?;
+                session.play(owner, bytes, deadline / 100, || {
+                    if let Some(ready) = ready { ready(context); }
+                })?;
                 Vec::new()
             }
             _ => return Err(denied()),
