@@ -38,9 +38,17 @@ try {
     if (@($entries | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint }).Count -ne 0) {
         throw 'Published output contains a reparse entry.'
     }
-    $files = @($entries | Where-Object { -not $_.PSIsContainer } | Sort-Object FullName | ForEach-Object {
-        [ordered]@{ path = $_.FullName.Substring($output.Length + 1).Replace('\','/'); sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() }
-    })
+    # Use .NET directly so Windows PowerShell does not need to load Get-FileHash.
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $files = @($entries | Where-Object { -not $_.PSIsContainer } | Sort-Object FullName | ForEach-Object {
+            $stream = [IO.File]::OpenRead($_.FullName)
+            try {
+                $digest = [BitConverter]::ToString($sha256.ComputeHash($stream)).Replace('-', '').ToLowerInvariant()
+            } finally { $stream.Dispose() }
+            [ordered]@{ path = $_.FullName.Substring($output.Length + 1).Replace('\','/'); sha256 = $digest }
+        })
+    } finally { $sha256.Dispose() }
     $evidence = [ordered]@{ version=1; profile='self-contained-win-x64'; buildOnly=$true; authorizesInstallation=$false; files=$files }
     $evidencePath = Join-Path $outputParent ((Split-Path $output -Leaf) + '.bundle.json')
     $evidence | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $evidencePath -Encoding utf8
