@@ -739,6 +739,24 @@ impl ControlConnection {
         Ok(request)
     }
     #[cfg(any(target_os = "android", test))]
+    pub(crate) fn renew_phone(
+        &mut self, binding: &DeliveryBinding, observation: &Observation, boot: [u8; 32],
+        revision: u64, deadline: u64, now: u64,
+    ) -> io::Result<()> {
+        self.advance(now)?;
+        let approved = self.approved.as_mut().ok_or_else(denied)?;
+        if self.role != Role::Phone || self.observation.as_ref() != Some(observation)
+            || approved.binding != *binding || approved.boot != boot
+            || revision <= approved.revision || deadline <= approved.until
+        {
+            return Err(denied());
+        }
+        approved.revision = revision;
+        approved.until = deadline;
+        self.deadline = deadline;
+        Ok(())
+    }
+    #[cfg(any(target_os = "android", test))]
     pub(crate) fn phone_datagram(&mut self, bytes: &mut [u8]) -> io::Result<Option<usize>> {
         if self.role != Role::Phone { return Err(denied()); }
         match self.conn.dgram_recv(bytes) {
@@ -1014,12 +1032,17 @@ pub(crate) mod tests {
             assert!(phone.queue_phone_ready(7, 100).is_err());
             if invalid == "route" { observed.connection[0] ^= 1; }
             let deadline = if invalid == "expiry" { 100 } else { 200 };
-            let result = phone.install_phone(&scope, DeliveryBinding::parse(&bytes).unwrap(), &observed,
+            let binding = DeliveryBinding::parse(&bytes).unwrap();
+            let result = phone.install_phone(&scope, binding.clone(), &observed,
                 grant.boot, grant.revision, deadline, 100);
             if invalid == "none" {
                 result.unwrap();
                 assert_eq!(phone.queue_phone_ready(7, 199).unwrap(), 2);
-                assert!(phone.queue_phone_ready(7, 200).is_err());
+                assert!(phone.renew_phone(&binding, &observed, grant.boot, grant.revision, 300, 199).is_err());
+                assert_eq!(phone.deadline(), 200);
+                phone.renew_phone(&binding, &observed, grant.boot, grant.revision + 1, 300, 199).unwrap();
+                assert!(phone.facts(200).unwrap().is_some());
+                assert!(phone.renew_phone(&binding, &observed, grant.boot, grant.revision + 2, 400, 300).is_err());
             } else {
                 assert!(result.is_err());
                 assert!(phone.queue_phone_ready(7, 101).is_err());

@@ -102,7 +102,7 @@ Java_com_focuswindow_client_transport_AuthorityPhoneBridge_open(JNIEnv* env, job
         std::lock_guard<std::mutex> lock(load_lock);
         if (!library || !address || deadline <= 0 || idle <= 0 || !network || !load(env, library)) return 0;
         phone_open = reinterpret_cast<PhoneOpen>(dlsym(runtime, "deskfuse_phone_audio_open_bound_v1"));
-        phone_call.store(reinterpret_cast<PhoneCall>(dlsym(runtime, "deskfuse_phone_audio_call_v2")));
+        phone_call.store(reinterpret_cast<PhoneCall>(dlsym(runtime, "deskfuse_phone_audio_call_v3")));
         phone_stop.store(reinterpret_cast<PhoneEnd>(dlsym(runtime, "deskfuse_phone_audio_stop")));
         phone_close.store(reinterpret_cast<PhoneEnd>(dlsym(runtime, "deskfuse_phone_audio_close")));
         open = phone_open;
@@ -118,7 +118,7 @@ extern "C" JNIEXPORT jbyteArray JNICALL
 Java_com_focuswindow_client_transport_AuthorityPhoneBridge_call(JNIEnv* env, jobject, jlong handle,
     jint op, jbyteArray input, jlong deadline, jobject ready) {
     const auto call = phone_call.load();
-    if (!handle || !input || !call || op < 1 || op > 130 || deadline < 0) {
+    if (!handle || !input || !call || op < 1 || op > 134 || deadline < 0) {
         phone_error(env, "java/lang/IllegalArgumentException"); return nullptr;
     }
     jbyte in[8192], out[8192];

@@ -620,7 +620,7 @@ impl NativeRuntime {
 
     fn forward_active(&mut self, id: [u8; 16], record: Record) -> io::Result<bool> {
         let negative = ac::negative(record.kind);
-        if matches!(record.kind, ac::PREPARE | ac::ISSUE | ac::PROOF) {
+        if record.kind == ac::PREPARE || record.kind == ac::ISSUE && record.body[0] != 3 {
             self.active_local_reply(id, record, 4)?;
             return Ok(true);
         }

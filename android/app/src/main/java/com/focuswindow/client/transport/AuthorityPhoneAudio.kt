@@ -2,6 +2,7 @@ package com.focuswindow.client.transport
 
 import android.content.Context
 import android.os.SystemClock
+import android.util.Log
 import androidx.annotation.Keep
 import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
@@ -10,6 +11,8 @@ import java.net.SocketTimeoutException
 import java.nio.ByteBuffer
 import java.util.UUID
 import java.util.concurrent.CompletableFuture
+import java.util.concurrent.ScheduledThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 
 @Keep
 private object AuthorityPhoneBridge {
@@ -23,10 +26,11 @@ private object AuthorityPhoneBridge {
 private enum class PhoneControl(val wire: Int) {
     INFO(1), PREPARE(2), ISSUE(3), PROOF(4), SIGNED_STOP(9), APPLIED_RESULT(11),
     OBSERVATION(128), INSTALL(129), PLAY(130),
+    RENEW_ISSUE(131), RENEW_PROOF(132), RENEW_RESULT(133), RENEW_INSTALL(134),
 }
 
-/** One gated first-delivery session. Run on the audio lifecycle thread. Only Stop
- * may enter from another thread, and it fences native admission synchronously. */
+/** One gated audio run. Renewal control uses the live native owner's mailbox.
+ * Stop fences native admission synchronously and signs independently. */
 internal class AuthorityPhoneAudio(
     context: Context,
     private val enrollment: TrustedCommittedEnrollment,
@@ -80,17 +84,19 @@ internal class AuthorityPhoneAudio(
         val native = AuthorityPhoneBridge.open(library, address, setupDeadline, idleMs, network)
         check(native != 0L) { "Could not open authority audio connection" }
         var requests: AudioPhoneRequests? = null
+        var renewals: ScheduledThreadPoolExecutor? = null
         try {
             synchronized(lifetime) {
                 if (stopped) return
                 handle = native
             }
             var cutoff = setupDeadline
-            fun deadline() = minOf(cutoff, Math.addExact(SystemClock.elapsedRealtimeNanos(), rpcMs * 1_000_000L))
-            fun call(kind: PhoneControl, bytes: ByteArray = byteArrayOf(), onReady: Runnable? = null): ByteArray {
+            fun call(kind: PhoneControl, bytes: ByteArray = byteArrayOf(), onReady: Runnable? = null,
+                expiresAt: Long = cutoff): ByteArray {
                 requireRoute()
                 enrollment.requireCurrent()
-                return AuthorityPhoneBridge.call(native, kind.wire, bytes, deadline(), onReady)
+                val deadline = minOf(expiresAt, Math.addExact(SystemClock.elapsedRealtimeNanos(), rpcMs * 1_000_000L))
+                return AuthorityPhoneBridge.call(native, kind.wire, bytes, deadline, onReady)
             }
 
             val sourceBytes = call(PhoneControl.INFO)
@@ -98,17 +104,22 @@ internal class AuthorityPhoneAudio(
             check(observation.size == 112)
             val connection = observation.copyOfRange(0, 16)
             val connectionId = ByteBuffer.wrap(connection)
-            val stopObservation = AudioStopObservation(UUID(connectionId.long, connectionId.long),
-                observation.copyOfRange(16, 48), observation.copyOfRange(48, 80), observation.copyOfRange(80, 112))
+            val nativeHash = observation.copyOfRange(16, 48)
+            val phoneHash = observation.copyOfRange(48, 80)
+            val nativeNonce = observation.copyOfRange(80, 112)
+            val stopObservation = AudioStopObservation(UUID(connectionId.long, connectionId.long), nativeHash, phoneHash, nativeNonce)
             val source = AudioSourceApproval(sourceBytes)
             source.requireActive(enrollment)
             val owner = AudioPhoneRequests(source, SystemClock::elapsedRealtimeNanos)
             requests = owner
-            fun prove(approval: AudioProofApproval, target: ByteArray): Pair<AudioGrantWindow, ByteArray> {
+            fun prove(approval: AudioProofApproval, target: ByteArray, expiresAt: Long = cutoff): Pair<AudioGrantWindow, ByteArray> {
+                val renewal = approval.operation == AudioOperation.RENEW
                 val pending = owner.begin(approval)
                 val issue = ByteBuffer.allocate(53).put(approval.operation.wire.toByte())
                     .put(approval.nonce()).putInt(rpcMs).put(target).array()
-                val (challenge, rootSignature) = TrustedSetupWire.parseSigned(call(PhoneControl.ISSUE, issue))
+                val (challenge, rootSignature) = TrustedSetupWire.parseSigned(call(
+                    if (renewal) PhoneControl.RENEW_ISSUE else PhoneControl.ISSUE, issue, expiresAt = expiresAt,
+                ))
                 pending.setChallenge(challenge, rootSignature)
                 val signature = signer.signAudioProof(enrollment, pending)
                 owner.confirmProof(pending)
@@ -119,8 +130,11 @@ internal class AuthorityPhoneAudio(
                 }
                 val proof = frozen.brokerNonce() + byteArrayOf(signature.size.toByte()) + signature
                 if (approval.operation == AudioOperation.ACQUIRE_SOURCE) beforeAcquire(approval.nonce())
-                val receipt = try { call(PhoneControl.PROOF, proof) } catch (_: SocketTimeoutException) {
-                    call(PhoneControl.APPLIED_RESULT, pending.appliedResultRequest())
+                val receipt = try {
+                    call(if (renewal) PhoneControl.RENEW_PROOF else PhoneControl.PROOF, proof, expiresAt = expiresAt)
+                } catch (_: SocketTimeoutException) {
+                    call(if (renewal) PhoneControl.RENEW_RESULT else PhoneControl.APPLIED_RESULT,
+                        pending.appliedResultRequest(), expiresAt = expiresAt)
                 }
                 return owner.accept(enrollment, pending, receipt, clockMarginPpm) to receipt
             }
@@ -130,31 +144,72 @@ internal class AuthorityPhoneAudio(
             val request = owner.nextRequestId()
             val delivery = call(PhoneControl.PREPARE, ByteBuffer.allocate(56).putLong(1).put(request).put(connection).array())
             val approval = AudioProofApproval.delivery(source, binding, delivery, AudioOperation.ATTACH_DELIVERY,
-                observation.copyOfRange(16, 48), observation.copyOfRange(48, 80), observation.copyOfRange(80, 112), request)
+                nativeHash, phoneHash, nativeNonce, request)
             val (window, receipt) = prove(approval, connection)
             window.requireCurrent(SystemClock.elapsedRealtimeNanos())
             enrollment.requireCurrent()
             deliveryAccepted()
-            val install = ByteArrayOutputStream()
-            DataOutputStream(install).use { out ->
-                out.write(window.boot())
-                out.writeLong(window.revision.toLong())
-                out.writeLong(minOf(parent.deadlineNanos, window.deadlineNanos))
-                out.write(observation)
-                for (bytes in listOf(sourceBytes, delivery, receipt)) {
-                    out.writeShort(bytes.size)
-                    out.write(bytes)
+            fun installBytes(grant: AudioGrantWindow, exactReceipt: ByteArray, deadline: Long): ByteArray {
+                val install = ByteArrayOutputStream()
+                DataOutputStream(install).use { out ->
+                    out.write(grant.boot())
+                    out.writeLong(grant.revision.toLong())
+                    out.writeLong(deadline)
+                    out.write(observation)
+                    for (bytes in listOf(sourceBytes, delivery, exactReceipt)) {
+                        out.writeShort(bytes.size)
+                        out.write(bytes)
+                    }
                 }
+                return install.toByteArray()
             }
-            call(PhoneControl.INSTALL, install.toByteArray())
+            val initialDeadline = minOf(parent.deadlineNanos, window.deadlineNanos)
+            call(PhoneControl.INSTALL, installBytes(window, receipt, initialDeadline))
+            val executor = ScheduledThreadPoolExecutor(1) { action -> Thread(action, "audio-renewal") }.apply {
+                setExecuteExistingDelayedTasksAfterShutdownPolicy(false)
+                prestartCoreThread()
+            }
+            renewals = executor
+            val deliveryDigest = TrustedEnrollmentProtocol.hash(delivery)
+            fun scheduleRenewal(localDeadline: Long) {
+                val remaining = localDeadline - SystemClock.elapsedRealtimeNanos()
+                if (remaining <= 0 || executor.isShutdown) return
+                executor.schedule({
+                    try {
+                        requireRoute()
+                        val renewal = AudioProofApproval.delivery(source, binding, delivery, AudioOperation.RENEW,
+                            nativeHash, phoneHash, nativeNonce, owner.nextRequestId(), deliveryDigest)
+                        val (grant, exactReceipt) = prove(renewal, ByteArray(16), localDeadline)
+                        check(grant.deadlineNanos > localDeadline)
+                        call(PhoneControl.RENEW_INSTALL, installBytes(grant, exactReceipt, grant.deadlineNanos),
+                            expiresAt = localDeadline)
+                        scheduleRenewal(grant.deadlineNanos)
+                    } catch (_: Exception) {
+                        if (!synchronized(lifetime) { stopped })
+                            Log.w("DeskFuseAudio", "Speaker renewal unavailable; existing local cutoff applies")
+                    }
+                }, remaining / 2, TimeUnit.NANOSECONDS)
+            }
             val config = ByteBuffer.allocate(16).putInt(bufferBursts).putInt(sharing).putInt(usage).putInt(reserveFrames).array()
-            call(PhoneControl.PLAY, config + renderer.toByteArray(Charsets.UTF_8), ready)
+            call(PhoneControl.PLAY, config + renderer.toByteArray(Charsets.UTF_8), Runnable {
+                ready.run()
+                scheduleRenewal(initialDeadline)
+            })
         } catch (error: Exception) {
             if (!synchronized(lifetime) { stopped }) {
                 stop()
                 throw error
             }
         } finally {
+            renewals?.let { executor ->
+                executor.shutdown()
+                var interrupted = false
+                while (!executor.isTerminated) {
+                    try { executor.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS) }
+                    catch (_: InterruptedException) { interrupted = true }
+                }
+                if (interrupted) Thread.currentThread().interrupt()
+            }
             val pendingStop = synchronized(lifetime) {
                 stopWork.also { if (it == null) handle = 0 }
             }

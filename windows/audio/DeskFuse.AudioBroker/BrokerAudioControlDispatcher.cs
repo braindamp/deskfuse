@@ -179,8 +179,8 @@ internal sealed class BrokerAudioControlDispatcher : IAudioWorkerEventOwner
                     return prepared.Bytes;
                 case AudioNetworkKind.Issue:
                     var operation = (AudioOperationKind)b[0]; AudioDeliveryDescriptor? candidate = null;
-                    if (acquisitionOnly && operation is not (AudioOperationKind.AcquireSource or AudioOperationKind.AttachDelivery))
-                        throw new UnauthorizedAccessException("Only first delivery attachment is enabled.");
+                    if (acquisitionOnly && operation is not (AudioOperationKind.AcquireSource or AudioOperationKind.AttachDelivery or AudioOperationKind.Renew))
+                        throw new UnauthorizedAccessException("Only first delivery attachment and same-delivery renewal are enabled.");
                     if (acquisitionOnly && (operation == AudioOperationKind.AttachDelivery) != (job.Pin is not null))
                         throw new UnauthorizedAccessException("First delivery requires confirmed native pin evidence.");
                     if (operation is AudioOperationKind.AttachDelivery or AudioOperationKind.SupersedeDelivery)
@@ -194,8 +194,8 @@ internal sealed class BrokerAudioControlDispatcher : IAudioWorkerEventOwner
                 case AudioNetworkKind.Proof:
                     var proof = AudioWorkerNetworkProtocol.Proof(b);
                     var committed = owner.Admit(origin, proof.Nonce, proof.Signature) ?? throw new UnauthorizedAccessException("Audio proof rejected.");
-                    if (acquisitionOnly && committed.Kind is not (AudioOperationKind.AcquireSource or AudioOperationKind.AttachDelivery))
-                        throw new UnauthorizedAccessException("Only first delivery proof is enabled.");
+                    if (acquisitionOnly && committed.Kind is not (AudioOperationKind.AcquireSource or AudioOperationKind.AttachDelivery or AudioOperationKind.Renew))
+                        throw new UnauthorizedAccessException("Only first delivery and renewal proofs are enabled.");
                     if (committed.Kind == AudioOperationKind.AcquireSource && owner.Snapshot().Phase == AudioAuthorityPhase.Preparing)
                     {
                         try { await prepareSource(committed).ConfigureAwait(false); }

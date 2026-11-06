@@ -14,9 +14,15 @@ use std::net::{SocketAddr, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
+    mpsc::{self, Receiver, SyncSender},
     Mutex,
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+const RENEW_ISSUE: u8 = 131;
+const RENEW_PROOF: u8 = 132;
+const RENEW_RESULT: u8 = 133;
+const RENEW_INSTALL: u8 = 134;
 
 fn denied() -> io::Error {
     io::Error::from(io::ErrorKind::PermissionDenied)
@@ -40,7 +46,9 @@ fn boot() -> io::Result<u64> {
 }
 
 struct Owner {
-    session: Mutex<Session>,
+    run: Mutex<AudioRun>,
+    commands: Mutex<Option<SyncSender<Command>>>,
+    command_pending: AtomicBool,
     wake: OwnedFd,
     timer: OwnedFd,
     armed_until: AtomicU64,
@@ -48,12 +56,29 @@ struct Owner {
     playing: AtomicBool,
     deadline: AtomicU64,
 }
-struct Session {
+struct AudioRun {
+    delivery: Delivery,
+    source: Option<SourceScope>,
+    playback: Option<AuthorityMedia>,
+}
+struct Delivery {
     socket: UdpSocket,
     connection: ControlConnection,
     request: u64,
     receipt: Option<Vec<u8>>,
-    source: Option<(SourceScope, u32)>,
+    generation: Option<u32>,
+}
+struct Command {
+    kind: u8,
+    body: Vec<u8>,
+    until: u64,
+    complete: SyncSender<io::Result<Vec<u8>>>,
+}
+struct PendingReply {
+    request: u64,
+    expected: u8,
+    until: u64,
+    complete: SyncSender<io::Result<Vec<u8>>>,
 }
 
 impl Owner {
@@ -93,13 +118,13 @@ impl Owner {
             return Err(io::Error::last_os_error());
         }
         Ok(Self {
-            session: Mutex::new(Session {
-                socket,
-                connection,
-                request: 0,
-                receipt: None,
+            run: Mutex::new(AudioRun {
+                delivery: Delivery { socket, connection, request: 0, receipt: None, generation: None },
                 source: None,
+                playback: None,
             }),
+            commands: Mutex::new(None),
+            command_pending: AtomicBool::new(false),
             wake,
             timer: unsafe { OwnedFd::from_raw_fd(fd) },
             armed_until: AtomicU64::new(0),
@@ -130,7 +155,22 @@ impl Owner {
         self.stopped.store(true, Ordering::Release);
         self.signal();
     }
-    fn wait(&self, session: &Session, until: u64, negative: bool) -> io::Result<()> {
+    fn submit(&self, kind: u8, body: &[u8], until: u64) -> io::Result<Vec<u8>> {
+        let remaining = until.checked_sub(self.live()?).filter(|ticks| *ticks > 0)
+            .ok_or(io::ErrorKind::TimedOut)?;
+        let (complete, reply) = mpsc::sync_channel(1);
+        self.commands.lock().map_err(|_| denied())?.as_ref().ok_or_else(denied)?
+            .try_send(Command { kind, body: body.to_vec(), until, complete })
+            .map_err(|_| denied())?;
+        self.command_pending.store(true, Ordering::Release);
+        self.signal();
+        reply.recv_timeout(Duration::from_nanos(remaining.saturating_mul(100)))
+            .map_err(|e| match e {
+                mpsc::RecvTimeoutError::Timeout => io::ErrorKind::TimedOut,
+                mpsc::RecvTimeoutError::Disconnected => io::ErrorKind::BrokenPipe,
+            })?
+    }
+    fn wait(&self, delivery: &Delivery, until: u64, negative: bool) -> io::Result<bool> {
         self.control_time(negative)?;
         let deadline = until.min(self.deadline.load(Ordering::Acquire));
         if self.armed_until.load(Ordering::Relaxed) != deadline {
@@ -157,7 +197,7 @@ impl Owner {
             }
             self.armed_until.store(deadline, Ordering::Relaxed);
         }
-        let timeout = session.connection.network_deadline().map_or(-1, |network| {
+        let timeout = delivery.connection.network_deadline().map_or(-1, |network| {
             network
                 .saturating_duration_since(Instant::now())
                 .as_nanos()
@@ -166,9 +206,9 @@ impl Owner {
         });
         let mut fds = [
             libc::pollfd {
-                fd: session.socket.as_raw_fd(),
+                fd: delivery.socket.as_raw_fd(),
                 events: libc::POLLIN
-                    | if session.connection.needs_write() {
+                    | if delivery.connection.needs_write() {
                         libc::POLLOUT
                     } else {
                         0
@@ -195,18 +235,19 @@ impl Owner {
         if fds[0].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
             return Err(denied());
         }
-        if fds[1].revents & libc::POLLIN != 0 {
+        let signaled = fds[1].revents & libc::POLLIN != 0;
+        if signaled {
             let mut value = 0u64;
             unsafe {
                 libc::read(self.wake.as_raw_fd(), (&mut value as *mut u64).cast(), 8);
             }
         }
         self.control_time(negative)?;
-        Ok(())
+        Ok(signaled)
     }
 }
 
-impl Session {
+impl Delivery {
     fn service(&mut self, owner: &Owner, negative: bool) -> io::Result<Vec<Record>> {
         self.connection
             .service_timeout(owner.control_time(negative)?)?;
@@ -266,21 +307,18 @@ impl Session {
                 owner.wait(self, until, negative)?;
             }
         }
-        let request = self.request.checked_add(1).ok_or_else(denied)?;
-        self.connection.queue_control(
-            Record {
-                kind,
-                request,
-                body: body.to_vec(),
-            },
-            owner.control_time(negative)?,
-        )?;
-        self.request = request;
+        let request = self.queue(kind, body.to_vec(), owner.control_time(negative)?)?;
         let reply = self.reply(owner, request, kind, until)?;
         if matches!(kind, wire::PROOF | wire::APPLIED_RESULT) {
             self.receipt = Some(reply.clone());
         }
         Ok(reply)
+    }
+    fn queue(&mut self, kind: u8, body: Vec<u8>, now: u64) -> io::Result<u64> {
+        let request = self.request.checked_add(1).ok_or_else(denied)?;
+        self.connection.queue_control(Record { kind, request, body }, now)?;
+        self.request = request;
+        Ok(request)
     }
     fn reply(&mut self, owner: &Owner, request: u64, kind: u8, until: u64) -> io::Result<Vec<u8>> {
         let negative = kind == wire::SIGNED_SOURCE_STOP;
@@ -301,7 +339,59 @@ impl Session {
             }
         }
     }
-    fn install(&mut self, owner: &Owner, bytes: &[u8]) -> io::Result<()> {
+}
+
+impl AudioRun {
+    fn service_command(&mut self, owner: &Owner, commands: &Receiver<Command>, pending: &mut Option<PendingReply>) {
+        owner.command_pending.store(false, Ordering::Release);
+        let Ok(Command { kind, body, until, complete }) = commands.try_recv() else { return; };
+        let result = (|| {
+            let now = owner.live()?;
+            if now >= until { return Err(io::ErrorKind::TimedOut.into()); }
+            if pending.as_ref().is_some_and(|reply| now >= reply.until) {
+                let _ = pending.take().unwrap().complete.try_send(Err(io::ErrorKind::TimedOut.into()));
+            }
+            if pending.is_some() { return Err(denied()); }
+            let wire = match kind {
+                RENEW_ISSUE if body.first() == Some(&3) => wire::ISSUE,
+                RENEW_PROOF => wire::PROOF,
+                RENEW_RESULT => wire::APPLIED_RESULT,
+                RENEW_INSTALL => {
+                    self.install(owner, &body, true)?;
+                    return Ok(None);
+                }
+                _ => return Err(denied()),
+            };
+            let request = self.delivery.queue(wire, body, now)?;
+            Ok(Some((request, wire)))
+        })();
+        match result {
+            Ok(Some((request, expected))) => *pending = Some(PendingReply { request, expected, until, complete }),
+            Ok(None) => { let _ = complete.try_send(Ok(Vec::new())); }
+            Err(error) => { let _ = complete.try_send(Err(error)); }
+        }
+    }
+
+    fn service_reply(&mut self, records: Vec<Record>, pending: &mut Option<PendingReply>, owner: &Owner) -> io::Result<()> {
+        let Some(waiting) = pending.as_ref() else { return Ok(()); };
+        let now = owner.live()?;
+        let result = if now >= waiting.until {
+            Err(io::ErrorKind::TimedOut.into())
+        } else if let Some(record) = records.into_iter().find(|record| record.request == waiting.request) {
+            if record.kind == waiting.expected + 128 {
+                if matches!(waiting.expected, wire::PROOF | wire::APPLIED_RESULT) {
+                    self.delivery.receipt = Some(record.body.clone());
+                }
+                Ok(record.body)
+            } else {
+                Err(denied())
+            }
+        } else { return Ok(()); };
+        let _ = pending.take().unwrap().complete.try_send(result);
+        Ok(())
+    }
+
+    fn install(&mut self, owner: &Owner, bytes: &[u8], renew: bool) -> io::Result<()> {
         let mut reader = Reader(bytes);
         let boot_id = reader.nonzero()?;
         let revision = u64::from_be_bytes(reader.nonzero()?);
@@ -315,26 +405,28 @@ impl Session {
         let size = reader.u16()? as usize;
         let receipt = reader.bytes(size)?;
         reader.end()?;
-        if self.receipt.as_deref() != Some(receipt) || self.source.is_some() {
+        if self.delivery.receipt.take().as_deref() != Some(receipt) {
             return Err(denied());
         }
-        self.connection.install_phone(
-            &source,
-            delivery,
-            &observation,
-            boot_id,
-            revision,
-            deadline,
-            owner.live()?,
-        )?;
+        let now = owner.live()?;
+        if renew {
+            if self.source.as_ref() != Some(&source) || self.delivery.generation != Some(generation) {
+                return Err(denied());
+            }
+            self.delivery.connection.renew_phone(&delivery, &observation, boot_id, revision, deadline, now)?;
+        } else {
+            if self.source.is_some() { return Err(denied()); }
+            self.delivery.connection.install_phone(&source, delivery, &observation, boot_id, revision, deadline, now)?;
+            self.source = Some(source);
+            self.delivery.generation = Some(generation);
+        }
         owner.deadline.store(deadline, Ordering::Release);
-        self.source = Some((source, generation));
-        self.receipt = None;
         Ok(())
     }
     fn play(&mut self, owner: &Owner, bytes: &[u8], until: u64, on_ready: impl FnOnce()) -> io::Result<()> {
-        let (source, generation) = self.source.as_ref().ok_or_else(denied)?;
-        let generation = *generation;
+        if self.playback.is_some() { return Err(denied()); }
+        let source = self.source.as_ref().ok_or_else(denied)?;
+        let generation = self.delivery.generation.ok_or_else(denied)?;
         let [epoch, stream, format] = source.wire;
         let mut reader = Reader(bytes);
         let config =
@@ -359,19 +451,19 @@ impl Session {
             {
                 break sample.output_generation;
             }
-            self.service(owner, false)?;
-            self.discard()?;
-            owner.wait(self, until.min(now + 100_000), false)?;
+            self.delivery.service(owner, false)?;
+            self.delivery.discard()?;
+            owner.wait(&self.delivery, until.min(now + 100_000), false)?;
         };
         if renderer.snapshot().map_err(io::Error::other)?.stream_error != 0 {
             return Err(denied());
         }
-        let ready = self.connection.queue_phone_ready(output, owner.live()?)?;
-        self.request = ready;
-        if !self.reply(owner, ready, wire::OUTPUT, until)?.is_empty() {
+        let ready = self.delivery.connection.queue_phone_ready(output, owner.live()?)?;
+        self.delivery.request = ready;
+        if !self.delivery.reply(owner, ready, wire::OUTPUT, until)?.is_empty() {
             return Err(denied());
         }
-        while !self.discard()? {
+        while !self.delivery.discard()? {
             owner.live()?;
         }
         let sample = renderer.timing_sample().map_err(io::Error::other)?;
@@ -382,9 +474,10 @@ impl Session {
             return Err(denied());
         }
         owner.live()?;
+        let (submit, commands) = mpsc::sync_channel(1);
+        *owner.commands.lock().map_err(|_| denied())? = Some(submit);
         owner.playing.store(true, Ordering::Release);
-        on_ready();
-        let mut media = AuthorityMedia::new(
+        self.playback = Some(AuthorityMedia::new(
             renderer,
             Configuration {
                 media_epoch: epoch,
@@ -394,11 +487,15 @@ impl Session {
                 ..Configuration::default()
             },
             generation,
-        );
+        ));
+        on_ready();
         let mut packet = [0; 1350];
+        let mut pending = None;
         let result = (|| -> io::Result<()> {
             loop {
-                self.service(owner, false)?;
+                let records = self.delivery.service(owner, false)?;
+                if pending.is_some() { self.service_reply(records, &mut pending, owner)?; }
+                let media = self.playback.as_mut().unwrap();
                 if media
                     .renderer()
                     .snapshot()
@@ -411,7 +508,7 @@ impl Session {
                 let mut drained = false;
                 for _ in 0..128 {
                     owner.live()?;
-                    let Some(size) = self.connection.phone_datagram(&mut packet)? else {
+                    let Some(size) = self.delivery.connection.phone_datagram(&mut packet)? else {
                         drained = true;
                         break;
                     };
@@ -423,13 +520,20 @@ impl Session {
                 media
                     .finish_batch(path)
                     .map_err(|error| io::Error::other(error.to_string()))?;
-                if drained {
-                    owner.wait(self, u64::MAX, false)?;
+                let signaled = if drained {
+                    let until = pending.as_ref().map_or(u64::MAX, |reply: &PendingReply| reply.until);
+                    owner.wait(&self.delivery, until, false)?
+                } else {
+                    owner.command_pending.load(Ordering::Acquire)
+                };
+                if signaled {
+                    self.service_command(owner, &commands, &mut pending);
                 }
             }
         })();
         owner.playing.store(false, Ordering::Release);
-        drop(media);
+        owner.commands.lock().map_err(|_| denied())?.take();
+        self.playback = None;
         if owner.stopped.load(Ordering::Acquire) {
             Ok(())
         } else {
@@ -468,7 +572,7 @@ unsafe extern "C" fn deskfuse_phone_audio_open_bound_v1(
     .unwrap_or(std::ptr::null_mut())
 }
 #[no_mangle]
-unsafe extern "C" fn deskfuse_phone_audio_call_v2(
+unsafe extern "C" fn deskfuse_phone_audio_call_v3(
     handle: *const c_void,
     op: u8,
     input: *const u8,
@@ -481,28 +585,32 @@ unsafe extern "C" fn deskfuse_phone_audio_call_v2(
 ) -> i32 {
     std::panic::catch_unwind(|| -> io::Result<i32> {
         let owner = unsafe { &*handle.cast::<Owner>() };
-        let mut session = owner.session.lock().map_err(|_| denied())?;
         let bytes = unsafe { std::slice::from_raw_parts(input, size) };
-        let result = match op {
-            wire::INFO..=wire::APPLIED_RESULT if !matches!(op, wire::OUTPUT | wire::DETACH) => {
-                session.exchange(owner, op, bytes, deadline / 100)?
+        let result = if (RENEW_ISSUE..=RENEW_INSTALL).contains(&op) {
+            owner.submit(op, bytes, deadline / 100)?
+        } else {
+            let mut run = owner.run.lock().map_err(|_| denied())?;
+            match op {
+                wire::INFO..=wire::APPLIED_RESULT if !matches!(op, wire::OUTPUT | wire::DETACH) => {
+                    run.delivery.exchange(owner, op, bytes, deadline / 100)?
+                }
+                128 => run.delivery
+                    .connection
+                    .observation(owner.live()?)?
+                    .ok_or_else(denied)?
+                    .encode()?,
+                129 => {
+                    run.install(owner, bytes, false)?;
+                    Vec::new()
+                }
+                130 => {
+                    run.play(owner, bytes, deadline / 100, || {
+                        if let Some(ready) = ready { ready(context); }
+                    })?;
+                    Vec::new()
+                }
+                _ => return Err(denied()),
             }
-            128 => session
-                .connection
-                .observation(owner.live()?)?
-                .ok_or_else(denied)?
-                .encode()?,
-            129 => {
-                session.install(owner, bytes)?;
-                Vec::new()
-            }
-            130 => {
-                session.play(owner, bytes, deadline / 100, || {
-                    if let Some(ready) = ready { ready(context); }
-                })?;
-                Vec::new()
-            }
-            _ => return Err(denied()),
         };
         if result.len() > capacity {
             return Err(denied());
@@ -526,7 +634,7 @@ unsafe extern "C" fn deskfuse_phone_audio_stop(handle: *const c_void) {
 unsafe extern "C" fn deskfuse_phone_audio_close(handle: *mut c_void) {
     let mut owner = unsafe { Box::from_raw(handle.cast::<Owner>()) };
     owner.stop();
-    if let Ok(session) = owner.session.get_mut() {
-        session.connection.close_phone(&session.socket);
+    if let Ok(run) = owner.run.get_mut() {
+        run.delivery.connection.close_phone(&run.delivery.socket);
     }
 }
