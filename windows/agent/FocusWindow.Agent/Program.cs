@@ -265,6 +265,8 @@ internal static class Program
             });
         if (lab is not null) await lab.ArmAsync().ConfigureAwait(false);
         using var host = new SessionHost(options, services, log);
+        // Public lookup relays only a selector, independently of the visual workspace.
+        using var speakerDiscovery = lab is null ? new TrustedSpeakerDiscovery() : null;
         var offer = await host.StartAsync(ct);
         if (!options.CameraFreePairing)
             PairingQr.Show(offer, open: !args.Contains("--no-open-qr"));

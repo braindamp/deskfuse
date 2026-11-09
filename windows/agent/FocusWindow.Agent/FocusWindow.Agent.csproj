@@ -58,5 +58,6 @@
   <ItemGroup>
     <ProjectReference Include="..\FocusWindow.Core\FocusWindow.Core.csproj" />
     <ProjectReference Include="..\..\audio\DeskFuse.Audio\DeskFuse.Audio.csproj" />
+    <ProjectReference Include="..\..\security\DeskFuse.WindowsSecurity\DeskFuse.WindowsSecurity.csproj" />
   </ItemGroup>
 </Project>
