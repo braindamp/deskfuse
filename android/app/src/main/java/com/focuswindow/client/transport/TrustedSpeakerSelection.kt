@@ -67,7 +67,7 @@ internal object TrustedSpeakerLocator {
             network.bindSocket(socket)
             socket.soTimeout = 400
             repeat(2) {
-                socket.send(DatagramPacket(payload, payload.size, address, 47813))
+                socket.send(DatagramPacket(payload, payload.size, address, 47814))
                 try {
                     val buffer = ByteArray(160)
                     val received = DatagramPacket(buffer, buffer.size)
