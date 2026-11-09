@@ -4,6 +4,16 @@ Authoritative design: `DeskFuse_Architecture_v0.6_and_Implementation_Programme.m
 delivered 27 October 2026. Implementation baseline:
 `experiment/vnext-audio-latency` at `2f181cf2da9c4efdde3013b115108ecac650d1ab`.
 
+## Current v0.6 milestone completion — 9 November 2026
+
+| Original phase / tranche | Source | Integration | Device qualification | Release enablement | Next task |
+|---|---|---|---|---|---|
+| **F1 / T03–T04 — authority and trusted setup (P1)** | SCM dispatcher, exact SYSTEM deployment validation, enrollment owner and repeated setup listener composed; CI pending | Source role is callable from SCM; installer activation and ordinary speaker bootstrap remain | Installed SCM/SYSTEM, repeated trusted setup unobserved | Disabled | **F0b/F1 / T03–T04 (P2):** exact installer activation, then bounded PrepareSpeaker |
+| **F0b / T02–T04 — deployment** | Protected roots and disabled publication implemented | No standalone activation transaction yet | Signed package and actual driver state unqualified | Disabled | Install exact closure and demand-start activation |
+| **F3 / T09 / H3 — trusted LAN Speaker** | Gated native first delivery/renewal implemented | Ordinary Speaker UI not yet integrated | No matched handset first-delivery | Disabled | Wire normal control after protected preparation |
+
+An implemented source increment is not a completed F1 milestone. F0a provenance/CI obligations apply to every changed source snapshot.
+
 **Current: source implementation continues under the Ultra High handoff.**
 Signing policy is settled. Protected preparation APIs and coordinated prepared-run
 scripts are implemented and tested offline. Installed trusted-installer/service

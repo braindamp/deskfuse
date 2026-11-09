@@ -29,10 +29,22 @@ internal static class Program
 {
     private static async Task<int> Main(string[] args)
     {
-        if (args.Any(a => a.StartsWith("--authority", StringComparison.Ordinal) || a.StartsWith("--maintenance=", StringComparison.Ordinal) ||
-            a.StartsWith("--deployment=", StringComparison.Ordinal)))
+        if (args.Length == 4 && args[0] == "--authority-service" &&
+            TryExactId(args[1], "--maintenance=", out var maintenance) &&
+            TryExactId(args[2], "--authority=", out var authority) &&
+            TryExactId(args[3], "--deployment=", out var deployment))
         {
-            Console.Error.WriteLine("The production authority service role is not yet fully integrated/qualified. Legacy broker fallback is refused.");
+            try { return BrokerAuthorityService.Dispatch(maintenance, authority, deployment); }
+            catch (Exception error)
+            {
+                Console.Error.WriteLine("Protected authority invocation failed: " + error.Message);
+                return 2;
+            }
+        }
+        if (args.Any(a => a.StartsWith("--authority", StringComparison.Ordinal) ||
+            a.StartsWith("--maintenance=", StringComparison.Ordinal) || a.StartsWith("--deployment=", StringComparison.Ordinal)))
+        {
+            Console.Error.WriteLine("Only exact installed SCM authority arguments are accepted.");
             return 2;
         }
         if (args.Contains("--help") || args.Contains("-h"))
@@ -121,6 +133,14 @@ internal static class Program
         catch (OperationCanceledException) { }
         finally { await broker.ShutdownAsync().ConfigureAwait(false); }
         return 0;
+    }
+
+    private static bool TryExactId(string argument, string prefix, out Guid value)
+    {
+        value = Guid.Empty;
+        return argument.StartsWith(prefix, StringComparison.Ordinal) &&
+            Guid.TryParseExact(argument[prefix.Length..], "N", out value) && value != Guid.Empty &&
+            string.Equals(argument[prefix.Length..], value.ToString("N"), StringComparison.Ordinal);
     }
 
     private static bool IsElevated()

@@ -72,7 +72,23 @@ internal static class BrokerServicePublication
         WritePublication(authority, next, command);
     }
 
-    private static void RequireConfiguration(ServiceHandle service, string expectedCommand)
+    /// <summary>Fail closed unless SCM started this exact approved demand-start image.</summary>
+    internal static void RequireStartingExact(BrokerDeploymentConfiguration configuration, string installedExecutable)
+    {
+        TrustedAuthorityInstallation.RequireSystem();
+        if (!string.Equals(Environment.ProcessPath, installedExecutable, StringComparison.OrdinalIgnoreCase))
+            throw new UnauthorizedAccessException("Running process differs from installed authority image.");
+        var command = CommandLine(installedExecutable, configuration);
+        using var scm = OpenSCManagerW(null, null, 1);
+        if (scm.IsInvalid) throw Error("Cannot inspect SCM at service startup.");
+        using var service = OpenServiceW(scm, ServiceName, ServiceAccess);
+        if (service.IsInvalid) throw Error("Exact authority service is missing.");
+        RequireServiceDescriptor(service);
+        RequireConfiguration(service, command, 3, 2, checked((uint)Environment.ProcessId));
+    }
+
+    private static void RequireConfiguration(ServiceHandle service, string expectedCommand,
+        uint expectedStartType = 4, uint expectedState = 1, uint expectedProcessId = 0)
     {
         _ = QueryServiceConfigW(service, nint.Zero, 0, out var needed);
         if (needed is < 40 or > 65536) throw Error("Invalid service configuration size.");
@@ -81,12 +97,12 @@ internal static class BrokerServicePublication
         {
             if (!QueryServiceConfigW(service, buffer, needed, out _)) throw Error("Cannot inspect configured service.");
             var config = Marshal.PtrToStructure<ServiceConfig>(buffer);
-            if (config.ServiceType != 0x10 || config.StartType != 4 || config.ErrorControl != 1 || config.TagId != 0 ||
+            if (config.ServiceType != 0x10 || config.StartType != expectedStartType || config.ErrorControl != 1 || config.TagId != 0 ||
                 Marshal.PtrToStringUni(config.BinaryPath) != expectedCommand || Marshal.PtrToStringUni(config.Account) != "LocalSystem" ||
                 !string.IsNullOrEmpty(Marshal.PtrToStringUni(config.LoadOrderGroup)) ||
                 (config.Dependencies != nint.Zero && Marshal.ReadInt16(config.Dependencies) != 0))
                 throw new InvalidDataException("Service configuration differs from the approved disabled deployment.");
-            if (!QueryServiceStatusEx(service, 0, out var status, (uint)Marshal.SizeOf<ServiceStatus>(), out _) || status.CurrentState != 1 || status.ProcessId != 0)
+            if (!QueryServiceStatusEx(service, 0, out var status, (uint)Marshal.SizeOf<ServiceStatus>(), out _) || status.CurrentState != expectedState || status.ProcessId != expectedProcessId)
                 throw new InvalidOperationException("Stop and qualify the exact service before changing its deployment.");
         }
         finally { Marshal.FreeHGlobal(buffer); }

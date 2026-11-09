@@ -89,6 +89,7 @@ internal sealed class BrokerInstalledDeployment : IDisposable
         }
         return SHA256.HashData(stream.ToArray());
     }
+    internal void RequireSignedAuthority() => code.RequireSignedEntrypoint(Entrypoint(BrokerInstalledRole.Authority));
     internal void RequireSignedSetup() => code.RequireSignedEntrypoint(Entrypoint(BrokerInstalledRole.Setup));
     internal string AuthorityExecutablePath
     {
