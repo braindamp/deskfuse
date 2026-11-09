@@ -74,6 +74,22 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: cargo build --locked --manifest-path vnext/m2a/quiche-lab/Cargo.toml --release --bin deskfuse-audio-worker
+      - name: Stage exact native worker for matched Windows package
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $built = 'vnext/m2a/quiche-lab/target/release/deskfuse-audio-worker.exe'
+          if (-not (Test-Path $built -PathType Leaf)) { throw 'Fixed audio worker was not built.' }
+          New-Item -ItemType Directory -Force -Path out/audio-worker/payload | Out-Null
+          Copy-Item -LiteralPath $built -Destination out/audio-worker/payload/DeskFuse.AudioWorker.exe
+          (git rev-parse HEAD).Trim() | Set-Content -Encoding ascii out/audio-worker/source-commit.txt
+          Get-FileHash out/audio-worker/payload/DeskFuse.AudioWorker.exe -Algorithm SHA256 | Format-List
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: deskfuse-audio-worker-x64
+          path: out/audio-worker/
+
 
 
   broker-control-test:
