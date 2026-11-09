@@ -89,8 +89,11 @@ internal sealed class BrokerAuthorityService
                 ready.Task.GetAwaiter().GetResult();
                 Report(Running, 0);
             }
-            while (!worker.Wait(2000))
+            while (!worker.IsCompleted)
+            {
+                Task.WhenAny(worker, Task.Delay(2000)).GetAwaiter().GetResult();
                 if (stop.IsCancellationRequested) Report(StopPending, 30000);
+            }
             worker.GetAwaiter().GetResult();
         }
         catch (OperationCanceledException) when (stop.IsCancellationRequested) { }
@@ -101,7 +104,11 @@ internal sealed class BrokerAuthorityService
             stop.Cancel();
             if (worker is not null)
             {
-                while (!worker.Wait(2000)) Report(StopPending, 30000);
+                while (!worker.IsCompleted)
+                {
+                    Task.WhenAny(worker, Task.Delay(2000)).GetAwaiter().GetResult();
+                    Report(StopPending, 30000);
+                }
                 try { worker.GetAwaiter().GetResult(); } catch (Exception cleanup)
                 { Console.Error.WriteLine("DeskFuse authority rundown: " + cleanup); }
             }
