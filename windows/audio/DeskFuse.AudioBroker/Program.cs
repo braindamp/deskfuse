@@ -29,6 +29,40 @@ internal static class Program
 {
     private static async Task<int> Main(string[] args)
     {
+        if (args.Length == 4 && args[0] == "--publish-authority-fresh" &&
+            TryExactId(args[1], "--maintenance=", out var freshMaintenance) &&
+            TryExactId(args[2], "--authority=", out var freshAuthority) &&
+            TryExactId(args[3], "--deployment=", out var freshDeployment))
+        {
+            try
+            {
+                BrokerServicePublication.PublishFreshDisabled(freshMaintenance, freshAuthority, freshDeployment);
+                return 0;
+            }
+            catch (Exception error)
+            {
+                Console.Error.WriteLine("Exact disabled authority publication failed: " + error.Message);
+                return 2;
+            }
+        }
+        if (args.Length == 5 && args[0] == "--publish-authority-update" &&
+            TryExactId(args[1], "--maintenance=", out var updateMaintenance) &&
+            TryExactId(args[2], "--authority=", out var updateAuthority) &&
+            TryExactId(args[3], "--previous=", out var previousDeployment) &&
+            TryExactId(args[4], "--deployment=", out var nextDeployment))
+        {
+            try
+            {
+                BrokerServicePublication.PublishUpdateDisabled(updateMaintenance, updateAuthority,
+                    previousDeployment, nextDeployment);
+                return 0;
+            }
+            catch (Exception error)
+            {
+                Console.Error.WriteLine("Exact disabled authority update failed: " + error.Message);
+                return 2;
+            }
+        }
         if (args.Length == 4 && args[0] == "--activate-authority" &&
             TryExactId(args[1], "--maintenance=", out var installMaintenance) &&
             TryExactId(args[2], "--authority=", out var installAuthority) &&
@@ -59,7 +93,9 @@ internal static class Program
         }
         if (args.Any(a => a.StartsWith("--authority", StringComparison.Ordinal) ||
             a.StartsWith("--activate-authority", StringComparison.Ordinal) ||
-            a.StartsWith("--maintenance=", StringComparison.Ordinal) || a.StartsWith("--deployment=", StringComparison.Ordinal)))
+            a.StartsWith("--publish-authority-", StringComparison.Ordinal) ||
+            a.StartsWith("--maintenance=", StringComparison.Ordinal) || a.StartsWith("--deployment=", StringComparison.Ordinal) ||
+            a.StartsWith("--previous=", StringComparison.Ordinal)))
         {
             Console.Error.WriteLine("Only exact installed SCM authority arguments are accepted.");
             return 2;
