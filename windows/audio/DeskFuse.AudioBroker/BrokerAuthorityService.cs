@@ -137,7 +137,8 @@ internal sealed class BrokerAuthorityService
             RandomNumberGenerator.GetBytes(32)); // One service incarnation for native source ownership.
         var speakerReady = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         using var denyOnStop = cancellation.Register(store.CloseAdmission);
-        var speakerTask = speaker.RunAsync(cancellation, speakerReady);
+        using var speakerStop = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
+        var speakerTask = speaker.RunAsync(speakerStop.Token, speakerReady);
         try
         {
             // Neither setup nor speaker preparation can report SCM RUNNING alone.
@@ -180,6 +181,7 @@ internal sealed class BrokerAuthorityService
         {
             store.CloseAdmission();
             rundown.CloseAllAdmission();
+            speakerStop.Cancel(); // Do not wait for a live accept loop after setup failure.
             try { await speakerTask.ConfigureAwait(false); }
             finally { await persistence.StopAsync().ConfigureAwait(false); }
         }
