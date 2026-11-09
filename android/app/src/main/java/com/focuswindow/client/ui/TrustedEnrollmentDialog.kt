@@ -187,7 +187,8 @@ internal fun TrustedEnrollmentDialog(lifecycle: Lifecycle, onDismiss: () -> Unit
                 if (BuildConfig.TRUSTED_SPEAKER_FIRST_DELIVERY) when (audioState) {
                     AuthorityAudioState.STARTING, AuthorityAudioState.PLAYING -> {
                         Text(if (audioState == AuthorityAudioState.PLAYING) "Trusted speaker is playing." else "Connecting trusted speaker…")
-                        if (audioState == AuthorityAudioState.PLAYING) {
+                        if (BuildConfig.TRUSTED_SPEAKER_HANDOVER &&
+                            audioState == AuthorityAudioState.PLAYING) {
                             OutlinedTextField(audioHost, { audioHost = it }, label = { Text("Approved alternate endpoint") }, singleLine = true)
                             OutlinedTextField(audioPort, { audioPort = it }, label = { Text("Alternate listener port") }, singleLine = true)
                             TextButton(onClick = {

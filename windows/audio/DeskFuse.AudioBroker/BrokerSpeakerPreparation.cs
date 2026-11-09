@@ -26,6 +26,7 @@ internal sealed class BrokerSpeakerPreparation
     private readonly Dictionary<Guid, Prepared> prepared = [];
     private readonly List<Task> reapers = [];
     private readonly object gate = new();
+    private CancellationToken serviceStop;
 
     internal BrokerSpeakerPreparation(BrokerInstalledDeployment deployment, BrokerHostIdentity host,
         TrustedBrokerEnrollmentStore store, BrokerAuthorityState registry, BrokerEnrollmentRundown rundown,
@@ -36,6 +37,23 @@ internal sealed class BrokerSpeakerPreparation
     }
 
     internal async Task RunAsync(CancellationToken stop, TaskCompletionSource ready)
+    {
+        serviceStop = stop;
+        try
+        {
+            await AcceptAsync(stop, ready).ConfigureAwait(false);
+        }
+        finally
+        {
+            // Joined abandonment timers cannot reference a disposed authority on
+            // service restart; an already begun native retirement is not cancelled.
+            Task[] pending;
+            lock (gate) pending = reapers.ToArray();
+            await Task.WhenAll(pending).ConfigureAwait(false);
+        }
+    }
+
+    private async Task AcceptAsync(CancellationToken stop, TaskCompletionSource ready)
     {
         while (!stop.IsCancellationRequested)
         {
@@ -121,16 +139,18 @@ internal sealed class BrokerSpeakerPreparation
             }
             prepared.Add(enrollment, owned);
             reapers.RemoveAll(t => t.IsCompleted);
-            reapers.Add(ReapUnprovedAsync(enrollment, owned));
+            reapers.Add(ReapUnprovedAsync(enrollment, owned, serviceStop));
         }
         return preparedSession.Listener;
     }
 
-    private async Task ReapUnprovedAsync(Guid enrollment, Prepared owned)
+    private async Task ReapUnprovedAsync(Guid enrollment, Prepared owned, CancellationToken stop)
     {
-        await Task.Delay(TimeSpan.FromSeconds(30)).ConfigureAwait(false);
+        try { await Task.Delay(TimeSpan.FromSeconds(30), stop).ConfigureAwait(false); }
+        catch (OperationCanceledException) when (stop.IsCancellationRequested) { return; }
         try
         {
+            if (stop.IsCancellationRequested) return;
             lock (gate)
                 if (!prepared.TryGetValue(enrollment, out var current) || !ReferenceEquals(current, owned)) return;
             if (owned.Session.Owner.Snapshot().Phase == AudioAuthorityPhase.Idle)
