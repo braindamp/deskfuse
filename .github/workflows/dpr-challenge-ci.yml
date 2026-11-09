@@ -121,9 +121,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           dotnet publish windows/setup/DeskFuse.EnrollmentWorker/DeskFuse.EnrollmentWorker.csproj -c Release -r win-x64 --self-contained true -p:Platform=x64 -warnaserror -o out/authority-roles/enrollment-worker
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          foreach ($role in @(@('setup','DeskFuse.Setup'),@('enrollment-worker','DeskFuse.EnrollmentWorker'))) {
+          $roles = @{ 'setup' = 'DeskFuse.Setup'; 'enrollment-worker' = 'DeskFuse.EnrollmentWorker' }
+          foreach ($role in $roles.Keys) {
             foreach ($suffix in @('.exe','.dll','.deps.json','.runtimeconfig.json')) {
-              $required = Join-Path (Join-Path 'out/authority-roles' $role[0]) ($role[1] + $suffix)
+              $required = Join-Path (Join-Path 'out/authority-roles' $role) ($roles[$role] + $suffix)
               if (-not (Test-Path $required -PathType Leaf)) { throw "Incomplete managed authority role: $required" }
             }
           }
