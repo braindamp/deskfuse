@@ -29,6 +29,46 @@ internal static class Program
 {
     private static async Task<int> Main(string[] args)
     {
+        // Cold installation is a distinct, exact SYSTEM-only action. The reviewed
+        // SHA-256 must come from an independent operator approval, not a package flag.
+        if (args.Length == 5 && args[0] == "--install-authority-fresh" &&
+            TryExactId(args[1], "--deployment=", out var initialDeployment) &&
+            TryExactText(args[2], "--source=", out var initialSource) &&
+            TryExactText(args[3], "--review=", out var initialReview) &&
+            TryExactText(args[4], "--approved-sha256=", out var initialApproval))
+        {
+            try
+            {
+                BrokerTrustedInstaller.InstallFresh(initialDeployment, initialSource, initialReview, initialApproval);
+                return 0;
+            }
+            catch (Exception error)
+            {
+                Console.Error.WriteLine("Trusted authority fresh installation unconfirmed: " + error.Message);
+                return 2;
+            }
+        }
+        if (args.Length == 8 && args[0] == "--install-authority-upgrade" &&
+            TryExactId(args[1], "--maintenance=", out var oldMaintenance) &&
+            TryExactId(args[2], "--authority=", out var oldAuthority) &&
+            TryExactId(args[3], "--previous=", out var oldDeployment) &&
+            TryExactId(args[4], "--deployment=", out var targetDeployment) &&
+            TryExactText(args[5], "--source=", out var upgradeSource) &&
+            TryExactText(args[6], "--review=", out var upgradeReview) &&
+            TryExactText(args[7], "--approved-sha256=", out var upgradeApproval))
+        {
+            try
+            {
+                BrokerTrustedInstaller.InstallUpgrade(oldMaintenance, oldAuthority, oldDeployment,
+                    targetDeployment, upgradeSource, upgradeReview, upgradeApproval);
+                return 0;
+            }
+            catch (Exception error)
+            {
+                Console.Error.WriteLine("Trusted authority upgrade unconfirmed: " + error.Message);
+                return 2;
+            }
+        }
         if (args.Length == 4 && args[0] == "--publish-authority-fresh" &&
             TryExactId(args[1], "--maintenance=", out var freshMaintenance) &&
             TryExactId(args[2], "--authority=", out var freshAuthority) &&
@@ -93,6 +133,10 @@ internal static class Program
         }
         if (args.Any(a => a.StartsWith("--authority", StringComparison.Ordinal) ||
             a.StartsWith("--activate-authority", StringComparison.Ordinal) ||
+            a.StartsWith("--install-authority-", StringComparison.Ordinal) ||
+            a.StartsWith("--source=", StringComparison.Ordinal) ||
+            a.StartsWith("--review=", StringComparison.Ordinal) ||
+            a.StartsWith("--approved-sha256=", StringComparison.Ordinal) ||
             a.StartsWith("--publish-authority-", StringComparison.Ordinal) ||
             a.StartsWith("--maintenance=", StringComparison.Ordinal) || a.StartsWith("--deployment=", StringComparison.Ordinal) ||
             a.StartsWith("--previous=", StringComparison.Ordinal)))
@@ -186,6 +230,15 @@ internal static class Program
         catch (OperationCanceledException) { }
         finally { await broker.ShutdownAsync().ConfigureAwait(false); }
         return 0;
+    }
+
+    private static bool TryExactText(string argument, string prefix, out string value)
+    {
+        value = string.Empty;
+        if (!argument.StartsWith(prefix, StringComparison.Ordinal) || argument.Length <= prefix.Length)
+            return false;
+        value = argument[prefix.Length..];
+        return !value.Contains('\0');
     }
 
     private static bool TryExactId(string argument, string prefix, out Guid value)

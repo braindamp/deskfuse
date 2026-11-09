@@ -81,6 +81,15 @@ try {
     $manifestPath = Join-Path $outputDir 'authority-candidate.json'
     [System.IO.File]::WriteAllText($manifestPath,
         ($manifest | ConvertTo-Json -Depth 5), (New-Object System.Text.UTF8Encoding($false)))
+    # Review bytes are distinct from the unapproved candidate metadata.
+    # This digest is candidate evidence only; it is NOT independent approval.
+    $review = [ordered]@{ schema = 1; commit = $sha; files = $ordered }
+    $reviewPath = Join-Path $outputDir 'authority-install-review.json'
+    [System.IO.File]::WriteAllText($reviewPath, ($review | ConvertTo-Json -Depth 5),
+        (New-Object System.Text.UTF8Encoding($false)))
+    $reviewSha = (Get-FileHash -LiteralPath $reviewPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    Write-Host "Review candidate digest (not independently approved): $reviewSha"
+    Write-Host "Review path: $reviewPath"
     Write-Host "F0b / T03–T04 staged candidate $sha; $($hashes.Count) files. Not signed, approved or installed."
     Write-Host "Candidate manifest: $manifestPath"
 }
