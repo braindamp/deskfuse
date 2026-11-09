@@ -76,7 +76,8 @@ if (-not $PSCmdlet.ShouldProcess($DeploymentId.ToString('N'),
     "Prepare protected authority deployment, publish disabled service and activate exact installed role")) {
     return
 }
-& $broker @($argsForAuthority.ToArray())
+$commandArguments = $argsForAuthority.ToArray()
+& $broker @commandArguments
 if ($LASTEXITCODE -ne 0) {
     throw "Protected authority installation returned $LASTEXITCODE. Retain the exact source, review and system state for reconciliation."
 }
