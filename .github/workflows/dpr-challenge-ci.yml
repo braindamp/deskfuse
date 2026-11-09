@@ -8,6 +8,7 @@ on:
       - 'windows/agent/**'
       - 'windows/native/**'
       - 'windows/audio/**'
+      - 'windows/setup/**'
       - 'windows/driver/**'
       - 'windows/shared/**'
       - 'windows/tools/**'
@@ -24,6 +25,7 @@ on:
       - 'windows/agent/**'
       - 'windows/native/**'
       - 'windows/audio/**'
+      - 'windows/setup/**'
       - 'windows/driver/**'
       - 'windows/shared/**'
       - 'windows/tools/**'
@@ -112,6 +114,23 @@ jobs:
         with:
           name: deskfuse-audio-broker-x64
           path: out/audio-broker/
+      - name: Publish exact managed authority setup roles (never activate)
+        shell: pwsh
+        run: |
+          dotnet publish windows/setup/DeskFuse.Setup/DeskFuse.Setup.csproj -c Release -r win-x64 --self-contained true -p:Platform=x64 -warnaserror -o out/authority-roles/setup
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          dotnet publish windows/setup/DeskFuse.EnrollmentWorker/DeskFuse.EnrollmentWorker.csproj -c Release -r win-x64 --self-contained true -p:Platform=x64 -warnaserror -o out/authority-roles/enrollment-worker
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          foreach ($role in @(@('setup','DeskFuse.Setup'),@('enrollment-worker','DeskFuse.EnrollmentWorker'))) {
+            foreach ($suffix in @('.exe','.dll','.deps.json','.runtimeconfig.json')) {
+              $required = Join-Path (Join-Path 'out/authority-roles' $role[0]) ($role[1] + $suffix)
+              if (-not (Test-Path $required -PathType Leaf)) { throw "Incomplete managed authority role: $required" }
+            }
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deskfuse-authority-roles-x64
+          path: out/authority-roles/
       - name: Compile standalone read-only taskbar audio watcher (no CMake dependency)
         run: dotnet build windows/audio/DeskFuse.TaskbarWatch/DeskFuse.TaskbarWatch.csproj -c Release -warnaserror
       - name: Compile explicit-opt-in WASAPI category probe (never run audio on CI)
@@ -163,6 +182,7 @@ jobs:
           --check-report out/provenance/wrapper.json
           --check-report out/provenance/maintenance-owner.json
           --artifact-dir out/unified-windows --artifact-dir out/audio-broker
+          --artifact-dir out/authority-roles
           --artifact-dir out/driver-test-owner
           --artifact out/native-contract/contract.windows.txt --output out/provenance/windows-build.json
       - uses: actions/upload-artifact@v4
