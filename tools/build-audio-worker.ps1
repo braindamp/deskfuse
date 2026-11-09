@@ -45,4 +45,9 @@ Assert-WorkerX64Image $taskBuiltWorker
 Assert-WorkerX64Image $taskBuiltDll
 Copy-Item -LiteralPath $taskBuiltWorker -Destination $taskWorker
 Copy-Item -LiteralPath $taskBuiltDll -Destination $taskDll
+$taskCommit = (& git -C $taskRoot rev-parse HEAD).Trim()
+if ($LASTEXITCODE -ne 0 -or $taskCommit -notmatch '^[0-9a-f]{40}
+) { throw 'Native role has no source commit.' }
+[System.IO.File]::WriteAllText((Join-Path (Split-Path -Parent $taskPayload) 'source-commit.txt'),
+    $taskCommit, (New-Object System.Text.UTF8Encoding($false)))
 Get-FileHash -LiteralPath $taskWorker, $taskDll -Algorithm SHA256 | Select-Object Path, Hash

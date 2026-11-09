@@ -32,7 +32,7 @@ class AuthorityAudioService : Service() {
         lastStart = startId
         val generation = intent?.getStringExtra("generation")
         when {
-            !BuildConfig.TRUSTED_SPEAKER_FIRST_DELIVERY || intent == null || generation == null -> if (active == null) stopSelf(startId)
+            intent == null || generation == null -> if (active == null) stopSelf(startId)
             intent.action == STOP -> {
                 active?.takeIf { it.generation == generation }?.let {
                     it.run.stop()
@@ -41,6 +41,7 @@ class AuthorityAudioService : Service() {
                 }
                 if (active == null) stopSelf(startId)
             }
+            !BuildConfig.TRUSTED_SPEAKER_FIRST_DELIVERY -> if (active == null) stopSelf(startId)
             intent.action == PREPARE_ALTERNATE && BuildConfig.TRUSTED_SPEAKER_HANDOVER -> {
                 active?.takeIf { it.generation == generation }?.let { delivery ->
                     runCatching {

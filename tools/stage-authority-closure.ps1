@@ -16,6 +16,11 @@ if ($LASTEXITCODE -ne 0 -or $sha -notmatch '^[0-9a-f]{40}$') { throw 'Cannot bin
 if ((& git -C $root status --porcelain --untracked-files=normal).Count -ne 0) {
     throw 'Authority closure requires a clean checkout. Uncommitted source cannot be independently approved.'
 }
+$workerSource = Join-Path (Join-Path $root (Split-Path -Parent $NativeWorker)) 'source-commit.txt'
+if (-not (Test-Path -LiteralPath $workerSource -PathType Leaf) -or
+    ([System.IO.File]::ReadAllText($workerSource)).Trim() -cne $sha) {
+    throw 'Native worker artifact source commit does not match current installed closure.'
+}
 $roles = @(
     @{ Name = 'Broker'; Root = $Broker; Entry = 'DeskFuse.AudioBroker.exe' },
     @{ Name = 'Setup'; Root = $Setup; Entry = 'DeskFuse.Setup.exe' },

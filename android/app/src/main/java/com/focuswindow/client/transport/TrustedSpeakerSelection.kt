@@ -15,6 +15,7 @@ internal data class SelectedTrustedSpeaker(
     val enrollment: TrustedCommittedEnrollment,
     val hostHash: ByteArray,
     val id: UUID,
+    val label: String,
     val hostHint: String,
 )
 
@@ -29,6 +30,7 @@ internal object TrustedSpeakerSelection {
         check(context.getSharedPreferences(STORE, Context.MODE_PRIVATE).edit()
             .putString("hostHash", hash)
             .putString("enrollment", binding.enrollment.toString())
+            .putString("label", hostHint)
             .putString("hostHint", hostHint).commit()) { "Could not save selected trusted PC" }
     }
 
@@ -37,15 +39,17 @@ internal object TrustedSpeakerSelection {
         val hash = preferences.getString("hostHash", null) ?: return null
         val id = preferences.getString("enrollment", null) ?: return null
         val host = preferences.getString("hostHint", null) ?: return null
+        val label = preferences.getString("label", host) ?: host
         require(hash.length == 64 && hash.all { it in '0'..'9' || it in 'a'..'f' })
         require(host.length in 1..253 && host.none { it.isISOControl() || it.isWhitespace() })
+        require(label.length in 1..253 && label.none { it.isISOControl() })
         val digest = ByteArray(32) { index -> hash.substring(index * 2, index * 2 + 2).toInt(16).toByte() }
         val enrollmentId = UUID.fromString(id)
         val committed = TrustedEnrollmentRepository(AndroidTrustedEnrollmentStore(context))
             .committed(digest, enrollmentId)
         committed.requireCurrent()
         require(BrokerScope.SPEAKER in committed.transcript().proposal.scopes)
-        return SelectedTrustedSpeaker(committed, digest, enrollmentId, host)
+        return SelectedTrustedSpeaker(committed, digest, enrollmentId, label, host)
     }
 }
 
