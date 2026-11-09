@@ -3,6 +3,7 @@ package com.focuswindow.client.transport
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
+import android.os.SystemClock
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.net.DatagramPacket
@@ -69,20 +70,31 @@ internal object TrustedSpeakerLocator {
         val address = network.getByName(selected.hostHint)
         DatagramSocket().use { socket ->
             network.bindSocket(socket)
-            socket.soTimeout = 400
-            repeat(2) {
-                socket.send(DatagramPacket(payload, payload.size, address, 47814))
+            // Windows may create a WaveRT endpoint and launch the retained
+            // native worker before replying. Do not confuse a 400 ms UDP
+            // receive timeout with an end-to-end preparation deadline.
+            val deadline = SystemClock.elapsedRealtime() + 30_000L
+            var nextProbe = 0L
+            var probes = 0
+            val buffer = ByteArray(160)
+            while (SystemClock.elapsedRealtime() < deadline) {
+                val now = SystemClock.elapsedRealtime()
+                if (probes < 2 && now >= nextProbe) {
+                    socket.send(DatagramPacket(payload, payload.size, address, 47814))
+                    probes++
+                    nextProbe = now + 8_000L
+                }
+                socket.soTimeout = minOf(1000L, (deadline - now).coerceAtLeast(1L)).toInt()
                 try {
-                    val buffer = ByteArray(160)
                     val received = DatagramPacket(buffer, buffer.size)
                     socket.receive(received)
-                    if (received.address != address) return@repeat
+                    if (received.address != address) continue
                     val parts = String(received.data, received.offset, received.length, Charsets.US_ASCII).split('|')
                     if (parts.size == 3 && parts[0] == "DESKFUSE_SPEAKER_READY_V1" &&
                         parts[1] == selected.id.toString()) {
                         val port = parts[2].toIntOrNull()
                         if (port != null && port in 1..65535)
-                            return@withContext Target(received.address.hostAddress ?: return@repeat, port)
+                            return@withContext Target(received.address.hostAddress ?: continue, port)
                     }
                 } catch (_: SocketTimeoutException) { }
             }

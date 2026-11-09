@@ -2,7 +2,7 @@ name: vNext M2a quiche Rust lab
 
 on:
   pull_request:
-    paths: ['vnext/m2a/quiche-lab/**', 'vnext/m1/**', 'windows/shared/**', 'windows/driver/DeskFuseAudio/**', 'windows/audio/DeskFuse.AudioBroker/**', 'windows/agent/FocusWindow.Tests/**', '.github/workflows/vnext-m2a-quiche.yml']
+    paths: ['vnext/m2a/quiche-lab/**', 'vnext/m1/**', 'windows/shared/**', 'windows/driver/DeskFuseAudio/**', 'windows/audio/DeskFuse.AudioBroker/**', 'windows/agent/FocusWindow.Tests/**', 'android/app/src/main/java/com/focuswindow/client/transport/TrustedSpeakerSelection.kt', '.github/workflows/vnext-m2a-quiche.yml']
   push:
     branches:
       - feature/vnext-wp001-native-lab
@@ -16,6 +16,7 @@ on:
       - 'windows/driver/DeskFuseAudio/**'
       - 'windows/audio/DeskFuse.AudioBroker/**'
       - 'windows/agent/FocusWindow.Tests/**'
+      - 'android/app/src/main/java/com/focuswindow/client/transport/TrustedSpeakerSelection.kt'
       - '.github/workflows/vnext-m2a-quiche.yml'
   workflow_dispatch:
 
