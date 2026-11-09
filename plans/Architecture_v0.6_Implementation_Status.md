@@ -10,7 +10,7 @@ delivered 27 October 2026. Implementation baseline:
 |---|---|---|---|---|---|
 | **F1 / T03–T04 — authority and trusted setup (P1)** | SCM dispatcher, exact SYSTEM deployment validation, enrollment owner and repeated setup listener composed; CI pending | Source role is callable from SCM; installer activation and ordinary speaker bootstrap remain | Installed SCM/SYSTEM, repeated trusted setup unobserved | Disabled | **F0b/F1 / T03–T04 (P2):** exact installer activation, then bounded PrepareSpeaker |
 | **F0b / T02–T04 — deployment** | Protected roots, disabled publication and exact SYSTEM activation; Windows CI now publishes setup/enrollment-worker managed roles with source receipt (qualification pending) | Installable combined signed closure and installer invocation remain | Signed package and actual driver state unqualified | Disabled | Combine exact broker/setup/enrollment/native role artifacts under signed install closure; invoke activation |
-| **F3 / T09 / H3 — trusted LAN Speaker** | Gated native first delivery/renewal implemented | Ordinary Speaker UI not yet integrated | No matched handset first-delivery | Disabled | Wire normal control after protected preparation |
+| **F3 / T09 / H3 — trusted LAN Speaker** | Normal Speaker/Stop now selects committed enrollment and requests bounded Wi-Fi locator; debug first delivery enabled separately from handover | Missing PC-side typed prepare and public locator response; no trusted-to-legacy fallback | No matched handset first-delivery | First delivery disabled in release | Implement P2 Windows prepare/locate, then device Start/Stop |
 
 An implemented source increment is not a completed F1 milestone. F0a provenance/CI obligations apply to every changed source snapshot.
 

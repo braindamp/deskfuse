@@ -58,6 +58,13 @@ import com.focuswindow.client.protocol.Modifiers
 import com.focuswindow.client.render.PhoneSurfaceView
 import com.focuswindow.client.session.SessionController
 import com.focuswindow.client.session.SpeakerService
+import com.focuswindow.client.transport.AuthorityAudioControl
+import com.focuswindow.client.transport.AuthorityAudioState
+import com.focuswindow.client.transport.TrustedSpeakerSelection
+import com.focuswindow.client.transport.TrustedSpeakerLocator
+import com.focuswindow.client.BuildConfig
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import com.focuswindow.client.transport.DefaultNetworkHandoff
 import com.focuswindow.client.session.SessionState
 import com.focuswindow.client.transport.PairingPayload
@@ -114,6 +121,7 @@ class MainActivity : ComponentActivity() {
     private var pcPairingError by mutableStateOf<String?>(null)
     private var manualPc by mutableStateOf("")
     private var trustedSetupVisible by mutableStateOf(false)
+    private var trustedSpeakerMessage by mutableStateOf<String?>(null)
 
     private val savePcFile = registerForActivityResult(ActivityResultContracts.CreateDocument(
         "application/octet-stream")) { uri ->
@@ -205,6 +213,7 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             val state by controller.state.collectAsState()
+            val trustedAudioState by AuthorityAudioControl.state.collectAsState()
             val advisories by controller.advisories.collectAsState()
             val pcAudioStatus by controller.pcAudioStatus.collectAsState()
             val phoneMicStatus by controller.phoneMicStatus.collectAsState()
@@ -233,12 +242,31 @@ class MainActivity : ComponentActivity() {
                         // The phone becomes a speaker for this PC: the host
                         // creates a Windows playback endpoint for it and the
                         // PC's sound follows to this phone.
-                        profile?.let { current ->
-                            SpeakerService.start(this@MainActivity, current)
+                        if (BuildConfig.TRUSTED_SPEAKER_FIRST_DELIVERY) {
+                            startSelectedTrustedSpeaker()
+                        } else {
+                            profile?.let { current -> SpeakerService.start(this@MainActivity, current) }
                         }
                     },
                 )
 
+                if (trustedAudioState in setOf(AuthorityAudioState.STARTING, AuthorityAudioState.PLAYING, AuthorityAudioState.STOPPING)) {
+                    Row {
+                        Text(when (trustedAudioState) {
+                            AuthorityAudioState.STARTING -> "Trusted Speaker: Connecting"
+                            AuthorityAudioState.PLAYING -> "Trusted Speaker: Playing"
+                            else -> "Trusted Speaker: Stopping"
+                        })
+                        if (trustedAudioState != AuthorityAudioState.STOPPING) {
+                            TextButton(onClick = { AuthorityAudioControl.stop(this@MainActivity) }) { Text("Stop Speaker") }
+                        }
+                    }
+                }
+                trustedSpeakerMessage?.let { message ->
+                    AlertDialog(onDismissRequest = { trustedSpeakerMessage = null },
+                        title = { Text("Trusted Speaker") }, text = { Text(message) },
+                        confirmButton = { TextButton(onClick = { trustedSpeakerMessage = null }) { Text("Close") } })
+                }
                 if (pcPickerVisible) {
                     AlertDialog(
                         onDismissRequest = {
@@ -693,6 +721,12 @@ class MainActivity : ComponentActivity() {
      * suspend/recover independently, with the broker keeping the PnP node.
      */
     private fun synchronizeSpeakerPresence(state: SessionState) {
+        if (BuildConfig.TRUSTED_SPEAKER_FIRST_DELIVERY) {
+            if (displayOwnsSpeaker) SpeakerService.stop(this)
+            displayOwnsSpeaker = false
+            displaySpeakerObserved = false
+            return
+        }
         when (state) {
             is SessionState.Streaming -> {
                 // Starting a foreground service from a background Activity is
@@ -715,6 +749,30 @@ class MainActivity : ComponentActivity() {
                 }
             }
             else -> Unit // Not a departure: keep speaker presence during handoff.
+        }
+    }
+
+    private fun startSelectedTrustedSpeaker() {
+        when (AuthorityAudioControl.state.value) {
+            AuthorityAudioState.STARTING, AuthorityAudioState.PLAYING -> {
+                AuthorityAudioControl.stop(this)
+                return
+            }
+            AuthorityAudioState.STOPPING -> return
+            else -> Unit
+        }
+        lifecycleScope.launch {
+            try {
+                val selected = withContext(Dispatchers.IO) {
+                    TrustedSpeakerSelection.resolve(applicationContext)
+                } ?: error("Select and enroll a trusted PC in Trusted phone setup first.")
+                val locator = TrustedSpeakerLocator.locate(applicationContext, selected)
+                    ?: error("Selected PC has no prepared trusted LAN listener. Start the installed DeskFuse authority on that PC and retry.")
+                AuthorityAudioControl.start(this@MainActivity, selected.enrollment,
+                    locator.host, locator.port, cellular = false)
+            } catch (error: Exception) {
+                trustedSpeakerMessage = error.message ?: "Cannot start trusted Speaker."
+            }
         }
     }
 

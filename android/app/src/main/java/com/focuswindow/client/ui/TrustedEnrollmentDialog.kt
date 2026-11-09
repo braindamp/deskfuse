@@ -37,6 +37,7 @@ import com.focuswindow.client.transport.TrustedEnrollmentRepository
 import com.focuswindow.client.transport.TrustedPreparedEnrollment
 import com.focuswindow.client.transport.TrustedSetupDiscovery
 import com.focuswindow.client.transport.TrustedSetupLocation
+import com.focuswindow.client.transport.TrustedSpeakerSelection
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -130,6 +131,7 @@ internal fun TrustedEnrollmentDialog(lifecycle: Lifecycle, onDismiss: () -> Unit
                                     val binding = saved.binding()
                                     committed = withContext(Dispatchers.IO) { repository.committed(binding.hostHash, binding.enrollment) }
                                     audioHost = host
+                                    committed?.let { TrustedSpeakerSelection.save(context, it, host) }
                                     step = 4; message = "Trusted pairing recovered."
                                 }
                                 EnrollmentOutcome.REVOKED -> message = "That pairing was revoked. Start a new trusted setup on Windows."
@@ -156,13 +158,14 @@ internal fun TrustedEnrollmentDialog(lifecycle: Lifecycle, onDismiss: () -> Unit
                             message = "Waiting for confirmation in Windows setup…"
                             committed = connection.get()!!.approve { lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) }
                             audioHost = host
+                            committed?.let { TrustedSpeakerSelection.save(context, it, host) }
                             step = 4; message = "Trusted pairing saved."
                         } }, enabled = !busy) { Text("Approve pairing") }
                     }
                     4 -> {
                         Text("Trusted pairing is saved on this phone.")
                         val enrollment = committed
-                        if (BuildConfig.DEBUG && enrollment != null && BrokerScope.SPEAKER in enrollment.transcript().proposal.scopes &&
+                        if (BuildConfig.TRUSTED_SPEAKER_FIRST_DELIVERY && enrollment != null && BrokerScope.SPEAKER in enrollment.transcript().proposal.scopes &&
                             audioState in setOf(AuthorityAudioState.IDLE, AuthorityAudioState.FAILED)) {
                             Text("Trusted speaker development test")
                             OutlinedTextField(audioHost, { audioHost = it }, label = { Text("Approved audio route") }, singleLine = true)
@@ -181,7 +184,7 @@ internal fun TrustedEnrollmentDialog(lifecycle: Lifecycle, onDismiss: () -> Unit
                         }
                     }
                 }
-                if (BuildConfig.DEBUG) when (audioState) {
+                if (BuildConfig.TRUSTED_SPEAKER_FIRST_DELIVERY) when (audioState) {
                     AuthorityAudioState.STARTING, AuthorityAudioState.PLAYING -> {
                         Text(if (audioState == AuthorityAudioState.PLAYING) "Trusted speaker is playing." else "Connecting trusted speaker…")
                         if (audioState == AuthorityAudioState.PLAYING) {
