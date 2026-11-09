@@ -91,8 +91,12 @@ internal sealed class BrokerSpeakerPreparation
                         throw new UnauthorizedAccessException("Unproved speaker source is retiring.");
                     if (snapshot.Phase == AudioAuthorityPhase.Closed)
                         throw new UnauthorizedAccessException("Prior source is closed pending rundown.");
-                    if (!prior.Session.Owner.Source.Identity.Subject.AsSpan().SequenceEqual(logon.UserSid))
-                        throw new UnauthorizedAccessException("Speaker enrollment belongs to another logon.");
+                    var identity = prior.Session.Owner.Source.Identity;
+                    if (!identity.Subject.AsSpan().SequenceEqual(logon.UserSid) ||
+                        !identity.Logon.AsSpan().SequenceEqual(logon.LogonSid) ||
+                        identity.AuthenticationId != logon.AuthenticationId ||
+                        identity.Session != logon.SessionId)
+                        throw new UnauthorizedAccessException("Speaker preparation cannot cross a logon incarnation.");
                     return prior.Session.Listener; // Duplicate never refreshes idle deadline.
                 }
                 prepared.Remove(enrollment);
