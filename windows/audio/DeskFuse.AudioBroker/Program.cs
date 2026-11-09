@@ -58,6 +58,7 @@ internal static class Program
             }
         }
         if (args.Any(a => a.StartsWith("--authority", StringComparison.Ordinal) ||
+            a.StartsWith("--activate-authority", StringComparison.Ordinal) ||
             a.StartsWith("--maintenance=", StringComparison.Ordinal) || a.StartsWith("--deployment=", StringComparison.Ordinal)))
         {
             Console.Error.WriteLine("Only exact installed SCM authority arguments are accepted.");
