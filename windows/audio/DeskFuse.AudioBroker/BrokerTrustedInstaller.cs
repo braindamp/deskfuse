@@ -45,9 +45,22 @@ internal static class BrokerTrustedInstaller
         if (string.IsNullOrWhiteSpace(source) || !Path.IsPathFullyQualified(source) ||
             string.IsNullOrWhiteSpace(review) || !Path.IsPathFullyQualified(review) ||
             !IsLowerHash(approvedSha256)) throw new InvalidDataException("Exact independent installer approval is required.");
-        var manifest = File.ReadAllBytes(review);
-        if (manifest.Length is < 100 or > 1024 * 1024 ||
-            !CryptographicOperations.FixedTimeEquals(SHA256.HashData(manifest), Convert.FromHexString(approvedSha256)))
+        // The approved entrypoint is also the executable performing installation:
+        // no independently launched helper may borrow its staged signature.
+        var expectedInstaller = Path.GetFullPath(Path.Combine(source,
+            BrokerInstalledDeployment.Entrypoint(BrokerInstalledRole.Authority)));
+        if (!string.Equals(Environment.ProcessPath, expectedInstaller, StringComparison.OrdinalIgnoreCase))
+            throw new UnauthorizedAccessException("Install must execute the exact signed authority binary in the approved source.");
+        byte[] manifest;
+        using (var file = new FileStream(review, FileMode.Open, FileAccess.Read, FileShare.Read))
+        {
+            if (file.Length is < 100 or > 1024 * 1024)
+                throw new InvalidDataException("Review document exceeds the admission bound.");
+            manifest = new byte[checked((int)file.Length)];
+            file.ReadExactly(manifest);
+            if (file.Length != manifest.Length) throw new InvalidDataException("Review document changed during inspection.");
+        }
+        if (!CryptographicOperations.FixedTimeEquals(SHA256.HashData(manifest), Convert.FromHexString(approvedSha256)))
             throw new UnauthorizedAccessException("Review manifest differs from the independently approved SHA-256.");
         using var parsed = JsonDocument.Parse(manifest);
         if (parsed.RootElement.ValueKind != JsonValueKind.Object) throw new InvalidDataException("Invalid approval document.");
