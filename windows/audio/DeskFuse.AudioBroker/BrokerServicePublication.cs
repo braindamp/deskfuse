@@ -117,6 +117,10 @@ internal static class BrokerServicePublication
         try
         {
             RequireConfiguration(service, command, 3);
+            // Startup takes this same exclusive BrokerAuthority owner lease.
+            // Release installer custody before waiting for the new service;
+            // retaining it here would deadlock START_PENDING.
+            owner.Dispose();
             if (!StartServiceW(service, 0, nint.Zero))
                 throw Error("Exact authority service did not start.");
             var start = Environment.TickCount64;
