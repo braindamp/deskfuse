@@ -250,7 +250,8 @@ class MainActivity : ComponentActivity() {
                     },
                 )
 
-                if (trustedAudioState in setOf(AuthorityAudioState.STARTING, AuthorityAudioState.PLAYING, AuthorityAudioState.STOPPING)) {
+                if (state !is SessionState.Streaming &&
+                    trustedAudioState in setOf(AuthorityAudioState.STARTING, AuthorityAudioState.PLAYING, AuthorityAudioState.STOPPING)) {
                     Row {
                         Text(when (trustedAudioState) {
                             AuthorityAudioState.STARTING -> "Trusted Speaker: Connecting"
@@ -485,6 +486,15 @@ class MainActivity : ComponentActivity() {
                             phoneMicrophonePermission.launch(Manifest.permission.RECORD_AUDIO)
                         }
                     },
+                    trustedSpeakerLabel = if (BuildConfig.TRUSTED_SPEAKER_FIRST_DELIVERY) {
+                        when (trustedAudioState) {
+                            AuthorityAudioState.IDLE, AuthorityAudioState.FAILED -> "SPEAKER"
+                            AuthorityAudioState.STARTING -> "SPEAKER CONNECTING"
+                            AuthorityAudioState.PLAYING -> "SPEAKER ON"
+                            AuthorityAudioState.STOPPING -> "SPEAKER STOPPING"
+                        }
+                    } else null,
+                    onToggleTrustedSpeaker = { startSelectedTrustedSpeaker() },
                     onAdvisoryAction = { },
                 )
             }

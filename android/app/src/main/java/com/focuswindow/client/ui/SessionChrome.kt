@@ -70,6 +70,8 @@ fun SessionChrome(
     onTogglePcAudio: () -> Unit,
     phoneMicStatus: String,
     onTogglePhoneMic: () -> Unit,
+    trustedSpeakerLabel: String?,
+    onToggleTrustedSpeaker: () -> Unit,
     onAdvisoryAction: (SessionAdvisory) -> Unit,
 ) {
     Box(Modifier.fillMaxSize()) {
@@ -79,6 +81,8 @@ fun SessionChrome(
             TopStatusBar(
                 onToggleDiagnostics = onToggleDiagnostics,
                 diagnosticsVisible = diagnosticsVisible,
+                trustedSpeakerLabel = trustedSpeakerLabel,
+                onToggleTrustedSpeaker = onToggleTrustedSpeaker,
                 modifier = Modifier.align(Alignment.TopCenter),
             )
         }
@@ -133,6 +137,8 @@ fun SessionChrome(
 private fun TopStatusBar(
     onToggleDiagnostics: () -> Unit,
     diagnosticsVisible: Boolean,
+    trustedSpeakerLabel: String?,
+    onToggleTrustedSpeaker: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Row(
@@ -144,6 +150,11 @@ private fun TopStatusBar(
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         Spacer(Modifier.weight(1f))
+        trustedSpeakerLabel?.let { label ->
+            StatusPill(text = label,
+                tone = if (label == "SPEAKER ON") Tone.Good else Tone.Neutral,
+                onClick = if (label == "SPEAKER STOPPING") null else onToggleTrustedSpeaker)
+        }
         StatusPill(
             text = if (diagnosticsVisible) "HIDE" else "STATS",
             tone = Tone.Neutral,
