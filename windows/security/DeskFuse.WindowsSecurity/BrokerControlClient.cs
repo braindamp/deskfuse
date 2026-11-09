@@ -18,6 +18,8 @@ public sealed class BrokerControlClient : IDisposable
     private readonly SafeProcessHandle server;
     public NamedPipeClientStream Stream { get; }
     private BrokerControlClient(NamedPipeClientStream stream, SafeProcessHandle server) { Stream = stream; this.server = server; }
+    public static Task<BrokerControlClient> ConnectSpeakerPreparationAsync(CancellationToken ct)
+        => Connect("DeskFuse.Authority.Speaker.v1", ct);
     public static Task<BrokerControlClient> ConnectSetupActivationAsync(CancellationToken ct)
         => Connect("DeskFuse.Authority.Setup.v1", ct);
     public static Task<BrokerControlClient> ConnectWorkerAsync(Guid registration, bool setupUi, CancellationToken ct)

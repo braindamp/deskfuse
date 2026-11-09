@@ -7,7 +7,7 @@ using Microsoft.Win32.SafeHandles;
 
 namespace DeskFuse.AudioBroker;
 
-internal enum BrokerPipeProfile { MediumWorker = 1, SetupUi = 2, SetupActivation = 3 }
+internal enum BrokerPipeProfile { MediumWorker = 1, SetupUi = 2, SetupActivation = 3, SpeakerPrepare = 4 }
 
 /// <summary>
 /// One persistent, local-only control pipe for an exact launched worker. Its name
@@ -47,6 +47,10 @@ internal sealed class BrokerLocalPipe : IDisposable, IEnrollmentChannel
         var name = profile == BrokerPipeProfile.SetupUi ? NameForSetupRegistration(worker.Registration) : NameForRegistration(worker.Registration);
         return CreateOwned(name, SecurityDescriptorForLogon(worker.Logon), profile);
     }
+
+    internal static BrokerLocalPipe CreateSpeakerPreparation()
+        => CreateOwned("DeskFuse.Authority.Speaker.v1",
+            $"O:SYG:SYD:P(A;;0x001f01ff;;;SY)(A;;0x{ClientAccessMask:x8};;;IU)", BrokerPipeProfile.SpeakerPrepare);
 
     internal static BrokerLocalPipe CreateSetupActivation()
         => CreateOwned("DeskFuse.Authority.Setup.v1", $"O:SYG:SYD:P(A;;0x001f01ff;;;SY)(A;;0x{ClientAccessMask:x8};;;BA)", BrokerPipeProfile.SetupActivation);

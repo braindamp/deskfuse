@@ -68,6 +68,22 @@ internal sealed class BrokerCallerBinding : IBrokerObservedCaller, IDisposable
         catch { process.Dispose(); throw; }
     }
 
+    internal BrokerLogonIdentity ObserveSpeakerLogon()
+    {
+        lock (gate)
+        {
+            if (disposed || pipe.Profile != BrokerPipeProfile.SpeakerPrepare ||
+                !pipe.WithConnectedClient(generation, handle =>
+                    Native.GetNamedPipeClientProcessId(handle, out var pid) && pid == processId &&
+                    Native.GetNamedPipeClientSessionId(handle, out var session) && session == sessionId &&
+                    Native.WaitForSingleObject(process, 0) == 258 &&
+                    ReadCreationTime(process) == creationFileTime &&
+                    ReadProcessLogon(process, pipe.Profile).Matches(logon)))
+                throw new UnauthorizedAccessException("Speaker preparation caller/logon changed.");
+            return logon;
+        }
+    }
+
     public bool Matches(IBrokerRegisteredWorker worker)
     {
         // A test-double or arbitrary implementation cannot nominate the native
@@ -99,7 +115,7 @@ internal sealed class BrokerCallerBinding : IBrokerObservedCaller, IDisposable
         if (!Native.OpenProcessToken(process, 0x8, out var token)) throw Native.Error("Cannot inspect the local caller token.");
         using (token) return profile switch
         {
-            BrokerPipeProfile.MediumWorker => BrokerWorkerLauncher.ReadLogon(token),
+            BrokerPipeProfile.MediumWorker or BrokerPipeProfile.SpeakerPrepare => BrokerWorkerLauncher.ReadLogon(token),
             BrokerPipeProfile.SetupUi => BrokerSetupActivation.ReadElevatedLogon(token),
             _ => throw new UnauthorizedAccessException("Invalid caller profile.")
         };
