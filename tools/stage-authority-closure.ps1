@@ -5,6 +5,7 @@ param(
     [string]$Broker = 'out/audio-broker',
     [string]$Setup = 'out/authority-roles/setup',
     [string]$Enrollment = 'out/authority-roles/enrollment-worker',
+    [string]$Agent = 'out/unified-windows',
     [string]$NativeWorker = 'out/audio-worker/payload',
     [string]$Output = 'out/authority-closure'
 )
@@ -19,6 +20,7 @@ $roles = @(
     @{ Name = 'Broker'; Root = $Broker; Entry = 'DeskFuse.AudioBroker.exe' },
     @{ Name = 'Setup'; Root = $Setup; Entry = 'DeskFuse.Setup.exe' },
     @{ Name = 'Enrollment'; Root = $Enrollment; Entry = 'DeskFuse.EnrollmentWorker.exe' },
+    @{ Name = 'Agent'; Root = $Agent; Entry = 'FocusWindow.Agent.exe' },
     @{ Name = 'AudioWorker'; Root = $NativeWorker; Entry = 'DeskFuse.AudioWorker.exe' }
 )
 $destination = Join-Path $root $Output
@@ -52,7 +54,8 @@ try {
         'DeskFuse.AudioBroker.exe','DeskFuse.AudioBroker.dll','DeskFuse.AudioBroker.deps.json','DeskFuse.AudioBroker.runtimeconfig.json',
         'DeskFuse.Setup.exe','DeskFuse.Setup.dll','DeskFuse.Setup.deps.json','DeskFuse.Setup.runtimeconfig.json',
         'DeskFuse.EnrollmentWorker.exe','DeskFuse.EnrollmentWorker.dll','DeskFuse.EnrollmentWorker.deps.json','DeskFuse.EnrollmentWorker.runtimeconfig.json',
-        'DeskFuse.AudioWorker.exe','DeskFuse.Audio.dll','DeskFuse.WindowsSecurity.dll','deskfuse-source-control.dll'
+        'DeskFuse.AudioWorker.exe','DeskFuse.Audio.dll','DeskFuse.WindowsSecurity.dll','deskfuse-source-control.dll',
+        'FocusWindow.Agent.exe','FocusWindow.Agent.dll','FocusWindow.Agent.deps.json','FocusWindow.Agent.runtimeconfig.json'
     )
     foreach ($name in $required) {
         if (-not $hashes.ContainsKey($name)) { throw "Incomplete exact authority closure: $name" }
