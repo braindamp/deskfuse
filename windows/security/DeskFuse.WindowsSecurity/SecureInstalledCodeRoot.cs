@@ -24,6 +24,17 @@ public sealed class SecureInstalledCodeRoot : IDisposable
         ProtectedDirectoryInspection directory, Dictionary<string, FileStream> files, Dictionary<string, string> hashes)
         => (DeploymentId, DirectoryPath, this.anchor, this.directory, this.files, this.hashes) = (id, path, anchor, directory, files, hashes);
 
+    /// <summary>Read-only signature check for installer-held staging files.
+    /// This returns no custody or approval; an independently approved SHA-256
+    /// still governs which bytes may enter the protected installed closure.</summary>
+    public static void RequireSignedSourceEntrypoint(FileStream heldSource)
+    {
+        ArgumentNullException.ThrowIfNull(heldSource);
+        if (!heldSource.CanRead || heldSource.CanWrite)
+            throw new UnauthorizedAccessException("Read-only signed installer source required.");
+        InstalledCodeSignature.RequireValid(heldSource);
+    }
+
     public static SecureInstalledCodeRoot CreateFresh(Guid deploymentId, IReadOnlyDictionary<string, string> independentlyApprovedFiles,
         Func<string, Stream> openApprovedSource)
     {

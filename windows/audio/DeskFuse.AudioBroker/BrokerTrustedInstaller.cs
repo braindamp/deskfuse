@@ -89,7 +89,7 @@ internal static class BrokerTrustedInstaller
                 Convert.FromHexString(files[BrokerInstalledDeployment.Entrypoint(entry)])))
                 throw new UnauthorizedAccessException("Signed source is not the approved source.");
             held.Position = 0;
-            InstalledCodeSignature.RequireValid(held);
+            SecureInstalledCodeRoot.RequireSignedSourceEntrypoint(held);
         }
         return files;
     }
