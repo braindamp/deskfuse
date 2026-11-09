@@ -29,6 +29,22 @@ internal static class Program
 {
     private static async Task<int> Main(string[] args)
     {
+        if (args.Length == 4 && args[0] == "--activate-authority" &&
+            TryExactId(args[1], "--maintenance=", out var installMaintenance) &&
+            TryExactId(args[2], "--authority=", out var installAuthority) &&
+            TryExactId(args[3], "--deployment=", out var installDeployment))
+        {
+            try
+            {
+                BrokerServicePublication.ActivatePublishedExact(installMaintenance, installAuthority, installDeployment);
+                return 0;
+            }
+            catch (Exception error)
+            {
+                Console.Error.WriteLine("Exact authority activation failed: " + error.Message);
+                return 2;
+            }
+        }
         if (args.Length == 4 && args[0] == "--authority-service" &&
             TryExactId(args[1], "--maintenance=", out var maintenance) &&
             TryExactId(args[2], "--authority=", out var authority) &&

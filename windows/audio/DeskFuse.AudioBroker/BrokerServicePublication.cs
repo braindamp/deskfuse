@@ -87,6 +87,74 @@ internal static class BrokerServicePublication
         RequireConfiguration(service, command, 3, 2, checked((uint)Environment.ProcessId));
     }
 
+    /// <summary>
+    /// Explicit SYSTEM-only installer activation. Publication never starts the
+    /// service; this operation only enables the exact stopped/disabled, signed
+    /// deployment and waits for the protected SCM role to report RUNNING.
+    /// </summary>
+    internal static void ActivatePublishedExact(Guid maintenanceNamespace, Guid authorityNamespace, Guid deploymentId)
+    {
+        TrustedAuthorityInstallation.RequireSystem();
+        using var maintenance = SecurePrivateStorageRoot.OpenExisting(PrivateStorageProfile.Maintenance, maintenanceNamespace);
+        using var authority = SecurePrivateStorageRoot.OpenExisting(PrivateStorageProfile.BrokerAuthority, authorityNamespace);
+        using var owner = authority.AcquireBrokerOwnerLease();
+        var configuration = TrustedAuthorityInstallation.ReadConfiguration(authority, maintenanceNamespace, deploymentId);
+        using var identity = BrokerHostIdentity.OpenExisting(authority, configuration.HostKeyCreationDeploymentId);
+        using var code = BrokerInstalledDeployment.Open(configuration);
+        code.RequireSignedAuthority(); code.RequireSignedSetup();
+        if (!string.Equals(Environment.ProcessPath, code.AuthorityExecutablePath, StringComparison.OrdinalIgnoreCase))
+            throw new UnauthorizedAccessException("Activation must run from the exact approved authority image.");
+        var command = CommandLine(code.AuthorityExecutablePath, configuration);
+        RequirePublished(authority, configuration, command);
+        using var scm = OpenSCManagerW(null, null, 1);
+        if (scm.IsInvalid) throw Error("Cannot open SCM for exact activation.");
+        using var service = OpenServiceW(scm, ServiceName, ServiceAccess | 0x10); // SERVICE_START
+        if (service.IsInvalid) throw Error("The published authority service is missing.");
+        RequireServiceDescriptor(service);
+        RequireConfiguration(service, command); // disabled and stopped, not already borrowed
+        if (!ChangeServiceConfigW(service, 0xffffffff, 3, 0xffffffff, null, null, nint.Zero, null, null, null, null))
+            throw Error("Cannot enable the exact published service.");
+        try
+        {
+            RequireConfiguration(service, command, 3);
+            if (!StartServiceW(service, 0, nint.Zero))
+                throw Error("Exact authority service did not start.");
+            var start = Environment.TickCount64;
+            while (true)
+            {
+                if (!QueryServiceStatusEx(service, 0, out var state, (uint)Marshal.SizeOf<ServiceStatus>(), out _))
+                    throw Error("Cannot observe authority activation.");
+                if (state.CurrentState == 4 && state.ProcessId != 0) return;
+                if (state.CurrentState is not (2 or 3) || Environment.TickCount64 - start >= 60000)
+                    throw new InvalidOperationException("Authority startup is not confirmed; check SCM and retained deployment before retry.");
+                Thread.Sleep(250);
+            }
+        }
+        catch
+        {
+            // Only restore disabled if SCM confirms no worker is running. An
+            // unknown/pending process must not be disabled and treated as retired.
+            if (QueryServiceStatusEx(service, 0, out var current, (uint)Marshal.SizeOf<ServiceStatus>(), out _) &&
+                current.CurrentState == 1 && current.ProcessId == 0)
+            {
+                if (!ChangeServiceConfigW(service, 0xffffffff, 4, 0xffffffff, null, null, nint.Zero, null, null, null, null))
+                    throw Error("Activation failed and disabled rollback is unconfirmed.");
+                RequireConfiguration(service, command);
+            }
+            throw;
+        }
+    }
+
+    private static void RequirePublished(SecurePrivateStorageRoot root, BrokerDeploymentConfiguration configuration, string command)
+    {
+        using var file = root.OpenProtectedRead($"bootstrap/service-published.{configuration.DeploymentId:N}.json");
+        var observed = SecurePrivateStorageRoot.ReadBounded(file, 4096);
+        var expected = JsonSerializer.SerializeToUtf8Bytes(new { version = 1, authorityNamespace = root.NamespaceId,
+            deployment = configuration.DeploymentId, service = ServiceName, command, disabled = true });
+        if (!observed.AsSpan().SequenceEqual(expected))
+            throw new UnauthorizedAccessException("The exact disabled service publication is not approved.");
+    }
+
     private static void RequireConfiguration(ServiceHandle service, string expectedCommand,
         uint expectedStartType = 4, uint expectedState = 1, uint expectedProcessId = 0)
     {
@@ -150,7 +218,9 @@ internal static class BrokerServicePublication
     [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] private static extern ServiceHandle OpenSCManagerW(string? machine, string? database, uint access);
     [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] private static extern ServiceHandle CreateServiceW(ServiceHandle scm, string name, string display, uint access, uint type, uint start, uint error, string binary, string? group, nint tag, string? dependencies, string? account, string? password);
     [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] private static extern ServiceHandle OpenServiceW(ServiceHandle scm, string name, uint access);
-    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool ChangeServiceConfigW(ServiceHandle service, uint type, uint start, uint error, string binary, string? group, nint tag, string? dependencies, string? account, string? password, string? display);
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool ChangeServiceConfigW(ServiceHandle service, uint type, uint start, uint error, string? binary, string? group, nint tag, string? dependencies, string? account, string? password, string? display);
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool StartServiceW(ServiceHandle service, uint argc, nint args);
     [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool QueryServiceConfigW(ServiceHandle service, nint buffer, uint size, out uint needed);
     [DllImport("advapi32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool QueryServiceStatusEx(ServiceHandle service, uint level, out ServiceStatus status, uint size, out uint needed);
     [DllImport("advapi32.dll")] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool CloseServiceHandle(nint service);
