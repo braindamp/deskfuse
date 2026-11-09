@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
+using System.Security.Cryptography;
 using DeskFuse.WindowsSecurity;
 
 namespace DeskFuse.AudioBroker;
@@ -132,9 +133,21 @@ internal sealed class BrokerAuthorityService
         var rundown = new BrokerEnrollmentRundown(registry);
         var persistence = new EnrollmentPersistenceOwner(store, host, rundown);
         var setup = new BrokerSetupCoordinator(installed, host, store, persistence, Enum.GetValues<BrokerProofScope>());
+        var speaker = new BrokerSpeakerPreparation(installed, host, store, registry, rundown,
+            RandomNumberGenerator.GetBytes(32)); // One service incarnation for native source ownership.
+        var speakerReady = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         using var denyOnStop = cancellation.Register(store.CloseAdmission);
+        var speakerTask = speaker.RunAsync(cancellation, speakerReady);
         try
         {
+            // Neither setup nor speaker preparation can report SCM RUNNING alone.
+            var initial = await Task.WhenAny(speakerReady.Task, speakerTask).ConfigureAwait(false);
+            if (initial == speakerTask)
+            {
+                await speakerTask.ConfigureAwait(false);
+                throw new InvalidOperationException("Speaker preparation listener ended before startup.");
+            }
+            await speakerReady.Task.ConfigureAwait(false);
             while (!cancellation.IsCancellationRequested)
             {
                 // FIRST_PIPE_INSTANCE is reacquired after the prior connection and workers retire.
@@ -142,7 +155,15 @@ internal sealed class BrokerAuthorityService
                 ready.TrySetResult();
                 try
                 {
-                    await pipe.WaitForConnectionAsync(cancellation).ConfigureAwait(false);
+                    var acceptance = pipe.WaitForConnectionAsync(cancellation);
+                    var completed = await Task.WhenAny(acceptance, speakerTask).ConfigureAwait(false);
+                    if (completed == speakerTask)
+                    {
+                        if (cancellation.IsCancellationRequested) break;
+                        await speakerTask.ConfigureAwait(false);
+                        throw new InvalidOperationException("Protected Speaker listener exited unexpectedly.");
+                    }
+                    await acceptance.ConfigureAwait(false);
                     await setup.RunActivationAsync(pipe, cancellation).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { break; }
@@ -159,7 +180,8 @@ internal sealed class BrokerAuthorityService
         {
             store.CloseAdmission();
             rundown.CloseAllAdmission();
-            await persistence.StopAsync().ConfigureAwait(false); // Exact joined owners, or a visible failure.
+            try { await speakerTask.ConfigureAwait(false); }
+            finally { await persistence.StopAsync().ConfigureAwait(false); }
         }
     }
     private void Report(uint state, uint waitHint, uint exitCode = 0)
