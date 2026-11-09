@@ -13,6 +13,8 @@ import com.focuswindow.client.R
 import com.focuswindow.client.media.PcAudioOutput
 import com.focuswindow.client.profile.PhoneProfile
 import com.focuswindow.client.transport.PairingPayload
+import com.focuswindow.client.transport.AuthorityAudioControl
+import com.focuswindow.client.transport.AuthorityAudioState
 import com.focuswindow.client.transport.DefaultNetworkHandoff
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -66,6 +68,11 @@ class SpeakerService : Service() {
     }
 
     private fun start(intent: Intent) {
+        if (AuthorityAudioControl.state.value in setOf(
+                AuthorityAudioState.STARTING, AuthorityAudioState.PLAYING, AuthorityAudioState.STOPPING)) {
+            stopSelf()
+            return
+        }
         createChannel()
         startForeground(NOTIFICATION_ID, buildNotification("Connecting to the PC"))
 

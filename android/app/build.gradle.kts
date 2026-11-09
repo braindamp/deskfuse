@@ -33,10 +33,14 @@ android {
         debug {
             applicationIdSuffix = ".debug"
             isMinifyEnabled = false
+            buildConfigField("boolean", "TRUSTED_SPEAKER_FIRST_DELIVERY", "true")
+            buildConfigField("boolean", "TRUSTED_SPEAKER_HANDOVER", "false")
         }
         release {
             isMinifyEnabled = true
             isShrinkResources = true
+            buildConfigField("boolean", "TRUSTED_SPEAKER_FIRST_DELIVERY", "false")
+            buildConfigField("boolean", "TRUSTED_SPEAKER_HANDOVER", "false")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",

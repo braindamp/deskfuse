@@ -9,6 +9,7 @@ import android.os.IBinder
 import android.os.Looper
 import android.os.Process
 import com.focuswindow.client.BuildConfig
+import com.focuswindow.client.session.SpeakerService
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.util.UUID
@@ -24,7 +25,8 @@ internal object AuthorityAudioControl {
     private var active: Grant? = null
 
     fun start(context: Context, enrollment: TrustedCommittedEnrollment, host: String, port: Int, cellular: Boolean) {
-        check(BuildConfig.DEBUG)
+        check(BuildConfig.TRUSTED_SPEAKER_FIRST_DELIVERY) { "Trusted speaker not qualified for this profile" }
+        check(!SpeakerService.running) { "Stop the legacy speaker before starting trusted audio" }
         require(BrokerScope.SPEAKER in enrollment.transcript().proposal.scopes)
         AudioCellularTarget(host, port)
         val grant = synchronized(gate) {
@@ -58,7 +60,7 @@ internal object AuthorityAudioControl {
     }
 
     fun prepareAlternate(context: Context, host: String, port: Int) {
-        check(BuildConfig.DEBUG)
+        check(BuildConfig.TRUSTED_SPEAKER_HANDOVER)
         val target = AudioCellularTarget(host, port)
         val generation = synchronized(gate) {
             check(status.value == AuthorityAudioState.PLAYING)
