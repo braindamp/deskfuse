@@ -172,7 +172,7 @@ internal sealed class BrokerAuthorityService
                 catch (Exception error)
                 {
                     if (cancellation.IsCancellationRequested) break;
-                    Console.Error.WriteLine("Rejected setup activation: " + error.Message);
+                    ReportSetupFailure(error);
                     await Task.Delay(250, cancellation).ConfigureAwait(false);
                 }
             }
@@ -186,6 +186,19 @@ internal sealed class BrokerAuthorityService
             finally { await persistence.StopAsync().ConfigureAwait(false); }
         }
     }
+    private static void ReportSetupFailure(Exception error)
+    {
+        // Failure-only local diagnostics; never called by native/media loops.
+        var native = error is Win32Exception win32 ? win32.NativeErrorCode : 0;
+        var message = $"Rejected setup activation (native error {native}): {error}";
+        Console.Error.WriteLine(message);
+        if (message.Length > 4096) message = message[..4096];
+        var source = RegisterEventSourceW(null, "DeskFuse.Authority");
+        if (source == nint.Zero) return;
+        try { _ = ReportEventW(source, 1, 0, 1001, nint.Zero, 1, 0, [message], nint.Zero); }
+        finally { _ = DeregisterEventSource(source); }
+    }
+
     private void Report(uint state, uint waitHint, uint exitCode = 0)
     {
         lock (statusGate)
@@ -213,6 +226,15 @@ internal sealed class BrokerAuthorityService
     private delegate void ServiceMainCallback(uint argc, nint argv);
     [UnmanagedFunctionPointer(CallingConvention.Winapi)]
     private delegate uint ServiceControlCallback(uint control, uint eventType, nint data, nint context);
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern nint RegisterEventSourceW(string? server, string source);
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ReportEventW(nint source, ushort type, ushort category, uint id, nint sid, ushort count, uint size,
+        [MarshalAs(UnmanagedType.LPArray, ArraySubType = UnmanagedType.LPWStr, SizeParamIndex = 5)] string[] strings, nint data);
+    [DllImport("advapi32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool DeregisterEventSource(nint source);
     [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool StartServiceCtrlDispatcherW(nint table);
