@@ -1,0 +1,49 @@
+name: WAN libdatachannel connectivity spike
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'experiments/wan-libdatachannel/**'
+      - '.github/workflows/wan-libdatachannel-spike.yml'
+jobs:
+  signal-tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r experiments/wan-libdatachannel/requirements.txt
+      - run: python -m unittest discover -s experiments/wan-libdatachannel/tests -v
+  native-linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install libdatachannel build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build libssl-dev pkg-config
+      - name: Fetch exact upstream tagged release
+        run: |
+          git clone --depth 1 --branch v0.24.6 https://github.com/paullouisageneau/libdatachannel.git upstream-libdatachannel
+          git -C upstream-libdatachannel submodule update --init --recursive --depth 1
+      - name: Build and install libdatachannel
+        run: |
+          cmake -S upstream-libdatachannel -B upstream-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/lib-install" \
+            -DNO_MEDIA=ON -DNO_WEBSOCKET=OFF \
+            -DNO_EXAMPLES=ON -DNO_TESTS=ON
+          cmake --build upstream-build -j 2
+          cmake --install upstream-build
+      - name: Build DeskFuse standalone C API probe
+        run: |
+          cmake -S experiments/wan-libdatachannel -B probe-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/lib-install"
+          cmake --build probe-build -j 2
+      - name: Verify argument validation (no real network)
+        env:
+          DESKFUSE_PROBE_TOKEN: non-production-test-token-longer-than-32-chars
+        run: |
+          if probe-build/deskfuse-wan-probe --role invalid --room test-room --signal ws://localhost:8765; then
+            echo 'Unexpected success' >&2
+            exit 1
+          fi
