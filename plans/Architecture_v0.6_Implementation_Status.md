@@ -10,6 +10,8 @@ The matched 21bfb42 Android debug APK installed on the connected handset. A curr
 
 The exact signed authority installation stopped before service publication: the Windows software KSP returned one protected SYSTEM-only ACE with mask 0xd01f01ff, which the validator rejected. Accept that observed full-access representation while retaining exact SYSTEM owner/group, protected DACL and single noncallback SYSTEM-only allow ACE. Broker Release self-contained publication passed. The partial authority namespace/key/deployment are retained for explicit recovery; no playback or full installation pass is claimed.
 
+F0b/F1 installed continuation: corrected key validation passed. Fresh service publication then rejected the Windows default IU/SU user-defined-control permissions. Set a restricted protected DACL on the exact newly created disabled service before validation/publication; existing services are not adopted or rewritten. Corrected broker self-contained Release publication passed. The failed deployment remains disabled/stopped and preserved pending exact recovery.
+
 ## Current v0.6 milestone completion — 9 November 2026
 
 | Original phase / tranche | Source | Integration | Device qualification | Release enablement | Next task |

@@ -37,9 +37,10 @@ internal static class BrokerServicePublication
         using var scm = OpenSCManagerW(null, null, 0x3); // Connect + create service.
         if (scm.IsInvalid) throw Error("Cannot open SCM for explicit installation.");
         // Collision is not an invitation to adopt or rewrite another service.
-        using var service = CreateServiceW(scm, ServiceName, "DeskFuse Authority", ServiceAccess, 0x10, 4, 1,
+        using var service = CreateServiceW(scm, ServiceName, "DeskFuse Authority", ServiceAccess | 0x00040000, 0x10, 4, 1,
             command, null, nint.Zero, null, null, null);
         if (service.IsInvalid) throw Error("Cannot reserve a fresh disabled authority service; existing services are not adopted.");
+        RestrictFreshServiceDescriptor(service);
         RequireServiceDescriptor(service);
         RequireConfiguration(service, command);
         WritePublication(authority, configuration, command);
@@ -180,6 +181,25 @@ internal static class BrokerServicePublication
         finally { Marshal.FreeHGlobal(buffer); }
     }
 
+    // SCM has no CreateService security-descriptor parameter. Restrict only the
+    // exact newly created DISABLED service before publishing or allowing startup.
+    // Windows defaults may grant IU/SU user-defined controls, which we forbid.
+    private static void RestrictFreshServiceDescriptor(ServiceHandle service)
+    {
+        var descriptor = new RawSecurityDescriptor("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x0002008d;;;AU)");
+        var acl = descriptor.DiscretionaryAcl!;
+        var bytes = new byte[acl.BinaryLength];
+        acl.GetBinaryForm(bytes, 0);
+        var pointer = Marshal.AllocHGlobal(bytes.Length);
+        try
+        {
+            Marshal.Copy(bytes, 0, pointer, bytes.Length);
+            var error = SetSecurityInfo(service, 2, 0x80000004, nint.Zero, nint.Zero, pointer, nint.Zero);
+            if (error != 0) throw new Win32Exception((int)error, "Cannot restrict the newly created disabled authority service.");
+        }
+        finally { Marshal.FreeHGlobal(pointer); }
+    }
+
     private static void RequireServiceDescriptor(ServiceHandle service)
     {
         var error = GetSecurityInfo(service, 2, 0x5, nint.Zero, nint.Zero, nint.Zero, nint.Zero, out var pointer);
@@ -228,6 +248,7 @@ internal static class BrokerServicePublication
     [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool QueryServiceConfigW(ServiceHandle service, nint buffer, uint size, out uint needed);
     [DllImport("advapi32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool QueryServiceStatusEx(ServiceHandle service, uint level, out ServiceStatus status, uint size, out uint needed);
     [DllImport("advapi32.dll")] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool CloseServiceHandle(nint service);
+    [DllImport("advapi32.dll")] private static extern uint SetSecurityInfo(ServiceHandle handle, uint type, uint information, nint owner, nint group, nint dacl, nint sacl);
     [DllImport("advapi32.dll")] private static extern uint GetSecurityInfo(ServiceHandle handle, int type, uint info, nint owner, nint group, nint dacl, nint sacl, out nint descriptor);
     [DllImport("advapi32.dll")] private static extern uint GetSecurityDescriptorLength(nint descriptor);
     [DllImport("kernel32.dll")] private static extern nint LocalFree(nint pointer);
