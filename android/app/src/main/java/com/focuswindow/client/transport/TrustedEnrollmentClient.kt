@@ -1,5 +1,6 @@
 package com.focuswindow.client.transport
 
+import com.focuswindow.client.BuildConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
@@ -148,7 +149,11 @@ internal class TrustedEnrollmentClient private constructor(
                 socket.enabledProtocols = socket.supportedProtocols.filter { it == "TLSv1.3" || it == "TLSv1.2" }.toTypedArray()
                 socket.enabledCipherSuites = socket.supportedCipherSuites.filter { it in cipherSuites }.toTypedArray()
                 require(socket.enabledProtocols.isNotEmpty() && socket.enabledCipherSuites.isNotEmpty())
-                socket.tcpNoDelay = true; socket.soTimeout = 5000; socket.connect(InetSocketAddress(host, port), 4000); socket.startHandshake()
+                if (BuildConfig.DEBUG) android.util.Log.d("TrustedSetup", "Connecting TCP")
+                socket.tcpNoDelay = true; socket.soTimeout = 5000; socket.connect(InetSocketAddress(host, port), 4000)
+                if (BuildConfig.DEBUG) android.util.Log.d("TrustedSetup", "Starting TLS")
+                socket.startHandshake()
+                if (BuildConfig.DEBUG) android.util.Log.d("TrustedSetup", "Reading offer")
                 val input = DataInputStream(socket.inputStream); val size = input.readInt()
                 require(size in 1..TrustedEnrollmentProtocol.MAX_FRAME && input.readUnsignedByte() == TrustedSetupWire.OFFER)
                 val envelope = ByteArray(size - 1).also { input.readFully(it) }
@@ -156,6 +161,7 @@ internal class TrustedEnrollmentClient private constructor(
                 val leaf = socket.session.peerCertificates.single() as X509Certificate
                 require(MessageDigest.isEqual(TrustedEnrollmentProtocol.hash(leaf.encoded), offer.tlsLeafHash) &&
                     TrustedEnrollmentProtocol.verify(offer.hostSpki, bytes, signature)) { "Offer does not bind this TLS connection" }
+                if (BuildConfig.DEBUG) android.util.Log.d("TrustedSetup", "Offer verified provisionally")
                 // The root remains provisional until full-digest OOB verification and foreground consent.
                 socket.soTimeout = 300_000
                 return TrustedEnrollmentClient(socket, signer, repository, envelope.copyOf())

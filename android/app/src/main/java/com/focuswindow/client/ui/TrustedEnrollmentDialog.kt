@@ -76,7 +76,16 @@ internal fun TrustedEnrollmentDialog(lifecycle: Lifecycle, onDismiss: () -> Unit
         job = scope.launch {
             try { action() }
             catch (cancelled: CancellationException) { throw cancelled }
-            catch (_: Exception) { message = "Setup did not finish. Saved pairing details are kept; reopen trusted setup to recover them." }
+            catch (failure: Exception) {
+                if (BuildConfig.DEBUG) {
+                    // Diagnostic types and call sites only: never record enrollment material.
+                    val causes = generateSequence<Throwable>(failure) { it.cause }.take(8)
+                    android.util.Log.e("TrustedSetup", causes.joinToString("\nCaused by: ") {
+                        it.javaClass.name + "\n" + it.stackTrace.take(12).joinToString("\n")
+                    })
+                }
+                message = "Setup did not finish. Saved pairing details are kept; reopen trusted setup to recover them."
+            }
             finally { busy = false }
         }
     }
