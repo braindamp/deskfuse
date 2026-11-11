@@ -36,23 +36,7 @@ internal static class BrokerWorkerToken
             throw BrokerWorkerLauncher.Native.Error("Cannot duplicate the private worker primary token.");
         try
         {
-            var system = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
-            var sid = new byte[system.BinaryLength]; system.GetBinaryForm(sid, 0);
-            using var owner = new BrokerWorkerLauncher.NativeBuffer(sid.Length);
-            Marshal.Copy(sid, 0, owner.Pointer, sid.Length);
-            var error = Native.SetSecurityInfo(copy, 6, 1, owner.Pointer, nint.Zero, nint.Zero, nint.Zero);
-            if (error != 0) throw new Win32Exception((int)error, "Cannot assign private token custody to SYSTEM.");
-
-            // Apply the final object DACL after assigning ownership: Windows can
-            // mark OWNER RIGHTS inherit-only during the owner-setting operation.
-            // This duplicate is still private; keep the exact policy effective.
-            var objectAcl = new RawSecurityDescriptor(expected).DiscretionaryAcl!;
-            var objectAclBytes = new byte[objectAcl.BinaryLength];
-            objectAcl.GetBinaryForm(objectAclBytes, 0);
-            using var objectAclMemory = new BrokerWorkerLauncher.NativeBuffer(objectAclBytes.Length);
-            Marshal.Copy(objectAclBytes, 0, objectAclMemory.Pointer, objectAclBytes.Length);
-            error = Native.SetSecurityInfo(copy, 6, 0x80000004, nint.Zero, nint.Zero, objectAclMemory.Pointer, nint.Zero);
-            if (error != 0) throw new Win32Exception((int)error, "Cannot apply the final private token DACL.");
+            ApplyObjectPolicy(copy, expected);
 
             var acl = DefaultAclBytes();
             using var aclMemory = new BrokerWorkerLauncher.NativeBuffer(acl.Length);
@@ -67,18 +51,72 @@ internal static class BrokerWorkerToken
         catch { copy.Dispose(); throw; }
     }
 
-    internal static void RequireProcess(SafeProcessHandle process, BrokerLogonIdentity approved)
+    private static void ApplyObjectPolicy(SafeAccessTokenHandle token, string expected)
     {
-        if (!Native.OpenProcessToken(process, QueryAccess, out var token))
-            throw BrokerWorkerLauncher.Native.Error("Cannot inspect the suspended worker's effective token.");
-        using (token) Require(token, approved);
+        var system = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
+        var sid = new byte[system.BinaryLength]; system.GetBinaryForm(sid, 0);
+        using var owner = new BrokerWorkerLauncher.NativeBuffer(sid.Length);
+        Marshal.Copy(sid, 0, owner.Pointer, sid.Length);
+        var error = Native.SetSecurityInfo(token, 6, 1, owner.Pointer, nint.Zero, nint.Zero, nint.Zero);
+        if (error != 0) throw new Win32Exception((int)error, "Cannot assign worker token custody to SYSTEM.");
+
+        // Apply the final object DACL after assigning ownership: Windows can
+        // mark OWNER RIGHTS inherit-only during the owner-setting operation.
+        // The token is private or has passed the exact safe creation profile.
+        var objectAcl = new RawSecurityDescriptor(expected).DiscretionaryAcl!;
+        var objectAclBytes = new byte[objectAcl.BinaryLength];
+        objectAcl.GetBinaryForm(objectAclBytes, 0);
+        using var objectAclMemory = new BrokerWorkerLauncher.NativeBuffer(objectAclBytes.Length);
+        Marshal.Copy(objectAclBytes, 0, objectAclMemory.Pointer, objectAclBytes.Length);
+        error = Native.SetSecurityInfo(token, 6, 0x80000004, nint.Zero, nint.Zero, objectAclMemory.Pointer, nint.Zero);
+        if (error != 0) throw new Win32Exception((int)error, "Cannot apply the final worker token DACL.");
+
+    }
+
+    internal static string CreatedObjectSddl(BrokerLogonIdentity approved)
+        => $"O:{new SecurityIdentifier(approved.UserSid, 0).Value}D:(A;;0x000f01ff;;;SY)(A;;0x000f01ff;;;BA)(A;;RC;;;OW)";
+
+    internal static void RequireCreatedObjectDescriptor(RawSecurityDescriptor actual, BrokerLogonIdentity approved)
+    {
+        const AccessControlSections sections = AccessControlSections.Owner | AccessControlSections.Access;
+        var expected = new RawSecurityDescriptor(CreatedObjectSddl(approved));
+        if (actual.GetSddlForm(sections) != expected.GetSddlForm(sections))
+            throw new InvalidDataException("Created worker token does not match the safe creation profile: " + actual.GetSddlForm(sections));
+    }
+
+    internal static void PrepareAndRequireProcess(SafeProcessHandle process, BrokerLogonIdentity approved)
+    {
+        // Broker-only READ_CONTROL | TOKEN_QUERY | WRITE_DAC | WRITE_OWNER.
+        if (!Native.OpenProcessToken(process, QueryAccess | 0x000c0000, out var token))
+            throw BrokerWorkerLauncher.Native.Error("Cannot retain the suspended worker's effective token for finalization.");
+        using (token)
+        {
+            RequireIdentityAndDefaults(token, approved);
+            var actual = BrokerWorkerLauncher.ReadObjectDescriptor(token);
+            var system = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
+            if (actual.Owner == system)
+            {
+                BrokerWorkerLauncher.RequireObjectDescriptor(actual, ObjectSddl(approved));
+                return;
+            }
+            // This exact transient profile denies ordinary-user mutation even
+            // before finalization. Never repair an unexpectedly exposed token.
+            RequireCreatedObjectDescriptor(actual, approved);
+            ApplyObjectPolicy(token, ObjectSddl(approved));
+            BrokerWorkerLauncher.RequireObjectDescriptor(token, ObjectSddl(approved));
+        }
     }
 
     private static void Require(SafeAccessTokenHandle token, BrokerLogonIdentity approved)
     {
+        RequireIdentityAndDefaults(token, approved);
+        BrokerWorkerLauncher.RequireObjectDescriptor(token, ObjectSddl(approved));
+    }
+
+    private static void RequireIdentityAndDefaults(SafeAccessTokenHandle token, BrokerLogonIdentity approved)
+    {
         if (!BrokerWorkerLauncher.ReadLogon(token).Matches(approved))
             throw new UnauthorizedAccessException("Private worker token changed the approved logon.");
-        BrokerWorkerLauncher.RequireObjectDescriptor(token, ObjectSddl(approved));
         using var information = BrokerWorkerLauncher.TokenInformation(token, 6);
         var pointer = Marshal.ReadIntPtr(information.Pointer);
         var offset = pointer.ToInt64() - information.Pointer.ToInt64();

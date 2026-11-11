@@ -118,7 +118,7 @@ internal sealed class BrokerWorkerLauncher
                 job.RequireMembership(worker.ProcessHandle);
                 RequireObjectDescriptor(worker.ProcessHandle, processSddl);
                 RequireObjectDescriptor(worker.ThreadHandle, threadSddl);
-                BrokerWorkerToken.RequireProcess(worker.ProcessHandle, approvedLogon);
+                BrokerWorkerToken.PrepareAndRequireProcess(worker.ProcessHandle, approvedLogon);
                 if (!Native.GetProcessMitigationPolicy(worker.ProcessHandle, 6, out var extensionFlags, 4) || (extensionFlags & 1) == 0 ||
                     !Native.GetProcessMitigationPolicy(worker.ProcessHandle, 13, out var childFlags, 4) || (childFlags & 1) == 0)
                     throw new InvalidDataException("Worker extension-point mitigation was not applied.");
@@ -216,6 +216,9 @@ internal sealed class BrokerWorkerLauncher
     }
 
     internal static void RequireObjectDescriptor(SafeHandle handle, string expectedSddl)
+        => RequireObjectDescriptor(ReadObjectDescriptor(handle), expectedSddl);
+
+    internal static RawSecurityDescriptor ReadObjectDescriptor(SafeHandle handle)
     {
         var error = Native.GetSecurityInfo(handle, 6, 0x5, nint.Zero, nint.Zero, nint.Zero, nint.Zero, out var descriptor);
         if (error != 0) throw new Win32Exception((int)error, "Cannot inspect created worker object security.");
@@ -224,26 +227,30 @@ internal sealed class BrokerWorkerLauncher
             var length = Native.GetSecurityDescriptorLength(descriptor);
             if (descriptor == nint.Zero || length is 0 or > 65536) throw new InvalidDataException("Invalid worker security descriptor.");
             var bytes = new byte[length]; Marshal.Copy(descriptor, bytes, 0, bytes.Length);
-            var actual = new RawSecurityDescriptor(bytes, 0);
-            var expected = new RawSecurityDescriptor(expectedSddl);
-            static string Describe(RawSecurityDescriptor value)
-            {
-                var sddl = value.GetSddlForm(AccessControlSections.Owner | AccessControlSections.Access);
-                return $"owner={value.Owner}; flags={value.ControlFlags}; count={value.DiscretionaryAcl?.Count}; sddl={sddl[..Math.Min(sddl.Length, 1000)]}";
-            }
-            if (actual.Owner != expected.Owner || (actual.ControlFlags & ControlFlags.DiscretionaryAclProtected) == 0 ||
-                actual.DiscretionaryAcl is null || expected.DiscretionaryAcl is null ||
-                actual.DiscretionaryAcl.Count != expected.DiscretionaryAcl.Count)
-                throw new InvalidDataException($"Worker object owner or DACL differs from the protected launch profile. Expected: {Describe(expected)}. Actual: {Describe(actual)}.");
-            for (var i = 0; i < expected.DiscretionaryAcl.Count; i++)
-            {
-                var a = actual.DiscretionaryAcl[i]; var e = expected.DiscretionaryAcl[i];
-                var ab = new byte[a.BinaryLength]; var eb = new byte[e.BinaryLength];
-                a.GetBinaryForm(ab, 0); e.GetBinaryForm(eb, 0);
-                if (!ab.AsSpan().SequenceEqual(eb)) throw new InvalidDataException($"Worker object ACL differs from protected launch profile. Expected: {Describe(expected)}. Actual: {Describe(actual)}.");
-            }
+            return new RawSecurityDescriptor(bytes, 0);
         }
         finally { if (descriptor != nint.Zero) Native.LocalFree(descriptor); }
+    }
+
+    internal static void RequireObjectDescriptor(RawSecurityDescriptor actual, string expectedSddl)
+    {
+        var expected = new RawSecurityDescriptor(expectedSddl);
+        static string Describe(RawSecurityDescriptor value)
+        {
+            var sddl = value.GetSddlForm(AccessControlSections.Owner | AccessControlSections.Access);
+            return $"owner={value.Owner}; flags={value.ControlFlags}; count={value.DiscretionaryAcl?.Count}; sddl={sddl[..Math.Min(sddl.Length, 1000)]}";
+        }
+        if (actual.Owner != expected.Owner || (actual.ControlFlags & ControlFlags.DiscretionaryAclProtected) == 0 ||
+            actual.DiscretionaryAcl is null || expected.DiscretionaryAcl is null ||
+            actual.DiscretionaryAcl.Count != expected.DiscretionaryAcl.Count)
+            throw new InvalidDataException($"Worker object owner or DACL differs from the protected launch profile. Expected: {Describe(expected)}. Actual: {Describe(actual)}.");
+        for (var i = 0; i < expected.DiscretionaryAcl.Count; i++)
+        {
+            var a = actual.DiscretionaryAcl[i]; var e = expected.DiscretionaryAcl[i];
+            var ab = new byte[a.BinaryLength]; var eb = new byte[e.BinaryLength];
+            a.GetBinaryForm(ab, 0); e.GetBinaryForm(eb, 0);
+            if (!ab.AsSpan().SequenceEqual(eb)) throw new InvalidDataException($"Worker object ACL differs from protected launch profile. Expected: {Describe(expected)}. Actual: {Describe(actual)}.");
+        }
     }
 
     internal sealed class CreationAttributes : IDisposable

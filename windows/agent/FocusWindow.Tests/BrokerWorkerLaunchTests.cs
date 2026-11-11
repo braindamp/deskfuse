@@ -96,6 +96,22 @@ public sealed class BrokerWorkerLaunchTests
         }
     }
 
+    [Fact]
+    public void Created_token_profile_rejects_unsafe_owner_rights_and_extra_grants()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        var sid = SidBytes(new SecurityIdentifier("S-1-5-21-1-2-3-1001"));
+        var logon = new BrokerLogonIdentity(sid, sid, 1, 1);
+        var safe = BrokerWorkerToken.CreatedObjectSddl(logon);
+        BrokerWorkerToken.RequireCreatedObjectDescriptor(new RawSecurityDescriptor(safe), logon);
+        foreach (var invalid in new[] {
+            safe.Replace("(A;;RC;;;OW)", ""),
+            safe.Replace("(A;;RC;;;OW)", "(A;IO;RC;;;OW)"),
+            safe + "(A;;GA;;;AU)", safe.Replace("O:S-1-5-21-1-2-3-1001", "O:SY"),
+            safe.Replace("0x000f01ff", "0x000f01fe"), safe.Replace("D:", "D:P") })
+            Assert.Throws<InvalidDataException>(() => BrokerWorkerToken.RequireCreatedObjectDescriptor(new RawSecurityDescriptor(invalid), logon));
+    }
+
     private static byte[] SidBytes(SecurityIdentifier sid)
     { var bytes = new byte[sid.BinaryLength]; sid.GetBinaryForm(bytes, 0); return bytes; }
 
