@@ -244,14 +244,32 @@ internal sealed class BrokerSetupCoordinator
     private static async Task<BrokerCallerBinding> Observe(BrokerRegisteredWorker worker, CancellationToken ct)
     {
         var pipe = worker.ControlPipe ?? throw new InvalidOperationException("Worker has no reserved control pipe.");
-        for (var rejected = 0; rejected < 8; rejected++)
+        try
         {
-            await pipe.WaitForConnectionAsync(ct).ConfigureAwait(false);
-            var caller = pipe.ObserveConnectedCaller();
-            if (caller.Matches(worker)) return caller;
-            caller.Dispose(); pipe.Disconnect(); // Only before protocol I/O; never reconnect established control.
+            for (var rejected = 0; rejected < 8; rejected++)
+            {
+                await pipe.WaitForConnectionAsync(ct).ConfigureAwait(false);
+                var caller = pipe.ObserveConnectedCaller();
+                if (caller.Matches(worker)) return caller;
+                caller.Dispose(); pipe.Disconnect(); // Only before protocol I/O; never reconnect established control.
+            }
+            throw new UnauthorizedAccessException("Too many foreign clients attempted the setup pipe.");
         }
-        throw new UnauthorizedAccessException("Too many foreign clients attempted the setup pipe.");
+        catch (Exception failure)
+        {
+            uint? exitCode = null;
+            try
+            {
+                // Inspect the retained incarnation before terminal cleanup can
+                // replace its exit status with our own termination code.
+                if (!worker.IsAlive() && BrokerWorkerLauncher.Native.GetExitCodeProcess(worker.ProcessHandle, out var code))
+                    exitCode = code;
+            }
+            catch { /* Diagnostic inspection must not replace the original failure. */ }
+            if (exitCode is { } exited)
+                throw new IOException($"Setup {worker.Kind} PID {worker.ProcessId}, registration {worker.Registration:N}, exited with code 0x{exited:x8} before observation completed.", failure);
+            throw;
+        }
     }
     private sealed record Pending(ulong Connection, EnrollmentFrameKind Kind, Task<EnrollmentPersistenceOwner.Reply> Operation, Guid? Enrollment, bool Recovery);
     private static async Task JoinRead(Task<EnrollmentFrame>? read)
