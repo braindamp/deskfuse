@@ -2,6 +2,7 @@ using System.Buffers.Binary;
 using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Security.Authentication;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
@@ -18,23 +19,65 @@ internal static class Program
         if (args.Length != 1 || !args[0].StartsWith(prefix, StringComparison.Ordinal) ||
             !Guid.TryParseExact(args[0][prefix.Length..], "N", out var registration) || registration == Guid.Empty ||
             args[0] != prefix + registration.ToString("N")) return 2;
+        var stage = "protected-control connection";
         try
         {
             using var lifetime = new CancellationTokenSource(TimeSpan.FromMinutes(5));
             using var control = await BrokerControlClient.ConnectWorkerAsync(registration, false, lifetime.Token);
+            stage = "enrollment TLS identity/certificate creation";
             using var identity = ECDsa.Create(ECCurve.NamedCurves.nistP256);
             var request = new CertificateRequest("CN=DeskFuse Enrollment", identity, HashAlgorithmName.SHA256);
             request.CertificateExtensions.Add(new X509BasicConstraintsExtension(false, false, 0, true));
             request.CertificateExtensions.Add(new X509KeyUsageExtension(X509KeyUsageFlags.DigitalSignature, true));
             request.CertificateExtensions.Add(new X509EnhancedKeyUsageExtension(new OidCollection { new("1.3.6.1.5.5.7.3.1") }, false));
             using var certificate = request.CreateSelfSigned(DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow.AddMinutes(10));
+            stage = "enrollment network worker";
             var worker = new SetupNetworkWorker(new(new EnrollmentStreamChannel(control.Stream)), certificate);
             await worker.Run(lifetime.Token); return 0;
         }
-        catch (Exception error) when (error is IOException or UnauthorizedAccessException or AuthenticationException or
-            OperationCanceledException or CryptographicException or SocketException or System.ComponentModel.Win32Exception)
-        { Console.Error.WriteLine("Enrollment transport stopped: " + error.GetType().Name); return 1; }
+        catch (Exception error)
+        {
+            ReportFailure(stage, registration, error);
+            return 1; // Every failure is terminal; never continue with partial trust.
+        }
     }
+
+    private static void ReportFailure(string stage, Guid registration, Exception error)
+    {
+        // Failure-only local evidence. No protocol data, keys or successful events.
+        try
+        {
+            var native = error is System.ComponentModel.Win32Exception win32 ? win32.NativeErrorCode : 0;
+            var message = $"Enrollment transport failed during {stage}; registration={registration:N}; native error={native}: {error}";
+            message = message[..Math.Min(message.Length, 4096)];
+            var source = RegisterEventSourceW(null, "DeskFuse.EnrollmentWorker");
+            if (source != 0)
+            {
+                try
+                {
+                    if (ReportEventW(source, 1, 0, 1002, 0, 1, 0, [message], 0)) return;
+                }
+                finally { _ = DeregisterEventSource(source); }
+            }
+            Console.Error.WriteLine(message);
+        }
+        catch
+        {
+            // Reporting must never replace the original terminal failure.
+            try { Console.Error.WriteLine("Enrollment transport stopped: " + error.GetType().Name); }
+            catch { }
+        }
+    }
+
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern nint RegisterEventSourceW(string? server, string source);
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ReportEventW(nint source, ushort type, ushort category, uint id,
+        nint sid, ushort count, uint size, string[] text, nint data);
+    [DllImport("advapi32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool DeregisterEventSource(nint source);
 }
 
 internal sealed class SetupNetworkWorker(EnrollmentFraming broker, X509Certificate2 certificate)
