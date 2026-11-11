@@ -226,16 +226,21 @@ internal sealed class BrokerWorkerLauncher
             var bytes = new byte[length]; Marshal.Copy(descriptor, bytes, 0, bytes.Length);
             var actual = new RawSecurityDescriptor(bytes, 0);
             var expected = new RawSecurityDescriptor(expectedSddl);
+            static string Describe(RawSecurityDescriptor value)
+            {
+                var sddl = value.GetSddlForm(AccessControlSections.Owner | AccessControlSections.Access);
+                return $"owner={value.Owner}; flags={value.ControlFlags}; count={value.DiscretionaryAcl?.Count}; sddl={sddl[..Math.Min(sddl.Length, 1000)]}";
+            }
             if (actual.Owner != expected.Owner || (actual.ControlFlags & ControlFlags.DiscretionaryAclProtected) == 0 ||
                 actual.DiscretionaryAcl is null || expected.DiscretionaryAcl is null ||
                 actual.DiscretionaryAcl.Count != expected.DiscretionaryAcl.Count)
-                throw new InvalidDataException("Worker object owner or DACL differs from the protected launch profile.");
+                throw new InvalidDataException($"Worker object owner or DACL differs from the protected launch profile. Expected: {Describe(expected)}. Actual: {Describe(actual)}.");
             for (var i = 0; i < expected.DiscretionaryAcl.Count; i++)
             {
                 var a = actual.DiscretionaryAcl[i]; var e = expected.DiscretionaryAcl[i];
                 var ab = new byte[a.BinaryLength]; var eb = new byte[e.BinaryLength];
                 a.GetBinaryForm(ab, 0); e.GetBinaryForm(eb, 0);
-                if (!ab.AsSpan().SequenceEqual(eb)) throw new InvalidDataException("Worker object ACL differs from protected launch profile.");
+                if (!ab.AsSpan().SequenceEqual(eb)) throw new InvalidDataException($"Worker object ACL differs from protected launch profile. Expected: {Describe(expected)}. Actual: {Describe(actual)}.");
             }
         }
         finally { if (descriptor != nint.Zero) Native.LocalFree(descriptor); }
