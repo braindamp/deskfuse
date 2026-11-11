@@ -128,6 +128,7 @@ internal sealed class BrokerAuthorityService
         using var host = BrokerHostIdentity.OpenExisting(authorityRoot, configuration.HostKeyCreationDeploymentId);
         // EnrollmentRecordFiles acquires the one exclusive BrokerAuthority owner lease.
         // Acquiring a second lease here would conflict even inside this process.
+        BrokerAuthorityMetadata.Publish(); // Before any medium client can authenticate us.
         using var store = new TrustedBrokerEnrollmentStore(authorityRoot, host.HostSha256);
         var registry = new BrokerAuthorityState(store);
         var rundown = new BrokerEnrollmentRundown(registry);

@@ -112,6 +112,44 @@ public sealed class BrokerWorkerLaunchTests
             Assert.Throws<InvalidDataException>(() => BrokerWorkerToken.RequireCreatedObjectDescriptor(new RawSecurityDescriptor(invalid), logon));
     }
 
+    [Fact]
+    public void Authority_metadata_profiles_allow_only_interactive_read_access()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        foreach (var pair in new[] { (BrokerAuthorityMetadata.ProcessBaseline, BrokerAuthorityMetadata.ProcessProfile),
+            (BrokerAuthorityMetadata.TokenBaseline, BrokerAuthorityMetadata.TokenProfile) })
+        {
+            BrokerAuthorityMetadata.RequireBaselineOrFinal(new RawSecurityDescriptor(pair.Item1), pair.Item1, pair.Item2);
+            BrokerAuthorityMetadata.RequireBaselineOrFinal(new RawSecurityDescriptor(pair.Item2), pair.Item1, pair.Item2);
+            foreach (var invalid in new[] { pair.Item2 + "(A;;GA;;;AU)", pair.Item2.Replace("O:BA", "O:SY"),
+                pair.Item2.Replace(";;;IU)", ";;;WD)"), pair.Item2.Replace("D:P", "D:") })
+                Assert.Throws<UnauthorizedAccessException>(() => BrokerAuthorityMetadata.RequireBaselineOrFinal(new RawSecurityDescriptor(invalid), pair.Item1, pair.Item2));
+        }
+        var sidBytes = SidBytes(new SecurityIdentifier(WellKnownSidType.InteractiveSid, null));
+        var sid = Marshal.AllocHGlobal(sidBytes.Length);
+        nint manager = 0, interactive = 0;
+        try
+        {
+            Marshal.Copy(sidBytes, 0, sid, sidBytes.Length);
+            Assert.True(Native.AuthzInitializeResourceManager(1, 0, 0, 0, null, out manager));
+            Assert.True(Native.AuthzInitializeContextFromSid(2, sid, manager, 0, 0, 0, out interactive));
+            var process = new RawSecurityDescriptor(BrokerAuthorityMetadata.ProcessProfile);
+            var token = new RawSecurityDescriptor(BrokerAuthorityMetadata.TokenProfile);
+            Assert.True(Check(process, interactive, 0x00101000));
+            Assert.True(Check(token, interactive, 8));
+            foreach (var denied in new uint[] { 1, 2, 8, 0x10, 0x20, 0x40, 0x80, 0x100, 0x200, 0x800, 0x40000, 0x80000 })
+                Assert.False(Check(process, interactive, denied));
+            foreach (var denied in new uint[] { 1, 2, 4, 0x10, 0x20, 0x40, 0x80, 0x100, 0x40000, 0x80000 })
+                Assert.False(Check(token, interactive, denied));
+        }
+        finally
+        {
+            if (interactive != 0) Native.AuthzFreeContext(interactive);
+            if (manager != 0) Native.AuthzFreeResourceManager(manager);
+            Marshal.FreeHGlobal(sid);
+        }
+    }
+
     private static byte[] SidBytes(SecurityIdentifier sid)
     { var bytes = new byte[sid.BinaryLength]; sid.GetBinaryForm(bytes, 0); return bytes; }
 
