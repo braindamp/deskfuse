@@ -9,5 +9,5 @@ public static class WindowsAuthorityClock
 {
     public static ulong Now100Nanoseconds { get { QueryInterruptTimePrecise(out var value); return value; } }
     public static long NowMilliseconds => checked((long)(Now100Nanoseconds / 10000));
-    [DllImport("kernel32.dll")] private static extern void QueryInterruptTimePrecise(out ulong value);
+    [DllImport("api-ms-win-core-realtime-l1-1-1.dll")] private static extern void QueryInterruptTimePrecise(out ulong value);
 }

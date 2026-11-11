@@ -185,6 +185,6 @@ internal sealed class BrokerSpeakerPreparation
         return value;
     }
 
-    [DllImport("kernel32.dll")]
+    [DllImport("api-ms-win-core-realtime-l1-1-1.dll")]
     private static extern void QueryInterruptTimePrecise(out ulong interruptTime);
 }
