@@ -43,6 +43,17 @@ internal static class BrokerWorkerToken
             var error = Native.SetSecurityInfo(copy, 6, 1, owner.Pointer, nint.Zero, nint.Zero, nint.Zero);
             if (error != 0) throw new Win32Exception((int)error, "Cannot assign private token custody to SYSTEM.");
 
+            // Apply the final object DACL after assigning ownership: Windows can
+            // mark OWNER RIGHTS inherit-only during the owner-setting operation.
+            // This duplicate is still private; keep the exact policy effective.
+            var objectAcl = new RawSecurityDescriptor(expected).DiscretionaryAcl!;
+            var objectAclBytes = new byte[objectAcl.BinaryLength];
+            objectAcl.GetBinaryForm(objectAclBytes, 0);
+            using var objectAclMemory = new BrokerWorkerLauncher.NativeBuffer(objectAclBytes.Length);
+            Marshal.Copy(objectAclBytes, 0, objectAclMemory.Pointer, objectAclBytes.Length);
+            error = Native.SetSecurityInfo(copy, 6, 0x80000004, nint.Zero, nint.Zero, objectAclMemory.Pointer, nint.Zero);
+            if (error != 0) throw new Win32Exception((int)error, "Cannot apply the final private token DACL.");
+
             var acl = DefaultAclBytes();
             using var aclMemory = new BrokerWorkerLauncher.NativeBuffer(acl.Length);
             Marshal.Copy(acl, 0, aclMemory.Pointer, acl.Length);
