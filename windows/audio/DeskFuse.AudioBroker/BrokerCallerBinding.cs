@@ -112,7 +112,10 @@ internal sealed class BrokerCallerBinding : IBrokerObservedCaller, IDisposable
 
     private static BrokerLogonIdentity ReadProcessLogon(SafeProcessHandle process, BrokerPipeProfile profile)
     {
-        if (!Native.OpenProcessToken(process, 0x8, out var token)) throw Native.Error("Cannot inspect the local caller token.");
+        // WindowsPrincipal.IsInRole duplicates the primary Setup token for
+        // CheckTokenMembership. Other profiles retain query-only inspection.
+        var access = profile == BrokerPipeProfile.SetupUi ? 0xau : 0x8u;
+        if (!Native.OpenProcessToken(process, access, out var token)) throw Native.Error("Cannot inspect the local caller token.");
         using (token) return profile switch
         {
             BrokerPipeProfile.MediumWorker or BrokerPipeProfile.SpeakerPrepare => BrokerWorkerLauncher.ReadLogon(token),
