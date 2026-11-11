@@ -129,7 +129,7 @@ fun StateScreen(
                 accent = Amber,
             )
 
-            is SessionState.Failed -> Failure(state, onRetry)
+            is SessionState.Failed -> Failure(state, onRetry, onScan)
 
             is SessionState.Ended -> Panel(
                 kicker = "ENDED",
@@ -146,7 +146,7 @@ fun StateScreen(
 }
 
 @Composable
-private fun Failure(state: SessionState.Failed, onRetry: () -> Unit) {
+private fun Failure(state: SessionState.Failed, onRetry: () -> Unit, onScan: () -> Unit) {
     Column(
         Modifier.width(380.dp),
         horizontalAlignment = Alignment.Start,
@@ -190,6 +190,7 @@ private fun Failure(state: SessionState.Failed, onRetry: () -> Unit) {
         if (state.recoverable) {
             ActionButton("Try again", onRetry)
         }
+        ActionButton("Find Windows PC", onScan)
     }
 }
 
