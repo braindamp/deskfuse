@@ -22,7 +22,7 @@ internal static class BrokerLaunchContract
         ["broker_token_default_dacl_information"] = 6,
         ["broker_token_all_access"] = BrokerWorkerToken.AllAccess,
         ["broker_token_query_access"] = BrokerWorkerToken.QueryAccess,
-        ["broker_create_no_window"] = BrokerWorkerLauncher.Native.CreateNoWindow,
+        ["broker_detached_process"] = BrokerWorkerLauncher.Native.DetachedProcess,
         ["broker_extended_limits_size"] = Marshal.SizeOf<BrokerWorkerLauncher.Native.ExtendedLimits>(),
         ["broker_basic_accounting_size"] = Marshal.SizeOf<BrokerWorkerLauncher.Native.BasicAccounting>(),
         ["broker_active_processes_offset"] = Marshal.OffsetOf<BrokerWorkerLauncher.Native.BasicAccounting>(nameof(BrokerWorkerLauncher.Native.BasicAccounting.ActiveProcesses)).ToInt64(),

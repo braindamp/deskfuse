@@ -29,7 +29,7 @@ Do not repair exposed threads after creation or add broad compatibility grants.
 
 Set broker-owned `DOTNET_EnableDiagnostics=0` before managed runtime startup.
 This is also used by the separate high UI environment; its elevated token parser
-is unchanged. Headless medium roles use CREATE_NO_WINDOW. None of these checks
+is unchanged. Headless medium roles use DETACHED_PROCESS (superseding CREATE_NO_WINDOW on 11 November 2026). Hidden-console startup conflicts with the retained no-children policy on the installed Windows PC; detached startup preserves that policy and avoids console-host creation. None of these checks
 adds work to PCM, packet or render processing.
 
 ## Source and executed checks

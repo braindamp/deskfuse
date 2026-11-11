@@ -1,5 +1,10 @@
 # Architecture v0.6 implementation status
 
+## F1 / T03-T04 — detached medium-worker startup (11 November 2026)
+
+The installed enrollment worker's native exit C0000142 was traced to Windows ConsoleInitialize. An unelevated isolated comparison using the installed executable confirmed CREATE_NO_WINDOW succeeds without child restriction, fails with it, and DETACHED_PROCESS reaches managed argument validation with the restriction retained. Central headless medium-worker launch now uses DETACHED_PROCESS; job containment, no-children policy, token/object security and bootstrap checks remain unchanged. SDK ABI metadata now checks the detached flag. This is source correction and isolated native evidence; installed enrollment, first audible Speaker playback and F3 qualification remain pending. No media-path changes or measured latency improvement claimed.
+
+
 Authoritative design: `DeskFuse_Architecture_v0.6_and_Implementation_Programme.md`,
 delivered 27 October 2026. Implementation baseline:
 `experiment/vnext-audio-latency` at `2f181cf2da9c4efdde3013b115108ecac650d1ab`.

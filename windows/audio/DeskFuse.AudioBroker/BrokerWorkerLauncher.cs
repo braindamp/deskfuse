@@ -109,7 +109,7 @@ internal sealed class BrokerWorkerLauncher
             var command = new StringBuilder('"' + image.ExecutablePath + '"' +
                 " --deskfuse-broker-registration=" + registration.ToString("N"));
             if (!Native.CreateProcessAsUserW(privateToken, image.ExecutablePath, command, ref processSecurity, ref threadSecurity,
-                    false, Native.CreateSuspended | Native.CreateNoWindow | Native.CreateUnicodeEnvironment | Native.ExtendedStartupInfoPresent,
+                    false, Native.CreateSuspended | Native.DetachedProcess | Native.CreateUnicodeEnvironment | Native.ExtendedStartupInfoPresent,
                     environment, image.WorkingDirectory, ref startup, out var created))
                 throw Native.Error("Trusted worker creation failed.");
             worker = new BrokerRegisteredWorker(created, registration, actualLogon, image, job, kind);
@@ -349,7 +349,7 @@ internal sealed class BrokerWorkerLauncher
 
     internal static class Native
     {
-        internal const uint CreateSuspended = 0x4, CreateNoWindow = 0x08000000, CreateUnicodeEnvironment = 0x400, ExtendedStartupInfoPresent = 0x80000;
+        internal const uint CreateSuspended = 0x4, DetachedProcess = 0x00000008, CreateUnicodeEnvironment = 0x400, ExtendedStartupInfoPresent = 0x80000;
         internal const ulong CreationMitigations = (1UL << 32) | (1UL << 52) | (1UL << 56) | (1UL << 60);
         internal static Win32Exception Error(string message) => new(Marshal.GetLastWin32Error(), message);
         [StructLayout(LayoutKind.Sequential)] internal struct SecurityAttributes { internal uint Length; internal nint Descriptor; internal int Inherit; }

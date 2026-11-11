@@ -72,7 +72,7 @@ int main() {
     VALUE("broker_token_default_dacl_information", TokenDefaultDacl);
     VALUE("broker_token_all_access", TOKEN_ALL_ACCESS);
     VALUE("broker_token_query_access", READ_CONTROL | TOKEN_QUERY);
-    VALUE("broker_create_no_window", CREATE_NO_WINDOW);
+    VALUE("broker_detached_process", DETACHED_PROCESS);
     VALUE("broker_extended_limits_size", sizeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION));
     VALUE("broker_basic_accounting_size", sizeof(JOBOBJECT_BASIC_ACCOUNTING_INFORMATION));
     VALUE("broker_active_processes_offset", offsetof(JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, ActiveProcesses));
