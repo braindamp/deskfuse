@@ -4,6 +4,12 @@ Authoritative design: `DeskFuse_Architecture_v0.6_and_Implementation_Programme.m
 delivered 27 October 2026. Implementation baseline:
 `experiment/vnext-audio-latency` at `2f181cf2da9c4efdde3013b115108ecac650d1ab`.
 
+## F0b / F1 / T03-T04 and F3 / T09 / H3 - local continuation, 11 November 2026
+
+The matched 21bfb42 Android debug APK installed on the connected handset. A current-source audio driver was built with WDK 10.0.26100.0, catalog-checked, locally development-signed and registered as oem7.inf; the previous oem128 package is preserved. Actual new-driver source admission is not yet observed. No boot settings changed.
+
+The exact signed authority installation stopped before service publication: the Windows software KSP returned one protected SYSTEM-only ACE with mask 0xd01f01ff, which the validator rejected. Accept that observed full-access representation while retaining exact SYSTEM owner/group, protected DACL and single noncallback SYSTEM-only allow ACE. Broker Release self-contained publication passed. The partial authority namespace/key/deployment are retained for explicit recovery; no playback or full installation pass is claimed.
+
 ## Current v0.6 milestone completion — 9 November 2026
 
 | Original phase / tranche | Source | Integration | Device qualification | Release enablement | Next task |

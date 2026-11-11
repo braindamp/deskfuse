@@ -109,7 +109,10 @@ internal sealed class BrokerHostIdentity : IDisposable, IEnrollmentHostSigner, I
                 (ControlFlags.DiscretionaryAclPresent | ControlFlags.DiscretionaryAclProtected) ||
             descriptor.DiscretionaryAcl is not { Count: 1 } acl || acl[0] is not CommonAce ace ||
             ace.AceType != AceType.AccessAllowed || ace.AceFlags != AceFlags.None || ace.IsCallback || ace.SecurityIdentifier != system ||
-            ace.AccessMask is not (unchecked((int)0x10000000)) and not 0x001f019b)
+            // The software KSP on Windows 10 can retain generic rights while
+            // adding its full-access mapping to this same SYSTEM-only ACE.
+            ace.AccessMask is not (unchecked((int)0x10000000)) and not 0x001f019b
+                and not (unchecked((int)0xd01f01ff)))
             throw new UnauthorizedAccessException("Host signing key is not SYSTEM-only.");
     }
 
