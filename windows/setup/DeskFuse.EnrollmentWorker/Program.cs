@@ -1,11 +1,9 @@
 using System.Buffers.Binary;
 using System.Net;
-using System.Net.Security;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Security.Authentication;
 using System.Security.Cryptography;
-using System.Security.Cryptography.X509Certificates;
 using DeskFuse.AudioBroker;
 using DeskFuse.WindowsSecurity;
 
@@ -25,14 +23,9 @@ internal static class Program
             using var lifetime = new CancellationTokenSource(TimeSpan.FromMinutes(5));
             using var control = await BrokerControlClient.ConnectWorkerAsync(registration, false, lifetime.Token);
             stage = "enrollment TLS identity/certificate creation";
-            using var identity = ECDsa.Create(ECCurve.NamedCurves.nistP256);
-            var request = new CertificateRequest("CN=DeskFuse Enrollment", identity, HashAlgorithmName.SHA256);
-            request.CertificateExtensions.Add(new X509BasicConstraintsExtension(false, false, 0, true));
-            request.CertificateExtensions.Add(new X509KeyUsageExtension(X509KeyUsageFlags.DigitalSignature, true));
-            request.CertificateExtensions.Add(new X509EnhancedKeyUsageExtension(new OidCollection { new("1.3.6.1.5.5.7.3.1") }, false));
-            using var certificate = request.CreateSelfSigned(DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow.AddMinutes(10));
+            var identity = EnrollmentTlsIdentity.Create();
             stage = "enrollment network worker";
-            var worker = new SetupNetworkWorker(new(new EnrollmentStreamChannel(control.Stream)), certificate);
+            var worker = new SetupNetworkWorker(new(new EnrollmentStreamChannel(control.Stream)), identity);
             await worker.Run(lifetime.Token); return 0;
         }
         catch (Exception error)
@@ -80,7 +73,7 @@ internal static class Program
     private static extern bool DeregisterEventSource(nint source);
 }
 
-internal sealed class SetupNetworkWorker(EnrollmentFraming broker, X509Certificate2 certificate)
+internal sealed class SetupNetworkWorker(EnrollmentFraming broker, EnrollmentTlsIdentity identity)
 {
     private sealed record Client(ulong Id, TcpClient Socket, EnrollmentFraming Frames);
     private readonly object gate = new();
@@ -94,7 +87,7 @@ internal sealed class SetupNetworkWorker(EnrollmentFraming broker, X509Certifica
         using var stop = CancellationTokenSource.CreateLinkedTokenSource(ct);
         using var listener = new TcpListener(IPAddress.Any, 0); listener.Start(1);
         var port = ((IPEndPoint)listener.LocalEndpoint).Port;
-        var cert = certificate.RawData;
+        var cert = identity.CertificateDer;
         if (cert.Length > 2048) throw new InvalidDataException("Enrollment TLS certificate exceeds its bound.");
         var ready = new byte[cert.Length + 4]; BinaryPrimitives.WriteUInt16BigEndian(ready, (ushort)port);
         BinaryPrimitives.WriteUInt16BigEndian(ready.AsSpan(2), (ushort)cert.Length); cert.CopyTo(ready, 4);
@@ -142,7 +135,7 @@ internal sealed class SetupNetworkWorker(EnrollmentFraming broker, X509Certifica
             if (frame.Kind == EnrollmentFrameKind.PublishOffer)
             {
                 var signed = EnrollmentFraming.ParseSigned(frame.Body); var offer = EnrollmentProtocol.ParseOffer(signed.Message);
-                if (!CryptographicOperations.FixedTimeEquals(SHA256.HashData(certificate.RawData), offer.TlsLeafSha256) ||
+                if (!CryptographicOperations.FixedTimeEquals(SHA256.HashData(identity.CertificateDer), offer.TlsLeafSha256) ||
                     !EnrollmentProtocol.Verify(offer.HostSpki, signed.Message, signed.Signature))
                     throw new InvalidDataException("Broker offer does not bind this TLS leaf.");
                 lock (gate)
@@ -180,16 +173,13 @@ internal sealed class SetupNetworkWorker(EnrollmentFraming broker, X509Certifica
             Client? client = null;
             try
             {
-                using var tls = new SslStream(socket.GetStream(), false);
+                var tls = new EnrollmentTlsChannel(socket.GetStream(), identity);
                 using (var handshake = CancellationTokenSource.CreateLinkedTokenSource(ct))
                 {
                     handshake.CancelAfter(TimeSpan.FromSeconds(5));
-                    await tls.AuthenticateAsServerAsync(new SslServerAuthenticationOptions
-                    { ServerCertificate = certificate, ClientCertificateRequired = false, EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
-                        CertificateRevocationCheckMode = X509RevocationMode.NoCheck, AllowRenegotiation = false }, handshake.Token);
+                    await tls.AuthenticateAsync(handshake.Token);
                 }
-                if (!AllowedCipher(tls.NegotiatedCipherSuite)) throw new AuthenticationException("ECDHE/AEAD TLS is required.");
-                var framing = new EnrollmentFraming(new EnrollmentStreamChannel(tls));
+                var framing = new EnrollmentFraming(tls);
                 byte[] offer;
                 lock (gate) { client = new(checked(++nextConnection), socket, framing); current = client; offer = publicOffer!.ToArray(); }
                 await framing.WriteAsync(EnrollmentFrameKind.Offer, offer, ct);
@@ -213,8 +203,4 @@ internal sealed class SetupNetworkWorker(EnrollmentFraming broker, X509Certifica
             }
         }
     }
-    private static bool AllowedCipher(TlsCipherSuite cipher) => cipher is TlsCipherSuite.TLS_AES_128_GCM_SHA256 or
-        TlsCipherSuite.TLS_AES_256_GCM_SHA384 or TlsCipherSuite.TLS_CHACHA20_POLY1305_SHA256 or
-        TlsCipherSuite.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 or TlsCipherSuite.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 or
-        TlsCipherSuite.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256;
 }

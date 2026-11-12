@@ -10,6 +10,7 @@
     <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
   <ItemGroup>
+    <PackageReference Include="BouncyCastle.Cryptography" Version="[2.7.0]" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
     <PackageReference Include="xunit" Version="2.9.2" />
     <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
@@ -18,6 +19,7 @@
     <ProjectReference Include="..\FocusWindow.Core\FocusWindow.Core.csproj" />
     <ProjectReference Include="..\..\tools\DeskFuse.DriverTestOwner.Core\DeskFuse.DriverTestOwner.Core.csproj" />
     <ProjectReference Include="..\..\tools\DeskFuse.DriverTestOwner\DeskFuse.DriverTestOwner.csproj" />
+    <Compile Include="..\..\setup\DeskFuse.EnrollmentWorker\EnrollmentTlsChannel.cs" Link="Enrollment\EnrollmentTlsChannel.cs" />
     <!-- Exercise the production pipe/identity code without Windows audio APIs. -->
     <Compile Include="..\..\audio\DeskFuse.Audio\PhoneEndpointBrokerClient.cs" Link="Audio\PhoneEndpointBrokerClient.cs" />
     <Compile Include="..\..\audio\DeskFuse.Audio\PhoneEndpointContract.cs" Link="Audio\PhoneEndpointContract.cs" />

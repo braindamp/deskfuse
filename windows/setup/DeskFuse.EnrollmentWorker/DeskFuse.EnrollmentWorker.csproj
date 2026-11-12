@@ -13,6 +13,7 @@
     <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
   <ItemGroup>
+    <PackageReference Include="BouncyCastle.Cryptography" Version="[2.7.0]" />
     <ProjectReference Include="..\..\security\DeskFuse.WindowsSecurity\DeskFuse.WindowsSecurity.csproj" />
     <Compile Include="..\..\audio\DeskFuse.AudioBroker\EnrollmentProtocol.cs" Link="Protocol\EnrollmentProtocol.cs" />
     <Compile Include="..\..\audio\DeskFuse.AudioBroker\EnrollmentFraming.cs" Link="Protocol\EnrollmentFraming.cs" />

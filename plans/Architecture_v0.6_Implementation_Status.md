@@ -1,5 +1,20 @@
 # Architecture v0.6 implementation status
 
+## F1 / T03-T04 — Windows 10 enrollment TLS compatibility (12 November 2026)
+
+The connected phone reached the setup TCP listener but received TLS EOF. Matching
+Schannel event 36869 identified the temporary credential's missing private-key
+provider information. A protected named-key evaluation also failed without
+ordinary-user key-use rights; that route was rejected. Enrollment now uses a
+pinned Bouncy Castle 2.7.0 adapter inside the same medium worker, retaining its
+in-memory P-256 identity, signed leaf/offer binding, TLS 1.2 ECDHE/ECDSA + AEAD,
+bounded records/handshake and terminal cancellation. No key persistence, SYSTEM
+network parser, global TLS change, driver or audio timing change is introduced.
+This is the narrow implementation correction documented in the existing trusted
+enrollment plan. Local pinned TLS, simultaneous read/write and cancellation
+passed. Installed pairing, trusted Speaker first sound (F3 / T09 / H3), broadcast
+discovery and production qualification remain open.
+
 ## F1 / T03-T04 — detached medium-worker startup (11 November 2026)
 
 The installed enrollment worker's native exit C0000142 was traced to Windows ConsoleInitialize. An unelevated isolated comparison using the installed executable confirmed CREATE_NO_WINDOW succeeds without child restriction, fails with it, and DETACHED_PROCESS reaches managed argument validation with the restriction retained. Central headless medium-worker launch now uses DETACHED_PROCESS; job containment, no-children policy, token/object security and bootstrap checks remain unchanged. SDK ABI metadata now checks the detached flag. This is source correction and isolated native evidence; installed enrollment, first audible Speaker playback and F3 qualification remain pending. No media-path changes or measured latency improvement claimed.

@@ -1,5 +1,17 @@
 # Trusted enrollment bootstrap — settled design and High implementation plan
 
+**Windows 10 installed TLS correction, 12 November 2026 (F1 / T03-T04):**
+The reference PC rejected the in-memory certificate in Schannel (event 36869;
+phone TCP succeeded, TLS ended with EOF). Keep the process/key/consent contract:
+the medium enrollment worker now uses pinned BouncyCastle.Cryptography 2.7.0
+only for enrollment TLS, with TLS 1.2 ECDHE/ECDSA + AEAD and no resumption.
+Its fresh P-256 leaf/key remain in that process; no PFX, key-file permission
+exception, SYSTEM TLS parser or machine policy change. The transient in-memory
+PKCS#8 transfer buffer is zeroed. This narrowly supersedes the platform-TLS
+implementation choice in section 5.1, not the enrollment protocol or audio TLS.
+Local pinned-handshake, full-duplex and cancellation checks passed; installed
+worker/phone pairing and audible Speaker output remain unqualified.
+
 **Focused E5 durability resolution, 29 October 2026:**
 [Enrollment_Durable_Completion_High_Handoff.md](Enrollment_Durable_Completion_High_Handoff.md)
 settles direct private publication, exact-byte retry/startup completion, retained
