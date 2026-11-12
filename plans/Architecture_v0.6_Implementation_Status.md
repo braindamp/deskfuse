@@ -1,5 +1,20 @@
 # Architecture v0.6 implementation status
 
+## F3 / T09 / H3 — request the qualified short engine period (12 November 2026)
+
+A read-only query on the selected PC's exact DeskFuse endpoint reported a matching
+48 kHz format, a current/default 480-frame engine period (10 ms), and a legal
+minimum of 128 frames (about 2.67 ms). The committed native source requires an
+actual period of at most 240 frames, but ordinary Speaker preparation passed
+minimumPeriod=false. It now requests the existing minimum-period owner, which
+queries the legal period, owns the event-driven companion and verifies the actual
+period and driver contract. No guessed period, relaxed limit or loopback fallback
+is introduced. More frequent engine processing can increase CPU work; no CPU or
+physical-latency improvement is claimed without measurement. The user approved
+this change before implementation. Driver, native binaries, Android, PCM buffers,
+authority checks and H4 gates are unchanged. Installed audible playback remains
+unqualified; this fixes a concrete source-configuration blocker.
+
 ## F3 / T09 / H3 — bounded cold Speaker startup (12 November 2026)
 
 The ordinary Speaker listener used a 1.5-second quarantined route lifetime,

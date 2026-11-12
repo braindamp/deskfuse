@@ -125,10 +125,12 @@ internal sealed class BrokerSpeakerPreparation
         // Cold first delivery includes PnP endpoint/source preparation. Keep its
         // existing phone setup budget, rather than the 1.5 s alternate-route warm
         // interval. This is a maximum control lifetime, never an audio delay.
-        // Conservative existing Game source. No H4 or automatic dual delivery.
+        // The committed source requires an actual engine period <= 240 frames.
+        // Request the existing legal minimum-period owner; a default 480-frame
+        // engine cannot satisfy that contract. No H4 or automatic dual delivery.
         var preparedSession = await BrokerProtectedAudioAcquisition.OpenAsync(
             deployment, host, store, registry, rundown, logon, enrollment, serviceBoot,
-            new AudioLeasePolicy(1_800_000, 30_000), new AudioWireContext(1, 1, 1), false,
+            new AudioLeasePolicy(1_800_000, 30_000), new AudioWireContext(1, 1, 1), minimumPeriod: true,
             bind, new AudioCandidatePolicy(15_000, 10_000, 8, 128, 65536, 32, 8, 8, 500),
             Clock100ns, cancellation, handover: false).ConfigureAwait(false);
         var owned = new Prepared(preparedSession, DateTimeOffset.UtcNow.AddSeconds(30));
