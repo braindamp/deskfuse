@@ -199,6 +199,55 @@ internal static class Program
             DeviceInstance.Matrix();
             return 0;
         }
+        // Interactive, phone-free diagnostic only. Creates one uniquely named
+        // throwaway endpoint and removes it when ENTER is pressed.
+        if (args.Length == 1 && args[0] == "period-probe-endpoint")
+        {
+            if (!IsElevated())
+            {
+                Console.Error.WriteLine("Run period-probe-endpoint in an elevated shell.");
+                return 1;
+            }
+            PhoneDevice? device = null;
+            try
+            {
+                var path = PhoneEndpointContract.InstancePath(Guid.NewGuid().ToString("N"));
+                try
+                {
+                    device = DeviceInstance.Create(path, PhoneEndpointContract.HardwareId,
+                        "DeskFuse Period Probe", "DeskFuse");
+                }
+                catch (DeviceCreationIncompleteException error)
+                {
+                    device = error.Device; // preserve cleanup ownership if creation was partial
+                    throw;
+                }
+                var endpoint = await EndpointResolver.ResolveAsync(device.InstancePath,
+                    TimeSpan.FromSeconds(20), CancellationToken.None);
+                if (endpoint is null)
+                    throw new InvalidOperationException("Temporary endpoint did not appear.");
+                Console.WriteLine("ENDPOINT_ID=" + endpoint);
+                Console.WriteLine("Run deskfuse-period-probe using this exact ID in a second shell.");
+                Console.WriteLine("Press ENTER here AFTER the probe finishes to remove the endpoint.");
+                if (Console.ReadLine() is null)
+                    throw new InvalidOperationException("Interactive console input required.");
+                return 0;
+            }
+            catch (Exception error)
+            {
+                Console.Error.WriteLine("Period probe endpoint failed: " + error.Message);
+                return 2;
+            }
+            finally
+            {
+                if (device is not null)
+                {
+                    Console.WriteLine("Removing temporary probe endpoint...");
+                    await DeviceInstance.RemoveAsync(device.InstancePath);
+                    Console.WriteLine("Temporary probe endpoint removed.");
+                }
+            }
+        }
         if (args.Length >= 1 && args[0] == "devprobe")
         {
             DeviceInstance.Probe();
