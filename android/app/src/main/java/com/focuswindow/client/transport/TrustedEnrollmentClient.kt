@@ -135,12 +135,19 @@ internal class TrustedEnrollmentClient private constructor(
         require(kind in setOf(TrustedSetupWire.OFFER, TrustedSetupWire.FROZEN, TrustedSetupWire.RECEIPT, TrustedSetupWire.STATUS, TrustedSetupWire.CANCEL))
         kind to ByteArray(size - 1).also { input.readFully(it) }
     }
-    override fun close() { if (stopped.compareAndSet(false, true)) socket.close() }
+    override fun close() { if (stopped.compareAndSet(false, true)) closeSocketOffMain(socket) }
 
     companion object {
+        // TLS close can send close_notify. Cleanup must outlive the disposed UI scope.
+        private fun closeSocketOffMain(socket: SSLSocket) {
+            CoroutineScope(Dispatchers.IO).launch {
+                try { socket.close() } catch (_: java.io.IOException) { }
+            }
+        }
+
         suspend fun connect(host: String, port: Int, signer: AndroidBrokerDeviceSigner, repository: TrustedEnrollmentRepository): TrustedEnrollmentClient = suspendCancellableCoroutine { continuation ->
             val pending = AtomicReference<SSLSocket?>()
-            continuation.invokeOnCancellation { pending.getAndSet(null)?.close() }
+            continuation.invokeOnCancellation { pending.getAndSet(null)?.let { closeSocketOffMain(it) } }
             CoroutineScope(continuation.context).launch(Dispatchers.IO) {
                 try {
                     val client = connectBlocking(host, port, signer, repository) { socket ->
