@@ -45,6 +45,7 @@ struct DeskFusePcmSource {
     deskfuse::PcmGeometry geometry;
     DeskFusePcmBindDiagnostic trace;
     void* traceStreams[16];
+    DeskFusePcmTraceEvent traceMetadata[16];
     ULONGLONG traceSerials[16], nextSerial;
 };
 namespace {
@@ -54,7 +55,10 @@ ULONGLONG TraceSerial(DeskFusePcmSource* s,void* stream) {
 ULONG TraceFlags(DeskFusePcmSource* s) {return (s->active?1u:0u)|(s->removed?2u:0u)|(s->denied?4u:0u)|(s->running?8u:0u)|(s->stream?16u:0u);}
 void TraceEvent(DeskFusePcmSource* s,ULONG kind,void* stream) {
     auto& d=s->trace;
-    DeskFuseTraceAppend(d,{0,TraceSerial(s,stream),s->generation,kind,s->streams,d.denials,TraceFlags(s),d.pin,d.mode,d.geometry,d.alignment});
+    DeskFusePcmTraceEvent e={};
+    if(stream)for(unsigned i=0;i<16;++i)if(s->traceStreams[i]==stream){e=s->traceMetadata[i];break;}
+    e.serial=TraceSerial(s,stream);e.generation=s->generation;e.kind=kind;e.streams=s->streams;e.denials=d.denials;e.flags=TraceFlags(s);
+    DeskFuseTraceAppend(d,e);
 }
 void CaptureBind(FileContext* f,DeskFusePcmSource* s,NTSTATUS status) {
     auto& d=f->diagnostic;
@@ -351,6 +355,7 @@ void DeskFusePcmStreamOpen(DeskFusePcmSource* source,void* stream,bool eligible,
     KIRQL irql;KeAcquireSpinLock(&source->lock,&irql);
     for(unsigned i=0;i<16;++i)if(!source->traceStreams[i]){source->traceStreams[i]=stream;source->traceSerials[i]=++source->nextSerial;break;}
     auto& d=source->trace;d.pin=pin;d.mode=mode;d.alignment=alignment;d.geometry={0,0,0,rate,channels,bits};
+    for(unsigned i=0;i<16;++i)if(source->traceStreams[i]==stream){auto& e=source->traceMetadata[i];e={};e.pin=pin;e.mode=mode;e.geometry=d.geometry;e.alignment=alignment;break;}
     ++source->streams;
     if (source->streams==1 && eligible && !source->removed) {source->stream=stream;source->denied=false;source->geometry={};d.firstDenial=0;d.denials=0;}
     else {DeskFuseTraceDeny(d,(source->streams>1?1u:0u)|(!eligible?2u:0u)|(source->removed?128u:0u));source->stream=nullptr;source->denied=true;RevokeLocked(source);}
@@ -385,7 +390,10 @@ void DeskFusePcmGeometryUpdate(DeskFusePcmSource* source,void* stream,
     if (!source) return;
     const auto next=deskfuse::pcm_geometry(notifications,packetFrames,rate,channels,bits);
     KIRQL irql;KeAcquireSpinLock(&source->lock,&irql);
-    if(!deskfuse::same_geometry(source->trace.geometry,next)) {source->trace.geometry=next;TraceEvent(source,3,stream);}
+    for(unsigned i=0;i<16;++i)if(source->traceStreams[i]==stream){
+        auto& e=source->traceMetadata[i];
+        if(!deskfuse::same_geometry(e.geometry,next)){e.geometry=next;source->trace.geometry=next;TraceEvent(source,3,stream);}break;
+    }
     if (source->stream==stream && !source->removed) {
         const bool changed=source->geometry.state==1 && !deskfuse::same_geometry(source->geometry,next);
         source->geometry=next;
