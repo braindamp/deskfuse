@@ -153,11 +153,11 @@ internal sealed class BrokerAudioControlDispatcher : IAudioWorkerEventOwner
         if (m.Kind == (byte)AudioNetworkKind.SignedSourceStop)
         {
             if (!job.Stop!.Complete()) throw new UnauthorizedAccessException("Invalid source Stop signature.");
-            RequestRundown();
+            RequestRundown("SignedSourceStop");
             await Publish().ConfigureAwait(false); return [(byte)AudioSourceStopState.Denied];
         }
         if (m.Kind == (byte)AudioNetworkKind.Stop)
-        { RequestRundown(); await Publish().ConfigureAwait(false); return [(byte)AudioSourceStopState.Denied]; }
+        { RequestRundown("Stop"); await Publish().ConfigureAwait(false); return [(byte)AudioSourceStopState.Denied]; }
         if (m.Kind == (byte)AudioNetworkKind.Info) return b.Length == 0 ? owner.Source.Bytes : owner.BindingDescriptor();
         if (m.Kind == (byte)AudioNetworkKind.Status) return owner.SignedRequestStatus(origin, b, signStatus);
         if (m.Kind == (byte)AudioNetworkKind.SourceStopStatus) return owner.QueryStopStatus(b, signStopStatus);
@@ -240,9 +240,10 @@ internal sealed class BrokerAudioControlDispatcher : IAudioWorkerEventOwner
         }
         catch (Exception error) { owner.CloseAdmission(); fail(error); throw; }
     }
-    private void RequestRundown()
+    private void RequestRundown(string origin)
     {
         if (Interlocked.Exchange(ref rundownRequested, 1) != 0) return;
+        StartupTrace.Write($"BROKER shutdown_origin={origin}");
         // Composition queues the actual retained resource-owner operation here;
         // that operation joins this dispatcher, so this job must not await it.
         try { requestRundown(); }

@@ -19,6 +19,19 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+// Failure-only Android log; no per-packet logging or control-path changes.
+#[link(name = "log")]
+extern "C" {
+    fn __android_log_write(priority: i32, tag: *const c_char, text: *const c_char) -> i32;
+}
+fn log_play_failure(operation: &str, error: &io::Error, stream_error: i32) {
+    let text = format!("Native PLAY failure operation={operation} kind={:?} native={:?} stream_error={stream_error} detail={error}", error.kind(), error.raw_os_error());
+    let bounded: String = text.chars().take(1536).collect::<String>().replace('\0', "\\0");
+    if let Ok(text) = std::ffi::CString::new(bounded) {
+        unsafe { __android_log_write(6, b"DeskFuseAudio\0".as_ptr().cast(), text.as_ptr()); }
+    }
+}
+
 const RENEW_ISSUE: u8 = 131;
 const RENEW_PROOF: u8 = 132;
 const RENEW_RESULT: u8 = 133;
@@ -509,37 +522,47 @@ impl AudioRun {
         on_ready();
         let mut packet = [0; 1350];
         let mut pending = None;
+        let mut operation = "delivery.service";
+        let mut stream_error = 0;
         let result = (|| -> io::Result<()> {
             loop {
+                operation = "delivery.service";
                 let records = self.delivery.service(owner, false)?;
-                if pending.is_some() { self.service_reply(records, &mut pending, owner)?; }
+                if pending.is_some() { operation = "service_reply"; self.service_reply(records, &mut pending, owner)?; }
                 let media = self.playback.as_mut().unwrap();
-                if media
+                operation = "renderer.snapshot";
+                stream_error = media
                     .renderer()
                     .snapshot()
                     .map_err(io::Error::other)?
-                    .stream_error
-                    != 0
-                {
+                    .stream_error;
+                if stream_error != 0 {
+                    operation = "renderer.stream_error";
                     return Err(denied());
                 }
                 let mut drained = false;
                 for _ in 0..128 {
+                    operation = "owner.live.receive";
                     owner.live()?;
+                    operation = "connection.phone_datagram";
                     let Some(size) = self.delivery.connection.phone_datagram(&mut packet)? else {
                         drained = true;
                         break;
                     };
+                    operation = "media.receive";
                     media
                         .receive(&packet[..size], path)
                         .map_err(|error| io::Error::other(error.to_string()))?;
                 }
+                operation = "owner.live.finish_batch";
                 owner.live()?;
+                operation = "media.finish_batch";
                 media
                     .finish_batch(path)
                     .map_err(|error| io::Error::other(error.to_string()))?;
                 let signaled = if drained {
                     let until = pending.as_ref().map_or(u64::MAX, |reply: &PendingReply| reply.until);
+                    operation = "owner.wait";
                     owner.wait(&self.delivery, until, false)?
                 } else {
                     owner.command_pending.load(Ordering::Acquire)
@@ -549,6 +572,7 @@ impl AudioRun {
                 }
             }
         })();
+        if let Err(error) = &result { log_play_failure(operation, error, stream_error); }
         owner.playing.store(false, Ordering::Release);
         owner.commands.lock().map_err(|_| denied())?.take();
         self.playback = None;
