@@ -1290,7 +1290,7 @@ CMiniportWaveRT::StreamCreated
         const auto& f=_Stream->m_pWfExt->Format;
         DeskFusePcmStreamOpen(m_PcmSource,_Stream,IsSystemRenderPin(_Pin) &&
             IsEqualGUID(_Stream->m_SignalProcessingMode,AUDIO_SIGNALPROCESSINGMODE_DEFAULT) &&
-            f.nSamplesPerSec==48000 && f.nChannels==2 && f.wBitsPerSample==16 && f.nBlockAlign==4);
+            f.nSamplesPerSec==48000 && f.nChannels==2 && f.wBitsPerSample==16 && f.nBlockAlign==4,_Pin,_Stream->m_SignalProcessingMode,f.nSamplesPerSec,f.nChannels,f.wBitsPerSample,f.nBlockAlign);
     }
     return STATUS_SUCCESS;
 }

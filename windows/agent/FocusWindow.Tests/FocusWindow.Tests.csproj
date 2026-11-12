@@ -49,6 +49,8 @@
     <Compile Include="..\..\audio\DeskFuse.AudioBroker\BrokerAudioControlDispatcher.cs" Link="Audio\BrokerAudioControlDispatcher.cs" />
     <Compile Include="..\..\audio\DeskFuse.AudioBroker\AudioAuthorityProtocol.cs" Link="Audio\AudioAuthorityProtocol.cs" />
     <Compile Include="..\..\audio\DeskFuse.AudioBroker\PcmGrant.cs" Link="Audio\PcmGrant.cs" />
+    <Compile Include="..\..\audio\DeskFuse.AudioBroker\PcmBindDiagnostic.cs" Link="Audio\PcmBindDiagnostic.cs" />
+    <Compile Include="..\..\audio\DeskFuse.AudioBroker\StartupTrace.cs" Link="Audio\StartupTrace.cs" />
     <Compile Include="..\..\audio\DeskFuse.AudioBroker\AudioRequestProtocol.cs" Link="Audio\AudioRequestProtocol.cs" />
     <Compile Include="..\..\audio\DeskFuse.AudioBroker\AudioSourceStopProtocol.cs" Link="Audio\AudioSourceStopProtocol.cs" />
     <Compile Include="..\..\audio\DeskFuse.AudioBroker\BrokerAudioOwner.cs" Link="Audio\BrokerAudioOwner.cs" />

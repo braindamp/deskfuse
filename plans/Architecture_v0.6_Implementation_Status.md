@@ -1,5 +1,20 @@
 # Architecture v0.6 implementation status
 
+## F3 / T09 / H3 — read-only failed-bind diagnostics (12 November 2026)
+
+Paired capture confirms PCM_BIND/170 before native EOF. The driver now caches a
+fixed-size, independently versioned diagnostic at bind rejection, before partial
+session cleanup. The creator-only diagnostic IOCTL works without a successful
+export and exposes no PCM, handles or kernel addresses. It records setup stage,
+status, source/owner state, geometry, denial origins and eight recent transitions.
+The broker preserves the original bind error if the optional query fails.
+All original admission, DRM/protection, stream/generation and receipt barriers
+remain unchanged. Diagnostic-only bookkeeping is not a latency measurement.
+Unsigned WDK driver and broker builds passed; bounded native history/snapshot
+checks and 15 focused managed control/ABI checks passed. User-only signing,
+driver deployment and rollback are required; no driver action was performed by
+the agent. First audible playback and all physical qualification remain pending.
+
 ## F3 / T09 / H3 — bounded cross-process startup diagnostics (12 November 2026)
 
 The latest attempt records native control EOF without the earlier Win32 busy

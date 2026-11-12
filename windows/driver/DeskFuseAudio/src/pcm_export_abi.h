@@ -14,6 +14,8 @@
 #define DESKFUSE_PCM_ACK_ARM DESKFUSE_PCM_IOCTL(2)
 #define DESKFUSE_PCM_FENCE DESKFUSE_PCM_IOCTL(3)
 #define DESKFUSE_PCM_REVOKE DESKFUSE_PCM_IOCTL(4)
+#define DESKFUSE_PCM_LAST_BIND_DIAGNOSTIC DESKFUSE_PCM_IOCTL(5)
+#include "pcm_bind_diagnostic.h"
 struct DeskFusePcmBind { unsigned int size, abi; GUID source; unsigned long long process_handle; };
 struct DeskFusePcmHandles { unsigned int size, abi; unsigned long long section, event, generation; };
 struct DeskFusePcmControl {

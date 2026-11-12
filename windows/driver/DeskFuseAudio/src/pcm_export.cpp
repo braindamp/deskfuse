@@ -25,7 +25,7 @@ struct Session {
     deskfuse::PcmCredits credits;
     bool revoked, storageReleased;
 };
-struct FileContext { PEPROCESS creator; Session* session; ERESOURCE serial; };
+struct FileContext { PEPROCESS creator; Session* session; ERESOURCE serial; DeskFusePcmBindDiagnostic diagnostic; };
 struct FileSerial {
     ERESOURCE* lock;
     explicit FileSerial(ERESOURCE* value):lock(value) {KeEnterCriticalRegion();ExAcquireResourceExclusiveLite(lock,TRUE);}
@@ -43,8 +43,25 @@ struct DeskFusePcmSource {
     bool removed, running, denied;
     ULONGLONG generation, correlationFrame, correlationQpc;
     deskfuse::PcmGeometry geometry;
+    DeskFusePcmBindDiagnostic trace;
+    void* traceStreams[16];
+    ULONGLONG traceSerials[16], nextSerial;
 };
 namespace {
+ULONGLONG TraceSerial(DeskFusePcmSource* s,void* stream) {
+    if(!stream)return 0;for(unsigned i=0;i<16;++i)if(s->traceStreams[i]==stream)return s->traceSerials[i];return 0;
+}
+ULONG TraceFlags(DeskFusePcmSource* s) {return (s->active?1u:0u)|(s->removed?2u:0u)|(s->denied?4u:0u)|(s->running?8u:0u)|(s->stream?16u:0u);}
+void TraceEvent(DeskFusePcmSource* s,ULONG kind,void* stream) {
+    auto& d=s->trace;
+    DeskFuseTraceAppend(d,{0,TraceSerial(s,stream),s->generation,kind,s->streams,d.denials,TraceFlags(s),d.pin,d.mode,d.geometry,d.alignment});
+}
+void CaptureBind(FileContext* f,DeskFusePcmSource* s,NTSTATUS status) {
+    auto& d=f->diagnostic;
+    const auto stage=d.stage;d=s->trace;d.size=sizeof(d);d.abi=1;d.stage=stage;d.status=status;d.source=s->id;
+    d.generation=s->generation;d.flags=TraceFlags(s);d.streams=s->streams;d.selected=TraceSerial(s,s->stream);d.geometry=s->geometry;
+    if(s->active){d.owner=reinterpret_cast<ULONG_PTR>(PsGetProcessId(s->active->owner));d.consumer=reinterpret_cast<ULONG_PTR>(PsGetProcessId(s->active->consumer));}
+}
 void ReleaseSource(DeskFusePcmSource* source) {
     if (InterlockedDecrement(&source->references)==0) ExFreePoolWithTag(source,Tag);
 }
@@ -133,6 +150,7 @@ NTSTATUS CreateStorage(Session* s) {
 NTSTATUS Bind(FileContext* file,const DeskFusePcmBind& request,DeskFusePcmHandles* result) {
     if (file->session || request.size!=sizeof(request) || request.abi!=DESKFUSE_PCM_ABI ||
         PsGetCurrentProcess()!=file->creator || !request.process_handle) return STATUS_ACCESS_DENIED;
+    file->diagnostic={};file->diagnostic.size=sizeof(file->diagnostic);file->diagnostic.abi=1;file->diagnostic.stage=1;file->diagnostic.source=request.source;
     DeskFusePcmSource* source=nullptr;
     ExAcquireFastMutex(&RegistryLock);
     for (auto e=Sources.Flink;e!=&Sources;e=e->Flink) {
@@ -142,23 +160,25 @@ NTSTATUS Bind(FileContext* file,const DeskFusePcmBind& request,DeskFusePcmHandle
         }
     }
     ExReleaseFastMutex(&RegistryLock);
-    if (!source) return STATUS_NOT_FOUND;
+    if (!source) {file->diagnostic.status=STATUS_NOT_FOUND;return STATUS_NOT_FOUND;}
     auto s=static_cast<Session*>(ExAllocatePool2(POOL_FLAG_NON_PAGED,sizeof(Session),Tag));
-    if (!s) {ReleaseSource(source);return STATUS_INSUFFICIENT_RESOURCES;}
+    if (!s) {KIRQL irql;KeAcquireSpinLock(&source->lock,&irql);CaptureBind(file,source,STATUS_INSUFFICIENT_RESOURCES);KeReleaseSpinLock(&source->lock,irql);ReleaseSource(source);return STATUS_INSUFFICIENT_RESOURCES;}
     s->source=source;ExInitializeRundownProtection(&s->producers);
     s->owner=file->creator;ObReferenceObject(s->owner);
+    file->diagnostic.stage=2;
     auto status=ObReferenceObjectByHandle(reinterpret_cast<HANDLE>(request.process_handle),PROCESS_DUP_HANDLE,
         *PsProcessType,UserMode,reinterpret_cast<PVOID*>(&s->consumer),nullptr);
-    if (NT_SUCCESS(status)) status=OpenProcessObject(s->owner,0x0008 /* PROCESS_VM_OPERATION */,&s->ownerHandle);
-    if (NT_SUCCESS(status)) status=OpenProcessObject(s->consumer,PROCESS_DUP_HANDLE,&s->consumerHandle);
-    if (NT_SUCCESS(status)) status=CreateStorage(s);
+    if (NT_SUCCESS(status)) {file->diagnostic.stage=3;status=OpenProcessObject(s->owner,0x0008 /* PROCESS_VM_OPERATION */,&s->ownerHandle);}
+    if (NT_SUCCESS(status)) {file->diagnostic.stage=4;status=OpenProcessObject(s->consumer,PROCESS_DUP_HANDLE,&s->consumerHandle);}
+    if (NT_SUCCESS(status)) {file->diagnostic.stage=5;status=CreateStorage(s);}
     HANDLE remoteSection=nullptr,remoteEvent=nullptr;
-    if (NT_SUCCESS(status)) status=ZwDuplicateObject(ZwCurrentProcess(),s->section,s->consumerHandle,
-        &remoteSection,SECTION_MAP_READ|SECTION_QUERY,0,0);
-    if (NT_SUCCESS(status)) status=ZwDuplicateObject(ZwCurrentProcess(),s->eventHandle,s->consumerHandle,
-        &remoteEvent,SYNCHRONIZE,0,0);
+    if (NT_SUCCESS(status)) {file->diagnostic.stage=6;status=ZwDuplicateObject(ZwCurrentProcess(),s->section,s->consumerHandle,
+        &remoteSection,SECTION_MAP_READ|SECTION_QUERY,0,0);}
+    if (NT_SUCCESS(status)) {file->diagnostic.stage=7;status=ZwDuplicateObject(ZwCurrentProcess(),s->eventHandle,s->consumerHandle,
+        &remoteEvent,SYNCHRONIZE,0,0);}
     if (NT_SUCCESS(status)) {
         KIRQL irql;KeAcquireSpinLock(&source->lock,&irql);
+        file->diagnostic.stage=8;
         if (source->active || source->removed || source->denied || source->streams>1) status=STATUS_DEVICE_BUSY;
         else {
             auto& c=s->map->control;c.size=sizeof(c);c.abi=DESKFUSE_PCM_ABI;c.source=source->id;
@@ -167,6 +187,7 @@ NTSTATUS Bind(FileContext* file,const DeskFusePcmBind& request,DeskFusePcmHandle
             c.correlation_frame=source->correlationFrame;c.correlation_qpc_100ns=source->correlationQpc;
             source->active=s;Signal(s);file->session=s;
         }
+        CaptureBind(file,source,status);
         KeReleaseSpinLock(&source->lock,irql);
     }
     if (!NT_SUCCESS(status)) {
@@ -174,6 +195,7 @@ NTSTATUS Bind(FileContext* file,const DeskFusePcmBind& request,DeskFusePcmHandle
         HANDLE ignored=nullptr;
         if (remoteSection) ZwDuplicateObject(s->consumerHandle,remoteSection,nullptr,&ignored,0,0,DUPLICATE_CLOSE_SOURCE);
         if (remoteEvent) ZwDuplicateObject(s->consumerHandle,remoteEvent,nullptr,&ignored,0,0,DUPLICATE_CLOSE_SOURCE);
+        if(file->diagnostic.stage!=8){KIRQL irql;KeAcquireSpinLock(&source->lock,&irql);CaptureBind(file,source,status);KeReleaseSpinLock(&source->lock,irql);}
         DeleteSession(s);return status;
     }
     *result={sizeof(*result),DESKFUSE_PCM_ABI,reinterpret_cast<ULONGLONG>(remoteSection),
@@ -213,6 +235,13 @@ NTSTATUS Dispatch(PDEVICE_OBJECT device,PIRP irp) {
             status=Bind(file,request,static_cast<DeskFusePcmHandles*>(buffer));
             if (NT_SUCCESS(status)) information=sizeof(DeskFusePcmHandles);
             break;
+        }
+        if(code==DESKFUSE_PCM_LAST_BIND_DIAGNOSTIC) {
+            if(PsGetCurrentProcess()!=file->creator){status=STATUS_ACCESS_DENIED;break;}
+            if(input!=0 || output<sizeof(file->diagnostic)){status=STATUS_BUFFER_TOO_SMALL;break;}
+            if(file->diagnostic.abi!=1){status=STATUS_NOT_FOUND;break;}
+            *static_cast<DeskFusePcmBindDiagnostic*>(buffer)=file->diagnostic;
+            information=sizeof(file->diagnostic);status=STATUS_SUCCESS;break;
         }
         auto s=file->session;
         if (!s || (PsGetCurrentProcess()!=s->consumer && PsGetCurrentProcess()!=s->owner)) {status=STATUS_ACCESS_DENIED;break;}
@@ -317,20 +346,25 @@ NTSTATUS DeskFusePcmSourceQuery(const GUID& id,DeskFuseTimingCapabilities* resul
         DESKFUSE_TIMING_BUILD,source->id,DESKFUSE_TIMING_REQUIRED,DESKFUSE_PCM_ABI};
     KeReleaseSpinLock(&source->lock,irql);ReleaseSource(source);return status;
 }
-void DeskFusePcmStreamOpen(DeskFusePcmSource* source,void* stream,bool eligible) {
+void DeskFusePcmStreamOpen(DeskFusePcmSource* source,void* stream,bool eligible,ULONG pin,const GUID& mode,ULONG rate,ULONG channels,ULONG bits,ULONG alignment) {
     if (!source) return;
     KIRQL irql;KeAcquireSpinLock(&source->lock,&irql);
+    for(unsigned i=0;i<16;++i)if(!source->traceStreams[i]){source->traceStreams[i]=stream;source->traceSerials[i]=++source->nextSerial;break;}
+    auto& d=source->trace;d.pin=pin;d.mode=mode;d.alignment=alignment;d.geometry={0,0,0,rate,channels,bits};
     ++source->streams;
-    if (source->streams==1 && eligible && !source->removed) {source->stream=stream;source->denied=false;source->geometry={};}
-    else {source->stream=nullptr;source->denied=true;RevokeLocked(source);}
+    if (source->streams==1 && eligible && !source->removed) {source->stream=stream;source->denied=false;source->geometry={};d.firstDenial=0;d.denials=0;}
+    else {DeskFuseTraceDeny(d,(source->streams>1?1u:0u)|(!eligible?2u:0u)|(source->removed?128u:0u));source->stream=nullptr;source->denied=true;RevokeLocked(source);}
+    TraceEvent(source,1,stream);
     KeReleaseSpinLock(&source->lock,irql);
 }
 void DeskFusePcmStreamClose(DeskFusePcmSource* source,void* stream) {
-    UNREFERENCED_PARAMETER(stream);if (!source) return;
+    if (!source) return;
     KIRQL irql;KeAcquireSpinLock(&source->lock,&irql);
     RevokeLocked(source);++source->generation;source->running=false;source->stream=nullptr;
     if (source->streams) --source->streams;
-    if (!source->streams) {source->denied=false;source->geometry={};}
+    TraceEvent(source,2,stream);
+    for(unsigned i=0;i<16;++i)if(source->traceStreams[i]==stream){source->traceStreams[i]=nullptr;source->traceSerials[i]=0;break;}
+    if (!source->streams) {source->denied=false;source->geometry={};source->trace.firstDenial=0;source->trace.denials=0;}
     KeReleaseSpinLock(&source->lock,irql);
 }
 void DeskFusePcmState(DeskFusePcmSource* source,void* stream,bool running,ULONGLONG frame,ULONGLONG qpc) {
@@ -351,6 +385,7 @@ void DeskFusePcmGeometryUpdate(DeskFusePcmSource* source,void* stream,
     if (!source) return;
     const auto next=deskfuse::pcm_geometry(notifications,packetFrames,rate,channels,bits);
     KIRQL irql;KeAcquireSpinLock(&source->lock,&irql);
+    if(!deskfuse::same_geometry(source->trace.geometry,next)) {source->trace.geometry=next;TraceEvent(source,3,stream);}
     if (source->stream==stream && !source->removed) {
         const bool changed=source->geometry.state==1 && !deskfuse::same_geometry(source->geometry,next);
         source->geometry=next;
@@ -361,9 +396,9 @@ void DeskFusePcmGeometryUpdate(DeskFusePcmSource* source,void* stream,
     }
     KeReleaseSpinLock(&source->lock,irql);
 }
-void DeskFusePcmDeny(DeskFusePcmSource* source) {
+void DeskFusePcmDeny(DeskFusePcmSource* source,ULONG reason) {
     if (!source) return;
-    KIRQL irql;KeAcquireSpinLock(&source->lock,&irql);source->denied=true;RevokeLocked(source);KeReleaseSpinLock(&source->lock,irql);
+    KIRQL irql;KeAcquireSpinLock(&source->lock,&irql);const bool changed=DeskFuseTraceDeny(source->trace,reason);source->denied=true;RevokeLocked(source);if(changed)TraceEvent(source,4,source->stream);KeReleaseSpinLock(&source->lock,irql);
 }
 bool DeskFusePcmReserve(DeskFusePcmSource* source,void* stream,ULONGLONG frame,ULONG frames,ULONGLONG qpc,DeskFusePcmReservation* reservation) {
     if (!source) return false;

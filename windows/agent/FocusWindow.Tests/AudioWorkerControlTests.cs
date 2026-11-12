@@ -6,6 +6,12 @@ namespace FocusWindow.Tests;
 
 public sealed class AudioWorkerControlTests
 {
+    [Fact]
+    public void Diagnostic_abi_matches_native_fixed_layout() {
+        Assert.Equal(88,System.Runtime.InteropServices.Marshal.SizeOf<PcmBindDiagnostic.TraceEvent>());
+        Assert.Equal(840,System.Runtime.InteropServices.Marshal.SizeOf<PcmBindDiagnostic.Snapshot>());
+    }
+
     [Theory]
     [InlineData("PCM_OPEN")]
     [InlineData("PCM_BIND")]

@@ -8,13 +8,13 @@ NTSTATUS DeskFusePcmSourceCreate(const GUID& id, DeskFusePcmSource** source);
 void DeskFusePcmSourceRetire(DeskFusePcmSource* source);
 NTSTATUS DeskFusePcmSourceQuery(const GUID& id, DeskFuseTimingCapabilities* result);
 void DeskFusePcmSourceDestroy(DeskFusePcmSource* source);
-void DeskFusePcmStreamOpen(DeskFusePcmSource* source, void* stream, bool eligible);
+void DeskFusePcmStreamOpen(DeskFusePcmSource* source, void* stream, bool eligible,ULONG pin,const GUID& mode,ULONG rate,ULONG channels,ULONG bits,ULONG alignment);
 void DeskFusePcmStreamClose(DeskFusePcmSource* source, void* stream);
 void DeskFusePcmState(DeskFusePcmSource* source, void* stream, bool running,
     ULONGLONG frame, ULONGLONG qpc100ns);
 void DeskFusePcmGeometryUpdate(DeskFusePcmSource* source, void* stream,
     ULONG notifications, ULONG packetFrames, ULONG rate, ULONG channels, ULONG bits);
-void DeskFusePcmDeny(DeskFusePcmSource* source);
+void DeskFusePcmDeny(DeskFusePcmSource* source,ULONG reason);
 bool DeskFusePcmReserve(DeskFusePcmSource* source, void* stream, ULONGLONG frame,
     ULONG frames, ULONGLONG commitQpc100ns, DeskFusePcmReservation* reservation);
 void DeskFusePcmPublish(DeskFusePcmSource* source, const DeskFusePcmReservation& reservation,

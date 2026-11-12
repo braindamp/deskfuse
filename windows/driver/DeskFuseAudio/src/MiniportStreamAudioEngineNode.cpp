@@ -948,7 +948,7 @@ NTSTATUS CMiniportWaveRTStream::SetLoopbackProtection(_In_ CONSTRICTOR_OPTION pr
     // Miniport driver mutes/unmutes the loopback here.
     // 
     m_ToneGenerator.SetMute(protectionOption == CONSTRICTOR_OPTION_MUTE);
-    if (protectionOption != CONSTRICTOR_OPTION_DISABLE) DeskFusePcmDeny(m_pMiniport->m_PcmSource);
+    if (protectionOption != CONSTRICTOR_OPTION_DISABLE) DeskFusePcmDeny(m_pMiniport->m_PcmSource,256);
     
     return STATUS_SUCCESS;
 }

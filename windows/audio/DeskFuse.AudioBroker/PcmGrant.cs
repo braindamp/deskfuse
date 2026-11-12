@@ -42,7 +42,11 @@ internal sealed class PcmGrant : IDisposable
                     Process=unchecked((ulong)consumer.DangerousGetHandle().ToInt64())};
                 if (!DeviceIoControl(_file,BindCode,ref request,Marshal.SizeOf<Bind>(),out var reply,
                     Marshal.SizeOf<Reply>(),out var returned,IntPtr.Zero))
-                    throw NativeFailure("PCM_BIND", Marshal.GetLastPInvokeError());
+                {
+                    var error=Marshal.GetLastPInvokeError();
+                    PcmBindDiagnostic.Read(_file,error);
+                    throw NativeFailure("PCM_BIND",error);
+                }
                 return (reply, returned);
             }, () =>
             {

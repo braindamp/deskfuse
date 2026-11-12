@@ -1022,7 +1022,7 @@ NTSTATUS CMiniportWaveRTStream::SetWritePacket(
             if (m_ulNotificationsPerBuffer==2) {
                 publish=DeskFusePcmReserve(m_pMiniport->m_PcmSource,this,first,exportFrames,
                     deskfuse::mul_div(now.QuadPart,10000000,m_ullPerformanceCounterFrequency.QuadPart),&reservation);
-            } else DeskFusePcmDeny(m_pMiniport->m_PcmSource);
+            } else DeskFusePcmDeny(m_pMiniport->m_PcmSource,4);
             if (eos) {
                 // Extend the wrapped packet number using the current 64-bit clock.
                 m_EosEndFrame = (static_cast<ULONGLONG>(m_llPacketCounter) +
@@ -1255,7 +1255,7 @@ Return Value:
     DPF_ENTER(("[CMiniportWaveRT::SetContentId]"));
 
     if (!drmRights || drmRights->CopyProtect || drmRights->DigitalOutputDisable)
-        DeskFusePcmDeny(m_pMiniport->m_PcmSource);
+        DeskFusePcmDeny(m_pMiniport->m_PcmSource,!drmRights?8u:((drmRights->CopyProtect?16u:0u)|(drmRights->DigitalOutputDisable?32u:0u)));
 
     NTSTATUS    ntStatus;
     ULONG       ulOldContentId = m_ulContentId;
@@ -1273,7 +1273,7 @@ Return Value:
     if (!NT_SUCCESS(ntStatus))
     {
         m_ulContentId = ulOldContentId;
-        DeskFusePcmDeny(m_pMiniport->m_PcmSource);
+        DeskFusePcmDeny(m_pMiniport->m_PcmSource,64);
     }
 
     //
