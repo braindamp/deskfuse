@@ -1,6 +1,22 @@
 # Architecture v0.6 implementation status
 
-## F3 / T09 / H3 — identify the failing PCM boundary (12 November 2026)
+## F3 / T09 / H3 — bounded cross-process startup diagnostics (12 November 2026)
+
+The latest attempt records native control EOF without the earlier Win32 busy
+exception. Both remain compatible with source denial/revocation at different
+points; no behavior fix is inferred. Optional user-mode ETW now records broker
+preparation phases/first admission-close caller, native OpenSource/AttachPcm and
+runtime errors before retirement, and PCM state/generation/geometry when snapshot
+validation rejects the export. Native C++ setup exceptions retain their original
+message/HRESULT through ETW instead of relying on unretained stderr. No inherited
+handles, protocol, driver, Android, buffer, scheduler or ownership changes.
+The bounded user-admin collector checks actual ETW reception before READY;
+its controlled capture is diagnostic evidence, not a latency measurement.
+Windows broker/source DLL and release worker builds passed; 14 focused control/
+PCM tests and collector decoder check passed. Physical capture and first audible
+playback remain pending. No administrator action was performed by the agent.
+
+## F3 / T09 / H3 â€” identify the failing PCM boundary (12 November 2026)
 
 The first substantive managed startup exception is resource-in-use, before native
 control closure. It lacks the operation and native error code. PcmGrant now labels
@@ -19,7 +35,7 @@ unsupported notification ownership or DRM conditions; it is not proof of an
 existing export owner. No stream-state reset or relaxed guard is justified by
 the present capture. First audible playback and F3/T09/H3 remain unqualified.
 
-## F3 / T09 / H3 — request the qualified short engine period (12 November 2026)
+## F3 / T09 / H3 â€” request the qualified short engine period (12 November 2026)
 
 A read-only query on the selected PC's exact DeskFuse endpoint reported a matching
 48 kHz format, a current/default 480-frame engine period (10 ms), and a legal
@@ -34,7 +50,7 @@ this change before implementation. Driver, native binaries, Android, PCM buffers
 authority checks and H4 gates are unchanged. Installed audible playback remains
 unqualified; this fixes a concrete source-configuration blocker.
 
-## F3 / T09 / H3 — bounded cold Speaker startup (12 November 2026)
+## F3 / T09 / H3 â€” bounded cold Speaker startup (12 November 2026)
 
 The ordinary Speaker listener used a 1.5-second quarantined route lifetime,
 although first source acquisition must create the PnP device and resolve/open its
@@ -51,7 +67,7 @@ the observed early route loss; it is not proof that all playback blockers are fi
 Windows broker and Android debug builds passed; installed audible playback remains
 the next required outcome. No driver/native audio binary change is included.
 
-## F1 / T03-T04 and F3 / T09 / H3 — one PC selection path (12 November 2026)
+## F1 / T03-T04 and F3 / T09 / H3 â€” one PC selection path (12 November 2026)
 
 In the gated first-delivery profile, Find Windows PC now selects the four-digit
 pairing path directly, reusing a matching saved selection for Speaker. The legacy
@@ -64,7 +80,7 @@ four digits directly; additional scopes and pending recovery keep explicit choic
 Commit/recovery saves the selection and enters the existing normal Speaker start.
 No production gate, native media, buffer, clock or audio lifecycle change.
 
-## F1 / T03-T04 — Windows 10 enrollment TLS compatibility (12 November 2026)
+## F1 / T03-T04 â€” Windows 10 enrollment TLS compatibility (12 November 2026)
 
 The connected phone reached the setup TCP listener but received TLS EOF. Matching
 Schannel event 36869 identified the temporary credential's missing private-key
@@ -79,7 +95,7 @@ enrollment plan. Local pinned TLS, simultaneous read/write and cancellation
 passed. Installed pairing, trusted Speaker first sound (F3 / T09 / H3), broadcast
 discovery and production qualification remain open.
 
-## F1 / T03-T04 — detached medium-worker startup (11 November 2026)
+## F1 / T03-T04 â€” detached medium-worker startup (11 November 2026)
 
 The installed enrollment worker's native exit C0000142 was traced to Windows ConsoleInitialize. An unelevated isolated comparison using the installed executable confirmed CREATE_NO_WINDOW succeeds without child restriction, fails with it, and DETACHED_PROCESS reaches managed argument validation with the restriction retained. Central headless medium-worker launch now uses DETACHED_PROCESS; job containment, no-children policy, token/object security and bootstrap checks remain unchanged. SDK ABI metadata now checks the detached flag. This is source correction and isolated native evidence; installed enrollment, first audible Speaker playback and F3 qualification remain pending. No media-path changes or measured latency improvement claimed.
 
@@ -96,13 +112,13 @@ The exact signed authority installation stopped before service publication: the 
 
 F0b/F1 installed continuation: corrected key validation passed. Fresh service publication then rejected the Windows default IU/SU user-defined-control permissions. Set a restricted protected DACL on the exact newly created disabled service before validation/publication; existing services are not adopted or rewritten. Corrected broker self-contained Release publication passed. The failed deployment remains disabled/stopped and preserved pending exact recovery.
 
-## Current v0.6 milestone completion — 9 November 2026
+## Current v0.6 milestone completion â€” 9 November 2026
 
 | Original phase / tranche | Source | Integration | Device qualification | Release enablement | Next task |
 |---|---|---|---|---|---|
-| **F1 / T03–T04 — authority and trusted setup (P1/P2)** | SCM dispatcher, protected setup and observed-logon Speaker intent; abandoned-source retirement timers now join/retire under service lifetime | User-agent LAN query relays selector only to SYSTEM; signed install closure remains external | Installed SCM/SYSTEM and handset grant unobserved | Disabled | Verify exact protected install and native listener admission |
-| **F0b / T02–T04 — deployment** | SYSTEM-only fresh/upgrade installer entry composes prepared code roots, exact disabled SCM publication and separate installed-image activation; source-bound review manifest emitted | Operator-approved manifest SHA-256 and signed matched artifact closure are still required; no installed run | Signed package, SYSTEM service, driver and handset unqualified | Disabled until external signature and operator approval | Verify matching signed binaries, approve reviewed manifest independently, perform exact installed activation and retain rollback |
-| **F3 / T09 / H3 — trusted LAN Speaker** | Normal Speaker/Stop selects committed enrollment from idle or active workspace UI; Android LAN locator, Windows relay and SYSTEM native preparation composed; H4 separately off | Source path integrated, exact signed install and native listener admission not physically observed | No matched handset first delivery/Stop or acoustic evidence | Production first delivery off | Qualify signed package then Checkpoint A on matched PC/phone |
+| **F1 / T03â€“T04 â€” authority and trusted setup (P1/P2)** | SCM dispatcher, protected setup and observed-logon Speaker intent; abandoned-source retirement timers now join/retire under service lifetime | User-agent LAN query relays selector only to SYSTEM; signed install closure remains external | Installed SCM/SYSTEM and handset grant unobserved | Disabled | Verify exact protected install and native listener admission |
+| **F0b / T02â€“T04 â€” deployment** | SYSTEM-only fresh/upgrade installer entry composes prepared code roots, exact disabled SCM publication and separate installed-image activation; source-bound review manifest emitted | Operator-approved manifest SHA-256 and signed matched artifact closure are still required; no installed run | Signed package, SYSTEM service, driver and handset unqualified | Disabled until external signature and operator approval | Verify matching signed binaries, approve reviewed manifest independently, perform exact installed activation and retain rollback |
+| **F3 / T09 / H3 â€” trusted LAN Speaker** | Normal Speaker/Stop selects committed enrollment from idle or active workspace UI; Android LAN locator, Windows relay and SYSTEM native preparation composed; H4 separately off | Source path integrated, exact signed install and native listener admission not physically observed | No matched handset first delivery/Stop or acoustic evidence | Production first delivery off | Qualify signed package then Checkpoint A on matched PC/phone |
 
 An implemented source increment is not a completed F1 milestone. F0a provenance/CI obligations apply to every changed source snapshot.
 
@@ -113,7 +129,7 @@ binding, actual SYSTEM role-host qualification, signed-package admission and
 physical gates remain open. Earlier entries are chronological evidence, not the
 current stopping state.
 
-## T01 / F0a — source truth and CI
+## T01 / F0a â€” source truth and CI
 
 Implemented source changes:
 
@@ -150,7 +166,7 @@ passed (1/1). Host tests were repeated using the actual MSVC ABI fixture: 210
 passed, 10 skipped, 0 failed.
 CI edits require real CI execution before being described as CI-qualified.
 
-## Original F0b preflight blocker — resolved by the continuation below
+## Original F0b preflight blocker â€” resolved by the continuation below
 
 Both unchanged baseline driver projects were copied with their shared headers
 into a fresh ignored staging directory. Actual MSVC x64/WDK 10.0.26100.0 builds
@@ -185,7 +201,7 @@ the two previously documented safety failures. T03 and later work has not begun.
 No driver, PnP, default audio route, physical display, Android installation,
 test-signing or other machine-configuration operations were performed.
 
-## Continuation — INF corrected; recovery implementation stopped
+## Continuation â€” INF corrected; recovery implementation stopped
 
 Applied the two Ultra-adjudicated functional INF corrections:
 
@@ -232,7 +248,7 @@ The next Ultra pass should resolve this narrow contract and specify its mocked
 failure tests, then hand it back for implementation. T03 and later remain
 unstarted. The INF receipt predates this status-only continuation record.
 
-## Latest T02 increment — state core and exact-instance adapter
+## Latest T02 increment â€” state core and exact-instance adapter
 
 Implemented the adjudicated recovery contract from
 `DeskFuse_T02_Recovery_Contract_and_High_Handoff.md` (beside the v0.6 architecture
@@ -306,7 +322,7 @@ script migration and mocked PowerShell integration remain unfinished. No
 installation, task registration, machine-configuration or hardware operation
 was performed. T03 and later remain unstarted.
 
-## Ultra implementation increment — 27 October
+## Ultra implementation increment â€” 27 October
 
 - T02 now has one-run approval binding, read-locked package custody, a short
   revocation/admission fence, Windows catalog/member and signer verification,
@@ -343,7 +359,7 @@ Physical device, signed SYSTEM, audio category, and end-to-end latency
 qualifications are not implied by source or unit tests.
 No device installation or machine-configuration change occurred in this pass.
 
-## Core closure source pass — 28 October
+## Core closure source pass â€” 28 October
 
 The earlier missing protected-root and composition decisions are now implemented
 in source. `DeskFuse.WindowsSecurity` owns one fixed maintenance registry root and
@@ -382,7 +398,7 @@ new certificate dated this pass. Further builds use the normal initialized SDK
 profile and explicitly disable development-certificate generation. No trust,
 import or certificate cleanup command was performed.
 
-## High continuation — standalone owner source
+## High continuation â€” standalone owner source
 
 The maintenance helper now has executable typed roles, protected per-run code and
 policy composition, independently checked scheduled-task definitions, separate
@@ -410,7 +426,7 @@ known failures for three-checkpoint UI/expiry timing. These remain visible and
 must be replaced by passing behavioral checks before activating the new flow.
 No architecture blocker requiring Ultra has been identified in this increment.
 
-## High continuation — protected preparation and coordinated runner
+## High continuation â€” protected preparation and coordinated runner
 
 `TrustedMaintenanceSetup` consumes independent protected helper/probe/runtime and
 package approvals. It copies verified bytes into new private files, verifies the
@@ -484,7 +500,7 @@ remain failures even if other reports passed. Keep the whole evidence directory.
 - No driver installation, PnP changes, default-route changes, test-signing changes
   or device/hardware operations are authorized by the build tooling changes.
 
-## Subsequent audio continuation — 29 October
+## Subsequent audio continuation â€” 29 October
 
 The historical gates above describe that earlier tranche. Current T03/T09 audio
 work is recorded in

@@ -3,7 +3,17 @@
 #define DESKFUSE_CAPTURE_LIFECYCLE_TEST
 #include "wasapi_capture.cpp"
 #include "../../../windows/driver/DeskFuseAudio/src/pcm_export_abi.h"
+#include <evntprov.h>
 namespace {
+void startup_failure(const char* message) noexcept {
+    const GUID id={0xe47848a1,0x9465,0x4513,{0x98,0x51,0x7e,0x2d,0xea,0xb1,0x56,0x20}};
+    wchar_t text[1025]=L"CPP OpenSource: ";
+    for (unsigned i=0;message[i] && i<1000;++i) text[16+i]=static_cast<unsigned char>(message[i]);
+    REGHANDLE handle=0;
+    if(EventRegister(&id,nullptr,nullptr,&handle)==ERROR_SUCCESS) {
+        EventWriteString(handle,4,1,text);EventUnregister(handle);
+    }
+}
 ComPtr<IMMDevice> exact_endpoint(const wchar_t* id) {
     if (!id || !*id) throw std::runtime_error("explicit endpoint required");
     ComPtr<IMMDeviceEnumerator> enumerator;
@@ -65,6 +75,7 @@ struct SourceControl {
                     else throw std::runtime_error("period event wait failed");
                 }
             } catch (const std::exception& error) {
+                startup_failure(error.what());
                 std::cerr << "DIRECT_BLOCKED " << error.what() << "\n";
                 SetEvent(failed.get());SetEvent(ready.get());
             } catch (...) {SetEvent(failed.get());SetEvent(ready.get());}

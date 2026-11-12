@@ -155,9 +155,14 @@ impl Source {
         else { self.ioctl(SNAPSHOT,None,&mut c)?; }
         #[cfg(not(test))]
         self.ioctl(SNAPSHOT,None,&mut c)?;
-        c.geometry.validate()?;
+        if let Err(error) = c.geometry.validate() {
+            crate::startup_trace::write(&format!("PCM state={} generation={} expected_generation={} geometry={:?}",c.state,c.generation,self.generation,c.geometry));
+            return Err(error);
+        }
         if c.size as usize!=std::mem::size_of::<Control>() || c.abi!=ABI || c.generation!=self.generation || c.state>1 ||
-            c.acknowledged>c.published || c.published-c.acknowledged>8 {return Err(invalid("source control retired/incompatible"))}Ok(c)
+            c.acknowledged>c.published || c.published-c.acknowledged>8 {
+            crate::startup_trace::write(&format!("PCM state={} generation={} expected_generation={} size={} abi={} geometry={:?}",c.state,c.generation,self.generation,c.size,c.abi,c.geometry));
+            return Err(invalid("source control retired/incompatible"))}Ok(c)
     }
     pub fn fence(&mut self,request_qpc:u64)->io::Result<CommitFence> {
         let mut c=Control::default();self.ioctl(FENCE,None,&mut c)?;

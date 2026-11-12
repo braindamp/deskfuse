@@ -170,7 +170,7 @@ impl NativeRuntime {
     }
 
     fn run(mut self) -> io::Result<()> {
-        let outcome = self.serve();
+        let outcome = self.serve().inspect_err(|e| crate::startup_trace::failure("RuntimeExitBeforeCleanup",e));
         self.authority.close();
         self.preparation = None;
         if let Some(source) = self.source.as_mut() { let _ = source.fence_delivery(); }
@@ -388,7 +388,7 @@ impl NativeRuntime {
                 }
                 let setup = self.preparation.take().unwrap();
                 let scope = setup.scope.clone();
-                let (source, mapped, digest) = setup.map(handles)?;
+                let (source, mapped, digest) = setup.map(handles).inspect_err(|e| crate::startup_trace::failure("AttachPcm",e))?;
                 self.live()?;
                 self.source = Some(SourceOwner::new(scope, Box::new(source)));
                 self.prepared_binding = Some(digest);
@@ -473,7 +473,7 @@ impl NativeRuntime {
             }
             if let Some(setup) = &mut self.preparation {
                 if self.authority.grant() != Some(&setup.grant) { return Err(invalid()); }
-                if let Some(body) = setup.opened()? {
+                if let Some(body) = setup.opened().inspect_err(|e| crate::startup_trace::failure("OpenSource",e))? {
                     self.live()?;
                     self.queue_confirmation(SOURCE_OPENED, body)?;
                 }

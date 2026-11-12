@@ -21,6 +21,14 @@ internal sealed class BrokerCommittedAudioSource : IBrokerEnrollmentResourceOwne
     private PhoneDevice? device;
     private PcmGrant? pcm;
     private bool fenced;
+    private string traceStage = "Created";
+    private int traceClosed;
+    private void Stage(string stage) { traceStage = stage; StartupTrace.Write($"BROKER pid={Environment.ProcessId} worker={Worker.ProcessId} stage={stage}"); }
+    private void Failure(Exception error) {
+        var code = error is System.ComponentModel.Win32Exception native ? native.NativeErrorCode : 0;
+        StartupTrace.Write($"BROKER worker={Worker.ProcessId} stage={traceStage} failure={error.GetType().Name} native={code}");
+        RequestRundown();
+    }
 
     private BrokerCommittedAudioSource(BrokerAudioOwner authority, BrokerAudioWorkerSession session, BrokerEnrollmentRundown rundown)
     { this.authority = authority; this.session = session; this.rundown = rundown; }
@@ -34,7 +42,7 @@ internal sealed class BrokerCommittedAudioSource : IBrokerEnrollmentResourceOwne
         var dispatcher = new BrokerAudioControlDispatcher(authority, session.Worker, host,
             host.SignAudioRequestStatus, host.SignAudioSourceStopStatus, resource.PrepareAsync,
             resource.RequestRundown, () => session.PublishAuthorityAsync(authority, CancellationToken.None),
-            session.SendReplyAsync, _ => resource.RequestRundown(), acquisitionOnly: true, handover: handover);
+            session.SendReplyAsync, resource.Failure, acquisitionOnly: true, handover: handover);
         rundown.RegisterAudio(authority, resource);
         onTracked?.Invoke();
         try { session.BindEvents(authority, dispatcher, resource.RequestRundown); }
@@ -91,17 +99,21 @@ internal sealed class BrokerCommittedAudioSource : IBrokerEnrollmentResourceOwne
             resolve.CancelAfter(budget);
             var endpoint = await EndpointResolver.ResolveAsync(device.InstancePath, budget, resolve.Token, requireUnique: true)
                 .ConfigureAwait(false) ?? throw new IOException("The owned speaker endpoint is unavailable.");
+            Stage("OpenSource");
             var opened = await session.ExchangeSourceAsync(authority, acquisition, AudioWorkerFrameKind.OpenSource,
                 context, AudioSourceAttachment.Endpoint(endpoint), authority.PreparationBudget(acquisition, PeriodLimit)).ConfigureAwait(false);
             var observation = AudioSourceAttachment.Opened(opened, key, endpoint);
 
             RequireLive(acquisition);
+            Stage("PcmOpen");
             pcm = new PcmGrant();
             RequireLive(acquisition);
+            Stage("PcmBind");
             pcm.Attach(endpoint, observation.Source, Worker.ProcessHandle);
             var offered = AudioSourceAttachment.Handles(pcm.FileHandle, pcm.SectionHandle, pcm.EventHandle, pcm.Generation);
             observation = observation with { PcmGeneration = pcm.Generation };
             var expected = AudioAuthorityProtocol.Binding(authority.Source, observation);
+            Stage("AttachPcm");
             var mapped = await session.ExchangeSourceAsync(authority, acquisition, AudioWorkerFrameKind.AttachPcm,
                 context, offered, authority.PreparationBudget(acquisition, MappingLimit)).ConfigureAwait(false);
             if (!mapped.AsSpan().SequenceEqual(expected))
@@ -111,10 +123,11 @@ internal sealed class BrokerCommittedAudioSource : IBrokerEnrollmentResourceOwne
                 throw new UnauthorizedAccessException("The exact owned endpoint changed during PCM attachment.");
             PcmGrant.RequireEndpoint(endpoint, observation.Source);
             RequireLive(acquisition);
+            Stage("CompletePreparation");
             if (!authority.CompletePreparation(acquisition, observation))
                 throw new UnauthorizedAccessException("Source preparation no longer owns publication.");
         }
-        catch { RequestRundown(); throw; }
+        catch (Exception error) { Failure(error); throw; }
     }
 
     private void RequestRundown()
@@ -125,6 +138,11 @@ internal sealed class BrokerCommittedAudioSource : IBrokerEnrollmentResourceOwne
 
     public void CloseAdmission()
     {
+        if (Interlocked.Exchange(ref traceClosed, 1) == 0) {
+            var frames = new System.Diagnostics.StackTrace().GetFrames().Take(5);
+            var origin = string.Join("/", frames.Select(f => f.GetMethod()?.Name));
+            StartupTrace.Write($"BROKER worker={Worker.ProcessId} stage={traceStage} close={origin}");
+        }
         authority.CloseAdmission();
         lock (gate)
         {

@@ -2,6 +2,8 @@
 //! DeskFuse M2a protocol wire layout. The input **must already be authenticated
 //! by the surrounding QUIC connection**; this parser does not authenticate it.
 //! No heap allocation is needed in encode/decode.
+#[cfg(windows)]
+mod startup_trace;
 pub mod deferred_trace;
 pub mod broker_control;
 pub mod audio_authority;
