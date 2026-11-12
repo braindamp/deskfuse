@@ -800,6 +800,7 @@ struct ClientMedia {
     recover_pending:u64, recover_started:u64, native_stale:u64,
     denied_reanchor:u64, ingress_frontier:ReceiveFrontier,
     session_context:Option<SourceContext>, anchor_pending:Option<PendingAnchor>,
+    native_capacity_probe_logged:bool,
     fresh_anchor_nonce:u64, authorized_recovery:u64, confirmed_reanchors:u64,
     audio:Option<AndroidAudio>,
     diagnostics:AndroidTrace,
@@ -841,6 +842,26 @@ impl ClientMedia {
         // upper bound, including FIR history; absence is not exhaustion.
         let budget=self.reorder.budget_snapshot(h,expected,observed.queued_storage_frames);
         if !budget.fits() {
+            // No reordered storage or hole is owned here. The native guarded
+            // publisher rechecks the CURRENT tail and the same physical cap.
+            // A real overflow still enters the existing recovery path.
+            if !modes.strict && !synthetic && playback_library.is_some() && self.audio.is_some() &&
+                self.session_context==Some(SourceContext {epoch:h.media_epoch,stream:h.source_stream_id,format:h.format_config_id}) &&
+                self.reorder.contiguous_native_candidate(h,expected,previous) {
+                let stale_before=self.native_stale;
+                let result=self.handle_media(wire,synthetic,playback_library,modes,authenticated_at);
+                if !self.native_capacity_probe_logged {
+                    self.native_capacity_probe_logged=true;
+                    #[cfg(target_os="android")]
+                    crate::phone_audio::log_native_capacity_probe(&format!(
+                        "Native capacity experiment budget={budget:?} pending_recovery={:?} stale_delta={} error={:?}",
+                        self.anchor_pending.as_ref().map(|p|p.reason.as_str()),
+                        self.native_stale-stale_before,result.as_ref().err().map(|e|e.to_string())));
+                    #[cfg(not(target_os="android"))]
+                    let _=stale_before;
+                }
+                return result;
+            }
             self.reorder.budget_drops+=1;
             if modes.strict {return Err("STRICT PCM violation: combined playout budget exhausted".into())}
             if let Some(speaker)=self.audio.as_mut() {

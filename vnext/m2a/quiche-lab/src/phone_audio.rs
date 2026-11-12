@@ -32,6 +32,14 @@ fn log_play_failure(operation: &str, error: &io::Error, stream_error: i32) {
     }
 }
 
+// One record per playback owner, only when the experiment path is exercised.
+pub(crate) fn log_native_capacity_probe(text: &str) {
+    let bounded:String=text.chars().take(1536).collect::<String>().replace('\0',"\\0");
+    if let Ok(text)=std::ffi::CString::new(bounded) {
+        unsafe { __android_log_write(4,b"DeskFuseAudio\0".as_ptr().cast(),text.as_ptr()); }
+    }
+}
+
 const RENEW_ISSUE: u8 = 131;
 const RENEW_PROOF: u8 = 132;
 const RENEW_RESULT: u8 = 133;

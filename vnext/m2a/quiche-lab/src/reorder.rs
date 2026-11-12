@@ -51,6 +51,12 @@ impl Default for Reorder {
     }
 }
 impl Reorder {
+    /// Only an established in-order block can go directly to guarded native publication.
+    pub fn contiguous_native_candidate(&self, header:Header, expected:Option<u64>, previous:Option<u32>)->bool {
+        expected==Some(header.first_source_frame) &&
+            previous.and_then(|n|n.checked_add(1))==Some(header.packet_sequence) &&
+            self.slots.iter().all(Option::is_none)
+    }
     pub fn clear(&mut self) { self.slots.fill(None); self.hole = None; }
     pub fn staged_frames(&self)->u64 {self.slots.iter().flatten().count() as u64 * 240}
     /// Span includes any missing source frames which would need concealment,
@@ -174,6 +180,17 @@ mod tests {
         assert!(!q.push(h(0), &[0;MEDIA_BYTES])); assert_eq!(q.duplicates,1);
         assert!(!q.push(h(9), &[0;MEDIA_BYTES])); assert_eq!(q.full_drops,1);
         q.clear(); assert!(q.pop(None,now,None,true).is_none()); assert!(q.deadline().is_none());
+    }
+    #[test]
+    fn native_candidate_requires_empty_staging_and_exact_continuity() {
+        let mut q=Reorder::default();
+        assert!(q.contiguous_native_candidate(h(38),Some(57120),Some(37)));
+        assert!(!q.contiguous_native_candidate(h(38),None,None));
+        assert!(!q.contiguous_native_candidate(h(38),Some(56880),Some(37)));
+        assert!(!q.contiguous_native_candidate(h(38),Some(57120),Some(36)));
+        assert!(!q.contiguous_native_candidate(h(0),Some(48000),Some(u32::MAX)));
+        push(&mut q,39);
+        assert!(!q.contiguous_native_candidate(h(38),Some(57120),Some(37)));
     }
     #[test]
     fn staged_pcm_and_hole_span_share_native_eighty_ms_budget() {
