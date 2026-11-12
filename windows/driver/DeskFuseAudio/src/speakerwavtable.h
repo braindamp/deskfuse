@@ -25,10 +25,10 @@ Abstract:
 #define SPEAKER_HOST_MIN_SAMPLE_RATE                24000
 #define SPEAKER_HOST_MAX_SAMPLE_RATE                96000
 
-// Experiment 1: preserve the old pin-instance limit to isolate the effect
-// of *advertised processing modes*. A later, separate experiment may reduce
-// capacity if tests demonstrate it is necessary.
-#define SPEAKER_MAX_INPUT_SYSTEM_STREAMS            6
+// Experiment 2: admit one WaveRT system-render pin to test whether ordinary
+// shared-mode clients join the already-running 128-frame engine stream.
+// Do not change PCM geometry or relax the export's single-producer guard.
+#define SPEAKER_MAX_INPUT_SYSTEM_STREAMS            1
 
 static 
 KSDATAFORMAT_WAVEFORMATEXTENSIBLE SpeakerHostPinSupportedDeviceFormats[] =
