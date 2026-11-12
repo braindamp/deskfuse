@@ -102,23 +102,25 @@ HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GRGWGX;;;BA)(A;;GRGWGX;;;WD)(A;;GRGWGX;;;RC)"
 ; the miniport (L"WaveSpeaker" / L"TopologySpeaker" in minipairs.h), because
 ; that is how PortCls finds the interface it must publish.
 ;
-; There is deliberately NO static FriendlyName here. The name in brackets in
-; the Windows sound list is the endpoint's own name, and it has to differ
-; per phone: the driver copies the phone's name from the device instance
-; (DEVPKEY_Device_FriendlyName) onto this interface. A fixed string here
-; would name every phone's endpoint the same.
+; Static FriendlyName values are filter-interface fallbacks. Per-phone
+; identity is provided by each software device instance; these values do
+; not implement per-phone interface display names.
 ;==========================================================================
 [DeskFuseAudio.I.WaveSpeaker]
 AddReg=DeskFuseAudio.I.WaveSpeaker.AddReg
 
 [DeskFuseAudio.I.WaveSpeaker.AddReg]
 HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%DeskFuseAudio.WaveSpeaker.szPname%
 
 [DeskFuseAudio.I.TopologySpeaker]
 AddReg=DeskFuseAudio.I.TopologySpeaker.AddReg
 
 [DeskFuseAudio.I.TopologySpeaker.AddReg]
 HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%DeskFuseAudio.TopologySpeaker.szPname%
+HKR,EP\0,%PKEY_AudioEndpoint_Association%,,%KSNODETYPE_ANY%
+HKR,EP\0,%PKEY_AudioEndpoint_Supports_EventDriven_Mode%,0x00010001,0x1
 
 ;==========================================================================
 ; Strings
@@ -138,6 +140,9 @@ KSCATEGORY_AUDIO="{6994AD04-93EF-11D0-A3CC-00A0C9223196}"
 KSCATEGORY_RENDER="{65E8773E-8F56-11D0-A3B9-00A0C9223196}"
 KSCATEGORY_REALTIME="{EB115FFC-10C8-4964-831D-6DCB02E6F23F}"
 KSCATEGORY_TOPOLOGY="{DDA54A40-1E4C-11D1-A050-405705C10000}"
+KSNODETYPE_ANY="{00000000-0000-0000-0000-000000000000}"
+PKEY_AudioEndpoint_Association="{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},2"
+PKEY_AudioEndpoint_Supports_EventDriven_Mode="{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},7"
 
 REG_MULTI_SZ = 0x00010000
 REG_SZ       = 0x00000000
