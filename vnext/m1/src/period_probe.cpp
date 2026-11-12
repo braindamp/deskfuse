@@ -14,16 +14,28 @@ ComPtr<IMMDevice> exact_endpoint(const wchar_t* id) {
 }
 class SilentRender {
 public:
-    void open(IMMDevice& endpoint, const WAVEFORMATEX& format, UINT32 frames) {
+    void open(IMMDevice& endpoint, const WAVEFORMATEX& format, UINT32 frames,
+              bool ordinaryAppTone = false) {
+        tone_ = ordinaryAppTone;
+        if (tone_ && !supported_mix(format, floatMix_))
+            throw std::runtime_error("ordinary test app requires 48k stereo float32/PCM16 mix");
         check(endpoint.Activate(__uuidof(IAudioClient3), CLSCTX_ALL, nullptr,
-            reinterpret_cast<void**>(audio_.GetAddressOf())), "normal Activate");
-        AudioClientProperties properties{};
-        properties.cbSize = sizeof(properties);
-        properties.eCategory = AudioCategory_Other;
-        properties.Options = AUDCLNT_STREAMOPTIONS_MATCH_FORMAT;
-        check(audio_->SetClientProperties(&properties), "normal SetClientProperties");
-        check(audio_->InitializeSharedAudioStream(AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-            frames, &format, nullptr), "normal InitializeSharedAudioStream");
+            reinterpret_cast<void**>(audio_.GetAddressOf())), "render Activate");
+        if (tone_) {
+            // Typical shared-mode app: adopt the running engine period; do NOT
+            // explicitly request a new 480-frame engine.
+            check(audio_->Initialize(AUDCLNT_SHAREMODE_SHARED,
+                AUDCLNT_STREAMFLAGS_EVENTCALLBACK, 0, 0, &format, nullptr),
+                "ordinary app Initialize");
+        } else {
+            AudioClientProperties properties{};
+            properties.cbSize = sizeof(properties);
+            properties.eCategory = AudioCategory_Other;
+            properties.Options = AUDCLNT_STREAMOPTIONS_MATCH_FORMAT;
+            check(audio_->SetClientProperties(&properties), "normal SetClientProperties");
+            check(audio_->InitializeSharedAudioStream(AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                frames, &format, nullptr), "normal InitializeSharedAudioStream");
+        }
         event_.reset(CreateEventW(nullptr, FALSE, FALSE, nullptr));
         if (!event_.get()) throw std::runtime_error("normal CreateEvent failed");
         check(audio_->SetEventHandle(event_.get()), "normal SetEventHandle");
@@ -41,10 +53,24 @@ public:
         if (padding > capacity_) throw std::runtime_error("normal padding invalid");
         const UINT32 count = capacity_ - padding;
         if (!count) return;
-        BYTE* unused = nullptr;
-        check(render_->GetBuffer(count, &unused), "normal GetBuffer");
-        check(render_->ReleaseBuffer(count, AUDCLNT_BUFFERFLAGS_SILENT),
-            "normal ReleaseBuffer");
+        BYTE* data = nullptr;
+        check(render_->GetBuffer(count, &data), "render GetBuffer");
+        if (tone_) {
+            // 250 Hz low-level square wave, only on the throwaway test endpoint.
+            for (UINT32 i = 0; i < count; ++i, ++toneFrame_) {
+                const float sample = ((toneFrame_ / 96) & 1) ? 0.08f : -0.08f;
+                for (UINT32 ch = 0; ch < 2; ++ch) {
+                    if (floatMix_) {
+                        std::memcpy(data + (i * 2 + ch) * 4, &sample, sizeof(sample));
+                    } else {
+                        const int16_t pcm = sample > 0 ? 2621 : -2621;
+                        std::memcpy(data + (i * 2 + ch) * 2, &pcm, sizeof(pcm));
+                    }
+                }
+            }
+        }
+        check(render_->ReleaseBuffer(count, tone_ ? 0 : AUDCLNT_BUFFERFLAGS_SILENT),
+            "render ReleaseBuffer");
     }
     [[nodiscard]] HANDLE event() const { return event_.get(); }
     void close() noexcept {
@@ -59,7 +85,8 @@ private:
     ComPtr<IAudioClient3> audio_;
     ComPtr<IAudioRenderClient> render_;
     UINT32 capacity_ = 0;
-    bool running_ = false;
+    uint64_t toneFrame_ = 0;
+    bool running_ = false, tone_ = false, floatMix_ = false;
 };
 
 void pump(SilentRender* normal, EnginePeriodCompanion* fast, DWORD milliseconds = 900) {
@@ -92,7 +119,8 @@ void report_period(IAudioClient& query, const WAVEFORMATEX& format, const char* 
               << " current_hr=" << static_cast<uint32_t>(p.current_result) << "\n";
 }
 
-void bind_snapshot(const char* phase, const GUID& source) {
+void bind_snapshot(const char* phase, const GUID& source,
+                   SilentRender* app = nullptr, EnginePeriodCompanion* fast = nullptr) {
     Handle file(CreateFileW(LR"(\\.\DeskFusePcm)", GENERIC_READ | GENERIC_WRITE, 0,
         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
     if (file.get() == INVALID_HANDLE_VALUE)
@@ -136,6 +164,38 @@ void bind_snapshot(const char* phase, const GUID& source) {
     if (bound) {
         if (written != sizeof(handles) || handles.abi != DESKFUSE_PCM_ABI)
             throw std::runtime_error("PCM bind returned invalid handles");
+        if (app && fast) {
+            const auto view = static_cast<const DeskFusePcmMapping*>(MapViewOfFile(
+                reinterpret_cast<HANDLE>(handles.section), FILE_MAP_READ, 0, 0,
+                sizeof(DeskFusePcmMapping)));
+            if (view) {
+                // Bind AFTER the app is producing, then consume only summary data.
+                // No ACK is required: eight slots suffice to verify provenance.
+                pump(app, fast, 150);
+                unsigned slots = 0;
+                uint64_t nonzero = 0, samples = 0;
+                for (const auto& slot : view->slots) {
+                    if (slot.ticket == 0 || slot.frames == 0 || slot.frames > DESKFUSE_PCM_FRAMES)
+                        continue;
+                    ++slots;
+                    const size_t bytes = static_cast<size_t>(slot.frames) *
+                        DESKFUSE_PCM_BYTES_PER_FRAME;
+                    for (size_t i = 0; i < bytes; ++i) {
+                        nonzero += slot.pcm[i] != 0;
+                        ++samples;
+                    }
+                }
+                std::cout << "PCM_SAMPLE phase=" << phase
+                          << " state=" << view->control.state
+                          << " published=" << view->control.published
+                          << " slots=" << slots << " bytes=" << samples
+                          << " nonzero_bytes=" << nonzero << "\n";
+                UnmapViewOfFile(view);
+            } else {
+                std::cout << "PCM_SAMPLE phase=" << phase
+                          << " map_failed=" << GetLastError() << "\n";
+            }
+        }
         CloseHandle(reinterpret_cast<HANDLE>(handles.section));
         CloseHandle(reinterpret_cast<HANDLE>(handles.event));
         DWORD ignored = 0;
@@ -149,8 +209,10 @@ void bind_snapshot(const char* phase, const GUID& source) {
 
 int wmain(int argc, wchar_t** argv) {
     try {
-        if (argc != 3 || std::wstring(argv[1]) != L"--endpoint-id" || !argv[2][0])
-            throw std::runtime_error("usage: deskfuse-period-probe --endpoint-id <temporary DeskFuse endpoint ID>");
+        const bool fastFirst = argc == 4 && std::wstring(argv[3]) == L"--fast-first";
+        if ((argc != 3 && !fastFirst) ||
+            std::wstring(argv[1]) != L"--endpoint-id" || !argv[2][0])
+            throw std::runtime_error("usage: deskfuse-period-probe --endpoint-id <temporary DeskFuse endpoint ID> [--fast-first]");
         ComApartment com;
         AudioMmcssTask mmcss;
         auto endpoint = exact_endpoint(argv[2]);
@@ -169,6 +231,23 @@ int wmain(int argc, wchar_t** argv) {
         std::cout << "FORMAT rate=" << format->nSamplesPerSec << " channels=" << format->nChannels
                   << " bits=" << format->wBitsPerSample << "\n";
         report_period(*query.Get(), *format, "idle");
+        if (fastFirst) {
+            EnginePeriodCompanion fast;
+            fast.initialize(*endpoint.Get(), *format, baseline);
+            fast.start();
+            pump(nullptr, &fast);
+            report_period(*query.Get(), *format, "fast_first_alone");
+            bind_snapshot("fast_first_alone", identity.source_instance);
+            SilentRender app;
+            app.open(*endpoint.Get(), *format, baseline.normal, true);
+            pump(&app, &fast);
+            report_period(*query.Get(), *format, "fast_first_with_app");
+            bind_snapshot("fast_first_with_app", identity.source_instance, &app, &fast);
+            app.close();
+            check(fast.stop(), "fast-first Stop");
+            std::cout << "DONE fast-first\n";
+            return 0;
+        }
         bind_snapshot("idle", identity.source_instance);
 
         SilentRender normal;
