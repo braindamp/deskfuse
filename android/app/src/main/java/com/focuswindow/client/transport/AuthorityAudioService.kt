@@ -166,6 +166,8 @@ class AuthorityAudioService : Service() {
             val binder = authority.asBinder()
             var linked = false
             var terminal = AuthorityAudioState.FAILED
+            var stage = "enrollment handoff"
+            if (BuildConfig.DEBUG) android.util.Log.d("DeskFuseAudio", "Speaker start")
             try {
                 run.requireLive()
                 binder.linkToDeath(died, 0)
@@ -182,11 +184,13 @@ class AuthorityAudioService : Service() {
                     audio.stop()
                     synchronized(candidateGate) { candidate }?.stop()
                 }
+                stage = "route and native audio session"
                 val routes = AuthorityAudioRoutes(this@AuthorityAudioService)
                 val ready = Runnable {
                     main.post {
                         if (active === this && !run.isStopped) {
                             playingAudio = audio
+                            if (BuildConfig.DEBUG) android.util.Log.d("DeskFuseAudio", "Renderer ready")
                             report(AuthorityAudioState.PLAYING)
                             notify(this, "Playing")
                         }
@@ -205,9 +209,16 @@ class AuthorityAudioService : Service() {
                     play(address, handle, requireRoute, {}, {})
                 }
                 terminal = AuthorityAudioState.IDLE
-            } catch (_: Exception) {
+            } catch (failure: Exception) {
                 if (run.isStopped) terminal = AuthorityAudioState.IDLE
+                else if (BuildConfig.DEBUG) {
+                    val evidence = generateSequence<Throwable>(failure) { it.cause }.take(6).joinToString("\nCaused by: ") {
+                        it.javaClass.name + "\n" + it.stackTrace.take(14).joinToString("\n")
+                    }
+                    android.util.Log.e("DeskFuseAudio", "Speaker failed during $stage\n$evidence")
+                }
             } finally {
+                if (BuildConfig.DEBUG) android.util.Log.d("DeskFuseAudio", "Speaker ended: $terminal")
                 run.stop()
                 if (linked) runCatching { binder.unlinkToDeath(died, 0) }
                 main.post {

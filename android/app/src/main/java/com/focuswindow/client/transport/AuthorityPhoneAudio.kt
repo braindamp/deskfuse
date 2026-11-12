@@ -122,7 +122,11 @@ internal class AuthorityPhoneAudio(
                 requireRoute()
                 enrollment.requireCurrent()
                 val deadline = minOf(expiresAt, Math.addExact(SystemClock.elapsedRealtimeNanos(), rpcMs * 1_000_000L))
-                return AuthorityPhoneBridge.call(native, kind.wire, bytes, deadline, onReady)
+                try { return AuthorityPhoneBridge.call(native, kind.wire, bytes, deadline, onReady) }
+                catch (failure: Exception) {
+                    if (com.focuswindow.client.BuildConfig.DEBUG) Log.e("DeskFuseAudio", "Control operation failed: ${kind.name}")
+                    throw failure
+                }
             }
 
             val sourceBytes = call(PhoneControl.INFO)
