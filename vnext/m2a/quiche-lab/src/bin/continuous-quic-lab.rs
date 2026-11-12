@@ -727,6 +727,7 @@ impl RecoveryTrigger {
 struct PendingAnchor {
     challenge: AnchorMessage,
     reason: RecoveryTrigger,
+    budget_evidence: Option<String>,
     recovery_ticket: u64,
     started: Instant,
     retry_at: Instant,
@@ -766,6 +767,7 @@ fn begin_fresh_anchor(
         let now = Instant::now();
         *pending = Some(PendingAnchor {
             reason,
+            budget_evidence: None,
             challenge: AnchorMessage {
                 kind: fresh_anchor::REQUEST,
                 nonce,
@@ -786,6 +788,8 @@ fn begin_fresh_anchor(
 struct NativeObservation {
     headroom:Option<deskfuse_quiche_lab::reorder::Headroom>,
     queued_storage_frames:u64,
+    stats:Option<AudioStats>,
+    playout:Option<PlayoutState>,
 }
 #[derive(Default)]
 struct ClientMedia {
@@ -835,7 +839,8 @@ impl ClientMedia {
         // Coherent callback state can legitimately be unavailable during a
         // callback. Capacity uses the always-available physical occupancy
         // upper bound, including FIR history; absence is not exhaustion.
-        if !self.reorder.fits_budget(h,expected,observed.queued_storage_frames) {
+        let budget=self.reorder.budget_snapshot(h,expected,observed.queued_storage_frames);
+        if !budget.fits() {
             self.reorder.budget_drops+=1;
             if modes.strict {return Err("STRICT PCM violation: combined playout budget exhausted".into())}
             if let Some(speaker)=self.audio.as_mut() {
@@ -843,6 +848,14 @@ impl ClientMedia {
                     speaker,SourceContext{epoch:h.media_epoch,stream:h.source_stream_id,
                                          format:h.format_config_id},self.ingress_frontier.floor(),
                     &mut self.diagnostics, RecoveryTrigger::CombinedQueueBudget)?;
+                if let Some(pending)=self.anchor_pending.as_mut() {
+                    if pending.budget_evidence.is_none() {
+                        pending.budget_evidence=Some(format!("budget={budget:?} previous_sequence={previous:?} expected={expected:?} candidate_sequence={} candidate_first={} candidate_end={} staged_count={} staged_frames={} stats={:?} playout={:?} authorized_recovery={}",
+                            h.packet_sequence,h.first_source_frame,h.first_source_frame.saturating_add(240),
+                            self.reorder.staged_frames()/240,self.reorder.staged_frames(),
+                            observed.stats,observed.playout,self.authorized_recovery));
+                    }
+                }
                 self.recover_started+=1;
             }
             self.reorder.clear();
@@ -863,12 +876,12 @@ impl ClientMedia {
         let stats=speaker.snapshot().map_err(|e|format!("AAudio status: {e}"))?;
         if stats.stream_error!=0 {return Err(format!("AAudio stream failed: code={}",stats.stream_error).into())}
         let state=speaker.playout_state().map_err(|e| format!("AAudio playout state: {e}"))?;
-        let fallback=NativeObservation {headroom:None,queued_storage_frames:stats.queued_frames};
+        let fallback=NativeObservation {headroom:None,queued_storage_frames:stats.queued_frames,stats:Some(stats),playout:state};
         let Some(state)=state else {return Ok(fallback)};
         if state.stream_error!=0 {return Err(format!("AAudio stream failed: code={}",state.stream_error).into())}
         // Recovery tickets remain the existing authoritative atomic API.
         if speaker.recovery_applied()!=self.authorized_recovery {return Ok(fallback)}
-        Ok(NativeObservation {queued_storage_frames:stats.queued_frames,
+        Ok(NativeObservation {stats:Some(stats),playout:Some(state),queued_storage_frames:stats.queued_frames,
             headroom:Some(deskfuse_quiche_lab::reorder::Headroom {
             primed:state.primed!=0,queued_frames:state.queued_playable_frames,
             callback_frames:state.max_callback_frames,
@@ -1174,14 +1187,14 @@ impl AuthorityMedia {
         let (header, _) = parse(wire, &self.0.configuration).map_err(|e| format!("Invalid PCM: {e:?}"))?;
         self.0.stage_media(header, wire, false, Some(path), PlayModes::default(), None)?;
         if let Some(pending) = self.0.anchor_pending.as_ref() {
-            return Err(format!("Authority delivery needs fresh-anchor recovery: trigger={}", pending.reason.as_str()).into());
+            return Err(format!("Authority delivery needs fresh-anchor recovery: trigger={} {}", pending.reason.as_str(), pending.budget_evidence.as_deref().unwrap_or("")).into());
         }
         Ok(())
     }
     pub(crate) fn finish_batch(&mut self, path: &str) -> Result<()> {
         self.0.drain_ready(true, false, Some(path), PlayModes::default(), None)?;
         if let Some(pending) = self.0.anchor_pending.as_ref() {
-            return Err(format!("Authority delivery needs fresh-anchor recovery: trigger={}", pending.reason.as_str()).into());
+            return Err(format!("Authority delivery needs fresh-anchor recovery: trigger={} {}", pending.reason.as_str(), pending.budget_evidence.as_deref().unwrap_or("")).into());
         }
         Ok(())
     }
@@ -1587,7 +1600,7 @@ mod client_staging_tests {
             let wire=captured_packet(sequence,48_000+u64::from(sequence)*AUDIO_FRAMES,&[0;960]);
             let (header,_)=parse(&wire,&Configuration::default()).unwrap();
             state.stage_media_observed(header,&wire,false,None,PlayModes::default(),None,
-                NativeObservation {headroom:None,queued_storage_frames:1920})?;
+                NativeObservation {headroom:None,queued_storage_frames:1920,..NativeObservation::default()})?;
         }
         state.drain_ready(true,false,None,PlayModes::default(),None)?;
         assert_eq!(state.received,3);
@@ -1613,7 +1626,7 @@ mod recovery_boundary_tests {
             challenge: AnchorMessage { kind:fresh_anchor::REQUEST, nonce:7,
                 frame:48000, context:SourceContext {epoch:1,stream:1,format:1} },
             recovery_ticket:3, started, retry_at:started, confirmed:None,
-            reason:RecoveryTrigger::SourceGap,
+            reason:RecoveryTrigger::SourceGap, budget_evidence:None,
         }
     }
     #[test]

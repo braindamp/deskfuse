@@ -30,6 +30,14 @@ impl Headroom {
             .saturating_mul(1_000_000_000) / 48_000).min(HOLD_LIMIT)
     }
 }
+#[derive(Debug, Clone, Copy)]
+pub struct BudgetSnapshot {
+    pub native_queued: u64, pub first: u64, pub end: u64,
+    pub floor: u64, pub span: u64, pub total: u64, pub limit: u64,
+}
+impl BudgetSnapshot {
+    pub fn fits(self) -> bool { self.total <= self.limit }
+}
 pub struct Reorder {
     slots: [Option<Media>; CAPACITY],
     hole: Option<(u64, Instant)>,
@@ -48,12 +56,17 @@ impl Reorder {
     /// Span includes any missing source frames which would need concealment,
     /// not merely the bytes already received. Both stores share one budget.
     pub fn fits_budget(&self,header:Header,expected:Option<u64>,native_queued:u64)->bool {
+        self.budget_snapshot(header,expected,native_queued).fits()
+    }
+    pub fn budget_snapshot(&self,header:Header,expected:Option<u64>,native_queued:u64)->BudgetSnapshot {
         let first=self.slots.iter().flatten().map(|m|m.header.first_source_frame)
             .chain(std::iter::once(header.first_source_frame)).min().unwrap();
         let end=self.slots.iter().flatten().map(|m|m.header.first_source_frame.saturating_add(240))
             .chain(std::iter::once(header.first_source_frame.saturating_add(240))).max().unwrap();
         let floor=expected.map_or(first,|floor|floor.min(first));
-        native_queued.saturating_add(end.saturating_sub(floor))<=TOTAL_FUTURE_FRAMES
+        let span=end.saturating_sub(floor);
+        BudgetSnapshot {native_queued,first,end,floor,span,
+            total:native_queued.saturating_add(span),limit:TOTAL_FUTURE_FRAMES}
     }
     pub fn push(&mut self, header: Header, bytes: &[u8]) -> bool {
         if bytes.len() != MEDIA_BYTES { return false; }
@@ -169,5 +182,13 @@ mod tests {
         assert!(q.fits_budget(h(3),Some(48240),3120)); // 3blocks including hole
         assert!(!q.fits_budget(h(3),Some(48240),3121));
         assert!(!q.fits_budget(h(20),Some(48240),0)); // huge gap is not free
+        let edge=q.budget_snapshot(h(3),Some(48240),3120);
+        assert_eq!((edge.floor,edge.end,edge.span,edge.total),(48240,48960,720,3840));
+        assert!(edge.fits());
+        let backlog=q.budget_snapshot(h(3),Some(48240),3121);
+        assert_eq!(backlog.total,3841); assert!(!backlog.fits());
+        let gap=q.budget_snapshot(h(20),Some(48240),0);
+        assert_eq!(gap.native_queued,0); assert_eq!(gap.span,4800); assert!(!gap.fits());
+        assert!(!q.budget_snapshot(h(3),Some(48240),u64::MAX).fits());
     }
 }
