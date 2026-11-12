@@ -700,8 +700,33 @@ impl PlayModes {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoveryTrigger {
+    CombinedQueueBudget,
+    RendererTicketMismatch,
+    ConcealmentRejected,
+    SourceGap,
+    NativeOverflow,
+    NativeDiscontinuity,
+    NativeRecoveryPending,
+}
+impl RecoveryTrigger {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CombinedQueueBudget => "combined_queue_budget",
+            Self::RendererTicketMismatch => "renderer_recovery_ticket_mismatch",
+            Self::ConcealmentRejected => "concealment_admission_rejected",
+            Self::SourceGap => "source_gap_requires_recovery",
+            Self::NativeOverflow => "native_overflow",
+            Self::NativeDiscontinuity => "native_discontinuity",
+            Self::NativeRecoveryPending => "native_recovery_pending",
+        }
+    }
+}
+
 struct PendingAnchor {
     challenge: AnchorMessage,
+    reason: RecoveryTrigger,
     recovery_ticket: u64,
     started: Instant,
     retry_at: Instant,
@@ -731,6 +756,7 @@ fn begin_fresh_anchor(
     context: SourceContext,
     rejection_frontier: u64,
     diagnostics: &mut AndroidTrace,
+    reason: RecoveryTrigger,
 ) -> Result<()> {
     if pending.is_none() {
         let nonce = *next_nonce;
@@ -739,6 +765,7 @@ fn begin_fresh_anchor(
         if nonce == 0 { return Err("recovery challenge nonce invalid".into()); }
         let now = Instant::now();
         *pending = Some(PendingAnchor {
+            reason,
             challenge: AnchorMessage {
                 kind: fresh_anchor::REQUEST,
                 nonce,
@@ -815,7 +842,7 @@ impl ClientMedia {
                 begin_fresh_anchor(&mut self.anchor_pending,&mut self.fresh_anchor_nonce,
                     speaker,SourceContext{epoch:h.media_epoch,stream:h.source_stream_id,
                                          format:h.format_config_id},self.ingress_frontier.floor(),
-                    &mut self.diagnostics)?;
+                    &mut self.diagnostics, RecoveryTrigger::CombinedQueueBudget)?;
                 self.recover_started+=1;
             }
             self.reorder.clear();
@@ -884,7 +911,7 @@ impl ClientMedia {
                         SourceContext { epoch:h.media_epoch, stream:h.source_stream_id,
                                         format:h.format_config_id },
                         self.ingress_frontier.floor(),
-                        &mut self.diagnostics,
+                        &mut self.diagnostics, RecoveryTrigger::RendererTicketMismatch,
                     )?;
                     self.recover_started += 1;
                 }
@@ -1015,7 +1042,7 @@ impl ClientMedia {
                                             format:h.format_config_id,
                                         },
                                         self.ingress_frontier.floor(),
-                                        &mut self.diagnostics,
+                                        &mut self.diagnostics, RecoveryTrigger::ConcealmentRejected,
                                     )?;
                                     self.recover_started += 1;
                                     break;
@@ -1047,7 +1074,7 @@ impl ClientMedia {
                                 format:h.format_config_id,
                             },
                             self.ingress_frontier.floor(),
-                            &mut self.diagnostics,
+                            &mut self.diagnostics, RecoveryTrigger::SourceGap,
                         )?;
                         self.recover_started += 1;
                         // The current packet establishes a
@@ -1075,8 +1102,7 @@ impl ClientMedia {
                 h.format_config_id, self.delivery_generation.unwrap_or(1), false, self.authorized_recovery)
                 .map_err(|e| format!("Android audio renderer: {e}"))? {
                 Admission::Accepted => {}
-                Admission::Overflow |
-                Admission::Discontinuity => {
+                rejection @ (Admission::Overflow | Admission::Discontinuity) => {
                     if modes.strict { return Err("STRICT PCM violation: native overflow or discontinuity".into()); }
                     self.audio_queue_full += 1;
                     self.recover_started += 1;
@@ -1088,7 +1114,7 @@ impl ClientMedia {
                             format:h.format_config_id,
                         },
                         self.ingress_frontier.floor(),
-                        &mut self.diagnostics,
+                        &mut self.diagnostics, if rejection == Admission::Overflow { RecoveryTrigger::NativeOverflow } else { RecoveryTrigger::NativeDiscontinuity },
                     )?;
                 }
                 Admission::RecoverPending => {
@@ -1102,7 +1128,7 @@ impl ClientMedia {
                             format:h.format_config_id,
                         },
                         self.ingress_frontier.floor(),
-                        &mut self.diagnostics,
+                        &mut self.diagnostics, RecoveryTrigger::NativeRecoveryPending,
                     )?;
                 }
                 Admission::Stale => {
@@ -1140,18 +1166,23 @@ pub(crate) struct AuthorityMedia(ClientMedia);
 #[cfg(target_os = "android")]
 impl AuthorityMedia {
     pub(crate) fn new(renderer: AndroidAudio, configuration: Configuration, generation: u32) -> Self {
-        Self(ClientMedia { audio: Some(renderer), configuration, delivery_generation: Some(generation), ..ClientMedia::default() })
+        Self(ClientMedia { audio: Some(renderer), configuration, delivery_generation: Some(generation),
+            fresh_anchor_nonce: 1, ..ClientMedia::default() })
     }
     pub(crate) fn renderer(&self) -> &AndroidAudio { self.0.audio.as_ref().unwrap() }
     pub(crate) fn receive(&mut self, wire: &[u8], path: &str) -> Result<()> {
         let (header, _) = parse(wire, &self.0.configuration).map_err(|e| format!("Invalid PCM: {e:?}"))?;
         self.0.stage_media(header, wire, false, Some(path), PlayModes::default(), None)?;
-        if self.0.anchor_pending.is_some() { return Err("Authority delivery needs fresh-anchor recovery".into()); }
+        if let Some(pending) = self.0.anchor_pending.as_ref() {
+            return Err(format!("Authority delivery needs fresh-anchor recovery: trigger={}", pending.reason.as_str()).into());
+        }
         Ok(())
     }
     pub(crate) fn finish_batch(&mut self, path: &str) -> Result<()> {
         self.0.drain_ready(true, false, Some(path), PlayModes::default(), None)?;
-        if self.0.anchor_pending.is_some() { return Err("Authority delivery needs fresh-anchor recovery".into()); }
+        if let Some(pending) = self.0.anchor_pending.as_ref() {
+            return Err(format!("Authority delivery needs fresh-anchor recovery: trigger={}", pending.reason.as_str()).into());
+        }
         Ok(())
     }
 }
@@ -1325,7 +1356,7 @@ fn client(remote: SocketAddr, ca: &str, cert: &str, key: &str, seconds: u64, syn
                     begin_fresh_anchor(
                         &mut state.anchor_pending, &mut state.fresh_anchor_nonce, speaker,
                         context, state.ingress_frontier.floor(),
-                        &mut state.diagnostics,
+                        &mut state.diagnostics, RecoveryTrigger::RendererTicketMismatch,
                     )?;
                     state.recover_started += 1;
                     state.reorder.clear();
@@ -1582,12 +1613,14 @@ mod recovery_boundary_tests {
             challenge: AnchorMessage { kind:fresh_anchor::REQUEST, nonce:7,
                 frame:48000, context:SourceContext {epoch:1,stream:1,format:1} },
             recovery_ticket:3, started, retry_at:started, confirmed:None,
+            reason:RecoveryTrigger::SourceGap,
         }
     }
     #[test]
     fn buffered_reply_and_media_after_owner_stall_cannot_complete_expired_exchange() {
         let start=Instant::now();
         let mut p=exchange(start);
+        assert_eq!(p.reason.as_str(), "source_gap_requires_recovery");
         let reply=AnchorMessage {kind:fresh_anchor::ANCHOR, frame:48240,..p.challenge};
         let expired=start+Duration::from_millis(fresh_anchor::TIMEOUT_MS);
         assert!(p.confirm(reply,expired).is_err());
