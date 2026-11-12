@@ -118,10 +118,14 @@ internal class AuthorityPhoneAudio(
             }
             var cutoff = setupDeadline
             fun call(kind: PhoneControl, bytes: ByteArray = byteArrayOf(), onReady: Runnable? = null,
-                expiresAt: Long = cutoff): ByteArray {
+                expiresAt: Long = cutoff, preparingSource: Boolean = false): ByteArray {
                 requireRoute()
                 enrollment.requireCurrent()
-                val deadline = minOf(expiresAt, Math.addExact(SystemClock.elapsedRealtimeNanos(), rpcMs * 1_000_000L))
+                // A first-source result lookup can wait for Windows PnP/endpoint setup.
+                // It uses the original absolute setup cutoff, without refreshing
+                // it or changing the proof lifetime, renewal RPCs or media timing.
+                val deadline = if (preparingSource) minOf(expiresAt, setupDeadline)
+                    else minOf(expiresAt, Math.addExact(SystemClock.elapsedRealtimeNanos(), rpcMs * 1_000_000L))
                 try { return AuthorityPhoneBridge.call(native, kind.wire, bytes, deadline, onReady) }
                 catch (failure: Exception) {
                     if (com.focuswindow.client.BuildConfig.DEBUG) Log.e("DeskFuseAudio", "Control operation failed: ${kind.name}")
@@ -159,12 +163,13 @@ internal class AuthorityPhoneAudio(
                     startStopWork()
                 }
                 val proof = frozen.brokerNonce() + byteArrayOf(signature.size.toByte()) + signature
-                if (approval.operation == AudioOperation.ACQUIRE_SOURCE) beforeAcquire(approval.nonce())
+                val preparingSource = approval.operation == AudioOperation.ACQUIRE_SOURCE
+                if (preparingSource) beforeAcquire(approval.nonce())
                 val receipt = try {
                     call(if (renewal) PhoneControl.RENEW_PROOF else PhoneControl.PROOF, proof, expiresAt = expiresAt)
                 } catch (_: SocketTimeoutException) {
                     call(if (renewal) PhoneControl.RENEW_RESULT else PhoneControl.APPLIED_RESULT,
-                        pending.appliedResultRequest(), expiresAt = expiresAt)
+                        pending.appliedResultRequest(), expiresAt = expiresAt, preparingSource = preparingSource)
                 }
                 return owner.accept(enrollment, pending, receipt, clockMarginPpm) to receipt
             }

@@ -1,5 +1,22 @@
 # Architecture v0.6 implementation status
 
+## F3 / T09 / H3 — bounded cold Speaker startup (12 November 2026)
+
+The ordinary Speaker listener used a 1.5-second quarantined route lifetime,
+although first source acquisition must create the PnP device and resolve/open its
+audio endpoint before returning its receipt. Native first-delivery integration
+fixtures already use 15 seconds. The service first-delivery configuration now
+uses that bounded 15-second setup lifetime; H4 remains disabled on this path.
+Android retains its 3-second initial proof RPC and exact applied-result recovery,
+but the read-only first-source result lookup can use the remaining original
+15-second setup deadline. Retries never refresh that deadline or issue a new
+positive operation. Proof validity, Stop, idle limits, renewal RPCs, source leases,
+media buffering and renderer timing are unchanged. Completion never waits for the
+budget to elapse. This corrects a source-level cold-start mismatch consistent with
+the observed early route loss; it is not proof that all playback blockers are fixed.
+Windows broker and Android debug builds passed; installed audible playback remains
+the next required outcome. No driver/native audio binary change is included.
+
 ## F1 / T03-T04 and F3 / T09 / H3 — one PC selection path (12 November 2026)
 
 In the gated first-delivery profile, Find Windows PC now selects the four-digit
