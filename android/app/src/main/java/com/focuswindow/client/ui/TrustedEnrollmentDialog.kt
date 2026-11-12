@@ -58,7 +58,6 @@ internal fun TrustedEnrollmentDialog(lifecycle: Lifecycle, onDismiss: () -> Unit
     var step by remember { mutableStateOf(0) }
     var host by remember { mutableStateOf("") }
     var port by remember { mutableStateOf("") }
-    var code by remember { mutableStateOf("") }
     var offered by remember { mutableStateOf<List<BrokerScope>>(emptyList()) }
     var selected by remember { mutableStateOf<Set<BrokerScope>>(emptySet()) }
     var found by remember { mutableStateOf<List<TrustedSetupLocation>>(emptyList()) }
@@ -149,27 +148,19 @@ internal fun TrustedEnrollmentDialog(lifecycle: Lifecycle, onDismiss: () -> Unit
                         } }, enabled = !busy) { Text("Recover pairing ${saved.binding().enrollment.toString().take(8)}") }
                     }
                     2 -> {
-                        Text("Enter all 52 characters shown in the genuine Windows setup window. A PC name or an old pairing code cannot verify this setup.")
-                        OutlinedTextField(code, { code = it }, label = { Text("Full verification code") }, enabled = !busy)
-                        TextButton(onClick = {
-                            try {
-                                val client = connection.get()!!
-                                if (code.startsWith("DESKFUSE-ENROLL-VERIFY-V1:")) client.verifyQr(code) else client.verifyText(code)
-                                step = 3; message = null
-                            } catch (_: Exception) { message = "The full code does not match this setup. Check the Windows setup window." }
-                        }, enabled = !busy) { Text("Verify code") }
-                    }
-                    3 -> {
-                        Text("Windows setup verified. Allow this phone to use:")
-                        for (permission in offered.filter { it in selected }) Text(permissionName(permission))
-                        Text("Check the Windows account and approve on both devices.")
+                        Text("Check that Windows setup shows the same number:")
+                        Text(connection.get()?.comparisonNumber().orEmpty(), style = androidx.compose.material3.MaterialTheme.typography.headlineLarge)
+                        Text("Only pair if the numbers on both devices match.")
                         TextButton(onClick = { work {
+                            require(lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED))
+                            connection.get()!!.confirmNumbersMatch()
                             message = "Waiting for confirmation in Windows setup…"
                             committed = connection.get()!!.approve { lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) }
                             audioHost = host
                             committed?.let { TrustedSpeakerSelection.save(context, it, host) }
                             step = 4; message = "Trusted pairing saved."
-                        } }, enabled = !busy) { Text("Approve pairing") }
+                        } }, enabled = !busy) { Text("Numbers match — Pair") }
+
                     }
                     4 -> {
                         Text("Trusted pairing is saved on this phone.")

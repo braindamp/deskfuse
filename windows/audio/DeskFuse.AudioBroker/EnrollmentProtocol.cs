@@ -135,6 +135,12 @@ internal static class EnrollmentProtocol
         r.End(); RequireCanonical(bytes, StatusRequest(value)); return value;
     }
 
+    internal static string ComparisonNumber(byte[] hash)
+    {
+        if (hash is not { Length: 32 }) throw Invalid();
+        return (BinaryPrimitives.ReadUInt32BigEndian(hash) % 10000).ToString("D4", System.Globalization.CultureInfo.InvariantCulture);
+    }
+
     internal static string VerificationQr(Guid ticket, byte[] hash)
     {
         if (ticket == Guid.Empty || hash is not { Length: 32 }) throw Invalid();

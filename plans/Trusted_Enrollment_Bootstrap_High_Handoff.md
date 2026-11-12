@@ -1,5 +1,14 @@
 # Trusted enrollment bootstrap — settled design and High implementation plan
 
+**User-selected pairing UX, 12 November 2026 (F1 / T03-T04):**
+Display four decimal digits on both devices, derived from the first four
+big-endian bytes of the frozen transcript SHA-256 modulo 10000, padded to four
+digits. Both users confirm "Numbers match — Pair"; no camera or typing required.
+The full signed transcript, foreground phone consent and durable receipt remain
+bound internally. This deliberately replaces full-digest human verification with
+a 10,000-value comparison; it is not a new commitment-based short-authentication
+protocol and does not retain the full fingerprint's collision resistance.
+
 **Windows 10 installed TLS correction, 12 November 2026 (F1 / T03-T04):**
 The reference PC rejected the in-memory certificate in Schannel (event 36869;
 phone TCP succeeded, TLS ended with EOF). Keep the process/key/consent contract:

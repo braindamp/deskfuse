@@ -63,6 +63,17 @@ internal class TrustedEnrollmentClient private constructor(
         require(TrustedEnrollmentProtocol.verify(offer.hostSpki, TrustedEnrollmentProtocol.frozen(hash), rootSignature))
         frozen = response.second.copyOf(); transcript
     }
+    fun comparisonNumber(): String {
+        val signed = frozen ?: error("No frozen transcript")
+        val hash = TrustedEnrollmentProtocol.hash(TrustedSetupWire.parseSigned(signed).first)
+        val value = hash.take(4).fold(0L) { number, byte -> (number shl 8) or (byte.toLong() and 255) }
+        return (value % 10000).toString().padStart(4, '0')
+    }
+    fun confirmNumbersMatch() {
+        check(!stopped.get() && !approvalIssued)
+        val signed = frozen ?: error("No frozen transcript")
+        checkedHash = TrustedEnrollmentProtocol.hash(TrustedSetupWire.parseSigned(signed).first)
+    }
     fun verifyText(text: String) {
         val signed = frozen ?: error("No frozen transcript")
         val hash = TrustedEnrollmentProtocol.hash(TrustedSetupWire.parseSigned(signed).first)

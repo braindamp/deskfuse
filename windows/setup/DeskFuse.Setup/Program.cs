@@ -3,7 +3,6 @@ using System.Security.Cryptography;
 using System.Security.Principal;
 using DeskFuse.AudioBroker;
 using DeskFuse.WindowsSecurity;
-using QRCoder;
 
 namespace DeskFuse.Setup;
 
@@ -101,9 +100,8 @@ internal sealed class SetupWindow : Form
     private readonly Label permissions = new() { AutoSize = true, MaximumSize = new Size(600, 0) };
     private readonly Label location = new() { AutoSize = true, MaximumSize = new Size(600, 0) };
     private readonly Label status = new() { AutoSize = true, MaximumSize = new Size(600, 0), Text = "Waiting for the protected pairing offer…" };
-    private readonly PictureBox qr = new() { Size = new Size(280, 280), SizeMode = PictureBoxSizeMode.Zoom };
     private readonly TextBox code = new() { ReadOnly = true, Multiline = true, Width = 590, Height = 60, Font = new Font(FontFamily.GenericMonospace, 12) };
-    private readonly Button confirm = new() { Text = "Confirm after the phone verifies this PC", AutoSize = true, Enabled = false };
+    private readonly Button confirm = new() { Text = "Numbers match — Pair", AutoSize = true, Enabled = false };
     private readonly Button cancel = new() { Text = "Cancel pairing", AutoSize = true };
     private readonly TaskCompletionSource result = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private EnrollmentOffer? offer;
@@ -115,7 +113,7 @@ internal sealed class SetupWindow : Form
         this.registration = registration; this.channel = channel; stop = CancellationTokenSource.CreateLinkedTokenSource(ct);
         Text = "DeskFuse — Pair this phone"; ClientSize = new Size(640, 580); MinimumSize = new Size(600, 550); StartPosition = FormStartPosition.CenterScreen;
         var layout = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false, AutoScroll = true, Padding = new Padding(18) };
-        layout.Controls.AddRange([account, permissions, location, status, qr, code, confirm, cancel]); Controls.Add(layout);
+        layout.Controls.AddRange([account, permissions, location, status, code, confirm, cancel]); Controls.Add(layout);
         confirm.Click += async (_, _) => await Confirm();
         cancel.Click += (_, _) => Close();
         Shown += (_, _) => _ = ReadControl();
@@ -191,13 +189,8 @@ internal sealed class SetupWindow : Form
     }
     private void ShowDigest(EnrollmentBinding value)
     {
-        using var generator = new QRCodeGenerator();
-        using var data = generator.CreateQrCode(EnrollmentProtocol.VerificationQr(value.TicketId, value.TranscriptSha256), QRCodeGenerator.ECCLevel.M);
-        var png = new PngByteQRCode(data).GetGraphic(8);
-        using var bytes = new MemoryStream(png, false); using var image = Image.FromStream(bytes);
-        var previous = qr.Image; qr.Image = new Bitmap(image); previous?.Dispose();
-        code.Text = string.Join(" ", EnrollmentProtocol.VerificationText(value.TranscriptSha256).Chunk(4).Select(chars => new string(chars)));
-        status.Text = "Scan this QR or enter the complete code on your phone. Approve on the phone, then confirm here.";
+        code.Text = EnrollmentProtocol.ComparisonNumber(value.TranscriptSha256);
+        status.Text = "Check that your phone shows the same four-digit number. Pair only if both numbers match.";
         confirm.Enabled = true;
     }
     private async Task Confirm()
@@ -236,5 +229,5 @@ internal sealed class SetupWindow : Form
     private static string AccountName(byte[] sid)
     { var value = new SecurityIdentifier(sid, 0); try { return value.Translate(typeof(NTAccount)).Value; } catch (IdentityNotMappedException) { return value.Value; } }
     protected override void Dispose(bool disposing)
-    { if (disposing) { stop.Cancel(); qr.Image?.Dispose(); stop.Dispose(); } base.Dispose(disposing); }
+    { if (disposing) { stop.Cancel(); stop.Dispose(); } base.Dispose(disposing); }
 }
