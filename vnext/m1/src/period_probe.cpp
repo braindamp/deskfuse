@@ -15,15 +15,14 @@ ComPtr<IMMDevice> exact_endpoint(const wchar_t* id) {
 class SilentRender {
 public:
     void open(IMMDevice& endpoint, const WAVEFORMATEX& format, UINT32 frames,
-              bool ordinaryAppTone = false) {
+              bool ordinaryAppTone = false, bool matchFast = false) {
         tone_ = ordinaryAppTone;
         if (tone_ && !supported_mix(format, floatMix_))
             throw std::runtime_error("ordinary test app requires 48k stereo float32/PCM16 mix");
         check(endpoint.Activate(__uuidof(IAudioClient3), CLSCTX_ALL, nullptr,
             reinterpret_cast<void**>(audio_.GetAddressOf())), "render Activate");
-        if (tone_) {
-            // Typical shared-mode app: adopt the running engine period; do NOT
-            // explicitly request a new 480-frame engine.
+        if (tone_ && !matchFast) {
+            // Typical shared-mode app uses the default shared-mode period.
             check(audio_->Initialize(AUDCLNT_SHAREMODE_SHARED,
                 AUDCLNT_STREAMFLAGS_EVENTCALLBACK, 0, 0, &format, nullptr),
                 "ordinary app Initialize");
@@ -209,10 +208,12 @@ void bind_snapshot(const char* phase, const GUID& source,
 
 int wmain(int argc, wchar_t** argv) {
     try {
-        const bool fastFirst = argc == 4 && std::wstring(argv[3]) == L"--fast-first";
+        const bool matchFast = argc == 4 && std::wstring(argv[3]) == L"--fast-first-matched";
+        const bool fastFirst = argc == 4 &&
+            (std::wstring(argv[3]) == L"--fast-first" || matchFast);
         if ((argc != 3 && !fastFirst) ||
             std::wstring(argv[1]) != L"--endpoint-id" || !argv[2][0])
-            throw std::runtime_error("usage: deskfuse-period-probe --endpoint-id <temporary DeskFuse endpoint ID> [--fast-first]");
+            throw std::runtime_error("usage: deskfuse-period-probe --endpoint-id <temporary DeskFuse endpoint ID> [--fast-first|--fast-first-matched]");
         ComApartment com;
         AudioMmcssTask mmcss;
         auto endpoint = exact_endpoint(argv[2]);
@@ -239,10 +240,12 @@ int wmain(int argc, wchar_t** argv) {
             report_period(*query.Get(), *format, "fast_first_alone");
             bind_snapshot("fast_first_alone", identity.source_instance);
             SilentRender app;
-            app.open(*endpoint.Get(), *format, baseline.normal, true);
+            app.open(*endpoint.Get(), *format, matchFast ? baseline.minimum : baseline.normal,
+                true, matchFast);
             pump(&app, &fast);
-            report_period(*query.Get(), *format, "fast_first_with_app");
-            bind_snapshot("fast_first_with_app", identity.source_instance, &app, &fast);
+            const char* phase = matchFast ? "fast_first_matched_app" : "fast_first_with_app";
+            report_period(*query.Get(), *format, phase);
+            bind_snapshot(phase, identity.source_instance, &app, &fast);
             app.close();
             check(fast.stop(), "fast-first Stop");
             std::cout << "DONE fast-first\n";
