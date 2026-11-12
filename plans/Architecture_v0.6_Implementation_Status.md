@@ -1,5 +1,24 @@
 # Architecture v0.6 implementation status
 
+## F3 / T09 / H3 — identify the failing PCM boundary (12 November 2026)
+
+The first substantive managed startup exception is resource-in-use, before native
+control closure. It lacks the operation and native error code. PcmGrant now labels
+its four failure boundaries PCM_OPEN, PCM_BIND, PCM_DUPLICATE and PCM_REVOKE,
+captures the cached P/Invoke error before message formatting, and retains the
+Win32Exception type/native code and system message. Existing bounded exception
+capture can identify the failing boundary without a debugger or native/phone/
+driver rebuild. No successful-path logging, timing, retries or ownership changes
+are introduced. This is a diagnostic increment, not a playback fix.
+
+The installed on-disk oem7 SYS matches the November build artifact and its host
+table advertises DEFAULT only; live mode behavior and all seven category/RAW
+cases remain unqualified. PCM_BIND conflates active export, removed source,
+denial and multiple streams. Denial can follow overlap/ineligible stream,
+unsupported notification ownership or DRM conditions; it is not proof of an
+existing export owner. No stream-state reset or relaxed guard is justified by
+the present capture. First audible playback and F3/T09/H3 remain unqualified.
+
 ## F3 / T09 / H3 — request the qualified short engine period (12 November 2026)
 
 A read-only query on the selected PC's exact DeskFuse endpoint reported a matching

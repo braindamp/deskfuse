@@ -18,7 +18,7 @@ internal sealed class PcmGrant : IDisposable
     }
     internal PcmGrant(SafeFileHandle file, Action<SafeFileHandle> revoke)
     {
-        if (file.IsInvalid) throw new Win32Exception();
+        if (file.IsInvalid) throw NativeFailure("PCM_OPEN", Marshal.GetLastPInvokeError());
         _file = file;
         this.revoke = revoke;
     }
@@ -42,12 +42,12 @@ internal sealed class PcmGrant : IDisposable
                     Process=unchecked((ulong)consumer.DangerousGetHandle().ToInt64())};
                 if (!DeviceIoControl(_file,BindCode,ref request,Marshal.SizeOf<Bind>(),out var reply,
                     Marshal.SizeOf<Reply>(),out var returned,IntPtr.Zero))
-                    throw new Win32Exception();
+                    throw NativeFailure("PCM_BIND", Marshal.GetLastPInvokeError());
                 return (reply, returned);
             }, () =>
             {
                 if (!DuplicateHandle(GetCurrentProcess(),_file,consumer,out var remote,0, false,2))
-                    throw new Win32Exception();
+                    throw NativeFailure("PCM_DUPLICATE", Marshal.GetLastPInvokeError());
                 return remote.ToUInt64();
             });
         }
@@ -79,10 +79,15 @@ internal sealed class PcmGrant : IDisposable
         if (bound) revoke(_file);
         _file.Dispose();
     }
+    internal static Win32Exception NativeFailure(string operation, int error)
+    {
+        var systemMessage = new Win32Exception(error).Message;
+        return new Win32Exception(error, $"{operation} failed: native error {error} (0x{unchecked((uint)error):X8}): {systemMessage}");
+    }
     private static void Revoke(SafeFileHandle file)
     {
         if (!DeviceIoControl(file,RevokeCode,IntPtr.Zero,0,IntPtr.Zero,0,out _,IntPtr.Zero))
-            throw new Win32Exception(); // preserve endpoint if producer rundown is unconfirmed
+            throw NativeFailure("PCM_REVOKE", Marshal.GetLastPInvokeError()); // preserve endpoint if producer rundown is unconfirmed
     }
     [StructLayout(LayoutKind.Sequential)] private struct Bind {public uint Size,Abi;public Guid Source;public ulong Process;}
     [StructLayout(LayoutKind.Sequential)] internal struct Reply {public uint Size,Abi;public ulong Section,Event,Generation;}

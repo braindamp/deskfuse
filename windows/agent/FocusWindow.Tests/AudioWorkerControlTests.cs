@@ -6,6 +6,28 @@ namespace FocusWindow.Tests;
 
 public sealed class AudioWorkerControlTests
 {
+    [Theory]
+    [InlineData("PCM_OPEN")]
+    [InlineData("PCM_BIND")]
+    [InlineData("PCM_DUPLICATE")]
+    [InlineData("PCM_REVOKE")]
+    public void Pcm_native_failure_keeps_captured_error_and_operation_when_last_error_changes(string operation)
+    {
+        var previous = System.Runtime.InteropServices.Marshal.GetLastPInvokeError();
+        try
+        {
+            System.Runtime.InteropServices.Marshal.SetLastPInvokeError(5);
+            var captured = System.Runtime.InteropServices.Marshal.GetLastPInvokeError();
+            System.Runtime.InteropServices.Marshal.SetLastPInvokeError(87);
+            var failure = PcmGrant.NativeFailure(operation, captured);
+            Assert.IsType<System.ComponentModel.Win32Exception>(failure);
+            Assert.Equal(5, failure.NativeErrorCode);
+            Assert.StartsWith($"{operation} failed: native error 5 (0x00000005): ", failure.Message);
+            Assert.EndsWith(new System.ComponentModel.Win32Exception(5).Message, failure.Message);
+        }
+        finally { System.Runtime.InteropServices.Marshal.SetLastPInvokeError(previous); }
+    }
+
     [Fact]
     public void Partial_kernel_bind_retains_broker_file_until_revoke_succeeds()
     {
