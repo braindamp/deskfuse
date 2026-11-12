@@ -1,5 +1,18 @@
 # Architecture v0.6 implementation status
 
+## F1 / T03-T04 and F3 / T09 / H3 — one PC selection path (12 November 2026)
+
+In the gated first-delivery profile, Find Windows PC now selects the four-digit
+pairing path directly, reusing a matching saved selection for Speaker. The legacy
+visual-session auto-connect/retry/deep-link path no longer takes over that profile.
+Discovery combines the working public PC locator, setup locators and saved PC;
+new pairing resolves its current setup port by bounded unicast to the selected
+address. These remain untrusted hints; signed TLS/offer/transcript and both-device
+consent checks are unchanged. Speaker-only new pairing shows its scope with the
+four digits directly; additional scopes and pending recovery keep explicit choice.
+Commit/recovery saves the selection and enters the existing normal Speaker start.
+No production gate, native media, buffer, clock or audio lifecycle change.
+
 ## F1 / T03-T04 — Windows 10 enrollment TLS compatibility (12 November 2026)
 
 The connected phone reached the setup TCP listener but received TLS EOF. Matching

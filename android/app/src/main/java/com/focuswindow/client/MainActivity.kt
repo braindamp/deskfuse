@@ -48,6 +48,9 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
+import com.focuswindow.client.transport.TrustedSetupDiscovery
 import com.focuswindow.client.input.InputMapper
 import com.focuswindow.client.media.PcAudioOutput
 import com.focuswindow.client.media.PhoneMicrophoneCapture
@@ -121,6 +124,8 @@ class MainActivity : ComponentActivity() {
     private var pcPairingError by mutableStateOf<String?>(null)
     private var manualPc by mutableStateOf("")
     private var trustedSetupVisible by mutableStateOf(false)
+    private var setupHost by mutableStateOf("")
+    private var speakerPreparing by mutableStateOf(false)
     private var trustedSpeakerMessage by mutableStateOf<String?>(null)
 
     private val savePcFile = registerForActivityResult(ActivityResultContracts.CreateDocument(
@@ -254,18 +259,19 @@ class MainActivity : ComponentActivity() {
                     trustedAudioState in setOf(AuthorityAudioState.STARTING, AuthorityAudioState.PLAYING, AuthorityAudioState.STOPPING)) {
                     Row {
                         Text(when (trustedAudioState) {
-                            AuthorityAudioState.STARTING -> "Trusted Speaker: Connecting"
-                            AuthorityAudioState.PLAYING -> "Trusted Speaker: Playing"
-                            else -> "Trusted Speaker: Stopping"
+                            AuthorityAudioState.STARTING -> "Connecting…"
+                            AuthorityAudioState.PLAYING -> "Speaker is playing"
+                            else -> "Stopping…"
                         })
                         if (trustedAudioState != AuthorityAudioState.STOPPING) {
                             TextButton(onClick = { AuthorityAudioControl.stop(this@MainActivity) }) { Text("Stop Speaker") }
                         }
                     }
                 }
+                if (speakerPreparing) Text("Connecting…")
                 trustedSpeakerMessage?.let { message ->
                     AlertDialog(onDismissRequest = { trustedSpeakerMessage = null },
-                        title = { Text("Trusted Speaker") }, text = { Text(message) },
+                        title = { Text("Speaker") }, text = { Text(message) },
                         confirmButton = { TextButton(onClick = { trustedSpeakerMessage = null }) { Text("Close") } })
                 }
                 if (pcPickerVisible) {
@@ -311,9 +317,7 @@ class MainActivity : ComponentActivity() {
                                     }
                                 }
                                 pcPairingError?.let { Text(it) }
-                                if (!pcPairingBusy) TextButton(onClick = {
-                                    pcPickerVisible = false; trustedSetupVisible = true; appDialogVisible = true
-                                }) { Text("Trusted phone setup") }
+
                             }
                         },
                         confirmButton = {
@@ -329,9 +333,11 @@ class MainActivity : ComponentActivity() {
                     )
                 }
 
-                if (trustedSetupVisible) TrustedEnrollmentDialog(lifecycle) {
-                    trustedSetupVisible = false; appDialogVisible = false
-                }
+                if (trustedSetupVisible) TrustedEnrollmentDialog(lifecycle, setupHost,
+                    onPaired = {
+                        trustedSetupVisible = false; appDialogVisible = false
+                        startSelectedTrustedSpeaker()
+                    }, onDismiss = { trustedSetupVisible = false; appDialogVisible = false })
 
                 sharedDocumentUri?.let { sharedUri ->
                     AlertDialog(
@@ -590,7 +596,7 @@ class MainActivity : ComponentActivity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         refreshProfile()
         // A previously approved PC requires no scanning or further confirmation.
-        if (controller.state.value is SessionState.Idle && !pcPickerVisible) {
+        if (!BuildConfig.TRUSTED_SPEAKER_FIRST_DELIVERY && controller.state.value is SessionState.Idle && !pcPickerVisible) {
             val existing = pairings.last()
             val current = profile
             if (existing != null && current != null) controller.start(existing, current)
@@ -763,6 +769,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startSelectedTrustedSpeaker() {
+        if (speakerPreparing) return
         when (AuthorityAudioControl.state.value) {
             AuthorityAudioState.STARTING, AuthorityAudioState.PLAYING -> {
                 AuthorityAudioControl.stop(this)
@@ -771,18 +778,20 @@ class MainActivity : ComponentActivity() {
             AuthorityAudioState.STOPPING -> return
             else -> Unit
         }
+        speakerPreparing = true
         lifecycleScope.launch {
             try {
                 val selected = withContext(Dispatchers.IO) {
                     TrustedSpeakerSelection.resolve(applicationContext)
-                } ?: error("Select and enroll a trusted PC in Trusted phone setup first.")
+                } ?: error("Choose your PC using Find Windows PC first.")
                 val locator = TrustedSpeakerLocator.locate(applicationContext, selected)
-                    ?: error("Selected PC has no prepared trusted LAN listener. Start the installed DeskFuse authority on that PC and retry.")
+                    ?: error("Check that DeskFuse is running on your PC, then try again.")
                 AuthorityAudioControl.start(this@MainActivity, selected.enrollment,
                     locator.host, locator.port, cellular = false)
-            } catch (error: Exception) {
-                trustedSpeakerMessage = error.message ?: "Cannot start trusted Speaker."
-            }
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (_: Exception) {
+                trustedSpeakerMessage = "Couldn’t connect. Check DeskFuse on your PC and try again."
+            } finally { speakerPreparing = false }
         }
     }
 
@@ -797,7 +806,18 @@ class MainActivity : ComponentActivity() {
         pcDiscoveryBusy = true
         pcPairingError = null
         lifecycleScope.launch {
-            runCatching { CameraFreeDiscovery.scan() }
+            runCatching {
+                if (!BuildConfig.TRUSTED_SPEAKER_FIRST_DELIVERY) CameraFreeDiscovery.scan()
+                else coroutineScope {
+                    val nearby = async { runCatching { CameraFreeDiscovery.scan() }.getOrDefault(emptyList()) }
+                    val setup = async { runCatching { TrustedSetupDiscovery.scan() }.getOrDefault(emptyList()) }
+                    val saved = withContext(Dispatchers.IO) { TrustedSpeakerSelection.resolve(applicationContext) }
+                    // These are public locator hints only; selection never grants authority.
+                    (nearby.await() + setup.await().map { DiscoveredPc(it.address, it.name, 47810, it.port) } +
+                        listOfNotNull(saved?.let { DiscoveredPc(it.hostHint, it.label, 47810, 47812) }))
+                        .distinctBy { it.address }
+                }
+            }
                 .onSuccess { discoveredPcs = it }
                 .onFailure {
                     pcPairingError = "Discovery unavailable. Enter the Windows PC address instead."
@@ -808,6 +828,20 @@ class MainActivity : ComponentActivity() {
 
     private fun enrollWith(pc: DiscoveredPc) {
         if (pcPairingBusy) return
+        if (BuildConfig.TRUSTED_SPEAKER_FIRST_DELIVERY) {
+            pcPairingBusy = true
+            lifecycleScope.launch {
+                try {
+                    val saved = withContext(Dispatchers.IO) { TrustedSpeakerSelection.resolve(applicationContext) }
+                    pcPickerVisible = false
+                    if (saved?.hostHint == pc.address) startSelectedTrustedSpeaker()
+                    else { setupHost = pc.address; trustedSetupVisible = true; appDialogVisible = true }
+                } catch (cancelled: CancellationException) { throw cancelled }
+                catch (_: Exception) { pcPairingError = "Couldn’t open this PC. Try again." }
+                finally { pcPairingBusy = false }
+            }
+            return
+        }
         val p = profile ?: profiles.current(this, insets).also { profile = it }
         pcPairingBusy = true
         pcPairingCode = null
@@ -833,6 +867,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun handlePairingUri(raw: String) {
+        if (BuildConfig.TRUSTED_SPEAKER_FIRST_DELIVERY) { beginPairing(); return }
         when (val result = PairingPayload.parse(raw)) {
             is PairingPayload.Companion.Result.Ok -> {
                 val p = profile ?: profiles.current(this, insets).also { profile = it }
@@ -848,6 +883,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun retry() {
+        if (BuildConfig.TRUSTED_SPEAKER_FIRST_DELIVERY) { beginPairing(); return }
         val p = profile ?: return
         val last = pairings.last()
         if (last != null) controller.start(last, p) else beginPairing()

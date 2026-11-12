@@ -23,16 +23,40 @@ internal object TrustedSetupDiscovery {
                 while (System.nanoTime() < end) {
                     val bytes = ByteArray(512); val packet = DatagramPacket(bytes, bytes.size)
                     try { socket.receive(packet) } catch (_: SocketTimeoutException) { continue }
-                    val parts = String(packet.data, packet.offset, packet.length, Charsets.US_ASCII).split('|')
-                    if (parts.size != 3 || parts[0] != "DESKFUSE_TRUSTED_SETUP_HOST_V1") continue
-                    val port = parts[2].toIntOrNull()?.takeIf { it in 1..65535 } ?: continue
-                    val nameBytes = runCatching { Base64.decode(parts[1], Base64.NO_WRAP) }.getOrNull()?.takeIf { it.size <= 128 } ?: continue
-                    val name = String(nameBytes, Charsets.UTF_8).filterNot { it.isISOControl() || it in '\u202a'..'\u202e' || it in '\u2066'..'\u2069' }.take(80)
-                    val address = packet.address.hostAddress ?: continue
-                    if (found.size < 64) found["$address:$port"] = TrustedSetupLocation(address, port, name)
+                    val location = parse(packet) ?: continue
+                    if (found.size < 64) found["${location.address}:${location.port}"] = location
                 }
             }
         }
         found.values.toList()
     }
+    /** Resolve only the selected public address. Its reply still confers no trust. */
+    suspend fun locate(host: String): TrustedSetupLocation? = withContext(Dispatchers.IO) {
+        val address = InetAddress.getByName(host)
+        DatagramSocket().use { socket ->
+            socket.soTimeout = 250
+            val query = "DESKFUSE_TRUSTED_SETUP_V1".toByteArray(Charsets.US_ASCII)
+            repeat(2) {
+                socket.send(DatagramPacket(query, query.size, address, 47813))
+                val until = System.nanoTime() + 750_000_000L
+                while (System.nanoTime() < until) {
+                    val packet = DatagramPacket(ByteArray(512), 512)
+                    try { socket.receive(packet) } catch (_: SocketTimeoutException) { continue }
+                    if (packet.address != address || packet.port != 47813) continue
+                    parse(packet)?.let { return@withContext it }
+                }
+            }
+        }
+        null
+    }
+
+    private fun parse(packet: DatagramPacket): TrustedSetupLocation? {
+        val parts = String(packet.data, packet.offset, packet.length, Charsets.US_ASCII).split('|')
+        if (parts.size != 3 || parts[0] != "DESKFUSE_TRUSTED_SETUP_HOST_V1") return null
+        val port = parts[2].toIntOrNull()?.takeIf { it in 1..65535 } ?: return null
+        val bytes = runCatching { Base64.decode(parts[1], Base64.NO_WRAP) }.getOrNull()?.takeIf { it.size <= 128 } ?: return null
+        val name = String(bytes, Charsets.UTF_8).filterNot { it.isISOControl() || it in '\u202a'..'\u202e' || it in '\u2066'..'\u2069' }.take(80)
+        return TrustedSetupLocation(packet.address.hostAddress ?: return null, port, name)
+    }
+
 }
