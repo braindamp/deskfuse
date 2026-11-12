@@ -1,9 +1,17 @@
 // Local, phone-free WaveRT stream lifetime experiment. No media/network path.
 #define DESKFUSE_CAPTURE_LIFECYCLE_TEST
 #include "wasapi_capture.cpp"
+#include <winioctl.h>
 #include "../../../windows/driver/DeskFuseAudio/src/pcm_export_abi.h"
 
 namespace {
+ComPtr<IMMDevice> exact_endpoint(const wchar_t* id) {
+    ComPtr<IMMDeviceEnumerator> enumerator;
+    check(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&enumerator)), "enumerator");
+    ComPtr<IMMDevice> endpoint;
+    check(enumerator->GetDevice(id, &endpoint), "exact source endpoint");
+    return endpoint;
+}
 class SilentRender {
 public:
     void open(IMMDevice& endpoint, const WAVEFORMATEX& format, UINT32 frames) {
