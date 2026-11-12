@@ -823,7 +823,8 @@ impl ClientMedia {
     fn stage_media_observed(&mut self,h:Header,wire:&[u8],synthetic:bool,
                    playback_library:Option<&str>,modes:PlayModes,
                    authenticated_at:Option<Instant>,observed:NativeObservation)->Result<()> {
-        self.startup.observe(observed.stats,observed.playout,h.packet_sequence,h.first_source_frame);
+        self.startup.observe(observed.stats,observed.playout,h.packet_sequence,h.first_source_frame,
+            || self.audio.as_ref().and_then(|audio|audio.callback_metrics().ok()));
         let previous=self.ingress_frontier.last_sequence();
         let expected=previous.map(|_|self.ingress_frontier.floor());
         if previous.is_some_and(|seq|h.packet_sequence<=seq) ||
@@ -1204,6 +1205,10 @@ impl AuthorityMedia {
     pub(crate) fn new(renderer: AndroidAudio, configuration: Configuration, generation: u32, startup:deskfuse_quiche_lab::startup_observation::Timeline) -> Self {
         Self(ClientMedia { audio: Some(renderer), configuration, delivery_generation: Some(generation),
             fresh_anchor_nonce: 1, startup, ..ClientMedia::default() })
+    }
+    pub(crate) fn finish_observation(&mut self) {
+        let metrics=self.0.audio.as_ref().and_then(|audio|audio.callback_metrics().ok());
+        self.0.startup.metrics("play_exit_callback_metrics",metrics);
     }
     pub(crate) fn renderer(&self) -> &AndroidAudio { self.0.audio.as_ref().unwrap() }
     pub(crate) fn receive(&mut self, wire: &[u8], path: &str) -> Result<()> {

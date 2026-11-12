@@ -1,17 +1,17 @@
 //! Bounded owner-thread startup observations; output is deferred until teardown.
-use crate::android_audio::{AudioStats,PlayoutState};
+use crate::android_audio::{AudioStats,PlayoutState,CallbackMetricsV8};
 use std::time::Instant;
 #[derive(Debug,Clone,Copy)]
 struct Sample {
     event: &'static str, us:u128, stats:Option<AudioStats>, playout:Option<PlayoutState>,
-    sequence:Option<u32>, source:Option<u64>,
+    sequence:Option<u32>, source:Option<u64>, metrics:Option<CallbackMetricsV8>,
 }
 pub struct Timeline {
-    start:Instant, records:[Option<Sample>;12], count:usize, active:bool,
+    start:Instant, records:[Option<Sample>;16], count:usize, active:bool,
     gate:Option<Instant>, baseline_rendered:u64, latest:Option<Sample>,
 }
 impl Default for Timeline {
-    fn default()->Self {Self {start:Instant::now(),records:[None;12],count:0,active:false,
+    fn default()->Self {Self {start:Instant::now(),records:[None;16],count:0,active:false,
         gate:None,baseline_rendered:0,latest:None}}
 }
 impl Timeline {
@@ -27,15 +27,26 @@ impl Timeline {
     }
     pub(crate) fn mark(&mut self,event:&'static str,stats:Option<AudioStats>) {
         if !self.active{return;}
-        self.retain(Sample {event,us:self.start.elapsed().as_micros(),stats,playout:None,sequence:None,source:None});
+        self.retain(Sample {event,us:self.start.elapsed().as_micros(),stats,playout:None,sequence:None,source:None,metrics:None});
     }
     pub(crate) fn opening_gate(&mut self,stats:AudioStats) {
         self.baseline_rendered=stats.rendered_frames;self.gate=Some(Instant::now());
         self.mark("gate_open_request",Some(stats));
     }
-    pub fn observe(&mut self,stats:Option<AudioStats>,playout:Option<PlayoutState>,sequence:u32,source:u64) {
+    pub fn metrics(&mut self,event:&'static str,metrics:Option<CallbackMetricsV8>) {
         if !self.active{return;}
-        let sample=Sample {event:"last_observation",us:self.start.elapsed().as_micros(),stats,playout,sequence:Some(sequence),source:Some(source)};
+        self.retain(Sample {event,us:self.start.elapsed().as_micros(),stats:None,playout:None,sequence:None,source:None,metrics});
+    }
+    pub fn observe(&mut self,stats:Option<AudioStats>,playout:Option<PlayoutState>,sequence:u32,source:u64,measure:impl FnOnce()->Option<CallbackMetricsV8>) {
+        if !self.active{return;}
+        let consuming=stats.is_some_and(|s|s.rendered_frames>self.baseline_rendered);
+        let elapsed=self.gate.map(|gate|gate.elapsed().as_millis());
+        let milestone=!self.seen("first_pcm_observed") ||
+            (consuming && !self.seen("first_consumption_observed")) ||
+            (elapsed.is_some_and(|v|v>=100) && !self.seen("after_gate_100ms_observed")) ||
+            (elapsed.is_some_and(|v|v>=300) && !self.seen("after_gate_300ms_observed"));
+        let metrics=if milestone {measure()} else {None};
+        let sample=Sample {event:"last_observation",us:self.start.elapsed().as_micros(),stats,playout,sequence:Some(sequence),source:Some(source),metrics};
         self.latest=Some(sample);
         self.retain(Sample {event:"first_pcm_observed",..sample});
         if stats.is_some_and(|s|s.rendered_frames>self.baseline_rendered) {
@@ -55,6 +66,10 @@ impl Drop for Timeline {
         for sample in self.records[..self.count].iter().flatten() {
             log_event(&format!("STARTUP_TIMELINE event={} t_us={} sequence={:?} source={:?} stats={:?} playout={:?}",
                 sample.event,sample.us,sample.sequence,sample.source,sample.stats,sample.playout));
+            if let Some(metrics)=sample.metrics {
+                log_event(&format!("CALLBACK_METRICS event={} t_us={} buckets_le_96_240_480_960_1920_above={:?} measured_calls={} total_wall_ns={} maximum_wall_ns={} clock_failures={} measurement_enabled={}",
+                    sample.event,sample.us,metrics.size_buckets,metrics.measured_calls,metrics.total_wall_ns,metrics.maximum_wall_ns,metrics.clock_failures,metrics.measurement_enabled));
+            }
         }
     }
 }

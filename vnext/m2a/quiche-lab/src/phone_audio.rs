@@ -473,6 +473,10 @@ impl AudioRun {
             OutputConfigV8::new(reader.u32()?, reader.u32()?, reader.u32()?, reader.u32()?)
                 .map_err(io::Error::other)?;
         let path = std::str::from_utf8(reader.0).map_err(io::Error::other)?;
+        // Temporary diagnostic APK: activate the renderer's existing timing hook.
+        // It is read once at open and remains immutable for the stream lifetime.
+        static MEASURE_CALLBACKS:std::sync::Once=std::sync::Once::new();
+        MEASURE_CALLBACKS.call_once(||std::env::set_var("DESKFUSE_AUDIO_MEASURE_CALLBACK","1"));
         let mut renderer =
             AndroidAudio::open_with_config(path, config).map_err(io::Error::other)?;
         if !unsafe {
@@ -518,6 +522,7 @@ impl AudioRun {
         owner.live()?;
         let (submit, commands) = mpsc::sync_channel(1);
         *owner.commands.lock().map_err(|_| denied())? = Some(submit);
+        startup.metrics("gate_callback_metrics",renderer.callback_metrics().ok());
         startup.opening_gate(gate_stats);
         owner.playing.store(true, Ordering::Release);
         self.playback = Some(AuthorityMedia::new(
@@ -585,6 +590,7 @@ impl AudioRun {
             }
         })();
         if let Err(error) = &result { log_play_failure(operation, error, stream_error); }
+        if let Some(media)=self.playback.as_mut(){media.finish_observation();}
         owner.playing.store(false, Ordering::Release);
         owner.commands.lock().map_err(|_| denied())?.take();
         self.playback = None;
