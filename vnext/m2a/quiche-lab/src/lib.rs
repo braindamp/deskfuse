@@ -5,6 +5,7 @@
 #[cfg(windows)]
 mod startup_trace;
 pub mod deferred_trace;
+#[doc(hidden)] pub mod startup_observation;
 pub mod broker_control;
 pub mod audio_authority;
 pub mod audio_tls;

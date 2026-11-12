@@ -811,6 +811,7 @@ struct ClientMedia {
     continuity_watch:ContinuityWatch,
     source_gap_frames:u64, source_concealed_frames:u64, source_unconcealed_frames:u64,
     reorder:deskfuse_quiche_lab::reorder::Reorder,
+    startup:deskfuse_quiche_lab::startup_observation::Timeline,
 }
 impl ClientMedia {
     fn stage_media(&mut self,h:Header,wire:&[u8],synthetic:bool,
@@ -822,6 +823,7 @@ impl ClientMedia {
     fn stage_media_observed(&mut self,h:Header,wire:&[u8],synthetic:bool,
                    playback_library:Option<&str>,modes:PlayModes,
                    authenticated_at:Option<Instant>,observed:NativeObservation)->Result<()> {
+        self.startup.observe(observed.stats,observed.playout,h.packet_sequence,h.first_source_frame);
         let previous=self.ingress_frontier.last_sequence();
         let expected=previous.map(|_|self.ingress_frontier.floor());
         if previous.is_some_and(|seq|h.packet_sequence<=seq) ||
@@ -853,7 +855,7 @@ impl ClientMedia {
                 if !self.native_capacity_probe_logged {
                     self.native_capacity_probe_logged=true;
                     #[cfg(target_os="android")]
-                    crate::phone_audio::log_native_capacity_probe(&format!(
+                    deskfuse_quiche_lab::startup_observation::log_event(&format!(
                         "Native capacity experiment budget={budget:?} pending_recovery={:?} stale_delta={} error={:?}",
                         self.anchor_pending.as_ref().map(|p|p.reason.as_str()),
                         self.native_stale-stale_before,result.as_ref().err().map(|e|e.to_string())));
@@ -1199,9 +1201,9 @@ impl ClientMedia {
 pub(crate) struct AuthorityMedia(ClientMedia);
 #[cfg(target_os = "android")]
 impl AuthorityMedia {
-    pub(crate) fn new(renderer: AndroidAudio, configuration: Configuration, generation: u32) -> Self {
+    pub(crate) fn new(renderer: AndroidAudio, configuration: Configuration, generation: u32, startup:deskfuse_quiche_lab::startup_observation::Timeline) -> Self {
         Self(ClientMedia { audio: Some(renderer), configuration, delivery_generation: Some(generation),
-            fresh_anchor_nonce: 1, ..ClientMedia::default() })
+            fresh_anchor_nonce: 1, startup, ..ClientMedia::default() })
     }
     pub(crate) fn renderer(&self) -> &AndroidAudio { self.0.audio.as_ref().unwrap() }
     pub(crate) fn receive(&mut self, wire: &[u8], path: &str) -> Result<()> {

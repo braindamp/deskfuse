@@ -464,6 +464,7 @@ impl AudioRun {
     }
     fn play(&mut self, owner: &Owner, bytes: &[u8], until: u64, on_ready: impl FnOnce()) -> io::Result<()> {
         if self.playback.is_some() { return Err(denied()); }
+        let mut startup=crate::startup_observation::Timeline::start();
         let source = self.source.as_ref().ok_or_else(denied)?;
         let generation = self.delivery.generation.ok_or_else(denied)?;
         let [epoch, stream, format] = source.wire;
@@ -479,6 +480,7 @@ impl AudioRun {
         } {
             return Err(denied());
         }
+        startup.mark("gate_bound_closed",None);
         let output = loop {
             let now = owner.live()?;
             if now >= until || renderer.snapshot().map_err(io::Error::other)?.stream_error != 0 {
@@ -497,24 +499,26 @@ impl AudioRun {
         if renderer.snapshot().map_err(io::Error::other)?.stream_error != 0 {
             return Err(denied());
         }
+        startup.mark("aaudio_started_observed",None);
         let ready = self.delivery.connection.queue_phone_ready(output, owner.live()?)?;
+        startup.mark("ready_request_queued",None);
         self.delivery.request = ready;
         if !self.delivery.reply(owner, ready, wire::OUTPUT, until)?.is_empty() {
             return Err(denied());
         }
+        startup.mark("ready_reply_received",None);
         while !self.delivery.discard()? {
             owner.live()?;
         }
+        startup.mark("decoded_media_discarded",None);
         let sample = renderer.timing_sample().map_err(io::Error::other)?;
-        if sample.state_after != 4
-            || sample.output_generation != output
-            || renderer.snapshot().map_err(io::Error::other)?.stream_error != 0
-        {
-            return Err(denied());
-        }
+        if sample.state_after != 4 || sample.output_generation != output {return Err(denied());}
+        let gate_stats=renderer.snapshot().map_err(io::Error::other)?;
+        if gate_stats.stream_error != 0 {return Err(denied());}
         owner.live()?;
         let (submit, commands) = mpsc::sync_channel(1);
         *owner.commands.lock().map_err(|_| denied())? = Some(submit);
+        startup.opening_gate(gate_stats);
         owner.playing.store(true, Ordering::Release);
         self.playback = Some(AuthorityMedia::new(
             renderer,
@@ -525,7 +529,7 @@ impl AudioRun {
                 maximum_frames: 240,
                 ..Configuration::default()
             },
-            generation,
+            generation, startup,
         ));
         on_ready();
         let mut packet = [0; 1350];
