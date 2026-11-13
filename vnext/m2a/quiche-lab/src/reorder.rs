@@ -55,7 +55,7 @@ impl Reorder {
     pub fn contiguous_native_candidate(&self, header:Header, expected:Option<u64>, previous:Option<u32>)->bool {
         expected==Some(header.first_source_frame) &&
             previous.and_then(|n|n.checked_add(1))==Some(header.packet_sequence) &&
-            self.slots.iter().all(Option::is_none)
+            self.slots.iter().all(Option::is_none) && self.hole.is_none()
     }
     pub fn clear(&mut self) { self.slots.fill(None); self.hole = None; }
     pub fn staged_frames(&self)->u64 {self.slots.iter().flatten().count() as u64 * 240}
@@ -144,6 +144,13 @@ mod tests {
     fn push(q:&mut Reorder,n:u32) { assert!(q.push(h(n), &[0;MEDIA_BYTES])); }
     fn room() -> Option<Headroom> {
         Some(Headroom {primed:true,queued_frames:1920,callback_frames:240})
+    }
+    #[test]
+    fn native_candidate_requires_no_stale_hole_deadline() {
+        let mut q=Reorder::default();
+        assert!(q.contiguous_native_candidate(h(1),Some(48_240),Some(0)));
+        q.hole=Some((48_240,Instant::now()));
+        assert!(!q.contiguous_native_candidate(h(1),Some(48_240),Some(0)));
     }
     #[test]
     fn same_batch_reordering_does_not_conceal_even_without_headroom() {

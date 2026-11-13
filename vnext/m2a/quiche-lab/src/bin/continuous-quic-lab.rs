@@ -810,6 +810,7 @@ struct ClientMedia {
     strict_baseline:Option<(deskfuse_quiche_lab::android_audio::RenderSnapshot,u64)>,
     continuity_watch:ContinuityWatch,
     source_gap_frames:u64, source_concealed_frames:u64, source_unconcealed_frames:u64,
+    published_media_frames:u64, retired_unpublished_frames:u64,
     reorder:deskfuse_quiche_lab::reorder::Reorder,
     startup:deskfuse_quiche_lab::startup_observation::Timeline,
 }
@@ -985,7 +986,7 @@ impl ClientMedia {
         // source-frame interval. This irreversible frontier
         // outlives every local AAudio re-prime.
         let previous_source_sequence = self.ingress_frontier.last_sequence();
-        let accepted = match self.ingress_frontier.ingest(
+        let prepared = match self.ingress_frontier.prepare(
             SourceContext {
                 epoch: h.media_epoch,
                 stream: h.source_stream_id,
@@ -1009,6 +1010,7 @@ impl ClientMedia {
             Err(SourceReject::Overflow) =>
                 return Err("authenticated source-frame range overflow".into()),
         };
+        let accepted=prepared.accepted;
         self.session_context.get_or_insert(SourceContext {
             epoch:h.media_epoch, stream:h.source_stream_id,
             format:h.format_config_id,
@@ -1055,6 +1057,7 @@ impl ClientMedia {
                         // BEFORE the next valid source interval.
                         const ZERO_PCM: [u8; PAYLOAD_BYTES] = [0; PAYLOAD_BYTES];
                         let mut complete_concealment = true;
+                        let mut concealed_in_gap = 0u64;
                         for offset in 0..(missing / AUDIO_FRAMES) {
                             let state = speaker.push_media(
                                 &ZERO_PCM,
@@ -1065,28 +1068,29 @@ impl ClientMedia {
                             match state {
                                 Admission::Accepted => {
                                     self.source_concealed_frames += AUDIO_FRAMES;
+                                    concealed_in_gap += AUDIO_FRAMES;
                                 }
                                 _ => {
                                     complete_concealment = false;
                                     self.source_unconcealed_frames +=
                                         missing - offset * AUDIO_FRAMES;
-                                    begin_fresh_anchor(
-                                        &mut self.anchor_pending,
-                                        &mut self.fresh_anchor_nonce, speaker,
-                                        SourceContext {
-                                            epoch:h.media_epoch,
-                                            stream:h.source_stream_id,
-                                            format:h.format_config_id,
-                                        },
-                                        self.ingress_frontier.floor(),
-                                        &mut self.diagnostics, RecoveryTrigger::ConcealmentRejected,
-                                    )?;
-                                    self.recover_started += 1;
                                     break;
                                 }
                             }
                         }
                         if !complete_concealment {
+                            // A prefix of the gap may already be published.
+                            // Retire only the unpublished suffix plus this packet.
+                            self.ingress_frontier.retire(prepared);
+                            self.retired_unpublished_frames += missing - concealed_in_gap + AUDIO_FRAMES;
+                            begin_fresh_anchor(
+                                &mut self.anchor_pending, &mut self.fresh_anchor_nonce, speaker,
+                                SourceContext {epoch:h.media_epoch,stream:h.source_stream_id,
+                                               format:h.format_config_id},
+                                self.ingress_frontier.floor(),
+                                &mut self.diagnostics, RecoveryTrigger::ConcealmentRejected,
+                            )?;
+                            self.recover_started += 1;
                             // The lost packet still advances
                             // the authenticated irreversible
                             // reception frontier. Never
@@ -1102,6 +1106,8 @@ impl ClientMedia {
                         // Account for it; later renderer generation and
                         // drift recovery will handle this explicitly.
                         self.source_unconcealed_frames += missing;
+                        self.ingress_frontier.retire(prepared);
+                        self.retired_unpublished_frames += missing + AUDIO_FRAMES;
                         begin_fresh_anchor(
                             &mut self.anchor_pending, &mut self.fresh_anchor_nonce,
                             speaker,
@@ -1138,9 +1144,14 @@ impl ClientMedia {
                 h.media_epoch, h.source_stream_id,
                 h.format_config_id, self.delivery_generation.unwrap_or(1), false, self.authorized_recovery)
                 .map_err(|e| format!("Android audio renderer: {e}"))? {
-                Admission::Accepted => {}
+                Admission::Accepted => {
+                    self.ingress_frontier.commit_published(prepared);
+                    self.published_media_frames += AUDIO_FRAMES;
+                }
                 rejection @ (Admission::Overflow | Admission::Discontinuity) => {
                     if modes.strict { return Err("STRICT PCM violation: native overflow or discontinuity".into()); }
+                    self.ingress_frontier.retire(prepared);
+                    self.retired_unpublished_frames += AUDIO_FRAMES;
                     self.audio_queue_full += 1;
                     self.recover_started += 1;
                     begin_fresh_anchor(
@@ -1156,6 +1167,8 @@ impl ClientMedia {
                 }
                 Admission::RecoverPending => {
                     if modes.strict { return Err("STRICT PCM violation: recovery pending".into()); }
+                    self.ingress_frontier.retire(prepared);
+                    self.retired_unpublished_frames += AUDIO_FRAMES;
                     self.recover_pending += 1;
                     begin_fresh_anchor(
                         &mut self.anchor_pending, &mut self.fresh_anchor_nonce,
@@ -1171,8 +1184,15 @@ impl ClientMedia {
                 Admission::Stale => {
                     if modes.strict { return Err("STRICT PCM violation: stale PCM admission".into()); }
                     self.native_stale += 1;
+                    // Rust expected this successor but the native writer has
+                    // already retired it: fail closed rather than hide divergence.
+                    return Err("native Stale contradicts the authenticated source frontier".into());
                 }
             }
+        } else {
+            // Verify-only mode has no publisher; advance the rejection floor
+            // without reporting native publication.
+            self.ingress_frontier.retire(prepared);
         }
         if self.received % 200 == 0 {
             let mut sample=AndroidPeriodic {
@@ -1209,6 +1229,11 @@ impl AuthorityMedia {
     pub(crate) fn finish_observation(&mut self) {
         let metrics=self.0.audio.as_ref().and_then(|audio|audio.callback_metrics().ok());
         self.0.startup.metrics("play_exit_callback_metrics",metrics);
+        deskfuse_quiche_lab::startup_observation::log_event(&format!(
+            "Source publication accounting media_published_frames={} conceal_published_frames={} retired_unpublished_frames={} native_stale={} rejection_floor={}",
+            self.0.published_media_frames,self.0.source_concealed_frames,
+            self.0.retired_unpublished_frames,self.0.native_stale,
+            self.0.ingress_frontier.floor()));
     }
     pub(crate) fn renderer(&self) -> &AndroidAudio { self.0.audio.as_ref().unwrap() }
     pub(crate) fn receive(&mut self, wire: &[u8], path: &str) -> Result<()> {

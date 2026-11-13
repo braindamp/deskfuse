@@ -41,6 +41,17 @@ impl ContinuityWatch {
     pub fn repeated_gaps(&self)->u32 {self.repeated_gaps}
 }
 
+/// A single-owner checked candidate. Preparation alone retires no source audio.
+#[must_use]
+pub struct Prepared {
+    pub accepted: Accepted,
+    context: Context,
+    sequence: u32,
+    end_frame: u64,
+    prior_context: Option<Context>,
+    prior_sequence: Option<u32>,
+    prior_floor: u64,
+}
 #[derive(Default)]
 pub struct ReceiveFrontier {
     context:Option<Context>,
@@ -48,32 +59,56 @@ pub struct ReceiveFrontier {
     next_frame:u64,
 }
 impl ReceiveFrontier {
-    pub fn ingest(
-        &mut self, context:Context, sequence:u32, first_frame:u64,
-        frames:u64,
-    )->Result<Accepted,Reject>{
-        if frames==0 || first_frame.checked_add(frames).is_none(){
-            return Err(Reject::Overflow);
-        }
-        if let Some(previous)=self.context{
-            if previous!=context{return Err(Reject::RetiredContext);}
+    /// Pure checked admission; does not advance the rejection frontier.
+    pub fn prepare(&self, context:Context, sequence:u32, first_frame:u64,
+                   frames:u64)->Result<Prepared,Reject>{
+        let Some(end_frame)=first_frame.checked_add(frames) else {return Err(Reject::Overflow)};
+        if frames==0 {return Err(Reject::Overflow)}
+        if self.context.is_some_and(|previous|previous!=context) {
+            return Err(Reject::RetiredContext);
         }
         let previous_seq=self.last_sequence;
         if let Some(last)=previous_seq {
-            if sequence<=last{return Err(Reject::Late);}
-            if first_frame<self.next_frame{return Err(Reject::Overlapping);}
+            if sequence<=last {return Err(Reject::Late)}
+            if first_frame<self.next_frame {return Err(Reject::Overlapping)}
         }
         let expected=if previous_seq.is_some(){self.next_frame}else{first_frame};
-        let decision=Accepted {
-            missing_sequences: previous_seq.map_or(0,|v|u64::from(sequence-v-1)),
-            missing_frames: first_frame-expected,
-            expected_source:expected,
-            newly_anchored:previous_seq.is_none(),
-        };
-        self.context=Some(context);
-        self.last_sequence=Some(sequence);
-        self.next_frame=first_frame+frames;
-        Ok(decision)
+        Ok(Prepared {
+            accepted:Accepted {
+                missing_sequences: previous_seq.map_or(0,|v|u64::from(sequence-v-1)),
+                missing_frames: first_frame-expected,
+                expected_source:expected,
+                newly_anchored:previous_seq.is_none(),
+            },
+            context,sequence,end_frame,
+            prior_context:self.context,prior_sequence:previous_seq,prior_floor:self.next_frame,
+        })
+    }
+    /// Native Accepted is the publication commit point, not proof of audible
+    /// presentation. No other owner can mutate this Rust cursor in between.
+    pub fn commit_published(&mut self, prepared:Prepared) {
+        self.finish(prepared);
+    }
+    /// Explicitly retire an abandoned interval without claiming publication.
+    pub fn retire(&mut self, prepared:Prepared) {
+        self.finish(prepared);
+    }
+    fn finish(&mut self, prepared:Prepared) {
+        debug_assert_eq!(self.context,prepared.prior_context);
+        debug_assert_eq!(self.last_sequence,prepared.prior_sequence);
+        debug_assert_eq!(self.next_frame,prepared.prior_floor);
+        self.context=Some(prepared.context);
+        self.last_sequence=Some(prepared.sequence);
+        self.next_frame=prepared.end_frame;
+    }
+    /// Verify-only callers without a native renderer still retire validated
+    /// received source intervals, without claiming publication.
+    pub fn ingest(&mut self, context:Context, sequence:u32, first_frame:u64,
+                  frames:u64)->Result<Accepted,Reject>{
+        let prepared=self.prepare(context,sequence,first_frame,frames)?;
+        let accepted=prepared.accepted;
+        self.retire(prepared);
+        Ok(accepted)
     }
     /// Called only after a matching, authenticated Windows fresh-capture
     /// nonce response. Advance the irrecoverable floor to that NEW source
@@ -90,6 +125,21 @@ impl ReceiveFrontier {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn checked_candidate_requires_explicit_publication_or_retirement() {
+        let ctx=Context{epoch:1,stream:1,format:1};
+        let mut frontier=ReceiveFrontier::default();
+        let first=frontier.prepare(ctx,3,48_000,240).unwrap();
+        assert_eq!(frontier.floor(),0);
+        assert_eq!(frontier.last_sequence(),None);
+        frontier.commit_published(first);
+        assert_eq!(frontier.floor(),48_240);
+        let abandoned=frontier.prepare(ctx,4,48_240,240).unwrap();
+        assert_eq!(frontier.floor(),48_240);
+        frontier.retire(abandoned);
+        assert_eq!(frontier.floor(),48_480);
+        assert_eq!(frontier.prepare(ctx,4,48_240,240).err(),Some(Reject::Late));
+    }
     #[test]
     fn sustained_source_holes_with_contiguous_packet_sequences_fail_closed(){
         let context=Context{epoch:1,stream:1,format:1};
