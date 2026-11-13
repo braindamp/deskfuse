@@ -1,6 +1,10 @@
 //! Bounded owner-thread startup observations; output is deferred until teardown.
 use crate::android_audio::{AudioStats,PlayoutState,CallbackMetricsV8};
 use std::time::Instant;
+// Deferred owner-thread observations only. One sample per 500-ms arrival
+// bucket, bounded to the most recent twelve seconds; no callback work.
+const INTERVAL_US:u128=500_000;
+const INTERVAL_SLOTS:usize=24;
 #[derive(Debug,Clone,Copy)]
 struct Sample {
     event: &'static str, us:u128, stats:Option<AudioStats>, playout:Option<PlayoutState>,
@@ -9,10 +13,14 @@ struct Sample {
 pub struct Timeline {
     start:Instant, records:[Option<Sample>;16], count:usize, active:bool,
     gate:Option<Instant>, baseline_rendered:u64, latest:Option<Sample>,
+    intervals:[Option<Sample>;INTERVAL_SLOTS], interval_next:usize,
+    interval_count:usize, interval_overwritten:u64, last_bucket:Option<u128>,
 }
 impl Default for Timeline {
     fn default()->Self {Self {start:Instant::now(),records:[None;16],count:0,active:false,
-        gate:None,baseline_rendered:0,latest:None}}
+        gate:None,baseline_rendered:0,latest:None,
+        intervals:[None;INTERVAL_SLOTS],interval_next:0,interval_count:0,
+        interval_overwritten:0,last_bucket:None}}
 }
 impl Timeline {
     pub(crate) fn start()->Self {
@@ -48,6 +56,22 @@ impl Timeline {
         let metrics=if milestone {measure()} else {None};
         let sample=Sample {event:"last_observation",us:self.start.elapsed().as_micros(),stats,playout,sequence:Some(sequence),source:Some(source),metrics};
         self.latest=Some(sample);
+        // Keep a rolling, strictly bounded view of source progress and native
+        // occupancy across a sustained run. The sample precedes admission;
+        // receipt never implies publication. Empty buckets have no invented data.
+        if let Some(gate)=self.gate {
+            let bucket=gate.elapsed().as_micros()/INTERVAL_US;
+            if self.last_bucket!=Some(bucket) {
+                if self.interval_count==INTERVAL_SLOTS {
+                    self.interval_overwritten=self.interval_overwritten.saturating_add(1);
+                } else {
+                    self.interval_count+=1;
+                }
+                self.intervals[self.interval_next]=Some(sample);
+                self.interval_next=(self.interval_next+1)%INTERVAL_SLOTS;
+                self.last_bucket=Some(bucket);
+            }
+        }
         self.retain(Sample {event:"first_pcm_observed",..sample});
         if stats.is_some_and(|s|s.rendered_frames>self.baseline_rendered) {
             self.retain(Sample {event:"first_consumption_observed",..sample});
@@ -69,6 +93,20 @@ impl Drop for Timeline {
             if let Some(metrics)=sample.metrics {
                 log_event(&format!("CALLBACK_METRICS event={} t_us={} buckets_le_96_240_480_960_1920_above={:?} measured_calls={} total_wall_ns={} maximum_wall_ns={} clock_failures={} measurement_enabled={}",
                     sample.event,sample.us,metrics.size_buckets,metrics.measured_calls,metrics.total_wall_ns,metrics.maximum_wall_ns,metrics.clock_failures,metrics.measurement_enabled));
+            }
+        }
+        #[cfg(target_os="android")]
+        {
+            log_event(&format!(
+                "STEADY_INTERVALS cadence_us={} slots={} retained={} overwritten={} sampling=on_packet_arrival_before_admission",
+                INTERVAL_US,INTERVAL_SLOTS,self.interval_count,self.interval_overwritten));
+            let oldest=if self.interval_count==INTERVAL_SLOTS {self.interval_next} else {0};
+            for n in 0..self.interval_count {
+                if let Some(sample)=self.intervals[(oldest+n)%INTERVAL_SLOTS] {
+                    log_event(&format!(
+                        "STEADY_INTERVAL t_us={} sequence={:?} source={:?} stats={:?} playout={:?}",
+                        sample.us,sample.sequence,sample.source,sample.stats,sample.playout));
+                }
             }
         }
     }
